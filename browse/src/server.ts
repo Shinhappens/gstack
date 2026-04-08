@@ -32,6 +32,7 @@ import {
   rotateRoot, listTokens, serializeRegistry, restoreRegistry, recordCommand,
   isRootToken, checkConnectRateLimit, type TokenInfo,
 } from './token-registry';
+import { validateTempPath } from './path-security';
 import { resolveConfig, ensureStateDir, readVersionHash } from './config';
 import { emitActivity, subscribe, getActivityAfter, getActivityHistory, getSubscriberCount } from './activity';
 import { inspectElement, modifyStyle, resetModifications, getModificationHistory, detachSession, type InspectorResult } from './cdp-inspector';
@@ -1457,9 +1458,12 @@ async function start() {
         }
         try {
           const pairBody = await req.json() as any;
-          const scopes = pairBody.admin
-            ? ['read', 'write', 'admin', 'meta'] as const
-            : (pairBody.scopes || ['read', 'write']) as const;
+          // Default: full access (read+write+admin+meta). The trust boundary is
+          // the pairing ceremony itself, not the scope. --control adds browser-wide
+          // destructive commands (stop, restart, disconnect). --restrict limits scope.
+          const scopes = pairBody.control || pairBody.admin
+            ? ['read', 'write', 'admin', 'meta', 'control'] as const
+            : (pairBody.scopes || ['read', 'write', 'admin', 'meta']) as const;
           const setupKey = createSetupKey({
             clientId: pairBody.clientId,
             scopes: [...scopes],
@@ -2028,6 +2032,60 @@ async function start() {
         }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // ─── File serving endpoint (for remote agents to retrieve downloaded files) ────
+      if (url.pathname === '/file' && req.method === 'GET') {
+        const tokenInfo = getTokenInfo(req);
+        if (!tokenInfo) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const filePath = url.searchParams.get('path');
+        if (!filePath) {
+          return new Response(JSON.stringify({ error: 'Missing "path" query parameter' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        try {
+          validateTempPath(filePath);
+        } catch (err: any) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 403, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (!fs.existsSync(filePath)) {
+          return new Response(JSON.stringify({ error: 'File not found' }), {
+            status: 404, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const stat = fs.statSync(filePath);
+        if (stat.size > 200 * 1024 * 1024) {
+          return new Response(JSON.stringify({ error: 'File too large (max 200MB)' }), {
+            status: 413, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const ext = path.extname(filePath).toLowerCase();
+        const MIME_MAP: Record<string, string> = {
+          '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+          '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+          '.avif': 'image/avif',
+          '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
+          '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
+          '.pdf': 'application/pdf', '.json': 'application/json',
+          '.html': 'text/html', '.txt': 'text/plain', '.mhtml': 'message/rfc822',
+        };
+        const contentType = MIME_MAP[ext] || 'application/octet-stream';
+        resetIdleTimer();
+        return new Response(Bun.file(filePath), {
+          headers: {
+            'Content-Type': contentType,
+            'Content-Length': String(stat.size),
+            'Content-Disposition': `inline; filename="${path.basename(filePath)}"`,
+            'Cache-Control': 'no-cache',
+          },
         });
       }
 

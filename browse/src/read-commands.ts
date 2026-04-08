@@ -10,8 +10,11 @@ import { consoleBuffer, networkBuffer, dialogBuffer } from './buffers';
 import type { Page, Frame } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
-import { TEMP_DIR, isPathWithin } from './platform';
+import { TEMP_DIR } from './platform';
 import { inspectElement, formatInspectorResult, getModificationHistory } from './cdp-inspector';
+import { validateReadPath } from './path-security';
+// Re-export for backward compatibility (tests import from read-commands)
+export { validateReadPath } from './path-security';
 
 // Redaction patterns for sensitive cookie/storage values — exported for test coverage
 export const SENSITIVE_COOKIE_NAME = /(^|[_.-])(token|secret|key|password|credential|auth|jwt|session|csrf|sid)($|[_.-])|api.?key/i;
@@ -39,38 +42,6 @@ function wrapForEvaluate(code: string): string {
   return needsBlockWrapper(trimmed)
     ? `(async()=>{\n${code}\n})()`
     : `(async()=>(${trimmed}))()`;
-}
-
-// Security: Path validation to prevent path traversal attacks
-// Resolve safe directories through realpathSync to handle symlinks (e.g., macOS /tmp → /private/tmp)
-const SAFE_DIRECTORIES = [TEMP_DIR, process.cwd()].map(d => {
-  try { return fs.realpathSync(d); } catch { return d; }
-});
-
-export function validateReadPath(filePath: string): void {
-  // Always resolve to absolute first (fixes relative path symlink bypass)
-  const resolved = path.resolve(filePath);
-  // Resolve symlinks — throw on non-ENOENT errors
-  let realPath: string;
-  try {
-    realPath = fs.realpathSync(resolved);
-  } catch (err: any) {
-    if (err.code === 'ENOENT') {
-      // File doesn't exist — resolve directory part for symlinks (e.g., /tmp → /private/tmp)
-      try {
-        const dir = fs.realpathSync(path.dirname(resolved));
-        realPath = path.join(dir, path.basename(resolved));
-      } catch {
-        realPath = resolved;
-      }
-    } else {
-      throw new Error(`Cannot resolve real path: ${filePath} (${err.code})`);
-    }
-  }
-  const isSafe = SAFE_DIRECTORIES.some(dir => isPathWithin(realPath, dir));
-  if (!isSafe) {
-    throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
-  }
 }
 
 /**
@@ -254,6 +225,50 @@ export async function handleReadCommand(
         networkBuffer.clear();
         return 'Network buffer cleared.';
       }
+
+      // Network capture extensions
+      if (args[0] === '--capture') {
+        const {
+          startCapture, stopCapture, getCaptureListener, isCaptureActive,
+        } = await import('./network-capture');
+
+        if (args[1] === 'stop') {
+          // Detach listener from current page
+          const page = bm.getPage();
+          const listener = getCaptureListener();
+          if (listener) page.removeListener('response', listener);
+          const result = stopCapture();
+          return `Network capture stopped. ${result.count} responses captured (${result.sizeKB}KB).`;
+        }
+
+        // Start capture
+        if (isCaptureActive()) return 'Capture already active. Use --capture stop first.';
+        const filterIdx = args.indexOf('--filter');
+        const filterPattern = filterIdx >= 0 ? args[filterIdx + 1] : undefined;
+        const info = startCapture(filterPattern);
+        // Attach listener to current page
+        const page = bm.getPage();
+        const listener = getCaptureListener();
+        if (listener) page.on('response', listener);
+        return `Network capture started${info.filter ? ` (filter: ${info.filter})` : ''}. Use --capture stop to stop.`;
+      }
+
+      if (args[0] === '--export') {
+        const { exportCapture } = await import('./network-capture');
+        const { validateOutputPath: vop } = await import('./path-security');
+        const exportPath = args[1];
+        if (!exportPath) throw new Error('Usage: network --export <path>');
+        vop(exportPath);
+        const count = exportCapture(exportPath);
+        return `Exported ${count} captured responses to ${exportPath}`;
+      }
+
+      if (args[0] === '--bodies') {
+        const { getCaptureBuffer } = await import('./network-capture');
+        return getCaptureBuffer().summary();
+      }
+
+      // Default: show request metadata
       if (networkBuffer.length === 0) return '(no network requests)';
       return networkBuffer.toArray().map(e =>
         `${e.method} ${e.url} → ${e.status || 'pending'} (${e.duration || '?'}ms, ${e.size || '?'}B)`
@@ -410,6 +425,76 @@ export async function handleReadCommand(
       (bm as any)._inspectorData = result;
       (bm as any)._inspectorTimestamp = Date.now();
       return formatInspectorResult(result, { includeUA });
+    }
+
+    case 'media': {
+      const { extractMedia } = await import('./media-extract');
+      const target = bm.getActiveFrameOrPage();
+      const filter = args.includes('--images') ? 'images' as const
+        : args.includes('--videos') ? 'videos' as const
+        : args.includes('--audio') ? 'audio' as const
+        : undefined;
+      const selectorArg = args.find(a => !a.startsWith('--'));
+      const result = await extractMedia(target, { selector: selectorArg, filter });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'data': {
+      const target = bm.getActiveFrameOrPage();
+      const wantJsonLd = args.includes('--jsonld') || args.length === 0;
+      const wantOg = args.includes('--og') || args.length === 0;
+      const wantTwitter = args.includes('--twitter') || args.length === 0;
+      const wantMeta = args.includes('--meta') || args.length === 0;
+
+      const result = await target.evaluate(({ wantJsonLd, wantOg, wantTwitter, wantMeta }) => {
+        const data: Record<string, any> = {};
+
+        if (wantJsonLd) {
+          const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+          const jsonLd: any[] = [];
+          scripts.forEach(s => {
+            try { jsonLd.push(JSON.parse(s.textContent || '')); } catch {}
+          });
+          data.jsonLd = jsonLd;
+        }
+
+        if (wantOg) {
+          const og: Record<string, string> = {};
+          document.querySelectorAll('meta[property^="og:"]').forEach(m => {
+            const prop = m.getAttribute('property')?.replace('og:', '') || '';
+            og[prop] = m.getAttribute('content') || '';
+          });
+          data.openGraph = og;
+        }
+
+        if (wantTwitter) {
+          const tw: Record<string, string> = {};
+          document.querySelectorAll('meta[name^="twitter:"]').forEach(m => {
+            const name = m.getAttribute('name')?.replace('twitter:', '') || '';
+            tw[name] = m.getAttribute('content') || '';
+          });
+          data.twitterCards = tw;
+        }
+
+        if (wantMeta) {
+          const meta: Record<string, string> = {};
+          const canonical = document.querySelector('link[rel="canonical"]');
+          if (canonical) meta.canonical = canonical.getAttribute('href') || '';
+          const desc = document.querySelector('meta[name="description"]');
+          if (desc) meta.description = desc.getAttribute('content') || '';
+          const keywords = document.querySelector('meta[name="keywords"]');
+          if (keywords) meta.keywords = keywords.getAttribute('content') || '';
+          const author = document.querySelector('meta[name="author"]');
+          if (author) meta.author = author.getAttribute('content') || '';
+          const title = document.querySelector('title');
+          if (title) meta.title = title.textContent || '';
+          data.meta = meta;
+        }
+
+        return data;
+      }, { wantJsonLd, wantOg, wantTwitter, wantMeta });
+
+      return JSON.stringify(result, null, 2);
     }
 
     default:
