@@ -49,7 +49,7 @@ function wrapForEvaluate(code: string): string {
  * Exported for DRY reuse in meta-commands (diff).
  */
 export async function getCleanText(page: Page | Frame): Promise<string> {
-  return await page.evaluate(() => {
+  return page.evaluate(() => {
     const body = document.body;
     if (!body) return '';
     const clone = body.cloneNode(true) as HTMLElement;
@@ -73,7 +73,7 @@ export async function handleReadCommand(
 
   switch (command) {
     case 'text': {
-      return await getCleanText(target);
+      return getCleanText(target);
     }
 
     case 'html': {
@@ -81,9 +81,9 @@ export async function handleReadCommand(
       if (selector) {
         const resolved = await session.resolveRef(selector);
         if ('locator' in resolved) {
-          return await resolved.locator.innerHTML({ timeout: 5000 });
+          return resolved.locator.innerHTML({ timeout: 5000 });
         }
-        return await target.locator(resolved.selector).innerHTML({ timeout: 5000 });
+        return target.locator(resolved.selector).innerHTML({ timeout: 5000 });
       }
       // page.content() is page-only; use evaluate for frame compat
       const doctype = await target.evaluate(() => {

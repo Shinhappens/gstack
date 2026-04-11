@@ -399,7 +399,7 @@ export async function handleWriteCommand(
         if (!fs.existsSync(fp)) throw new Error(`File not found: ${fp}`);
         if (path.isAbsolute(fp)) {
           let resolvedFp: string;
-          try { resolvedFp = fs.realpathSync(path.resolve(fp)); } catch { resolvedFp = path.resolve(fp); }
+          try { resolvedFp = fs.realpathSync(path.resolve(fp)); } catch (err: any) { if (err?.code !== 'ENOENT') throw err; resolvedFp = path.resolve(fp); }
           if (!SAFE_DIRECTORIES.some(dir => isPathWithin(resolvedFp, dir))) {
             throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
           }
@@ -455,7 +455,7 @@ export async function handleWriteCommand(
       if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
       const raw = fs.readFileSync(filePath, 'utf-8');
       let cookies: any[];
-      try { cookies = JSON.parse(raw); } catch { throw new Error(`Invalid JSON in ${filePath}`); }
+      try { cookies = JSON.parse(raw); } catch (err: any) { throw new Error(`Invalid JSON in ${filePath}: ${err?.message || err}`); }
       if (!Array.isArray(cookies)) throw new Error('Cookie file must contain a JSON array');
 
       // Auto-fill domain from current page URL when missing (consistent with cookie command)
@@ -520,8 +520,9 @@ export async function handleWriteCommand(
       const pickerUrl = `http://127.0.0.1:${port}/cookie-picker?code=${code}`;
       try {
         Bun.spawn(['open', pickerUrl], { stdout: 'ignore', stderr: 'ignore' });
-      } catch {
-        // open may fail silently — URL is in the message below
+      } catch (err: any) {
+        // open may fail on non-macOS or if 'open' binary is missing — URL is in the message below
+        if (err?.code !== 'ENOENT' && !err?.message?.includes('spawn')) throw err;
       }
 
       return `Cookie picker opened at http://127.0.0.1:${port}/cookie-picker\nDetected browsers: ${browsers.map(b => b.name).join(', ')}\nSelect domains to import, then close the picker when done.`;
@@ -606,7 +607,10 @@ export async function handleWriteCommand(
                 (el as HTMLElement).style.setProperty('display', 'none', 'important');
                 removed++;
               });
-            } catch {}
+            } catch (err: any) {
+              // querySelectorAll throws DOMException on invalid CSS selectors — skip those
+              if (!(err instanceof DOMException)) throw err;
+            }
           }
           return removed;
         }, selectors);
@@ -815,7 +819,9 @@ export async function handleWriteCommand(
               document.querySelectorAll(sel).forEach(el => {
                 (el as HTMLElement).style.display = 'none';
               });
-            } catch {}
+            } catch (err: any) {
+              if (!(err instanceof DOMException)) throw err;
+            }
           }
           // Also hide fixed/sticky (except nav)
           for (const el of document.querySelectorAll('*')) {
@@ -838,7 +844,9 @@ export async function handleWriteCommand(
               document.querySelectorAll(sel).forEach(el => {
                 (el as HTMLElement).style.display = 'none';
               });
-            } catch {}
+            } catch (err: any) {
+              if (!(err instanceof DOMException)) throw err;
+            }
           }
         }, hideSelectors);
       }
@@ -950,13 +958,13 @@ export async function handleWriteCommand(
               reader.onerror = () => reject('Failed to read blob');
               reader.readAsDataURL(blob);
             });
-          } catch {
-            return 'ERROR:EXPIRED';
+          } catch (err: any) {
+            return `ERROR:EXPIRED:${err?.message || 'unknown'}`;
           }
         }, url);
 
         if (dataUrl === 'ERROR:TOO_LARGE') throw new Error('Blob too large (>100MB). Use a different approach.');
-        if (dataUrl === 'ERROR:EXPIRED') throw new Error('Blob URL expired or inaccessible.');
+        if (dataUrl.startsWith('ERROR:EXPIRED')) throw new Error(`Blob URL expired or inaccessible: ${dataUrl.slice('ERROR:EXPIRED:'.length)}`);
 
         const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
         if (!match) throw new Error('Failed to decode blob data');

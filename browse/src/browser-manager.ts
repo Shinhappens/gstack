@@ -127,7 +127,9 @@ export class BrowserManager {
         if (fs.existsSync(path.join(candidate, 'manifest.json'))) {
           return candidate;
         }
-      } catch {}
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT' && err?.code !== 'EACCES') throw err;
+      }
     }
     return null;
   }
@@ -288,11 +290,16 @@ export class BrowserManager {
           let origIcon = iconMatch ? iconMatch[1] : 'app';
           if (!origIcon.endsWith('.icns')) origIcon += '.icns';
           const destIcon = path.join(chromeResources, origIcon);
-          try { fs.copyFileSync(iconSrc, destIcon); } catch { /* non-fatal */ }
+          try {
+            fs.copyFileSync(iconSrc, destIcon);
+          } catch (err: any) {
+            if (err?.code !== 'ENOENT' && err?.code !== 'EACCES') throw err;
+          }
         }
       }
-    } catch {
-      // Non-fatal: app name just stays as Chrome for Testing
+    } catch (err: any) {
+      // Non-fatal: app name stays as Chrome for Testing (ENOENT/EACCES expected)
+      if (err?.code !== 'ENOENT' && err?.code !== 'EACCES') throw err;
     }
 
     // Build custom user agent: keep Chrome version for site compatibility,
@@ -364,7 +371,11 @@ export class BrowserManager {
       const cleanup = () => {
         for (const key of Object.keys(window)) {
           if (key.startsWith('cdc_') || key.startsWith('__webdriver')) {
-            try { delete (window as any)[key]; } catch {}
+            try {
+              delete (window as any)[key];
+            } catch (e: any) {
+              if (!(e instanceof TypeError)) throw e;
+            }
           }
         }
       };
@@ -446,7 +457,9 @@ export class BrowserManager {
       this.activeTabId = id;
       this.wirePageEvents(page);
       // Inject indicator on restored page (addInitScript only fires on new navigations)
-      try { await page.evaluate(indicatorScript); } catch {}
+      try {
+        await page.evaluate(indicatorScript);
+      } catch {}
     } else {
       await this.newTab();
     }
@@ -581,7 +594,9 @@ export class BrowserManager {
     try {
       const u = new URL(activeUrl);
       activeOriginPath = u.origin + u.pathname;
-    } catch {}
+    } catch (err: any) {
+      if (!(err instanceof TypeError)) throw err;
+    }
 
     for (const [id, page] of this.pages) {
       try {
@@ -598,7 +613,9 @@ export class BrowserManager {
             if (pu.origin + pu.pathname === activeOriginPath) {
               fuzzyId = id;
             }
-          } catch {}
+          } catch (err: any) {
+            if (!(err instanceof TypeError)) throw err;
+          }
         }
       } catch {}
     }
@@ -1131,7 +1148,7 @@ export class BrowserManager {
           await dialog.dismiss();
         }
       } catch {
-        // Dialog may have been dismissed by navigation — ignore
+        // Dialog may have been dismissed by navigation
       }
     });
 

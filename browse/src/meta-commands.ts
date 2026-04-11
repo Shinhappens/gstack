@@ -248,8 +248,9 @@ export async function handleMetaCommand(
       try {
         commands = JSON.parse(jsonStr);
         if (!Array.isArray(commands)) throw new Error('not array');
-      } catch {
+      } catch (err: any) {
         // Fallback: pipe-delimited format "goto url | click @e5 | snapshot -ic"
+        if (!(err instanceof SyntaxError) && err?.message !== 'not array') throw err;
         commands = jsonStr.split(' | ')
           .filter(seg => seg.trim().length > 0)
           .map(seg => tokenizePipeSegment(seg.trim()));
@@ -291,7 +292,7 @@ export async function handleMetaCommand(
           } else {
             // Parse error from JSON result
             let errMsg = cr.result;
-            try { errMsg = JSON.parse(cr.result).error || cr.result; } catch {}
+            try { errMsg = JSON.parse(cr.result).error || cr.result; } catch (err: any) { if (!(err instanceof SyntaxError)) throw err; }
             results.push(`[${name}] ERROR: ${errMsg}`);
           }
           lastWasWrite = WRITE_COMMANDS.has(name);
@@ -431,8 +432,9 @@ export async function handleMetaCommand(
             execSync(`osascript -e 'tell application "${appName}" to activate'`, { stdio: 'pipe', timeout: 3000 });
             activated = true;
             break;
-          } catch {
-            // Try next browser
+          } catch (err: any) {
+            // Try next browser — osascript fails if app not found or AppleScript errors
+            if (err?.status === undefined && !err?.message?.includes('Command failed')) throw err;
           }
         }
 
@@ -448,8 +450,9 @@ export async function handleMetaCommand(
               await resolved.locator.scrollIntoViewIfNeeded({ timeout: 5000 });
               return `Browser activated. Scrolled ${args[0]} into view.`;
             }
-          } catch {
-            // Ref not found — still activated the browser
+          } catch (err: any) {
+            // Ref not found or element gone — still activated the browser
+            if (!err?.message?.includes('not found') && !err?.message?.includes('closed') && !err?.message?.includes('Target') && !err?.message?.includes('timeout')) throw err;
           }
         }
 
@@ -491,7 +494,9 @@ export async function handleMetaCommand(
       let gitRoot: string;
       try {
         gitRoot = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-      } catch {
+      } catch (err: any) {
+        // execSync throws with exit status on non-git directories
+        if (err?.status === undefined && !err?.message?.includes('Command failed')) throw err;
         return 'Not in a git repository — cannot locate inbox.';
       }
 
@@ -514,8 +519,9 @@ export async function handleMetaCommand(
             url: data.page?.url || 'unknown',
             userMessage: data.userMessage || '',
           });
-        } catch {
-          // Skip malformed files
+        } catch (err: any) {
+          // Skip malformed JSON or unreadable files
+          if (!(err instanceof SyntaxError) && err?.code !== 'ENOENT' && err?.code !== 'EACCES') throw err;
         }
       }
 
@@ -537,7 +543,7 @@ export async function handleMetaCommand(
       // Handle --clear flag
       if (args.includes('--clear')) {
         for (const file of files) {
-          try { fs.unlinkSync(path.join(inboxDir, file)); } catch {}
+          try { fs.unlinkSync(path.join(inboxDir, file)); } catch (err: any) { if (err?.code !== 'ENOENT') throw err; }
         }
         lines.push(`Cleared ${files.length} message${files.length === 1 ? '' : 's'}.`);
       }
