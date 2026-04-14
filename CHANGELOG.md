@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.16.4.0] - 2026-04-13
+
+### Added
+- **Cookie origin pinning.** When you import cookies for specific domains, JS execution is now blocked on pages that don't match those domains. This prevents the attack where a prompt injection navigates to an attacker's site and runs `document.cookie` to steal your imported cookies. Subdomain matching works automatically (importing `.github.com` allows `api.github.com`). When no cookies are imported, everything works as before. 3 PRs from @halbert04.
+- **Command audit log.** Every browse command now gets a persistent forensic trail in `~/.gstack/.browse/browse-audit.jsonl`. Timestamp, command, args, page origin, duration, status, error, and whether cookies were imported. Append-only, never truncated, survives server restarts. Best-effort writes that never block command execution. From @halbert04.
+- **Cookie domain tracking.** gstack now tracks which domains cookies were imported from. Foundation for origin pinning above. Direct imports via `--domain` track automatically. New `--all` flag makes full-browser cookie import an explicit opt-in instead of the default.
+
+### Fixed
+- **Symlink bypass in file writes.** `validateOutputPath` only checked the parent directory for symlinks, not the file itself. A symlink at `/tmp/evil.png` pointing to `/etc/crontab` passed validation because the parent `/tmp` was safe. Now checks the file with `lstatSync` before writing. From @Hybirdss.
+- **Cookie-import path bypass.** Two issues: relative paths bypassed all validation (the `path.isAbsolute()` gate let `sensitive-file.json` through), and symlink resolution was missing (`path.resolve` without `realpathSync`). Now resolves to absolute, resolves symlinks, and checks against safe directories. From @urbantech.
+- **Shell injection in setup scripts.** `gstack-settings-hook` interpolated file paths directly into `bun -e` JavaScript blocks. A path with quotes broke the JS string context. Now uses environment variables (`process.env`). Systematic audit confirmed only this script was vulnerable. From @garagon.
+- **Form field credential leak.** Snapshot redaction only applied to `type="password"` fields. Hidden and text fields named `csrf_token`, `api_key`, `session_id` were exposed unredacted in LLM context. Now checks field name and id against sensitive patterns. From @garagon.
+- **Learnings prompt injection.** Three fixes: input validation (type/key/confidence allowlists), injection pattern detection in insight field (blocks "ignore previous instructions" etc.), and cross-project trust gate (only user-stated learnings cross project boundaries). From @Ziadstr.
+- **IPv6 metadata bypass.** The URL constructor normalizes `::ffff:169.254.169.254` to `::ffff:a9fe:a9fe` (hex), which wasn't in the blocklist. Added both hex-encoded forms. From @mehmoodosman.
+- **Session files world-readable.** Design session files in `/tmp` were created with default permissions (0644). Now 0600 (owner-only). From @garagon.
+- **Frozen lockfile in setup.** `bun install` now uses `--frozen-lockfile` to prevent supply chain attacks via floating semver ranges. From @halbert04.
+- **Dockerfile chmod fix.** Removed duplicate recursive `chmod -R 1777 /tmp` (recursive sticky bit on files has no defined behavior). From @Gonzih.
+- **Hardcoded /tmp in cookie import.** `cookie-import-browser` used `/tmp` directly instead of `os.tmpdir()`, breaking Windows support.
+
+### Security
+- Closed 14 security issues (#665-#675, #566, #479, #467, #545) that were fixed in prior waves but still open on GitHub.
+- Closed 17 community security PRs with thank-you messages and commit references.
+- Security wave 3: 12 fixes, 7 contributors. Big thanks to @Hybirdss, @urbantech, @garagon, @Ziadstr, @halbert04, @mehmoodosman, @Gonzih.
+
 ## [0.16.3.0] - 2026-04-09
 
 ### Changed

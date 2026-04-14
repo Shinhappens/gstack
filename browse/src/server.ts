@@ -35,6 +35,7 @@ import {
 import { validateTempPath } from './path-security';
 import { resolveConfig, ensureStateDir, readVersionHash } from './config';
 import { emitActivity, subscribe, getActivityAfter, getActivityHistory, getSubscriberCount } from './activity';
+import { initAuditLog, writeAuditEntry } from './audit';
 import { inspectElement, modifyStyle, resetModifications, getModificationHistory, detachSession, type InspectorResult } from './cdp-inspector';
 // Bun.spawn used instead of child_process.spawn (compiled bun binaries
 // fail posix_spawn on all executables including /bin/bash)
@@ -47,6 +48,7 @@ import * as crypto from 'crypto';
 // ─── Config ─────────────────────────────────────────────────────
 const config = resolveConfig();
 ensureStateDir(config);
+initAuditLog(config.auditLog);
 
 // ─── Auth ───────────────────────────────────────────────────────
 const AUTH_TOKEN = crypto.randomUUID();
@@ -1013,7 +1015,7 @@ async function handleCommandInternal(
           await cleanupHiddenMarkers(page);
         }
       } else {
-        result = await handleReadCommand(command, args, session);
+        result = await handleReadCommand(command, args, session, browserManager);
       }
     } else if (WRITE_COMMANDS.has(command)) {
       result = await handleWriteCommand(command, args, session, browserManager);
@@ -1088,13 +1090,14 @@ async function handleCommandInternal(
     }
 
     // Activity: emit command_end (skipped for chain subcommands)
+    const successDuration = Date.now() - startTime;
     if (!opts?.skipActivity) {
       emitActivity({
         type: 'command_end',
         command,
         args,
         url: browserManager.getCurrentUrl(),
-        duration: Date.now() - startTime,
+        duration: successDuration,
         status: 'ok',
         result: result,
         tabs: browserManager.getTabCount(),
@@ -1102,6 +1105,17 @@ async function handleCommandInternal(
         clientId: tokenInfo?.clientId,
       });
     }
+
+    writeAuditEntry({
+      ts: new Date().toISOString(),
+      cmd: command,
+      args: args.join(' '),
+      origin: browserManager.getCurrentUrl(),
+      durationMs: successDuration,
+      status: 'ok',
+      hasCookies: browserManager.hasCookieImports(),
+      mode: browserManager.getConnectionMode(),
+    });
 
     browserManager.resetFailures();
     // Restore original active tab if we pinned to a specific one
@@ -1120,13 +1134,14 @@ async function handleCommandInternal(
     }
 
     // Activity: emit command_end (error) — skipped for chain subcommands
+    const errorDuration = Date.now() - startTime;
     if (!opts?.skipActivity) {
       emitActivity({
         type: 'command_end',
         command,
         args,
         url: browserManager.getCurrentUrl(),
-        duration: Date.now() - startTime,
+        duration: errorDuration,
         status: 'error',
         error: err.message,
         tabs: browserManager.getTabCount(),
@@ -1134,6 +1149,18 @@ async function handleCommandInternal(
         clientId: tokenInfo?.clientId,
       });
     }
+
+    writeAuditEntry({
+      ts: new Date().toISOString(),
+      cmd: command,
+      args: args.join(' '),
+      origin: browserManager.getCurrentUrl(),
+      durationMs: errorDuration,
+      status: 'error',
+      error: err.message,
+      hasCookies: browserManager.hasCookieImports(),
+      mode: browserManager.getConnectionMode(),
+    });
 
     browserManager.incrementFailures();
     let errorMsg = wrapError(err);
