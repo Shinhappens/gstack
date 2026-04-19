@@ -68,14 +68,15 @@ gstack/
 ├── hosts/           # Typed host configs (one per AI agent)
 │   ├── claude.ts    # Primary host config
 │   ├── codex.ts, factory.ts, kiro.ts  # Existing hosts
-│   ├── opencode.ts, slate.ts, cursor.ts, openclaw.ts  # New hosts
+│   ├── opencode.ts, slate.ts, cursor.ts, openclaw.ts  # IDE hosts
+│   ├── hermes.ts, gbrain.ts  # Agent runtime hosts
 │   └── index.ts     # Registry: exports all, derives Host type
 ├── scripts/         # Build + DX tooling
 │   ├── gen-skill-docs.ts  # Template → SKILL.md generator (config-driven)
 │   ├── host-config.ts     # HostConfig interface + validator
 │   ├── host-config-export.ts  # Shell bridge for setup script
 │   ├── host-adapters/     # Host-specific adapters (OpenClaw tool mapping)
-│   ├── resolvers/   # Template resolver modules (preamble, design, review, etc.)
+│   ├── resolvers/   # Template resolver modules (preamble, design, review, gbrain, etc.)
 │   ├── skill-check.ts     # Health dashboard
 │   └── dev-skill.ts       # Watch mode
 ├── test/            # Skill validation + eval tests
@@ -138,6 +139,11 @@ SKILL.md files are **generated** from `.tmpl` templates. To update docs:
 To add a new browse command: add it to `browse/src/commands.ts` and rebuild.
 To add a snapshot flag: add it to `SNAPSHOT_FLAGS` in `browse/src/snapshot.ts` and rebuild.
 
+**Token ceiling:** Generated SKILL.md files must stay under 100KB (~25K tokens).
+`gen-skill-docs` warns if any file exceeds this. If a skill template grows past the
+ceiling, consider extracting optional sections into separate resolvers that only
+inject when relevant, or making verbose evaluation rubrics more concise.
+
 **Merge conflicts on SKILL.md files:** NEVER resolve conflicts on generated SKILL.md
 files by accepting either side. Instead: (1) resolve conflicts on the `.tmpl` templates
 and `scripts/gen-skill-docs.ts` (the sources of truth), (2) run `bun run gen:skill-docs`
@@ -172,6 +178,18 @@ Rules:
   If a block needs context from a previous step, restate it in the prose above.
 - **Express conditionals as English.** Instead of nested `if/elif/else` in bash,
   write numbered decision steps: "1. If X, do Y. 2. Otherwise, do Z."
+
+## Writing style (V1)
+
+Default output from every tier-≥2 skill follows the Writing Style section in
+`scripts/resolvers/preamble.ts`: jargon glossed on first use (curated list in
+`scripts/jargon-list.json`, baked at gen-skill-docs time), questions framed in
+outcome terms ("what breaks for your users if...") not implementation terms,
+short sentences, decisions close with user impact. Power users who want the
+tighter V0 prose set `gstack-config set explain_level terse` (binary switch,
+no middle mode). See `docs/designs/PLAN_TUNING_V1.md` for the full design
+rationale. The review pacing overhaul that originally tried to ride alongside
+writing-style was extracted to V1.1 — see `docs/designs/PACING_UPDATES_V0.md`.
 
 ## Browser interaction
 
@@ -333,7 +351,7 @@ own version bump and CHANGELOG entry. The entry describes what THIS branch adds 
 not what was already on main.
 
 **When to write the CHANGELOG entry:**
-- At `/ship` time (Step 5), not during development or mid-branch.
+- At `/ship` time (Step 13), not during development or mid-branch.
 - The entry covers ALL commits on this branch vs the base branch.
 - Never fold new work into an existing CHANGELOG entry from a prior version that
   already landed on main. If main has v0.10.0.0 and your branch adds features,

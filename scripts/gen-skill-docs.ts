@@ -289,6 +289,18 @@ function transformFrontmatter(content: string, host: Host): string {
     }
   }
 
+  // Preserve additional keepFields beyond name and description
+  if (fm.keepFields) {
+    for (const field of fm.keepFields) {
+      if (field === 'name' || field === 'description') continue;
+      // Match YAML field with possible multi-line/array value (indented lines after colon)
+      const fieldMatch = frontmatter.match(new RegExp(`^${field}:(.*(?:\\n(?:[ \\t]+.+))*)`, 'm'));
+      if (fieldMatch) {
+        newFm += `${field}:${fieldMatch[1]}\n`;
+      }
+    }
+  }
+
   // Rename fields (copy values from template frontmatter with new keys)
   if (fm.renameFields) {
     for (const [oldName, newName] of Object.entries(fm.renameFields)) {
@@ -542,6 +554,12 @@ for (const currentHost of hostsToRun) {
       const lines = content.split('\n').length;
       const tokens = Math.round(content.length / 4); // ~4 chars per token
       tokenBudget.push({ skill: relOutput, lines, tokens });
+
+      // Token ceiling check: warn if any generated SKILL.md exceeds ~25K tokens (100KB)
+      const TOKEN_CEILING_BYTES = 100_000;
+      if (content.length > TOKEN_CEILING_BYTES) {
+        console.warn(`⚠️  TOKEN CEILING: ${relOutput} is ${content.length} bytes (~${tokens} tokens), exceeds ${TOKEN_CEILING_BYTES} byte ceiling (~25K tokens)`);
+      }
     }
 
     // Generate gstack-lite and gstack-full for OpenClaw host
