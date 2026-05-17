@@ -320,6 +320,26 @@ Effort both-scales: when an option involves effort, label both human-team and CC
 
 Net line closes the tradeoff. Per-skill instructions may add stricter rules.
 
+12. **Non-ASCII characters — write directly, never \u-escape.** When any
+    string field (question, option label, option description) contains
+    Chinese (繁體/簡體), Japanese, Korean, or other non-ASCII text, emit
+    the literal UTF-8 characters in the JSON string. **Never escape them
+    as `\uXXXX`.** Claude Code's tool parameter pipe is UTF-8 native
+    and passes characters through unchanged. Manually escaping requires
+    recalling each codepoint from training, which is unreliable for long
+    CJK strings — the model regularly emits the wrong codepoint (e.g.
+    writes `\u3103` thinking it is 管 U+7BA1, but `\u3103` is
+    actually ㄃, so the user sees `管理工具` rendered as `㄃3用箱`).
+    The trigger is long, multi-line questions with hundreds of CJK
+    characters: that is exactly when reflexive escaping kicks in and
+    exactly when miscoding is most damaging. Long ≠ escape. Keep
+    characters literal.
+
+    Wrong: `"question": "請選擇\uXXXX\uXXXX\uXXXX\uXXXX"`
+    Right: `"question": "請選擇管理工具"`
+
+    Only JSON-mandatory escapes remain allowed: `\n`, `\t`, `\"`, `\\`.
+
 ### Self-check before emitting
 
 Before calling AskUserQuestion, verify:
@@ -332,6 +352,7 @@ Before calling AskUserQuestion, verify:
 - [ ] Dual-scale effort labels on effort-bearing options (human / CC)
 - [ ] Net line closes the decision
 - [ ] You are calling the tool, not writing prose
+- [ ] Non-ASCII characters (CJK / accents) written directly, NOT \u-escaped
 
 
 ## Artifacts Sync (skill start)
@@ -723,9 +744,7 @@ Replace `SKILL_NAME`, `OUTCOME`, and `USED_BROWSE` before running.
 
 ## Plan Status Footer
 
-In plan mode before ExitPlanMode: if the plan file lacks `## GSTACK REVIEW REPORT`, run `~/.claude/skills/gstack/bin/gstack-review-read` and append the standard runs/status/findings table. With `NO_REVIEWS` or empty, append a 5-row placeholder with verdict "NO REVIEWS YET — run `/autoplan`". If a richer report exists, skip.
-
-PLAN MODE EXCEPTION — always allowed (it's the plan file).
+Skills that run plan reviews (`/plan-*-review`, `/codex review`) include the EXIT PLAN MODE GATE blocking checklist at the end of the skill, which verifies the plan file ends with `## GSTACK REVIEW REPORT` before ExitPlanMode is called. Skills that don't run plan reviews (operational skills like `/ship`, `/qa`, `/review`) typically don't operate in plan mode and have no review report to verify; this footer is a no-op for them. Writing the plan file is the one edit allowed in plan mode.
 
 # /sync-gbrain — Keep gbrain current and teach the agent to use it
 
@@ -767,34 +786,64 @@ Before doing anything, check that /setup-gbrain has been run on this Mac.
 ~/.claude/skills/gstack/bin/gstack-gbrain-detect 2>/dev/null
 ```
 
-**Split-engine model.** Code stage always runs locally against a per-machine
-PGLite brain (or whatever `gbrain config` points to), with each worktree of a
-repo registered as its own source. Artifacts/memory stages route through
-whatever `setup-gbrain` configured — including remote-MCP (Path 4). The two
-sides are independent: code lookups are local + worktree-scoped, artifacts
-remain cross-machine.
+**Split-engine model (v1.34.0.0+).** Code stage runs locally against the
+per-machine gbrain engine (PGLite or whatever `gbrain config` points to),
+with each worktree of a repo registered as its own source. **Memory stage
+also runs locally** in local-stdio MCP mode — `gstack-memory-ingest` shells
+out to `gbrain import` against the same local engine. In remote-http MCP
+mode (Path 4), the memory stage instead persists staged markdown to
+`~/.gstack/transcripts/<run-id>/` and the artifacts pipeline pushes it to
+the brain admin's pull job (plan D11). Brain-sync (the `gstack-brain-sync`
+push to git) is the one stage that never touches local engine and runs
+regardless of mode.
 
-A previous version of this skill bounced remote-MCP users out of the code
-stage entirely. That was wrong: the code-stage CLI calls (`gbrain sources
-add`, `sync --strategy code`, `sources attach`) target the LOCAL gbrain CLI
-+ DB regardless of whether `~/.claude.json` has `gbrain` registered as a
-remote HTTP MCP for artifacts. We no longer skip the code stage in
-remote-MCP mode.
-
-If `gbrain_on_path=false` OR `gbrain_config_exists=false`, STOP and tell
-the user:
-
-> "/sync-gbrain requires /setup-gbrain to be run first. Run `/setup-gbrain`
-> to install gbrain, register the MCP server, and set per-repo trust policy."
-
-Do NOT continue — the skill is unsafe when the local gbrain CLI is missing
-(we'd write a CLAUDE.md guidance block referencing tools that don't exist).
+Practically: local PGLite stays code-only on remote-http machines; the
+remote brain holds everything else. Local-stdio machines mix code +
+transcripts in one local engine, as they always have.
 
 Also check the per-repo trust policy. If `gstack-gbrain-repo-policy get` for
 this repo returns `deny`, STOP:
 
 > "This repo's gbrain trust policy is `deny`. Run `/setup-gbrain --repo` to
 > change it before syncing."
+
+---
+
+## Step 1.5: Local engine pre-flight (plan D12)
+
+Read `gbrain_local_status` from the Step 1 detect output. Branch as follows
+BEFORE invoking the orchestrator:
+
+- **`ok`**: proceed to Step 2 normally.
+- **`no-cli`**: STOP. "Local gbrain CLI not installed. Run `/setup-gbrain`
+  first."
+- **`missing-config`** AND `gbrain_mcp_mode == "remote-http"`: tell the user
+  "Your brain queries (the `mcp__gbrain__*` tools) work via remote MCP, but
+  symbol code search needs a local PGLite. Run `/setup-gbrain` and pick
+  'Yes' at the new 'local code index' prompt (Step 4.5), or run
+  `gbrain init --pglite --json` directly. Continuing without code stage."
+  Then proceed to Step 2 — the orchestrator's `runCodeImport()` and
+  `runMemoryIngest()` will return SKIP per plan D12; only `runBrainSyncPush()`
+  will run. Do NOT abort.
+- **`missing-config`** AND `gbrain_mcp_mode != "remote-http"`: STOP. "Local
+  gbrain CLI is installed but no engine config. Run `/setup-gbrain` first."
+- **`broken-config`** OR **`broken-db`**: STOP with a clear message:
+  ```
+  Local gbrain config at ~/.gbrain/config.json points at an unreachable
+  engine (status: {gbrain_local_status}). Two options:
+    1. Re-run /setup-gbrain — Step 1.5 offers Retry / Switch to PGLite /
+       Switch brain mode / Quit (plan D4).
+    2. Repair manually: mv ~/.gbrain/config.json ~/.gbrain/config.json.bak
+       && gbrain init --pglite --json
+  Re-run /sync-gbrain after.
+  ```
+  Do NOT continue — the orchestrator would skip code+memory and only run
+  brain-sync, which is a degraded state the user should fix explicitly.
+
+This pre-flight short-circuits the orchestrator before it spends ~80ms
+probing the engine again. The orchestrator independently runs the same
+classifier for defense-in-depth, but Step 1.5's STOP is where the user
+gets the actionable remediation message.
 
 ---
 

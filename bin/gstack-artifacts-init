@@ -227,11 +227,18 @@ projects/*/ceo-plans/*.md
 projects/*/ceo-plans/*/*.md
 projects/*/designs/*.md
 projects/*/designs/*/*.md
+projects/*/*-design-*.md
+projects/*/*-test-plan-*.md
 projects/*/timeline.jsonl
 retros/*.md
 developer-profile.json
 builder-journey.md
 builder-profile.jsonl
+# Transcripts staged in remote-http MCP mode (per plan D11 split-engine).
+# gstack-memory-ingest persists per-run dirs here when local gbrain import
+# is skipped; brain admin pulls + indexes into the remote brain.
+transcripts/run-*/*.md
+transcripts/run-*/**/*.md
 # NOT synced (machine-local UX state):
 #   projects/*/question-preferences.json (per-machine UX preferences)
 #   projects/*/question-log.jsonl (audit/derivation log stays with preferences)
@@ -247,11 +254,15 @@ cat > "$GSTACK_HOME/.brain-privacy-map.json" <<'EOF'
   {"pattern": "projects/*/ceo-plans/*/*.md", "class": "artifact"},
   {"pattern": "projects/*/designs/*.md", "class": "artifact"},
   {"pattern": "projects/*/designs/*/*.md", "class": "artifact"},
+  {"pattern": "projects/*/*-design-*.md", "class": "artifact"},
+  {"pattern": "projects/*/*-test-plan-*.md", "class": "artifact"},
   {"pattern": "retros/*.md", "class": "artifact"},
   {"pattern": "builder-journey.md", "class": "artifact"},
   {"pattern": "projects/*/timeline.jsonl", "class": "behavioral"},
   {"pattern": "developer-profile.json", "class": "behavioral"},
-  {"pattern": "builder-profile.jsonl", "class": "behavioral"}
+  {"pattern": "builder-profile.jsonl", "class": "behavioral"},
+  {"pattern": "transcripts/run-*/*.md", "class": "behavioral"},
+  {"pattern": "transcripts/run-*/**/*.md", "class": "behavioral"}
 ]
 EOF
 
@@ -261,6 +272,8 @@ cat > "$GSTACK_HOME/.gitattributes" <<'EOF'
 retros/*.md merge=union
 projects/*/designs/**/*.md merge=union
 projects/*/ceo-plans/**/*.md merge=union
+projects/*/*-design-*.md merge=union
+projects/*/*-test-plan-*.md merge=union
 EOF
 
 # ---- register merge drivers in local git config ----

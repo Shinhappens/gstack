@@ -35,8 +35,10 @@ import { execSync, spawnSync } from "child_process";
 import { homedir } from "os";
 import { createHash } from "crypto";
 
+import "../lib/conductor-env-shim";
 import { detectEngineTier, withErrorContext, canonicalizeRemote } from "../lib/gstack-memory-helpers";
 import { ensureSourceRegistered, sourcePageCount } from "../lib/gbrain-sources";
+import { localEngineStatus, type LocalEngineStatus } from "../lib/gbrain-local-status";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -290,6 +292,42 @@ function releaseLock(): void {
 
 // ── Stage runners ──────────────────────────────────────────────────────────
 
+/**
+ * Build a SKIP result for the code/memory stage when the local engine is
+ * not in 'ok' state (per plan D12). Surface the status verbatim so the
+ * verdict block tells the user exactly what's wrong without re-probing.
+ *
+ * Reasons mapped to user-actionable summaries:
+ *   no-cli         → "gbrain CLI not on PATH; install via /setup-gbrain"
+ *   missing-config → "no local engine; run /setup-gbrain to add local PGLite"
+ *   broken-config  → "config file at ~/.gbrain/config.json is malformed; see /setup-gbrain Step 1.5"
+ *   broken-db      → "config points at unreachable DB; see /setup-gbrain Step 1.5"
+ */
+function skipStageForLocalStatus(
+  stage: "code" | "memory",
+  status: LocalEngineStatus,
+  t0: number,
+): StageResult {
+  const reasons: Record<Exclude<LocalEngineStatus, "ok">, string> = {
+    "no-cli": "gbrain CLI not on PATH; install via /setup-gbrain",
+    "missing-config":
+      "no local engine; run /setup-gbrain to add local PGLite for code search",
+    "broken-config":
+      "config at ~/.gbrain/config.json is malformed; see /setup-gbrain Step 1.5",
+    "broken-db":
+      "config points at unreachable DB; see /setup-gbrain Step 1.5",
+  };
+  const reason = reasons[status as Exclude<LocalEngineStatus, "ok">];
+  return {
+    name: stage,
+    ran: false,
+    ok: true, // SKIP (per D12) — not a stage failure, just an unsatisfied prerequisite
+    duration_ms: Date.now() - t0,
+    summary: `skipped — local engine ${status} — ${reason}`,
+  };
+}
+
+
 async function runCodeImport(args: CliArgs): Promise<StageResult> {
   const t0 = Date.now();
   const root = repoRoot();
@@ -302,6 +340,9 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
 
   const sourceId = deriveCodeSourceId(root);
 
+  // dry-run preview always shows the would-do steps, regardless of local
+  // engine state. Useful for "what would /sync-gbrain do" without probing
+  // the engine.
   if (args.mode === "dry-run") {
     return {
       name: "code",
@@ -311,6 +352,17 @@ async function runCodeImport(args: CliArgs): Promise<StageResult> {
       summary: `would: gbrain sources add ${sourceId} --path ${root} --federated; gbrain sync --strategy code --source ${sourceId}; gbrain sources attach ${sourceId}`,
       detail: { source_id: sourceId, source_path: root, status: "skipped" },
     };
+  }
+
+  // Split-engine pre-flight (per plan D12): when local engine is not ok, SKIP
+  // code stage cleanly. Brain-sync stage still runs because it doesn't depend
+  // on local engine. The /sync-gbrain Step 1.5 pre-flight surfaces the user
+  // remediation message; this skip just keeps the orchestrator from crashing
+  // when the local DB is dead. Skipped on --dry-run (above) since dry-run
+  // never actually probes anything.
+  const localStatus = localEngineStatus({ noCache: false });
+  if (localStatus !== "ok") {
+    return skipStageForLocalStatus("code", localStatus, t0);
   }
 
   // Step 0: Best-effort cleanup of pre-pathhash legacy source.
@@ -431,6 +483,15 @@ function runMemoryIngest(args: CliArgs): StageResult {
     return { name: "memory", ran: false, ok: true, duration_ms: 0, summary: "would: gstack-memory-ingest --probe" };
   }
 
+  // Split-engine pre-flight (per plan D12). gstack-memory-ingest shells out
+  // to `gbrain import` which targets the LOCAL engine. When that engine is
+  // not ok, SKIP cleanly so brain-sync (the only stage that doesn't depend
+  // on local engine) still runs.
+  const localStatus = localEngineStatus({ noCache: false });
+  if (localStatus !== "ok") {
+    return skipStageForLocalStatus("memory", localStatus, t0);
+  }
+
   const ingestPath = join(import.meta.dir, "gstack-memory-ingest.ts");
   const ingestArgs = ["run", ingestPath];
   if (args.mode === "full") ingestArgs.push("--bulk");
@@ -442,14 +503,30 @@ function runMemoryIngest(args: CliArgs): StageResult {
     timeout: 35 * 60 * 1000,
   });
 
-  const summary = (result.stderr || "").split("\n").filter((l) => l.includes("[memory-ingest]")).slice(-1)[0] || "ingest pass complete";
+  // D6: parse [memory-ingest] lines from the child's stderr. ERR-prefixed
+  // lines indicate a system-level failure (gbrain crashed or CLI missing)
+  // and the child exits non-zero. Per-file failures are summarized in the
+  // last non-ERR [memory-ingest] line but do NOT make the verdict ERR.
+  const stderrLines = (result.stderr || "").split("\n");
+  const memLines = stderrLines.filter((l) => l.includes("[memory-ingest]"));
+  const errLine = memLines.find((l) => l.includes("[memory-ingest] ERR"));
+  const lastMemLine = memLines.slice(-1)[0];
+  const rawSummary = errLine || lastMemLine || "ingest pass complete";
+  // Strip the "[memory-ingest] " prefix and any leading "ERR: " for cleaner
+  // verdict output. The orchestrator's own formatStage will prefix with OK/ERR.
+  const summary = rawSummary
+    .replace(/^.*\[memory-ingest\]\s*/, "")
+    .replace(/^ERR:\s*/, "");
 
+  const ok = result.status === 0;
   return {
     name: "memory",
     ran: true,
-    ok: result.status === 0,
+    ok,
     duration_ms: Date.now() - t0,
-    summary: result.status === 0 ? summary : `memory ingest exited ${result.status}`,
+    summary: ok
+      ? summary
+      : `${summary}${result.status === null ? " (killed by signal / timeout)" : ` (exit ${result.status})`}`,
   };
 }
 
