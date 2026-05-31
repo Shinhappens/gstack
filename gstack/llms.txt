@@ -61,6 +61,7 @@ Conventions:
 - [/setup-gbrain](setup-gbrain/SKILL.md): Set up gbrain for this coding agent: install the CLI, initialize a local PGLite or Supabase brain, register MCP, capture per-remote trust policy.
 - [/ship](ship/SKILL.md): Ship workflow: detect + merge base branch, run tests, review diff, bump VERSION, update CHANGELOG, commit, push, create PR.
 - [/skillify](skillify/SKILL.md): Codify the most recent successful /scrape flow into a permanent browser-skill on disk.
+- [/spec](spec/SKILL.md): Turn vague intent into a precise, executable spec in five phases.
 - [/sync-gbrain](sync-gbrain/SKILL.md): Keep gbrain current with this repo's code and refresh agent search guidance in CLAUDE.md.
 - [/unfreeze](unfreeze/SKILL.md): Clear the freeze boundary set by /freeze, allowing edits to all directories again.
 
@@ -140,6 +141,7 @@ Run with `browse <command> [args]`. Full reference: `browse/SKILL.md`.
 - `disconnect`: Disconnect headed browser, return to headless mode
 - `focus [@ref]`: Bring headed browser window to foreground (macOS)
 - `handoff [message]`: Open visible Chrome at current page for user takeover
+- `memory [--json]`: Snapshot Bun heap + per-tab JS heap + Chromium process tree + bounded buffer sizes.
 - `restart`: Restart server
 - `resume`: Re-snapshot after user takeover, return control to AI
 - `state save|load <name>`: Save/load browser state (cookies + URLs)
