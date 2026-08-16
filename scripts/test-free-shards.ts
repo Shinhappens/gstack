@@ -27,21 +27,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
+import { isPaidTestFile } from '../test/helpers/paid-test-set';
 
 const ROOT = path.resolve(import.meta.dir, '..');
-const TEST_ROOTS = ['browse/test', 'test', 'make-pdf/test'] as const;
+// design/test and ios-qa/daemon/test were both silently absent from every
+// runner (package.json glob + this list) — design tests (including a teardown
+// bomb) and the 10 hermetic ios-qa daemon suites never ran in any CI or local
+// free run. Keep the two lists in sync with package.json's test script.
+const TEST_ROOTS = ['browse/test', 'test', 'make-pdf/test', 'design/test', 'ios-qa/daemon/test'] as const;
 const TEST_FILE_REGEX = /\.test\.(?:[cm]?[jt]s|tsx|jsx)$/;
-
-// Tests that require API spend, external services, or e2e harnesses.
-// These are filtered out before any sharding or curation.
-const PAID_EVAL_TESTS = [
-  /^browse\/test\/security-review-fullstack\.test\.ts$/,
-  /^test\/skill-e2e-.*\.test\.ts$/,
-  /^test\/skill-llm-eval\.test\.ts$/,
-  /^test\/skill-routing-e2e\.test\.ts$/,
-  /^test\/codex-e2e\.test\.ts$/,
-  /^test\/gemini-e2e\.test\.ts$/,
-] as const;
 
 // POSIX-only patterns that indicate a test will fail on windows-latest no
 // matter how the runner shards. Codex's v1.18.0.0 review flagged the first
@@ -84,13 +78,6 @@ const WINDOWS_FRAGILE_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   // BROWSE_HEADLESS_SKIP=1 to skip the browser launch but still need a working
   // server, which they don't get on Windows.
   { pattern: /BROWSE_HEADLESS_SKIP|spawn\(\[['"]bun['"],\s*['"]run['"]/, reason: 'spawns the browse server subprocess (Bun-driven path is Windows-broken)' },
-  // Tests that read browse/src/sidebar-agent.ts — deleted in v1.14.0.0
-  // sidebar refactor (replaced by sidepanel-terminal.js). 10 security tests
-  // still reference it and fail on import. They've been broken on every
-  // platform since v1.14, but Bun on macOS/Linux reports the failure as a
-  // module-load error (exit 0) while Bun on Windows treats it as a hard
-  // fail (exit 1). Tracked as a follow-up: update or delete these tests.
-  { pattern: /sidebar-agent\.ts/, reason: 'reads deleted browse/src/sidebar-agent.ts (pre-existing breakage from v1.14.0.0 sidebar refactor)' },
 ];
 
 // Explicit known-Windows-incompatible test files that don't fit a regex
@@ -108,6 +95,32 @@ const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }> = [
   },
 ];
 
+// Force-include overrides: files a WINDOWS_FRAGILE_PATTERNS regex excludes for
+// a reason that does not actually apply to them. Each entry documents WHY the
+// pattern hit is a false positive — the point of these files is Windows
+// coverage, so auto-excluding them defeats the regression tests they carry.
+const KNOWN_WINDOWS_SAFE: Array<{ file: string; reason: string }> = [
+  {
+    file: 'browse/test/file-permissions.test.ts',
+    // Trips the POSIX-mode-bitmask pattern, but every `mode & 0o777` assertion
+    // is platform-guarded (win32 returns early / takes the icacls branch).
+    // This file carries the win32-only icacls-by-SID regression tests, which
+    // can ONLY execute on windows-latest — excluding it here means the
+    // machine-account ACL lockout regression is never exercised on the one
+    // platform it bricks.
+    reason: 'mode-bitmask hits are POSIX-branch only; win32-only ACL regression tests must run on windows-latest',
+  },
+  {
+    file: 'browse/test/terminal-agent-owner-watchdog.test.ts',
+    // Trips the spawn(['bun','run',...]) pattern, whose reason is the
+    // Playwright-bound browse server. This test spawns terminal-agent.ts,
+    // which imports only fs/path/crypto + local helpers (no Playwright, no
+    // PTY at module scope) and boots under Bun on Windows — the owner-PID
+    // orphan leak it pins was reported on Windows (#2019).
+    reason: 'spawns terminal-agent (no Playwright), not the browse server; owner-orphan leak is a Windows defect',
+  },
+];
+
 export const DEFAULT_SHARD_COUNT = 20;
 export const FREE_TEST_TIMEOUT_MS = 10_000;
 
@@ -118,7 +131,7 @@ export function normalizeRelativePath(filePath: string): string {
 export function isFreeTestFile(relativePath: string): boolean {
   const normalized = normalizeRelativePath(relativePath);
   if (!TEST_FILE_REGEX.test(normalized)) return false;
-  return !PAID_EVAL_TESTS.some(pattern => pattern.test(normalized));
+  return !isPaidTestFile(normalized);
 }
 
 /**
@@ -177,10 +190,15 @@ export function curateWindowsSafe(files: string[], rootDir = ROOT): CurationResu
   const safe: string[] = [];
   const excluded: Array<{ file: string; reason: string }> = [];
   const knownBad = new Map(KNOWN_WINDOWS_INCOMPATIBLE.map((e) => [e.file, e.reason]));
+  const knownSafe = new Set(KNOWN_WINDOWS_SAFE.map((e) => e.file));
   for (const relativePath of files) {
     const knownReason = knownBad.get(relativePath);
     if (knownReason) {
       excluded.push({ file: relativePath, reason: knownReason });
+      continue;
+    }
+    if (knownSafe.has(relativePath)) {
+      safe.push(relativePath);
       continue;
     }
     const absolute = path.join(rootDir, relativePath);
@@ -271,14 +289,39 @@ function formatShardSummary(shards: string[][]): string[] {
   });
 }
 
+/**
+ * True when a shard's output shows the run ended WITHOUT bun's final summary
+ * ("Ran N tests across ..."). A process.exit() fired mid-suite skips the
+ * summary AND hands back whatever code the caller passed — historically 0,
+ * which made a truncated shard indistinguishable from a green one. Exit code
+ * alone is therefore not evidence of completion; the summary line is.
+ * (Fault-injection coverage: test/exit-propagation.test.ts.)
+ */
+export function shardRunLooksTruncated(status: number | null, output: string): boolean {
+  if (status !== 0) return false; // already failing — not the silent case
+  return !/Ran \d+ tests? across \d+ files?/.test(output);
+}
+
 function runShard(files: string[], shardNumber: number, totalShards: number): number {
   const header = `[test:free] shard ${shardNumber}/${totalShards} (${files.length} files)`;
   console.log(header);
   const result = spawnSync(process.execPath, buildShardArgs(files), {
     cwd: ROOT,
-    stdio: 'inherit',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8',
     env: process.env,
   });
+  // Preserve the inherit-style UX: replay the shard's output.
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  const combined = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+  if (shardRunLooksTruncated(result.status, combined)) {
+    console.error(
+      `${header} exited 0 WITHOUT bun's final summary — the run was truncated ` +
+        '(a process.exit fired mid-suite). Treating as FAILED.',
+    );
+    return 1;
+  }
   if (result.status !== 0) {
     console.error(`${header} failed with exit code ${result.status ?? 1}`);
   }

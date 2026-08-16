@@ -15,6 +15,12 @@ env:
 jobs:
   # Build Docker image with pre-baked toolchain (cached — only rebuilds on Dockerfile/lockfile change)
   build-image:
+    # Dependabot-triggered pull_request runs get a read-only GITHUB_TOKEN, so
+    # a lockfile bump = new hash = failed ghcr push = permanently red check
+    # (EV6, fork port wave 2). Skip the build for dependabot; the evals job's
+    # needs-chain tolerates it because no eval test selects on a lockfile-only
+    # diff — a maintainer's next push rebuilds the image with real perms.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubicloud-standard-8
     permissions:
       contents: read
@@ -45,19 +51,30 @@ jobs:
       - if: steps.check.outputs.exists == 'false'
         run: cp package.json bun.lock .github/docker/
 
+      # A fork PR's GITHUB_TOKEN only has `packages: read`, so pushing fails.
+      # Still BUILD (validates Dockerfile.ci changes), just don't publish. This
+      # job intentionally keeps no `if:` so fork PRs still get one real, honest
+      # green check here instead of a run where every job is grey.
       - if: steps.check.outputs.exists == 'false'
         uses: docker/build-push-action@v6
         with:
           context: .github/docker
           file: .github/docker/Dockerfile.ci
-          push: true
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: |
             ${{ steps.meta.outputs.tag }}
             ${{ env.IMAGE }}:latest
 
+  # Fork PRs never receive repository secrets (ANTHROPIC_API_KEY et al), so every
+  # API-calling eval fails at SDK auth before a model runs. Skip deterministically
+  # rather than leaving the outcome to Docker-cache luck: a warm cache let these
+  # run and fail, a cold one made build-image fail its push and the shards skip.
+  # Same-repo PRs, pushes, and workflow_dispatch keep full coverage. Fork work
+  # gets real coverage via a trusted base-repo branch.
   evals:
     runs-on: ${{ matrix.suite.runner || 'ubicloud-standard-8' }}
     needs: build-image
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     container:
       image: ${{ needs.build-image.outputs.image-tag }}
       credentials:
@@ -169,19 +186,28 @@ jobs:
             console.log("seeded", p);
           '
 
-      # PTY smokes drive the interactive `claude` TUI and send /office-hours and
-      # /plan-ceo-review. Claude Code discovers user-scoped skills from
-      # $HOME/.claude/skills/<name>/SKILL.md, but .claude/skills is gitignored, so
-      # a fresh CI checkout has NO registry — claude prints "Unknown command:
-      # /plan-ceo-review". Mirror setup's --no-prefix registry minimally: a gstack
-      # root symlink (resolves the preamble's absolute ~/.claude/skills/gstack/bin/*
-      # and ~/.claude/skills/gstack/<skill>/sections/* paths) plus a per-skill
-      # top-level dir holding SKILL.md (+ sections) symlinks for the two skills
+      # PTY smokes drive the interactive `claude` TUI and send /office-hours,
+      # /plan-ceo-review, /plan-eng-review, and /plan-design-review. Claude Code
+      # discovers user-scoped skills from $HOME/.claude/skills/<name>/SKILL.md,
+      # but .claude/skills is gitignored, so a fresh CI checkout has NO registry
+      # — claude prints "Unknown command: /plan-ceo-review". Mirror setup's
+      # --no-prefix registry minimally: a gstack root symlink (resolves the
+      # preamble's absolute ~/.claude/skills/gstack/bin/* and
+      # ~/.claude/skills/gstack/<skill>/sections/* paths) plus a per-skill
+      # top-level dir holding SKILL.md (+ sections) symlinks for the four skills
       # these tests invoke. No ./setup (it builds binaries, launches Chromium,
       # installs fonts, reads a /dev/tty prompt) and no binary build (SKILL.md +
       # bin/ + sections/ are committed). $HOME is /github/home here; the spawned
       # claude inherits it (this runner adds no HOME/CLAUDE_CONFIG_DIR override,
       # no hermetic mode) and the Seed step already proved claude reads $HOME.
+      #
+      # KEEP THIS STEP even though seedSkills/hermeticSkillsConfigDir() now
+      # registers skills for hermetic PTY children: that registry is SYMLINKS
+      # into the repo checkout, and this container's cross-mount symlinks
+      # defeat the TUI skill scanner (see the note inside the step below) —
+      # the real-file copies here are what the TUI actually reads. HOME is
+      # also not hermeticized, so the absolute ~/.claude/skills/gstack/...
+      # preamble paths resolve through the gstack root symlink this step makes.
       - name: Register gstack skills for PTY smoke
         if: matrix.suite.name == 'e2e-pty-plan-smoke'
         run: |
@@ -201,7 +227,7 @@ jobs:
           # registry recognized it, isolating the failure to the container's
           # cross-mount symlink). Copy SKILL.md + sections as real files so the TUI
           # reads them directly.
-          for s in office-hours plan-ceo-review; do
+          for s in office-hours plan-ceo-review plan-eng-review plan-design-review; do
             rm -rf "${SKILLS_DIR:?}/$s"
             mkdir -p "$SKILLS_DIR/$s"
             cp "$REPO/$s/SKILL.md" "$SKILLS_DIR/$s/SKILL.md"
@@ -216,7 +242,7 @@ jobs:
           # ~/.claude/skills/gstack symlink above.
           PROJ_SKILLS="$REPO/.claude/skills"
           mkdir -p "$PROJ_SKILLS"
-          for s in office-hours plan-ceo-review; do
+          for s in office-hours plan-ceo-review plan-eng-review plan-design-review; do
             rm -rf "${PROJ_SKILLS:?}/$s"
             mkdir -p "$PROJ_SKILLS/$s"
             cp "$REPO/$s/SKILL.md" "$PROJ_SKILLS/$s/SKILL.md"
@@ -229,18 +255,22 @@ jobs:
           for f in \
             "$SKILLS_DIR/office-hours/SKILL.md" \
             "$SKILLS_DIR/plan-ceo-review/SKILL.md" \
+            "$SKILLS_DIR/plan-eng-review/SKILL.md" \
+            "$SKILLS_DIR/plan-design-review/SKILL.md" \
             "$SKILLS_DIR/gstack/bin/gstack-update-check" \
             "$SKILLS_DIR/gstack/office-hours/sections/design-and-handoff.md" \
-            "$SKILLS_DIR/gstack/plan-ceo-review/sections/review-sections.md"; do
+            "$SKILLS_DIR/gstack/plan-ceo-review/sections/review-sections.md" \
+            "$SKILLS_DIR/gstack/plan-eng-review/sections/review-sections.md" \
+            "$SKILLS_DIR/gstack/plan-design-review/sections/review-sections.md"; do
             if [ ! -e "$f" ]; then
               echo "ERROR: skill-registry target missing (symlink dangles): $f" >&2
               exit 1
             fi
           done
-          grep -m1 '^name: office-hours$'    "$SKILLS_DIR/office-hours/SKILL.md"    >/dev/null \
-            || { echo "ERROR: office-hours SKILL.md missing 'name: office-hours' frontmatter" >&2; exit 1; }
-          grep -m1 '^name: plan-ceo-review$' "$SKILLS_DIR/plan-ceo-review/SKILL.md" >/dev/null \
-            || { echo "ERROR: plan-ceo-review SKILL.md missing 'name: plan-ceo-review' frontmatter" >&2; exit 1; }
+          for s in office-hours plan-ceo-review plan-eng-review plan-design-review; do
+            grep -m1 "^name: $s\$" "$SKILLS_DIR/$s/SKILL.md" >/dev/null \
+              || { echo "ERROR: $s SKILL.md missing 'name: $s' frontmatter" >&2; exit 1; }
+          done
           echo "skill registry OK"
 
       - name: Run ${{ matrix.suite.name }}
@@ -263,7 +293,7 @@ jobs:
   report:
     runs-on: ubicloud-standard-8
     needs: evals
-    if: always() && github.event_name == 'pull_request'
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     permissions:
       contents: read

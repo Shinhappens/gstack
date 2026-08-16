@@ -14,14 +14,39 @@ import * as path from 'path';
 import { spawn as nodeSpawn } from 'child_process';
 import { safeUnlink, safeUnlinkQuiet, safeKill, isProcessAlive } from './error-handling';
 import { writeSecureFile, mkdirSecure } from './file-permissions';
-import { resolveConfig, ensureStateDir, readVersionHash } from './config';
+import { resolveConfig, ensureStateDir, readVersionHash, isPairAgentEnabled } from './config';
 import { parseProxyConfig, computeConfigHash, ProxyConfigError } from './proxy-config';
 import { redactProxyUrl } from './proxy-redact';
 import { spawnTerminalAgent } from './terminal-agent-control';
 
 const config = resolveConfig();
 const IS_WINDOWS = process.platform === 'win32';
-const MAX_START_WAIT = IS_WINDOWS ? 15000 : (process.env.CI ? 30000 : 8000); // Node+Chromium takes longer on Windows
+
+/**
+ * Startup health-probe budget (ms) for a freshly spawned server. The daemon is
+ * detached + unref'd, so it keeps booting regardless of how long the CLI is
+ * willing to poll — this constant only bounds how long `startServer` waits
+ * before reporting failure.
+ *
+ * Overridable via `BROWSE_START_TIMEOUT` (ms) for hosts where even the platform
+ * ceiling isn't enough — e.g. Windows under heavy load (#1846), where the 15s
+ * budget can still elapse before a busy box finishes booting Node+Chromium.
+ * Mirrors the `BROWSE_*` tunable convention used throughout server.ts
+ * (BROWSE_PORT, BROWSE_IDLE_TIMEOUT, ...). A non-positive or unparseable value
+ * falls back to the platform default. Pure + exported for tests.
+ */
+export function resolveStartTimeout(env: NodeJS.ProcessEnv = process.env): number {
+  // Cold Chromium launch measured ~5.7s at load avg 10 on a dev machine running
+  // many servers; at load 12+ it exceeds the old 8s budget, so the CLI gave up
+  // while the (detached) daemon was still booting → "Server failed to start
+  // within 8s". 15s matches the Windows budget and gives real headroom; the poll
+  // loop returns the instant the daemon is healthy, so this only costs time in a
+  // genuine-failure case.
+  const platformDefault = IS_WINDOWS ? 15000 : (env.CI ? 30000 : 15000); // Node+Chromium takes longer on Windows
+  const override = parseInt(env.BROWSE_START_TIMEOUT || '', 10);
+  return Number.isFinite(override) && override > 0 ? override : platformDefault;
+}
+const MAX_START_WAIT = resolveStartTimeout();
 
 export function resolveServerScript(
   env: Record<string, string | undefined> = process.env,
@@ -143,7 +168,7 @@ async function killServer(pid: number): Promise<void> {
     try {
       Bun.spawnSync(
         ['taskkill', '/PID', String(pid), '/T', '/F'],
-        { stdout: 'pipe', stderr: 'pipe', timeout: 5000 }
+        { stdout: 'pipe', stderr: 'pipe', timeout: 5000, windowsHide: true }
       );
     } catch (err: any) {
       if (err?.code !== 'ENOENT') throw err;
@@ -323,9 +348,9 @@ async function startServer(extraEnv?: Record<string, string>): Promise<ServerSta
     const launcherCode =
       `const{spawn}=require('child_process');` +
       `spawn(process.execPath,[${JSON.stringify(NODE_SERVER_SCRIPT)}],` +
-      `{detached:true,stdio:['ignore','ignore','ignore'],env:Object.assign({},process.env,` +
+      `{detached:true,windowsHide:true,stdio:['ignore','ignore','ignore'],env:Object.assign({},process.env,` +
       `${extraEnvStr})}).unref()`;
-    Bun.spawnSync(['node', '-e', launcherCode], { stdio: ['ignore', 'ignore', 'ignore'] });
+    Bun.spawnSync(['node', '-e', launcherCode], { stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true });
   } else {
     // macOS/Linux: Bun.spawn().unref() only removes the child from Bun's event
     // loop — it does NOT call setsid(), so the spawned server stays in the
@@ -340,6 +365,7 @@ async function startServer(extraEnv?: Record<string, string>): Promise<ServerSta
     // the Windows path's rationale — same root cause, different OS API.
     nodeSpawn('bun', ['run', SERVER_SCRIPT], {
       detached: true,
+      windowsHide: true,
       stdio: ['ignore', 'ignore', 'ignore'],
       env: { ...process.env, BROWSE_STATE_FILE: config.stateFile, BROWSE_PARENT_PID: parentPid, ...extraEnv },
     }).unref();
@@ -357,6 +383,17 @@ async function startServer(extraEnv?: Record<string, string>): Promise<ServerSta
     await Bun.sleep(100);
   }
 
+  // One last check before declaring failure. The daemon is detached + unref'd,
+  // so on a loaded machine it can become healthy in the gap between the poll
+  // loop's final tick and now — the probe timed out, the launch did not
+  // (#1846). Re-checking here turns that false negative into a success, and
+  // mirrors the post-loop recovery already done in ensureServer(). A genuinely
+  // failed server is still unhealthy, so this falls through to the error report.
+  const lateState = readState();
+  if (lateState && await isServerHealthy(lateState.port)) {
+    return lateState;
+  }
+
   // Server didn't start in time — check the on-disk startup error log.
   // Both platforms now spawn with stdio: 'ignore', so the server writes
   // errors to disk for the CLI to read (see server.ts start().catch).
@@ -372,12 +409,29 @@ async function startServer(extraEnv?: Record<string, string>): Promise<ServerSta
   throw new Error(`Server failed to start within ${MAX_START_WAIT / 1000}s`);
 }
 
+export class ServerLockError extends Error {
+  code: string;
+  constructor(code: string, lockPath: string, cause: string) {
+    super(`E_SERVER_LOCK (${code}): cannot acquire ${lockPath} — ${cause}`);
+    this.name = 'ServerLockError';
+    this.code = code;
+  }
+}
+
 /**
  * Acquire an exclusive lockfile to prevent concurrent ensureServer() races (TOCTOU).
- * Returns a cleanup function that releases the lock.
+ * Returns a cleanup function that releases the lock, or null when another
+ * LIVE process genuinely holds the lock (real contention).
+ *
+ * Error honesty (#1084): only EEXIST is contention. ENOENT (state dir
+ * missing) self-heals with one mkdir retry; every other errno (EACCES,
+ * ENOSPC, ...) throws ServerLockError with the real errno instead of
+ * reporting phantom "another process holds the lock" contention forever.
  */
-function acquireServerLock(): (() => void) | null {
-  const lockPath = `${config.stateFile}.lock`;
+export function acquireServerLock(
+  lockPath: string = `${config.stateFile}.lock`,
+  depth = 0,
+): (() => void) | null {
   try {
     // 'wx' — create exclusively, fails if file already exists (atomic check-and-create)
     // Using string flag instead of numeric constants for Bun Windows compatibility
@@ -385,8 +439,18 @@ function acquireServerLock(): (() => void) | null {
     fs.writeSync(fd, `${process.pid}\n`);
     fs.closeSync(fd);
     return () => { safeUnlink(lockPath); };
-  } catch {
-    // Lock already held — check if the holder is still alive
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') {
+      // Lock dir missing — create it and retry once.
+      if (depth >= 1) throw new ServerLockError('ENOENT', lockPath, 'lock directory could not be created');
+      mkdirSecure(path.dirname(lockPath));
+      return acquireServerLock(lockPath, depth + 1);
+    }
+    if (err?.code !== 'EEXIST') {
+      throw new ServerLockError(err?.code || 'UNKNOWN', lockPath, err?.message || String(err));
+    }
+    // EEXIST — real contention. Check if the holder is still alive.
+    // Depth cap 5 bounds the stale-lock unlink/retry livelock.
     try {
       const holderPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
       if (holderPid && isProcessAlive(holderPid)) {
@@ -394,9 +458,15 @@ function acquireServerLock(): (() => void) | null {
       }
       // Stale lock — remove and retry
       fs.unlinkSync(lockPath);
-      return acquireServerLock();
-    } catch {
-      return null;
+      if (depth >= 5) return null;
+      return acquireServerLock(lockPath, depth + 1);
+    } catch (readErr: any) {
+      if (readErr?.code === 'ENOENT') {
+        // Lock vanished between open and read (holder released) — retry.
+        if (depth >= 5) return null;
+        return acquireServerLock(lockPath, depth + 1);
+      }
+      throw new ServerLockError(readErr?.code || 'UNKNOWN', lockPath, readErr?.message || String(readErr));
     }
   }
 }
@@ -442,8 +512,8 @@ async function ensureServer(flags?: GlobalFlags): Promise<ServerState> {
     return state;
   }
 
-  // BROWSE_NO_AUTOSTART: sidebar agent sets this so the child claude never
-  // spawns an invisible headless browser. If the headed server is down,
+  // BROWSE_NO_AUTOSTART: agent-spawned children (e.g. the terminal-agent PTY
+  // claude) set this so a child never spawns an invisible headless browser. If the headed server is down,
   // fail fast with a clear error instead of silently starting a new one.
   if (process.env.BROWSE_NO_AUTOSTART === '1') {
     console.error('[browse] Server not available and BROWSE_NO_AUTOSTART is set.');
@@ -527,7 +597,7 @@ export function extractTabId(args: string[]): { tabId: number | undefined; args:
 async function sendCommand(state: ServerState, command: string, args: string[], retries = 0): Promise<void> {
   // Precedence: CLI --tab-id flag > BROWSE_TAB env var.
   // make-pdf always passes --tab-id; human users typically rely on BROWSE_TAB
-  // (set by sidebar-agent per-tab) or the active tab.
+  // or the active tab.
   const extracted = extractTabId(args);
   args = extracted.args;
   const envTab = process.env.BROWSE_TAB;
@@ -898,8 +968,12 @@ async function handlePairAgent(state: ServerState, args: string[]): Promise<void
   if (pairData.tunnel_url) {
     serverUrl = pairData.tunnel_url;
   } else if (!localHost) {
-    // No tunnel active. Check if ngrok is available and auto-start.
-    const ngrokAvailable = isNgrokAvailable();
+    // No tunnel active. Remote tunneling (pair-agent) is opt-in — never
+    // auto-start it unless the user explicitly enabled it, even if ngrok is
+    // installed and authed. First use goes through the /pair-agent skill's
+    // consent question, which sets the key.
+    const pairEnabled = isPairAgentEnabled();
+    const ngrokAvailable = pairEnabled && isNgrokAvailable();
     if (ngrokAvailable) {
       console.log('[browse] ngrok detected. Starting tunnel...');
       try {
@@ -923,6 +997,14 @@ async function handlePairAgent(state: ServerState, args: string[]): Promise<void
         console.warn('[browse] Using localhost (same-machine only).\n');
         serverUrl = pairData.server_url;
       }
+    } else if (!pairEnabled) {
+      // Consent gate, not a tooling gap: when pair_agent is off, ngrok
+      // setup instructions can never fix it. Name the real remedy, with
+      // the same wording as the /tunnel/start 403 body in server.ts.
+      console.warn('[browse] No tunnel active: pair-agent is off (tunnel exposes this browser beyond the machine).');
+      console.warn('[browse] Instructions will use localhost (same-machine only).');
+      console.warn('[browse] For remote agents: enable once with `gstack-config set pair_agent on` — or run /pair-agent, which asks for consent and sets it.\n');
+      serverUrl = pairData.server_url;
     } else {
       console.warn('[browse] No tunnel active and ngrok is not installed/configured.');
       console.warn('[browse] Instructions will use localhost (same-machine only).');
@@ -1085,7 +1167,6 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
       const serverEnv: Record<string, string> = {
         BROWSE_HEADED: '1',
         BROWSE_PORT: '34567',
-        BROWSE_SIDEBAR_CHAT: '1',
         // Disable parent-process watchdog: the user controls the headed browser
         // window lifecycle. The CLI exits immediately after connect, so watching
         // it would kill the server ~15s later. Cleanup happens via browser
@@ -1116,10 +1197,6 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
       if (process.platform === 'darwin') {
         console.log('(If you still don\'t see it, check Mission Control / other Spaces.)');
       }
-
-      // sidebar-agent.ts spawn was here. Ripped alongside the chat queue —
-      // the Terminal pane runs an interactive PTY now, no more one-shot
-      // claude -p subprocesses to multiplex.
 
       // Auto-start terminal agent (non-compiled bun process). Owns the PTY
       // WebSocket for the sidebar Terminal pane. Routes through the shared

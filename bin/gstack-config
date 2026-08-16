@@ -133,6 +133,8 @@ lookup_default() {
 
     redact_repo_visibility) echo "" ;; # empty → fall through to gh/glab detection
     redact_prepush_hook) echo "false" ;;
+    pair_agent) echo "off" ;; # remote tunnel consent — fail-closed until /pair-agent asks
+    founder_resources) echo "true" ;; # office-hours resource pitch — #538 permanent opt-out sets false
     # Brain-aware planning (v1.48 / T5+T10+T16). Defaults documented inline:
     #   brain_trust_policy@<endpoint-id>  — unset on fresh install; setup-gbrain
     #                                writes 'personal' for local engines,
@@ -257,6 +259,16 @@ resolve_user_slug() {
   printf '%s' "$_slug"
 }
 
+read_config_value() {
+  local key="$1"
+  if [ ! -f "$CONFIG_FILE" ]; then
+    return 0
+  fi
+  grep -E "^${key}:" "$CONFIG_FILE" 2>/dev/null \
+    | tail -1 \
+    | sed -E "s/^${key}:[[:space:]]*//; s/[[:space:]]+$//"
+}
+
 case "${1:-}" in
   get)
     KEY="${2:?Usage: gstack-config get <key>}"
@@ -264,12 +276,11 @@ case "${1:-}" in
     # endpoint-namespaced keys introduced by the brain-aware planning layer).
     # Endpoint ids are sha8/sha16 hex for remote MCP URLs, or the literal
     # "local" for stdio/PGLite engines (see endpoint_hash).
-    if ! printf '%s' "$KEY" | grep -qE '^[a-zA-Z0-9_]+(@[a-zA-Z0-9]+)?$'; then
+    if ! printf '%s' "$KEY" | LC_ALL=C grep -qE '^[a-zA-Z0-9_]+(@[a-zA-Z0-9]+)?$'; then
       echo "Error: key must contain only alphanumeric characters, underscores, and an optional @<endpoint-id> suffix" >&2
       exit 1
     fi
-    # Use literal match for keys containing @ (endpoint ids), regex otherwise
-    VALUE=$(grep -F "${KEY}:" "$CONFIG_FILE" 2>/dev/null | grep -E "^${KEY%@*}(@[a-zA-Z0-9]+)?:" | grep -F "${KEY}:" | tail -1 | awk '{print $2}' | tr -d '[:space:]' || true)
+    VALUE=$(read_config_value "$KEY" || true)
     if [ -z "$VALUE" ]; then
       VALUE=$(lookup_default "$KEY")
     fi
@@ -280,7 +291,7 @@ case "${1:-}" in
     VALUE="${3:?Usage: gstack-config set <key> <value>}"
     # Validate key (alphanumeric + underscore + optional @<endpoint-id> suffix).
     # Accepts hex hashes and the literal "local" from endpoint_hash.
-    if ! printf '%s' "$KEY" | grep -qE '^[a-zA-Z0-9_]+(@[a-zA-Z0-9]+)?$'; then
+    if ! printf '%s' "$KEY" | LC_ALL=C grep -qE '^[a-zA-Z0-9_]+(@[a-zA-Z0-9]+)?$'; then
       echo "Error: key must contain only alphanumeric characters, underscores, and an optional @<endpoint-id> suffix" >&2
       exit 1
     fi
@@ -310,6 +321,14 @@ case "${1:-}" in
       echo "Warning: redact_prepush_hook '$VALUE' not recognized. Valid values: true, false. Using false." >&2
       VALUE="false"
     fi
+    if [ "$KEY" = "pair_agent" ] && [ "$VALUE" != "on" ] && [ "$VALUE" != "off" ]; then
+      echo "Warning: pair_agent '$VALUE' not recognized. Valid values: on, off. Using off." >&2
+      VALUE="off"
+    fi
+    if [ "$KEY" = "founder_resources" ] && [ "$VALUE" != "true" ] && [ "$VALUE" != "false" ]; then
+      echo "Warning: founder_resources '$VALUE' not recognized. Valid values: true, false. Using true." >&2
+      VALUE="true"
+    fi
     if [ "$KEY" = "plan_tune_hooks" ] && [ "$VALUE" != "prompt" ] && [ "$VALUE" != "yes" ] && [ "$VALUE" != "no" ]; then
       echo "Warning: plan_tune_hooks '$VALUE' not recognized. Valid values: prompt, yes, no. Using prompt." >&2
       VALUE="prompt"
@@ -326,14 +345,15 @@ case "${1:-}" in
     if [ ! -f "$CONFIG_FILE" ]; then
       printf '%s' "$CONFIG_HEADER" > "$CONFIG_FILE"
     fi
-    # Escape sed special chars in value and drop embedded newlines
-    ESC_VALUE="$(printf '%s' "$VALUE" | head -1 | sed 's/[&/\]/\\&/g')"
+    # Drop embedded newlines, then escape sed replacement metacharacters.
+    SAFE_VALUE="$(printf '%s' "$VALUE" | head -1)"
+    ESC_VALUE="$(printf '%s' "$SAFE_VALUE" | sed 's/[&/\]/\\&/g')"
     if grep -qE "^${KEY}:" "$CONFIG_FILE" 2>/dev/null; then
       # Portable in-place edit (BSD sed uses -i '', GNU sed uses -i without arg)
       _tmpfile="$(mktemp "${CONFIG_FILE}.XXXXXX")"
       sed "/^${KEY}:/s/.*/${KEY}: ${ESC_VALUE}/" "$CONFIG_FILE" > "$_tmpfile" && mv "$_tmpfile" "$CONFIG_FILE"
     else
-      echo "${KEY}: ${VALUE}" >> "$CONFIG_FILE"
+      echo "${KEY}: ${SAFE_VALUE}" >> "$CONFIG_FILE"
     fi
     # Auto-relink skills when prefix setting changes (skip during setup to avoid recursive call)
     if [ "$KEY" = "skill_prefix" ] && [ -z "${GSTACK_SETUP_RUNNING:-}" ]; then
@@ -351,7 +371,7 @@ case "${1:-}" in
                skill_prefix checkpoint_mode checkpoint_push explain_level \
                codex_reviews gstack_contributor skip_eng_review workspace_root \
                artifacts_sync_mode artifacts_sync_mode_prompted plan_tune_hooks; do
-      VALUE=$(grep -E "^${KEY}:" "$CONFIG_FILE" 2>/dev/null | tail -1 | awk '{print $2}' | tr -d '[:space:]' || true)
+      VALUE=$(read_config_value "$KEY" || true)
       SOURCE="default"
       if [ -n "$VALUE" ]; then
         SOURCE="set"

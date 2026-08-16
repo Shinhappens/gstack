@@ -28,6 +28,8 @@ triggers:
 
 {{PREAMBLE}}
 
+{{THIRD_PARTY_ACTIONS}}
+
 {{BASE_BRANCH_DETECT}}
 
 {{GBRAIN_CONTEXT_LOAD}}
@@ -74,6 +76,18 @@ Never skip a verification step because a prior `/ship` run already performed it.
 {{SECTION_INDEX:ship}}
 
 ---
+
+## Step 0.9: Apple target detection
+
+Shipping to the App Store is not landing a PR. If the repository contains an
+`.xcodeproj`, `.xcworkspace`, or a Swift package with an app product AND the
+user's ask is store distribution (App Store, TestFlight, "release my app"),
+**STOP and Read `~/.claude/skills/gstack/ship/sections/apple-release.md` FIRST**
+— before the branch gate and any preflight below. Store distribution proceeds
+from whatever branch the user is on (a clean tree on the base branch is the
+solo developer's normal case, not an error) and follows the adapter end to
+end. The branch gate and repository-landing pipeline below apply ONLY to
+repository-landing asks, including on Apple repos.
 
 ## Step 1: Pre-flight
 
@@ -393,9 +407,15 @@ _HOOK_INSTALLED="no"
 # committed hook and write a machine-local wrapper into the working tree.
 _HOOKS_DIR=$(git rev-parse --git-path hooks 2>/dev/null || echo "")
 _GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null || echo "")
+# Linked worktrees: --absolute-git-dir is .git/worktrees/<name> but hooks
+# resolve to the COMMON .git/hooks, so match against the common dir too or
+# every Conductor worktree false-negatives as a "custom hooks path". The
+# /nonexistent fallback keeps the case pattern from collapsing to "/*"
+# (match-everything) when resolution fails.
+_GIT_COMMON=$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd || echo /nonexistent)
 _HOOKS_IN_GIT_DIR="no"
 case "$_HOOKS_DIR" in
-  "$_GIT_DIR"/*|hooks|.git/hooks) _HOOKS_IN_GIT_DIR="yes" ;;
+  "$_GIT_DIR"/*|"$_GIT_COMMON"/*|hooks|.git/hooks) _HOOKS_IN_GIT_DIR="yes" ;;
 esac
 _PREPUSH_PROMPTED=$([ -f "${GSTACK_HOME:-$HOME/.gstack}/.redact-prepush-prompted" ] && echo "yes" || echo "no")
 echo "REDACT_PREPUSH: $_REDACT_PREPUSH"
@@ -464,16 +484,17 @@ git push -u origin <branch-name>
 
 ## Step 20: Persist ship metrics
 
-Log coverage and plan completion data so `/retro` can track trends:
+Log coverage and plan completion data so `/retro` can track trends.
+
+Route the append through `gstack-review-log`. It resolves the project slug and
+the canonical branch form itself, creates the directory, validates the JSON, and
+enqueues the row for gbrain sync. It takes **no path argument** — never build a
+`<branch>-reviews.jsonl` path by hand. A branch with a `/` in it turns a
+hand-built path into a subdirectory write, and the row goes somewhere `/retro`
+will never look.
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" && mkdir -p ~/.gstack/projects/$SLUG
-```
-
-Append to `~/.gstack/projects/$SLUG/$BRANCH-reviews.jsonl`:
-
-```bash
-echo '{"skill":"ship","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","coverage_pct":COVERAGE_PCT,"plan_items_total":PLAN_TOTAL,"plan_items_done":PLAN_DONE,"verification_result":"VERIFY_RESULT","version":"VERSION","branch":"BRANCH"}' >> ~/.gstack/projects/$SLUG/$BRANCH-reviews.jsonl
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"ship","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","coverage_pct":COVERAGE_PCT,"plan_items_total":PLAN_TOTAL,"plan_items_done":PLAN_DONE,"verification_result":"VERIFY_RESULT","version":"VERSION","branch":"'"$(git rev-parse --abbrev-ref HEAD)"'"}'
 ```
 
 Substitute from earlier steps:
@@ -482,7 +503,9 @@ Substitute from earlier steps:
 - **PLAN_DONE**: count of DONE + CHANGED items from Step 8 (0 if no plan file)
 - **VERIFY_RESULT**: "pass", "fail", or "skipped" from Step 8.1
 - **VERSION**: from the VERSION file
-- **BRANCH**: current branch name
+
+The branch name is filled in by the shell — there is no `BRANCH` placeholder to
+substitute.
 
 This step is automatic — never skip it, never ask for confirmation.
 
