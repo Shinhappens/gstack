@@ -32,6 +32,7 @@ export interface BrowseConfig {
 export function getGitRoot(): string | null {
   try {
     const proc = Bun.spawnSync(['git', 'rev-parse', '--show-toplevel'], {
+    windowsHide: true,
       stdout: 'pipe',
       stderr: 'pipe',
       // Raised from 2s: under heavy machine load `git rev-parse` routinely
@@ -86,6 +87,7 @@ export function resolveConfig(
 function isIgnoredByGit(projectDir: string, relPath: string): boolean {
   try {
     const proc = Bun.spawnSync(['git', 'check-ignore', '-q', '--', relPath], {
+    windowsHide: true,
       cwd: projectDir, stdout: 'pipe', stderr: 'pipe',
       timeout: 2_000,
     });
@@ -112,6 +114,20 @@ export function ensureStateDir(config: BrowseConfig): void {
       throw new Error(`Cannot create state directory ${config.stateDir}: a file exists at that path`);
     }
     throw err;
+  }
+
+  // Load-bearing guard: a self-contained ignore INSIDE the state dir so its
+  // contents can NEVER be `git add`-ed, regardless of the project's own
+  // .gitignore (which may be absent, or the append below may silently fail).
+  // The state dir holds session-state.json (live cookies + localStorage/
+  // sessionStorage tokens) and browse-network.log / browse-audit.jsonl
+  // (captured request headers can carry bearer tokens). Written unconditionally,
+  // synchronously, before return — the project-.gitignore dance below is now
+  // redundant safety, kept so `.gstack/` still reads as ignored in git status.
+  try {
+    fs.writeFileSync(path.join(config.stateDir, '.gitignore'), '*\n');
+  } catch {
+    // Best-effort; the project-.gitignore path below is the fallback.
   }
 
   // Ensure .gstack/ is in the project's .gitignore
@@ -146,6 +162,7 @@ export function ensureStateDir(config: BrowseConfig): void {
 export function getRemoteSlug(): string {
   try {
     const proc = Bun.spawnSync(['git', 'remote', 'get-url', 'origin'], {
+    windowsHide: true,
       stdout: 'pipe',
       stderr: 'pipe',
       timeout: 2_000,

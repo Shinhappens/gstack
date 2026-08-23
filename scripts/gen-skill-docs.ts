@@ -44,14 +44,14 @@ function loadGbrainOverride(): { detected: boolean } {
   try {
     const json = JSON.parse(fs.readFileSync(detectionPath, 'utf-8')) as { gbrain_local_status?: string };
     // "timeout" = slow-but-healthy engine (#1964); "thin-client" = remote-HTTP
-    // MCP brain with no local engine by design (#2051). Both usable — same
-    // treatment as "ok", matching gstack-gbrain-detect --is-ok.
-    return {
-      detected:
-        json.gbrain_local_status === 'ok' ||
-        json.gbrain_local_status === 'timeout' ||
-        json.gbrain_local_status === 'thin-client',
-    };
+    // MCP brain with no local engine by design (#2051); "engine-locked" = same
+    // class (#2456): PGLite is single-writer, so a live `gbrain serve` (e.g.
+    // an MCP server) owns the embedded DB — gbrain is installed and healthy,
+    // a legitimate holder has the lock, so a transient lock must not silently
+    // strip brain blocks from every SKILL.md. All usable — same treatment as
+    // "ok", matching gstack-gbrain-detect --is-ok.
+    const USABLE = ['ok', 'timeout', 'thin-client', 'engine-locked'];
+    return { detected: USABLE.includes(json.gbrain_local_status ?? '') };
   } catch {
     return { detected: false };
   }
@@ -92,12 +92,13 @@ const HOST_ARG_VAL: HostArg = (() => {
 let HOST: Host = HOST_ARG_VAL === 'all' ? 'claude' : HOST_ARG_VAL;
 
 // ─── Model Overlay Selection ────────────────────────────────
-// --model is explicit. We do NOT auto-detect from host (host ≠ model).
-// Default is 'claude'. Missing overlay file → empty string (graceful).
+// --model is explicit. Without it, each host uses HostConfig.defaultModel.
+// Host defaults are generation fallbacks, not claims that host === model.
+// Missing overlay file → empty string (graceful).
 import { ALL_MODEL_NAMES, resolveModel, type Model } from './models';
 const MODEL_ARG = process.argv.find(a => a.startsWith('--model'));
-const MODEL_ARG_VAL: Model = (() => {
-  if (!MODEL_ARG) return 'claude';
+const MODEL_ARG_VAL: Model | null = (() => {
+  if (!MODEL_ARG) return null;
   const val = MODEL_ARG.includes('=') ? MODEL_ARG.split('=')[1] : process.argv[process.argv.indexOf(MODEL_ARG) + 1];
   const resolved = resolveModel(val);
   if (!resolved) {
@@ -105,6 +106,10 @@ const MODEL_ARG_VAL: Model = (() => {
   }
   return resolved;
 })();
+
+function generationModelForHost(host: Host): Model {
+  return MODEL_ARG_VAL ?? getHostConfig(host).defaultModel;
+}
 
 // ─── Catalog Mode (v1.45.0.0 T4) ────────────────────────────
 // 'trim' (default): shorten frontmatter description to lead sentence and
@@ -413,6 +418,7 @@ export function toYamlInlineScalar(s: string): string {
     s !== s.trim() ||                       // leading/trailing whitespace
     /:(\s|$)/.test(s) ||                    // "foo: bar" / trailing colon → mapping ambiguity
     /\s#/.test(s) ||                        // " #" → inline comment
+    /\.\.\./.test(s) ||                     // "..." → document-end marker; strict parsers reject mid-scalar (catalog-trim truncation appends it)
     /^[\s>|&*!%@`"'#,\[\]{}?-]/.test(s);    // leading YAML indicator char
   return needsQuote ? JSON.stringify(s) : s;
 }
@@ -667,12 +673,32 @@ function applyHostRewrites(content: string, hostConfig: HostConfig): string {
  * unresolved. Extracted so SKILL.md and section templates resolve through the
  * exact same path — a security/sanitization fix to one can't miss the other.
  */
+/**
+ * A second {{PREAMBLE}} in one template re-expands the entire ~12K-token
+ * preamble mid-document (#2508/#2362 — a PROSE mention of the macro in
+ * spec/SKILL.md.tmpl expanded it a second time, +43KB per /spec load).
+ * Resolution is context-blind, so any second occurrence — code fence, prose,
+ * anywhere — is a generation error, never intentional. Throw at render time
+ * so the mistake cannot reach a generated SKILL.md again.
+ */
+export function assertSinglePreamble(tmplContent: string, relTmplPath: string): void {
+  const count = (tmplContent.match(/\{\{PREAMBLE\}\}/g) || []).length;
+  if (count > 1) {
+    throw new Error(
+      `${relTmplPath} contains {{PREAMBLE}} ${count} times — a template may reference it `
+      + `at most once (each occurrence expands the full preamble; see #2508/#2362). `
+      + `Refer to "the preamble" in prose instead of the macro.`,
+    );
+  }
+}
+
 function resolvePlaceholders(
   tmplContent: string,
   ctx: TemplateContext,
   hostConfig: HostConfig,
   relTmplPath: string,
 ): string {
+  assertSinglePreamble(tmplContent, relTmplPath);
   // effectiveSuppressedResolvers() honors --respect-detection: when gbrain is
   // detected locally, GBRAIN_* resolvers un-suppress. Shared by SKILL.md and
   // section generation so both paths get the same gbrain-aware behavior.
@@ -732,7 +758,7 @@ function buildContext(
   const interactive = interactiveMatch ? interactiveMatch[1] === 'true' : undefined;
   return {
     skillName, tmplPath, benefitsFrom, host, paths: HOST_PATHS[host],
-    preambleTier, model: MODEL_ARG_VAL, interactive, explainLevel: EXPLAIN_LEVEL,
+    preambleTier, model: generationModelForHost(host), interactive, explainLevel: EXPLAIN_LEVEL,
   };
 }
 

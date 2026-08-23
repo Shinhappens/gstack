@@ -22,6 +22,7 @@ import { emitActivity } from './activity';
 import { validateNavigationUrl } from './url-validation';
 import { TabSession, type RefEntry } from './tab-session';
 import { resolveChromiumProfile, cleanSingletonLocks } from './config';
+import { launchWithXProtectHeal } from './xprotect-heal';
 import { withCdpSession } from './cdp-bridge';
 import type { MemorySnapshot, MemoryStructureStats, MemoryTabSnapshot, MemoryProcess } from './memory-snapshot';
 
@@ -458,8 +459,23 @@ export class BrowserManager {
       console.log(`[browse] Extensions loaded from: ${extensionsDir}`);
     }
 
-    this.browser = await chromium.launch({
+    // XProtect self-heal wrapper (P0 #2554): a macOS definition update can
+    // start SIGKILLing the pinned Chromium at spawn. On the classified
+    // signature, clear quarantine on the Playwright cache + force-reinstall
+    // once, then retry this launch once. This headless path always uses the
+    // Playwright cache (no executablePath), so the heal is never scoped out.
+    this.browser = await launchWithXProtectHeal(() => chromium.launch({
       headless: useHeadless,
+      // #2220: the daemon owns signal policy, not Playwright. Playwright's
+      // default handlers close Chromium the moment THIS process receives
+      // SIGINT/SIGTERM/SIGHUP — which fights the deliberate headless
+      // SIGTERM-ignore in server.ts (the daemon survives the signal but
+      // loses its browser out from under it). All three are false; server.ts
+      // routes the signals it actually honors through activeShutdown, which
+      // closes Chromium itself.
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
       // On Windows, Chromium's sandbox fails when the server is spawned through
       // the Bun→Node process chain (GitHub #276). Disable it — local daemon
       // browsing user-specified URLs has marginal sandbox benefit. Also disabled
@@ -468,7 +484,7 @@ export class BrowserManager {
       chromiumSandbox: shouldEnableChromiumSandbox(),
       ...(launchArgs.length > 0 ? { args: launchArgs } : {}),
       ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
-    });
+    }));
 
     // Chromium disconnect → distinguish clean user-quit from crash. Both
     // events look identical to Playwright (one 'disconnected' fires), but
@@ -651,8 +667,16 @@ export class BrowserManager {
     // three more (--disable-popup-blocking, --disable-component-update,
     // --disable-default-apps — each a documented automation tell per Patchright).
     const { STEALTH_IGNORE_DEFAULT_ARGS } = await import('./stealth');
-    this.context = await chromium.launchPersistentContext(userDataDir, {
+    // XProtect self-heal wrapper (P0 #2554). usesCustomExecutable scopes the
+    // heal out when GSTACK_CHROMIUM_PATH supplies the bundle — that bundle
+    // belongs to the wrapper/embedder and is never quarantine-cleared or
+    // reinstalled over (probePoisonedChromiumBundle's scope contract).
+    this.context = await launchWithXProtectHeal(() => chromium.launchPersistentContext(userDataDir, {
       headless: false,
+      // #2220: daemon owns signal policy — see launch() for the rationale.
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
       // Match the sandbox policy used by launch() above. Without this,
       // Playwright auto-adds --no-sandbox on every headed launch and the user
       // sees Chromium's "unsupported command-line flag" yellow infobar.
@@ -663,7 +687,7 @@ export class BrowserManager {
       ...(executablePath ? { executablePath } : {}),
       ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
       ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT_ARGS,
-    });
+    }), { usesCustomExecutable: Boolean(executablePath) });
     this.browser = this.context.browser();
     this.connectionMode = 'headed';
     this.intentionalDisconnect = false;
@@ -797,7 +821,19 @@ export class BrowserManager {
     this.consecutiveFailures = 0;
   }
 
+  // How long close() waits for a graceful shutdown before falling back to
+  // SIGKILL (launched mode) or abandoning the context close (headed mode).
+  // A field, not a literal, so the SIGKILL fallback is unit-testable without
+  // a 5-second wait.
+  private closeRaceMs = 5000;
+
   async close() {
+    // unref'd race timer: without unref, every successful close still pins
+    // the caller's event loop for the full window.
+    const raceTimeout = (ms: number) => new Promise<false>((resolve) => {
+      const t = setTimeout(() => resolve(false), ms);
+      (t as { unref?: () => void }).unref?.();
+    });
     if (this.browser || (this.connectionMode === 'headed' && this.context)) {
       if (this.connectionMode === 'headed') {
         // Headed/persistent context mode: close the context (which closes the browser)
@@ -805,15 +841,24 @@ export class BrowserManager {
         if (this.browser) this.browser.removeAllListeners('disconnected');
         await Promise.race([
           this.context ? this.context.close() : Promise.resolve(),
-          new Promise(resolve => setTimeout(resolve, 5000)),
+          raceTimeout(this.closeRaceMs),
         ]).catch(() => {});
       } else {
-        // Launched mode: close the browser we spawned
+        // Launched mode: close the browser we spawned.
         this.browser.removeAllListeners('disconnected');
-        await Promise.race([
-          this.browser.close(),
-          new Promise(resolve => setTimeout(resolve, 5000)),
-        ]).catch(() => {});
+        // Grab the child handle BEFORE the race: nulling this.browser after a
+        // race-timeout used to ABANDON a live Chromium whose sockets kept the
+        // caller's event loop (and keep-alive connections into test servers)
+        // open forever — the intermittent whole-suite wedge. If graceful close
+        // doesn't finish in time, the child gets SIGKILL, not freedom.
+        const child = this.browser.process?.();
+        const closed = await Promise.race([
+          this.browser.close().then(() => true as const),
+          raceTimeout(this.closeRaceMs),
+        ]).catch(() => false as const);
+        if (closed === false && child && child.exitCode === null && !child.killed) {
+          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        }
       }
       this.browser = null;
     }
@@ -1009,6 +1054,25 @@ export class BrowserManager {
   transferTab(tabId: number, toClientId: string): void {
     if (!this.pages.has(tabId)) throw new Error(`Tab ${tabId} not found`);
     this.tabOwnership.set(tabId, toClientId);
+  }
+
+  /**
+   * Release all tab ownership held by a client (called on revoke / reducing
+   * re-pair). Deletes the ownership entries so an own-only client re-pairing
+   * under the same name can no longer inherit the revoked agent's
+   * authenticated tabs (checkTabAccess gates own-only on owner === clientId).
+   * Tabs are NOT closed — leaving the page open is the local human's call, not
+   * the daemon's; the residual is a root-only tab. Returns the released ids.
+   */
+  releaseClientTabs(clientId: string): number[] {
+    const released: number[] = [];
+    for (const [tabId, owner] of this.tabOwnership) {
+      if (owner === clientId) {
+        this.tabOwnership.delete(tabId);
+        released.push(tabId);
+      }
+    }
+    return released;
   }
 
   async getTabListWithTitles(): Promise<Array<{ id: number; url: string; title: string; active: boolean }>> {
@@ -1681,8 +1745,15 @@ export class BrowserManager {
       // The handoff path (headless → headed re-launch) takes the same
       // anti-detection posture.
       const { STEALTH_IGNORE_DEFAULT_ARGS } = await import('./stealth');
-      newContext = await chromium.launchPersistentContext(userDataDir, {
+      // XProtect self-heal wrapper (P0 #2554): handoff always launches the
+      // Playwright-cache bundle (no executablePath), so the heal applies
+      // exactly as in launch()/launchHeaded().
+      newContext = await launchWithXProtectHeal(() => chromium.launchPersistentContext(userDataDir, {
         headless: false,
+        // #2220: daemon owns signal policy — see launch() for the rationale.
+        handleSIGINT: false,
+        handleSIGTERM: false,
+        handleSIGHUP: false,
         // Match the sandbox policy used by launchHeaded() / launch(). The
         // handoff path is the headless→headed re-launch and shares the same
         // anti-detection posture, including no spurious --no-sandbox infobar.
@@ -1692,7 +1763,7 @@ export class BrowserManager {
         ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
         ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT_ARGS,
         timeout: 15000,
-      });
+      }));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return `ERROR: Cannot open headed browser — ${msg}. Headless browser still running.`;

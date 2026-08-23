@@ -24,7 +24,6 @@ import {
   runContentFilters, type ContentFilterResult,
   markHiddenElements, getCleanTextWithStripping, cleanupHiddenMarkers,
 } from './content-security';
-import { getStatus as getSecurityStatus } from './security';
 import { isSidecarAvailable, scanWithSidecar } from './security-sidecar-client';
 import { writeSecureFile, mkdirSecure, appendSecureFile } from './file-permissions';
 import { handleSnapshot, SNAPSHOT_FLAGS } from './snapshot';
@@ -32,7 +31,9 @@ import {
   initRegistry, validateToken as validateScopedToken, checkScope, checkDomain,
   checkRate, createToken, createSetupKey, exchangeSetupKey, revokeToken,
   listTokens, recordCommand,
-  isRootToken, checkConnectRateLimit, type TokenInfo,
+  isRootToken, checkConnectRateLimit, type TokenInfo, type ScopeCategory,
+  DEFAULT_PAIR_SCOPES, InvalidScopeError, ReservedClientIdError, assertValidClientId,
+  assertValidTokenOptions, revokeSetupKeys, getClientSession, grantReducesAccess,
 } from './token-registry';
 import { validateTempPath } from './path-security';
 import { resolveConfig, ensureStateDir, readVersionHash, resolveChromiumProfile, cleanSingletonLocks, isPairAgentEnabled } from './config';
@@ -47,6 +48,9 @@ import { inspectElement, modifyStyle, resetModifications, getModificationHistory
 // Bun.spawn used instead of child_process.spawn (compiled bun binaries
 // fail posix_spawn on all executables including /bin/bash)
 import { safeUnlink, safeUnlinkQuiet, safeKill } from './error-handling';
+import {
+  findAvailablePort, formatExplicitPortUnavailableError, formatRandomPortUnavailableError,
+} from './port-allocator';
 import { readAgentRecord, killAgentByRecord, agentRecordPath, spawnTerminalAgent } from './terminal-agent-control';
 import { isProcessAlive } from './error-handling';
 import { sanitizeBody, stripLoneSurrogateEscapes, stripLoneSurrogates, sanitizeReplacer } from './sanitize';
@@ -915,124 +919,14 @@ let isShuttingDown = false;
 // the good final snapshot with a degraded one (zero tabs).
 let sessionPersistInterval: ReturnType<typeof setInterval> | null = null;
 
-type PortCheckResult =
-  | { available: true }
-  | { available: false; code?: string; message: string };
-
-type FailedPortAttempt = {
-  port: number;
-  result: Extract<PortCheckResult, { available: false }>;
-};
-
-const RANDOM_PORT_MIN = 10000;
-const RANDOM_PORT_MAX = 60000;
-const RANDOM_PORT_RETRIES = 5;
-
-function normalizePortError(err: unknown): Extract<PortCheckResult, { available: false }> {
-  const maybeNodeError = err as NodeJS.ErrnoException | undefined;
-  return {
-    available: false,
-    code: maybeNodeError?.code,
-    message: maybeNodeError?.message || String(err),
-  };
-}
-
-function isOccupiedPort(result: Extract<PortCheckResult, { available: false }>): boolean {
-  return result.code === 'EADDRINUSE';
-}
-
-function formatPortFailureDetail(attempt: FailedPortAttempt): string {
-  const { code, message } = attempt.result;
-  return code ? `${attempt.port} (${code}: ${message})` : `${attempt.port} (${message})`;
-}
-
-function formatExplicitPortUnavailableError(
-  port: number,
-  result: Extract<PortCheckResult, { available: false }>
-): Error {
-  if (isOccupiedPort(result)) {
-    return new Error(`[browse] Port ${port} (from BROWSE_PORT env) is in use`);
-  }
-
-  const detail = result.code ? `${result.code}: ${result.message}` : result.message;
-  return new Error(
-    `[browse] Cannot bind BROWSE_PORT=${port} on 127.0.0.1 (${detail}). ` +
-    `This usually means localhost port binding is blocked by the current sandbox or OS permissions, ` +
-    `not that the port is occupied. Allow localhost binding, or run browse from an unrestricted terminal.`
-  );
-}
-
-function formatRandomPortUnavailableError(attempts: FailedPortAttempt[]): Error {
-  const blockingAttempts = attempts.filter((attempt) => !isOccupiedPort(attempt.result));
-
-  if (blockingAttempts.length > 0) {
-    const last = blockingAttempts[blockingAttempts.length - 1];
-    return new Error(
-      `[browse] Cannot bind localhost ports after ${attempts.length} attempts in range ` +
-      `${RANDOM_PORT_MIN}-${RANDOM_PORT_MAX}. Last error: ${formatPortFailureDetail(last)}. ` +
-      `This usually means the current sandbox or OS permissions are blocking localhost port binding, ` +
-      `not that every sampled port is occupied. Allow localhost binding, set BROWSE_PORT to an approved ` +
-      `port, or run browse from an unrestricted terminal.`
-    );
-  }
-
-  return new Error(
-    `[browse] No available port after ${RANDOM_PORT_RETRIES} attempts in range ` +
-    `${RANDOM_PORT_MIN}-${RANDOM_PORT_MAX}; every sampled port was already in use`
-  );
-}
-
-// Test if a port is available by binding and immediately releasing.
-// Uses net.createServer instead of Bun.serve to avoid a race condition
-// in the Node.js polyfill where listen/close are async but the caller
-// expects synchronous bind semantics. See: #486
-function checkPortAvailable(port: number, hostname: string = '127.0.0.1'): Promise<PortCheckResult> {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    let settled = false;
-    const finish = (result: PortCheckResult) => {
-      if (settled) return;
-      settled = true;
-      resolve(result);
-    };
-
-    srv.once('error', (err) => finish(normalizePortError(err)));
-    try {
-      srv.listen(port, hostname, () => {
-        srv.close(() => finish({ available: true }));
-      });
-    } catch (err) {
-      finish(normalizePortError(err));
-    }
-  });
-}
-
-function isPortAvailable(port: number, hostname: string = '127.0.0.1'): Promise<boolean> {
-  return checkPortAvailable(port, hostname).then((result) => result.available);
-}
+// Port allocation lives in port-allocator.ts (#2314, decision 8) so the
+// terminal-agent shares the SAME fixed 10000-60000 scan range instead of
+// binding port:0 into the OS ephemeral range. The imports at the top of
+// this file re-expose the pieces __testInternals__ pins.
 
 // Find port: explicit BROWSE_PORT, or random in 10000-60000
-async function findPort(): Promise<number> {
-  // Explicit port override (for debugging)
-  if (BROWSE_PORT) {
-    const result = await checkPortAvailable(BROWSE_PORT);
-    if (result.available) {
-      return BROWSE_PORT;
-    }
-    throw formatExplicitPortUnavailableError(BROWSE_PORT, result);
-  }
-
-  // Random port with retry
-  const attempts: FailedPortAttempt[] = [];
-  for (let attempt = 0; attempt < RANDOM_PORT_RETRIES; attempt++) {
-    const port = RANDOM_PORT_MIN + Math.floor(Math.random() * (RANDOM_PORT_MAX - RANDOM_PORT_MIN));
-    const result = await checkPortAvailable(port);
-    if (result.available) {
-      return port;
-    }
-    attempts.push({ port, result });
-  }
-  throw formatRandomPortUnavailableError(attempts);
+function findPort(): Promise<number> {
+  return findAvailablePort(BROWSE_PORT);
 }
 
 /**
@@ -1107,7 +1001,7 @@ async function handleCommandInternalImpl(
         status: 403, json: true,
         result: JSON.stringify({
           error: `Command "${command}" not allowed by your token scope`,
-          hint: `Your scopes: ${tokenInfo.scopes.join(', ')}. Ask the user to re-pair with --admin for eval/cookies/storage access.`,
+          hint: `Your scopes: ${tokenInfo.scopes.join(', ')}. Ask the user to re-pair without --restrict for full page access, or with --control for browser control commands.`,
         }),
       };
     }
@@ -1493,6 +1387,13 @@ async function handleCommand(body: any, tokenInfo?: TokenInfo | null): Promise<R
 if (import.meta.main) {
   // SIGINT (Ctrl+C): user intentionally stopping → shutdown.
   process.on('SIGINT', () => activeShutdown?.());
+  // SIGHUP (terminal hangup): with handleSIGHUP:false at the three launch
+  // sites (#2220), Playwright no longer closes Chromium when this process
+  // gets hung up on — this handler is now the ONLY Chromium cleanup on
+  // SIGHUP (ENG-OV4). Route to the same shutdown path as SIGINT:
+  // activeShutdown closes the browser, releases ports, and removes the
+  // state file. Without it, a hangup would leak a live Chromium.
+  process.on('SIGHUP', () => activeShutdown?.());
   // SIGTERM behavior depends on mode:
   // - Normal (headless) mode: Claude Code's Bash sandbox fires SIGTERM when the
   //   parent shell exits between tool invocations. Ignoring it keeps the server
@@ -1720,7 +1621,13 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
   // validateAuth was deleted in v1.35.0.0.
   function validateAuth(req: Request): boolean {
     const header = req.headers.get('authorization');
-    return header === `Bearer ${authToken}`;
+    if (header === null) return false;
+    // Constant-time compare so a byte-by-byte early-exit can't leak the token
+    // prefix via response timing. timingSafeEqual requires equal-length inputs,
+    // so the length check gates it (the length itself is not secret).
+    const got = Buffer.from(header);
+    const want = Buffer.from(`Bearer ${authToken}`);
+    return got.length === want.length && crypto.timingSafeEqual(got, want);
   }
 
   // Factory-scoped shutdown. Closes the cfg-provided browserManager so
@@ -1999,10 +1906,13 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
           mode: browserManager.getConnectionMode(),
           uptime: Math.floor((Date.now() - startTime) / 1000),
           tabs: browserManager.getTabCount(),
-          // Security module status — drives the shield icon in the sidepanel.
-          // Returns {status: 'protected'|'degraded'|'inactive', layers: {...}}.
-          // Fed by the page-content side (testsavant sidecar, canary state).
-          security: getSecurityStatus(),
+          // No `security` field (#2557): the only writer of the status it
+          // reported (sidebar-agent.ts's session-state file) went away with
+          // the chat path, so it read from a file nothing wrote — reporting
+          // a permanent 'inactive', or a stale false-green 'protected'
+          // wherever an old state file survived on disk. The live defenses
+          // (content-security L1-L3, the L4 sidecar on /pty-inject-scan)
+          // report through their own call sites, not through /health.
           // Terminal-agent discovery. ONLY a port number — never a token.
           // Tokens flow via the /pty-session HttpOnly cookie path. See
           // `pty-session-cookie.ts` for the rationale (codex outside-voice
@@ -2408,7 +2318,14 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
             scopes: session.scopes,
             agent: session.clientId,
           }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        } catch {
+        } catch (err) {
+          // Name the caller's typo (bad scope, negative rateLimit, reserved
+          // clientId) instead of hiding it behind the generic body error.
+          if (err instanceof InvalidScopeError || err instanceof ReservedClientIdError) {
+            return new Response(JSON.stringify({ error: err.message }), {
+              status: 400, headers: { 'Content-Type': 'application/json' },
+            });
+          }
           return new Response(JSON.stringify({ error: 'Invalid request body' }), {
             status: 400, headers: { 'Content-Type': 'application/json' },
           });
@@ -2422,15 +2339,28 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
             status: 403, headers: { 'Content-Type': 'application/json' },
           });
         }
-        const clientId = url.pathname.slice('/token/'.length);
+        // decodeURIComponent so CLI-encoded names (spaces, UTF-8) round-trip.
+        let clientId: string;
+        try {
+          clientId = decodeURIComponent(url.pathname.slice('/token/'.length));
+        } catch {
+          return new Response(JSON.stringify({ error: 'Malformed client ID encoding' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
         const revoked = revokeToken(clientId);
-        if (!revoked) {
+        // Release tabs UNCONDITIONALLY: ownership outlives the token (it clears
+        // only on tab close), so a client whose token already expired can still
+        // own tabs. Gating release on a revoke hit would orphan that ownership
+        // and let a same-name re-pair inherit an authenticated tab.
+        const tabsReleased = browserManager.releaseClientTabs(clientId).length;
+        if (!revoked && tabsReleased === 0) {
           return new Response(JSON.stringify({ error: `Agent "${clientId}" not found` }), {
             status: 404, headers: { 'Content-Type': 'application/json' },
           });
         }
-        console.log(`[browse] Revoked token for: ${clientId}`);
-        return new Response(JSON.stringify({ revoked: clientId }), {
+        console.log(`[browse] Revoked ${revoked} token(s), released ${tabsReleased} tab(s) for: ${clientId}`);
+        return new Response(JSON.stringify({ revoked: clientId, tokens_deleted: revoked, tabs_released: tabsReleased }), {
           status: 200, headers: { 'Content-Type': 'application/json' },
         });
       }
@@ -2442,13 +2372,17 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
             status: 403, headers: { 'Content-Type': 'application/json' },
           });
         }
-        const agents = listTokens().map(t => ({
+        // includeSetup: pending (unexchanged) setup keys are live grants the
+        // operator must be able to see — without them, revoking a paired-but-
+        // never-connected agent "works" while the list shows nothing.
+        const agents = listTokens({ includeSetup: true }).map(t => ({
           clientId: t.clientId,
           scopes: t.scopes,
           domains: t.domains,
           expiresAt: t.expiresAt,
           commandCount: t.commandCount,
           createdAt: t.createdAt,
+          pending: t.type === 'setup',
         }));
         return new Response(JSON.stringify({ agents }), {
           status: 200, headers: { 'Content-Type': 'application/json' },
@@ -2464,12 +2398,61 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
         }
         try {
           const pairBody = await req.json() as any;
-          // Default: full access (read+write+admin+meta). The trust boundary is
-          // the pairing ceremony itself, not the scope. --control adds browser-wide
-          // destructive commands (stop, restart, disconnect). --restrict limits scope.
+          // Reject a reserved/invalid clientId up front (createSetupKey enforces
+          // it too, but this makes the 400 unambiguous and skips the teardown).
+          if (pairBody.clientId !== undefined) assertValidClientId(pairBody.clientId);
+          // Default: DEFAULT_PAIR_SCOPES (full page access). The trust boundary
+          // is the pairing ceremony itself, not the scope. --control adds
+          // browser-wide destructive commands (stop, restart, disconnect).
+          // --restrict limits scope — but can never grant control: that scope
+          // stays behind the explicit control flag.
+          if (!pairBody.control && !pairBody.admin
+              && Array.isArray(pairBody.scopes) && pairBody.scopes.includes('control')) {
+            return new Response(JSON.stringify({
+              error: 'The control scope requires the control flag (--control); it cannot be granted via a scopes list.',
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+          }
           const scopes = pairBody.control || pairBody.admin
-            ? ['read', 'write', 'admin', 'meta', 'control'] as const
-            : (pairBody.scopes || ['read', 'write', 'admin', 'meta']) as const;
+            ? [...DEFAULT_PAIR_SCOPES, 'control' as const]
+            : ((pairBody.scopes || [...DEFAULT_PAIR_SCOPES]) as ScopeCategory[]);
+          // D1: a re-pair supersedes prior grants. ALWAYS drop stale setup keys
+          // so a superseded broad key can never be exchanged — this closes the
+          // shadow-key hole where a narrowing re-pair before the agent connects
+          // would otherwise leave the old broad key live. Revoke the live
+          // SESSION only when the new grant actually reduces access, so a
+          // broaden/refresh never strands a working agent mid-task. Compare
+          // against the resolved grant (not raw pairBody) so dropping 'control'
+          // or a default re-pair is classified correctly. Revoke runs BEFORE
+          // createSetupKey — revokeToken deletes all of a clientId's tokens, so
+          // minting first would nuke the fresh key.
+          const grant = {
+            scopes: [...scopes] as ScopeCategory[],
+            domains: pairBody.domains as string[] | undefined,
+            rateLimit: pairBody.rateLimit ?? 10,
+            tabPolicy: 'own-only' as const,
+          };
+          // Validate BEFORE any revoke (createSetupKey validates too, but that
+          // runs after the teardown below). A bad scope or negative rateLimit
+          // must 400 without knocking a live session offline — otherwise a
+          // reducing re-pair with a typo (--restrict red) destroys the session
+          // and mints no replacement.
+          assertValidTokenOptions(grant.scopes, grant.rateLimit);
+          const priorSession = pairBody.clientId ? getClientSession(pairBody.clientId) : null;
+          let superseded: { tokens_deleted: number; tabs_released: number } | undefined;
+          if (priorSession && grantReducesAccess(priorSession, grant)) {
+            const tokensDeleted = revokeToken(pairBody.clientId);
+            const tabsReleased = browserManager.releaseClientTabs(pairBody.clientId).length;
+            superseded = { tokens_deleted: tokensDeleted, tabs_released: tabsReleased };
+            console.log(`[browse] Superseded ${tokensDeleted} token(s), released ${tabsReleased} tab(s) for reducing re-pair: ${pairBody.clientId}`);
+          } else if (pairBody.clientId) {
+            revokeSetupKeys(pairBody.clientId);
+            // No live session, but tab ownership outlives token expiry: free any
+            // tabs orphaned by an expired session so this re-pair can't inherit
+            // an earlier incarnation's authenticated pages (mirrors DELETE
+            // /token's unconditional release). A live-session broaden keeps its
+            // tabs — the working agent still owns them.
+            if (!priorSession) browserManager.releaseClientTabs(pairBody.clientId);
+          }
           const setupKey = createSetupKey({
             clientId: pairBody.clientId,
             scopes: [...scopes],
@@ -2504,8 +2487,16 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
             scopes: setupKey.scopes,
             tunnel_url: verifiedTunnelUrl,
             server_url: `http://127.0.0.1:${browsePort}`,
+            ...(superseded ? { superseded } : {}),
           }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        } catch {
+        } catch (err) {
+          // Name the caller's typo (bad scope, negative rateLimit, reserved
+          // clientId) instead of hiding it behind the generic body error.
+          if (err instanceof InvalidScopeError || err instanceof ReservedClientIdError) {
+            return new Response(JSON.stringify({ error: err.message }), {
+              status: 400, headers: { 'Content-Type': 'application/json' },
+            });
+          }
           return new Response(JSON.stringify({ error: 'Invalid request body' }), {
             status: 400, headers: { 'Content-Type': 'application/json' },
           });

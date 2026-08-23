@@ -3,7 +3,7 @@
  * host-config-export.ts, and golden-file regression checks.
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, beforeAll } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import { validateHostConfig, validateAllConfigs, type HostConfig } from '../scripts/host-config';
@@ -112,6 +112,7 @@ describe('validateHostConfig', () => {
       name: 'test-host',
       displayName: 'Test Host',
       cliCommand: 'testcli',
+      defaultModel: 'claude',
       globalRoot: '.test/skills/gstack',
       localSkillRoot: '.test/skills/gstack',
       hostSubdir: '.test',
@@ -163,6 +164,12 @@ describe('validateHostConfig', () => {
     const c = makeValid();
     c.cliAliases = ['alias-one', 'alias-two'];
     expect(validateHostConfig(c)).toEqual([]);
+  });
+
+  test('invalid defaultModel is caught', () => {
+    const c = makeValid();
+    (c as any).defaultModel = 'llama-local';
+    expect(validateHostConfig(c).some(e => e.includes('defaultModel'))).toBe(true);
   });
 
   test('invalid globalRoot is caught', () => {
@@ -401,7 +408,9 @@ describe('host-config-export.ts CLI', () => {
     expect(exitCode).toBe(1);
   });
 
-  test('detect finds claude (since we are running in claude)', () => {
+  // Gated: the secretless free-tests CI lane deliberately installs no claude
+  // CLI, so "we are running in claude" is false there by design.
+  test.skipIf(!Bun.which('claude'))('detect finds claude (since we are running in claude)', () => {
     const { stdout, exitCode } = run('detect');
     expect(exitCode).toBe(0);
     // claude binary should be on PATH in this environment
@@ -418,6 +427,33 @@ describe('host-config-export.ts CLI', () => {
 
 describe('golden-file regression', () => {
   const GOLDEN_DIR = path.join(ROOT, 'test', 'fixtures', 'golden');
+
+  // #2532: the codex/factory goldens read gitignored .agents/ and .factory/
+  // artifacts that only gen-skill-docs.test.ts (a serial tree-mutating file)
+  // produces. On a clean clone — or when this file runs in isolation — those
+  // dirs don't exist and the goldens fail with ENOENT, an order dependency,
+  // not a regression. Self-provision: generate a host's artifacts iff its
+  // ship SKILL.md is missing. Existing artifacts are never overwritten here,
+  // so a genuinely stale artifact still fails the golden (that is the test's
+  // job; freshness enforcement lives in gen-skill-docs.test.ts).
+  beforeAll(() => {
+    const hostArtifacts: Array<[string, string]> = [
+      ['codex', path.join(ROOT, '.agents', 'skills', 'gstack-ship', 'SKILL.md')],
+      ['factory', path.join(ROOT, '.factory', 'skills', 'gstack-ship', 'SKILL.md')],
+    ];
+    for (const [host, artifact] of hostArtifacts) {
+      if (fs.existsSync(artifact)) continue;
+      const result = Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', host], {
+        cwd: ROOT,
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(
+          `golden-file beforeAll: gen-skill-docs --host ${host} failed (exit ${result.exitCode}):\n`
+          + result.stderr.toString(),
+        );
+      }
+    }
+  });
 
   test('Claude ship skill matches golden baseline', () => {
     const golden = fs.readFileSync(path.join(GOLDEN_DIR, 'claude-ship-SKILL.md'), 'utf-8');
@@ -441,6 +477,13 @@ describe('golden-file regression', () => {
 // ─── Individual host config correctness ─────────────────────
 
 describe('host config correctness', () => {
+  test('Codex defaults to generic GPT while all existing hosts retain Claude', () => {
+    expect(codex.defaultModel).toBe('gpt');
+    for (const host of ALL_HOST_CONFIGS.filter(h => h.name !== 'codex')) {
+      expect(host.defaultModel).toBe('claude');
+    }
+  });
+
   test('claude is the only host with real-dir-symlink strategy', () => {
     for (const config of ALL_HOST_CONFIGS) {
       if (config.name === 'claude') {
