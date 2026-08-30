@@ -111,8 +111,12 @@ describe('selectTests', () => {
     expect(result.selected).toContain('plan-ceo-split-overflow');
     // v2 plan Phase B carve: the section-loading E2E depends on plan-ceo-review/**.
     expect(result.selected).toContain('plan-ceo-section-loading');
-    expect(result.selected.length).toBe(23);
-    expect(result.skipped.length).toBe(Object.keys(E2E_TOUCHFILES).length - 23);
+    // Token-reduction Phase 1: the preamble script A/B also keys on plan-ceo-review/**.
+    expect(result.selected).toContain('preamble-script-ab');
+    // AUQ repetition-cut NOT-WORSE gate drives plan-ceo-review, so it keys on it too.
+    expect(result.selected).toContain('auq-repetition-cut-ab');
+    expect(result.selected.length).toBe(25);
+    expect(result.skipped.length).toBe(Object.keys(E2E_TOUCHFILES).length - 25);
   });
 
   test('global touchfile triggers ALL tests', () => {

@@ -149,14 +149,14 @@ Bun auto-loads `.env` — no extra config. Conductor workspaces inherit `.env` f
 | Tier | Command | Cost | What it tests |
 |------|---------|------|---------------|
 | 1 — Static | `bun run test` | Free | Command validation, snapshot flags, SKILL.md correctness, TODOS-format.md refs, observability unit tests |
-| 2 — E2E | `bun run test:e2e` | ~$3.85 | Full skill execution via `claude -p` subprocess |
+| 2 — E2E | `bun run test:e2e` | ~$4.20 | Full skill execution via `claude -p` subprocess |
 | 3 — LLM eval | `EVALS=1 bun test test/skill-llm-eval.test.ts` | ~$0.15 standalone | LLM-as-judge scoring of generated SKILL.md docs |
 | 2+3 | `bun run test:evals` | ~$4 combined | E2E + LLM-as-judge (runs both) |
 
 ```bash
 bun run test                 # Tier 1 only (run before every commit, ~90-100s for the full ~7,000-test suite)
 bun run test:e2e             # Tier 2: E2E only (needs EVALS=1, can't run inside Claude Code)
-bun run test:evals           # Tier 2 + 3 combined (~$4/run)
+bun run test:evals           # Tier 2 + 3 combined (~$4.35/run)
 ```
 
 ### Tier 1: Static validation (free)
@@ -166,6 +166,12 @@ concurrent shard processes under a strict output contract — a shard that exits
 without bun's own terminal summary line, or a crashed worker, fails the run, so
 silent truncation can never report green. Pass `--verbose` to forward the full
 child stream; `--wall-timeout <secs>` overrides the per-shard kill deadline.
+`GSTACK_FREE_JOBS=<n>` overrides the shard count (digits only, loud on garbage),
+and `GSTACK_FREE_RETRY_FLAKY=1` opts into one serial retry pass for
+syscall-supervised sandboxes (off by default — dev boxes should see flakes).
+Working in a cloud sandbox? Run `scripts/sandbox-doctor.sh` once per boot to
+make the suite run green (details in
+[docs/TESTING_INTERNALS.md](docs/TESTING_INTERNALS.md)).
 Don't type bare `bun test` for the suite: it walks the whole repo, loads paid
 eval files, and misses the strict classifier. No API keys needed.
 
@@ -174,8 +180,9 @@ eval files, and misses the strict classifier. No API keys needed.
 - **Generator tests** (`test/gen-skill-docs.test.ts`) — Tests the template system: verifies placeholders resolve correctly, output includes value hints for flags (e.g. `-d <N>` not just `-d`), enriched descriptions for key commands (e.g. `is` lists valid states, `press` lists key examples).
 - **Tier-alignment invariant** (`test/e2e-tier-alignment.test.ts`) — For every self-gated `test/skill-e2e-*.test.ts` named in a touchfiles dep list, the file's `EVALS_TIER` self-gate must match its declared tier in `E2E_TIERS`. Kills the "inert demotion" class where a test is re-tiered in `touchfiles.ts` but the file still gates on the old tier and keeps running in the wrong lane. Unmapped or mixed-tier files are reported, never silently skipped.
 - **Catalog budget** (`test/catalog-budget.test.ts`) — Caps the aggregate discovery surface: the sum of every skill's frontmatter `name` + `description` (what every host loads at discovery, every session) must stay under 1,150 token-equivalents, with a 260-byte per-skill cap. Counting goes through the shared census in `test/helpers/skill-census.ts` (physical files vs authored skills vs registry entries — three deliberately different counts). Adding a skill? The failure message carries the re-measure + ratchet protocol.
+- **Context-budget ratchet** (`test/context-budget-ratchet.test.ts`) — CI ceilings on the two token ledgers the catalog budget doesn't cover: the always-on full-frontmatter aggregate and each skill's per-invocation eager tokens (SKILL.md + forced-read references), graded against `test/fixtures/context-budget.json` via `lib/context-bill.ts`. New skills fail until they have a ceiling; ceilings for removed skills must be pruned. Legitimate growth or a landed reduction: re-run `bun test/helpers/capture-context-budget.ts` and commit the refreshed fixture in the same commit, so the change is a visible decision in the diff.
 
-### Tier 2: E2E via `claude -p` (~$3.85/run)
+### Tier 2: E2E via `claude -p` (~$4.20/run)
 
 Spawns `claude -p` as a subprocess with `--output-format stream-json --verbose`, streams NDJSON for real-time progress, and scans for browse errors. This is the closest thing to "does this skill actually work end-to-end?"
 
@@ -352,11 +359,11 @@ worth the review overhead.
 
 ## Multi-host development
 
-gstack generates SKILL.md files for 8 hosts from one set of `.tmpl` templates.
+gstack generates SKILL.md files for 10 hosts from one set of `.tmpl` templates.
 Each host is a typed config in `hosts/*.ts`. The generator reads these configs
 to produce host-appropriate output (different frontmatter, paths, tool names).
 
-**Supported hosts:** Claude (primary), Codex, Factory, Kiro, OpenCode, Slate, Cursor, OpenClaw.
+**Supported hosts:** Claude (primary), Codex, Factory, Kiro, OpenCode, Slate, Cursor, OpenClaw, Hermes, GBrain.
 
 ### Generating for all hosts
 
@@ -365,7 +372,7 @@ to produce host-appropriate output (different frontmatter, paths, tool names).
 bun run gen:skill-docs                    # Claude (default)
 bun run gen:skill-docs --host codex       # Codex
 bun run gen:skill-docs --host opencode    # OpenCode
-bun run gen:skill-docs --host all         # All 8 hosts
+bun run gen:skill-docs --host all         # All 10 hosts
 
 # Or use build, which does all hosts + compiles binaries
 bun run build
@@ -418,7 +425,8 @@ When you add a new skill template, all hosts get it automatically:
 1. Create `{skill}/SKILL.md.tmpl`
 2. Run `bun run gen:skill-docs --host all`
 3. The dynamic template discovery picks it up, no static list to update
-4. Commit `{skill}/SKILL.md`, external host output is generated at setup time and gitignored
+4. Budget it: run `bun test/helpers/capture-context-budget.ts` and commit the refreshed `test/fixtures/context-budget.json` — the context-budget ratchet fails any skill without a ceiling
+5. Commit `{skill}/SKILL.md`, external host output is generated at setup time and gitignored
 
 ## Conductor workspaces
 
