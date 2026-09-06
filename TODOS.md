@@ -2,6 +2,55 @@
 
 ## NEXT PRIORITY
 
+### P2: fork-port residual wave deferrals (filed at Wave A, 2026-09-03)
+
+Filed from the time-attack/gstack residual evaluation
+(docs/designs/fork-port-residual-2026-09/REPORT.md) and its CEO + eng reviews.
+Waves B–E2 of that plan are scheduled work, not TODOs; these are the items the
+reviews deliberately deferred, each with rationale:
+
+- **Shared `_gstack_owned_link` helper** — the ownership gate now exists in
+  six places (setup's `_claude_entry_is_ours` / `_claude_entry_owned_strongly`
+  used by link_claude_skill_dirs and _install_alias_skill_md, while
+  cleanup_old_claude_symlinks and cleanup_prefixed_claude_symlinks inline their
+  own marker/cmp/banner chain and readlink `case`; bin/gstack-relink
+  `_entry_is_ours`; bin/gstack-uninstall's per-entry loop). Extract one sourced
+  helper so the destructive-path guard cannot drift, and while there: make the
+  `.gstack-owned` marker's recorded install path load-bearing (today any marker
+  counts, so a Windows fork copy carrying gstack's generated header is still
+  treated as ours on a mode flip). Effort S. Priority P2. Depends on: none.
+- **Config-key reader tripwire** — `transcript_ingest_mode=off` sat unread for
+  months while setup-gbrain advertised it. A free test that asserts every key
+  in bin/gstack-config's default table is read by at least one binary (or is
+  explicitly listed as prose-only) makes a dead consent switch a red test.
+  Effort S. Priority P2. Depends on: Wave E1 landing the reader.
+- **"Pre-existing" failure vocabulary** — scripts/resolvers/preamble/
+  generate-test-failure-triage.ts classifies from `git diff --name-only` and
+  never asks for a base-branch run. Rewrite T1 to verified/unverified with the
+  base branch's CI status (`gh run list --branch <base>`) as default evidence
+  and a failing-files-only worktree run as an opt-in. Effort M → S with CC.
+  Priority P2. Depends on: none.
+- **Opt-in `reply_language` config key** (#679) — render into the Writing
+  Style section only when set; keep identifiers and commands in English; add
+  the mixed-language tests the issue asked for. Not an always-on voice line
+  (community-PR guardrail). Effort S. Priority P3.
+- **Remove the `~/.gstack/.auth.json` writer** — browser-manager.ts:638-640
+  says the component-baked GBrowser extension reads it. Confirm GBrowser
+  bootstraps via `POST /extension-token`; if so, delete the writer plus a
+  migration that removes the orphaned credential file. Effort S. Priority P3.
+  Depends on: GBrowser source check.
+- **CONTRIBUTING rule for fork-derived changes** — a change lifted from a fork
+  enters upstream only behind a test verified red on upstream HEAD first, with
+  credit to the original author; cherry-picks allowed when the fork commit
+  carries that test. 34 of 48 top fork candidates died under refutation; the
+  rule is what made the survivors safe. Effort S. Priority P2.
+- **Hook slug-derivation parity audit** — question-preference-hook keyed
+  project prefs by cwd basename while the writer keyed by owner-repo (Wave E1
+  fixes it via `slugFromCacheOnly`). Audit question-log-hook and every other
+  Claude hook that buckets by project for the same mismatch. Effort S.
+  Priority P3. Depends on: Wave E1.
+
+
 ### P1: ZeroEntropy sunset — gbrain's default embedding provider dies Sept 4, 2026 (#2365)
 
 **What:** ZeroEntropy (acquired by Notion) shuts down September 4, 2026. gbrain's
@@ -48,6 +97,40 @@ wave"). Each was explicitly deferred with rationale, not dropped:
   (gbrain MCP routing), #2535 (outside voice for /investigate,/cso,/devex),
   #2576 (fast-ship rework — re-evaluate against v1.66's CI speedup),
   #2580 (land-and-deploy CI tiers — human-gate UX needs maintainer call).
+
+### P2/P3: v1.78 fix-wave deferrals (filed at wave time, each deferred with rationale)
+
+- **mermaid 10→11-class major bumps in lib/diagram-render** — the wave's
+  dependency pass cleared 102 of 105 OSV advisories via in-range bumps +
+  overrides; the residual ignores (image-size no-fix, @anthropic-ai/sdk under
+  the harness-pinned agent-sdk) carry `ignoreUntil` expiries (~2026-11-30) and
+  re-justify themselves on expiry. When the agent-sdk pin next moves, drop the
+  GHSA-p7fg ignore. Effort S. **Priority:** P3.
+- **#2701 cookie-import profile pills (Local State info_cache)** — confirmed
+  bug + minimal fix known, but PR #2658 rewrites the same file; land or
+  reject #2658 first, then apply the info_cache read + numeric-aware sort.
+  Effort S. **Priority:** P3. **Blocked by:** #2658 disposition.
+- **#2750 split absorption** — the record-scanning Codex JSONL parser (real
+  fix; current Codex streams interleave envelopes so sessions vanish from
+  /retro global) should be absorbed once the author splits it from the
+  bundled schema additions + 1 MiB scan-budget change (asked in the wave's
+  disposition comment). Effort S (review). **Priority:** P3.
+- **#2709 macOS live verification** — the GPU flag set is reporter-validated
+  and darwin-gated with a GSTACK_DISABLE_GPU=off escape; the stop-path reap
+  is Linux-tested. Verify both on real Apple-silicon hardware (flags drop the
+  spin to 0%, screenshots still work, reap kills the survivor) on first
+  access to an M-series box. Effort S. **Priority:** P3.
+- **Periodic-lane stabilization (#2756)** — the weekly lane in its v1.77
+  shape (73-shard sharded runner, pinned CLI, EVALS_ALL census) has never
+  been green; the v1.78 wave killed the deterministic v1.76 AUQ collapse but
+  the residual set churns (band-edge variance, the pre-existing
+  exited/hits=[] startup class, known flakes). Evidence table + suggested
+  direction (band recalibration against a fresh pinned-container
+  distribution) in the issue. Effort M. **Priority:** P2.
+- **Outside-voice resolved-model print** — #2735's second suggestion (print
+  the concrete fallback model at dispatch time) is a functional change
+  needing model resolution in the preflight; descoped from the copy fix.
+  Effort S. **Priority:** P3.
 
 ### P2: v1.69 fix-wave residuals (filed at wave time, each deferred with rationale)
 
@@ -162,10 +245,11 @@ The wave's Step-7 coverage audit (5 subsystem agents, ~700 changed paths,
 shipped verified by hand or adjacent tests); each is a cheap pin against
 silent regression:
 
-- **setup Playwright bootstrap block** — `_clear_playwright_quarantine`,
-  `_PW_LOCK` stale-holder reclaim, `_kill_tree`/`_wait_with_deadline`, Ubuntu
-  26.04 platform override: zero test references. The P0 #2554 heal's shell
-  half. Effort S each.
+- **setup Playwright bootstrap block** — `_PW_LOCK` stale-holder reclaim,
+  `_kill_tree`/`_wait_with_deadline`, and the platform override are now pinned
+  by test/setup-playwright-best-effort.test.ts (fork-port Wave A). Still
+  unpinned: `_clear_playwright_quarantine` (the P0 #2554 heal's shell half).
+  Effort S.
 - **redact-prepush `scanAddedLines` slicing** — the >1MiB catch-up-diff chunk
   path (the reason the function exists) is unexercised; a regression
   reintroduces blocking-while-unscanned. Effort S.
@@ -567,14 +651,15 @@ duration-packed free shards, the sharded paid runner as the CI engine
 coverage contract + gate census, eval-budget timeout tiers, and the
 coverage fill. Remaining, in rough priority order:
 
-- **P1 — Delete the legacy evals.yml matrix after parity.** The sliced lane
-  runs alongside the 18-row matrix (`needs: evals`, so provider concurrency
-  never doubles). After 1-2 PR cycles of parity (compare executed-test sets:
-  intersection strict + the 8 KNOWN_MATRIX_GAPS files as expected additions;
-  stochastic outcomes informational), delete the matrix as a PURE-DELETION
-  commit (one revert restores it), drop the `needs: evals` edge, rewrite
-  test/evals-workflow-matrix.test.ts into a runner-wiring pin, and retire
-  KNOWN_MATRIX_GAPS/KNOWN_TIER_UNSET wholesale. Effort S.
+- **DONE (v1.77.0.0 test-infra wave 1) — Delete the legacy evals.yml matrix after
+  parity.** Deleted as a pure-deletion commit (one revert restores it) after
+  a static parity receipt: sliced gate census (49 files) ⊇ matrix files (18),
+  31 files of extra coverage. `needs: evals` edge dropped, PR comment moved
+  into slices-report, KNOWN_MATRIX_GAPS/KNOWN_TIER_UNSET retired,
+  test/evals-workflow-matrix.test.ts rewritten as
+  test/evals-workflow-wiring.test.ts. The register-skills fail-fast
+  verification loop was ported to the surviving lanes FIRST via the shared
+  .github/actions/register-gstack-skills composite.
 - **P1 — Maintainer decision: make `slices-report` a required check** once
   post-migration flake data exists (the Codex outside-voice's "green means
   green is not delivered while paid stays advisory" point — correct, and
@@ -812,7 +897,18 @@ SKILL.md untouched). `bun test` is green again.
 
 ## Scope-gate follow-ups (filed via /plan-eng-review on the plan-mode auto-select-B change)
 
-### P2: SDK eval budgets charge API-queue latency to the work budget — pick a structural fix
+### DONE (v1.77.0.0) — SDK eval budgets charge API-queue latency to the work budget
+
+**Shipped shape:** the two-phase timer landed WITHOUT the codemod this entry
+feared: the total wall stays <= timeout (work phase = remainder after first
+byte), so every outer/inner bun-timeout relationship is untouched; a silent
+API now dies EARLY at the startup grace (90s local / 300s CI floor, enforced
+Math.max) with the distinct reason 'timeout_startup'. Option (b)'s 300s CI
+floor is in (test/session-runner-startup-grace.test.ts pins it). The
+budget-EXTENSION variant (work budget = full timeout from first byte, which
+DOES need the tier/wall reshape) remains wave-2 scope in the overhaul plan.
+
+Original entry follows for context:
 
 **What:** `runSkillTest`'s single `setTimeout(timeout)` arms at spawn, so session
 startup AND the model's first-completion queue time are charged against the
@@ -2326,6 +2422,44 @@ Linux cookie import shipped in v0.11.11.0 (Wave 3). Supports Chrome, Chromium, B
 
 ## Ship
 
+### Runtime enforcement of foreground dispatch (PreToolUse hook)
+
+**What:** A PreToolUse hook (settings.json) that forces or verifies `run_in_background: false` on Agent tool calls made inside gstack workflows, making the #497/#2440 bug class structurally impossible on Claude Code instead of prose-pinned.
+
+**Why:** v1.79.0.0 fixed the class at the prose+test layer (every synchronous dispatch site carries the flag, pinned by `test/run-in-background-guidance.test.ts`), but phrase-presence pins are file-level, not call-level, and a genuinely blocking foreground call still can't be interrupted by prose. Runtime enforcement is the structural fix; prose guidance can't survive a model that ignores it.
+
+**Context:** Third recurrence of the class (#497 → #2440 → /ship Step 18 stranding). The hook must scope to gstack skill sessions (never break legitimate background Agent use elsewhere), is Claude-host only (other hosts get nothing from it), and mirrors the existing question-preference PreToolUse hook wiring in `bin/gstack-settings-hook*`. Filed from the v1.79.0.0 CEO plan review (approach C, deliberately split out for bake time).
+
+**Effort:** M (human) / S (CC)
+**Priority:** P1
+**Depends on:** None
+
+*Priority raised P2 → P1 by the v1.79.0.0 adversarial review: the spawned trust chain is agent-self-asserted (the echo exists because the agent typed the env prefix a prompt told it to), so instruction text read before the preamble can convert an interactive run to full-auto. Prose cannot close this; the hook can.*
+
+### Structural ship-mode for document-release
+
+**What:** A capability-narrowed dispatch mode for /document-release (cannot bump VERSION, run review passes, or push) instead of narrowing the full workflow through prose in /ship's dispatch prompt; the parent /ship owns all git operations.
+
+**Why:** The v1.79.0.0 scope guard works by telling the subagent what not to do; a structural mode makes the forbidden operations unavailable rather than discouraged. Codex outside voice (v1.79.0.0 eng review) called the current shape "runs a large workflow and then disables half of it through prose" — correct long-term, wrong to fold into a regression fix.
+
+**Context:** Redesigns the #2733 JSON contract (files_updated/commit_sha/pushed/documentation_section/decisions), so it needs its own PR with bake time. Start from `ship/sections/pr-body.md.tmpl` Step 18 and `document-release/SKILL.md.tmpl`'s spawned contract; decide whether the mode is a dispatch-prompt parameter or a `GSTACK_DOC_RELEASE_MODE` env the preamble echoes.
+
+**Effort:** L (human) / M (CC)
+**Priority:** P3
+**Depends on:** None
+
+### Cross-host dispatch semantics audit
+
+**What:** Audit every subagent-dispatch site's rendering on non-Claude hosts (codex, factory, openclaw, hermes) and decide per host: rewrite to the host's native delegation primitive, inline-execute the step, or skip it.
+
+**Why:** The codex-host ship render inlines Step 18 instructing an Agent-tool dispatch that Codex cannot perform (no Agent tool, no run_in_background). Pre-existing (predates v1.79.0.0), surfaced by the eng-review outside voice. Host rewrites currently key on the exact string 'use the Agent tool', which none of the ship dispatch openers match, so Claude-specific instructions pass through verbatim.
+
+**Context:** See `hosts/define-host.ts:55`, `hosts/factory.ts:34`, `hosts/hermes.ts:15` for the existing rewrite mechanism, and `test/fixtures/golden/codex-ship-SKILL.md` for what codex actually receives today. The v1.79.0.0 `{{FOREGROUND_DISPATCH_NOTE}}` resolver is a natural place to start host-branching.
+
+**Effort:** M (human) / S (CC)
+**Priority:** P3
+**Depends on:** None
+
 ### /ship Step 12 test harness should exec the actual template bash, not a reimplementation
 
 **What:** `test/ship-version-sync.test.ts` currently reimplements the bash from `ship/SKILL.md.tmpl` Step 12 inside template literals. When the template changes, both sides must be updated — exactly the drift-risk pattern the Step 12 fix is meant to prevent, applied to our own testing strategy. Replace with a helper that extracts the fenced bash blocks from the template at test time and runs them verbatim (similar to the `skill-parser.ts` pattern).
@@ -2668,18 +2802,35 @@ Shipped as v0.5.0 on main. Includes `/plan-design-review` (report-only design au
 
 ## Document-Release
 
+### Spawned-session auto-choices are invisible to /plan-tune
+
+**What:** Capture auto-chosen decisions from spawned sessions (OPENCLAW_SESSION or GSTACK_SESSION_KIND=spawned) into `gstack-question-log` so `/plan-tune` learning sees them.
+
+**Why:** In spawned sessions the model never calls AskUserQuestion (it auto-chooses the recommended option per the spawned-session block), so the PostToolUse capture hook never fires and no prose brief is ever logged — every gate decision made inside a /ship Step 18 document-release subagent is missing from the question-tuning corpus.
+
+**Context:** #2733 made spawned sessions reachable from Claude Code subagents (every Conductor-hosted /ship now produces one). The subagent reports auto-chosen decisions in the JSON contract's `decisions` array (user-visible in the ship console), but nothing writes them to `~/.gstack/` question analytics. Start from the spawned-session instruction block in `bin/gstack-skill-start` — add a "log each auto-chosen decision with bin/gstack-question-log" sentence and a `source` value distinguishing auto-chosen from human-answered so tuning never trains on machine picks as if a human made them.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** #2733 fix (GSTACK_SESSION_KIND=spawned marker) landing.
+
 ### Auto-invoke /document-release from /ship — SHIPPED
 
 Shipped in v0.8.4; redesigned twice since. Current design (v0.18.2.0+, carved in
 v1.54.0.0): `/ship` Step 18 (`ship/sections/pr-body.md`) dispatches
 `/document-release` as a general-purpose subagent AFTER Step 17 (push) and
 BEFORE Step 19 (PR creation); the subagent's JSON contract (`files_updated`,
-`commit_sha`, `pushed`, `documentation_section`) is baked into the initial PR
-body. Subagent failure is non-blocking. The skeleton names "the
-/document-release subagent" at three touchpoints (section-index trigger + STOP
-pointer, Step 17 handoff, hoisted doc-sync invariant). Pinned by
-`test/ship-document-release-dispatch.test.ts` + carve-guards anchors; behavior
-proven by the `ship-docsync` gate E2E (`test/skill-e2e-ship-docsync.test.ts`).
+`commit_sha`, `pushed`, `documentation_section`, `decisions` since v1.76.0.0)
+is baked into the initial PR body — except `decisions`, which prints to the
+ship console and never enters PR markdown. Since v1.76.0.0 (#2733) the dispatch
+marks the subagent `GSTACK_SESSION_KIND=spawned` so its interactive gates
+auto-choose the recommended option. Subagent failure is non-blocking. The
+skeleton names "the /document-release subagent" at three touchpoints
+(section-index trigger + STOP pointer, Step 17 handoff, hoisted doc-sync
+invariant). Pinned by `test/ship-document-release-dispatch.test.ts` +
+carve-guards anchors; behavior proven by the `ship-docsync` gate E2E
+(`test/skill-e2e-ship-docsync.test.ts`) and the spawned-dispatch gate E2E
+(`test/skill-e2e-docsync-spawned.test.ts`).
 
 ### Machine-checkable Step 18 dispatch receipt in /ship's Section self-check
 
@@ -3843,10 +3994,15 @@ globs (D). What remains, re-filed individually:
   darwin-skipped handoff tests in browse/test/handoff.test.ts — verify
   whether the v1.67 XProtect + rebrand work un-blocks them, then un-skip or
   fix. Effort S.
-- Transcript trust/scope/source isolation (PR 2232, issue 2140) — needs the
-  never-double-store review. Effort M.
+- Transcript trust/scope/source isolation (PR 2232, issue 2140) — split:
+  the `transcript_ingest_mode` reader (off skips, B → --all-history, unset
+  unchanged) ships in fork-port Wave E1; repo-scoping and `--source-id`
+  isolation still need the never-double-store review plus a gbrain flag
+  probe. Close the PR after E1 with a pointer here. Effort M.
 - Versionless-repo onboarding (#1474, issues 2343/2334) — the #2501 JSON
   version-path half landed; the no-version-file-at-all flow did not.
 - Playwright bootstrap abort/timeout absorbs (PRs 2233/2359, issues
-  1902/2136) — partially superseded by v1.67's bounded bootstrap; verify
-  and close or extract the remainder.
+  1902/2136) — DONE in fork-port Wave A: the install is best-effort and
+  bounded (GSTACK_PLAYWRIGHT_INSTALL_TIMEOUT, default 600s), lock contention
+  is a reason code, skills always register. Close #2233, #1900, #1901, #1902,
+  #913 with the receipt (test/setup-playwright-best-effort.test.ts).
