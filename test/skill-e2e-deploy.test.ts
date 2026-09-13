@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { JUDGE_MS, CAPTURE_MS } from './helpers/eval-budgets';
+import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
 import {
   ROOT, browseBin, runId, evalsEnabled,
@@ -68,7 +68,7 @@ Do NOT use AskUserQuestion. Do NOT run gh or fly commands.`,
       workingDirectory: landDir,
       maxTurns: 20,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob'],
-      timeout: JUDGE_MS,
+      timeout: CAPTURE_MS,
       testName: 'land-and-deploy-workflow',
       runId,
     });
@@ -86,7 +86,7 @@ Do NOT use AskUserQuestion. Do NOT run gh or fly commands.`,
 
     const reportDir = path.join(landDir, '.gstack', 'deploy-reports');
     expect(fs.existsSync(reportDir)).toBe(true);
-  }, CAPTURE_MS);
+  }, CAPTURE_LONG_MS);
 });
 
 // --- Land-and-Deploy First-Run E2E ---
@@ -149,7 +149,7 @@ Just demonstrate the first-run dry-run output.`,
       workingDirectory: firstRunDir,
       maxTurns: 20,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob'],
-      timeout: JUDGE_MS,
+      timeout: CAPTURE_MS,
       testName: 'land-and-deploy-first-run',
       runId,
     });
@@ -168,7 +168,7 @@ Just demonstrate the first-run dry-run output.`,
     const reportContent = fs.readFileSync(path.join(reportDir, reportFiles[0]), 'utf-8');
     const hasPlatform = reportContent.toLowerCase().includes('fly') || reportContent.toLowerCase().includes('first-run-app');
     expect(hasPlatform).toBe(true);
-  }, CAPTURE_MS);
+  }, CAPTURE_LONG_MS);
 });
 
 // --- Land-and-Deploy Review Gate E2E ---
@@ -227,7 +227,7 @@ Show what the readiness gate output would look like.`,
       workingDirectory: reviewDir,
       maxTurns: 15,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob'],
-      timeout: JUDGE_MS,
+      timeout: CAPTURE_MS,
       testName: 'land-and-deploy-review-gate',
       runId,
     });
@@ -247,7 +247,7 @@ Show what the readiness gate output would look like.`,
     const hasReviewMention = reportContent.toLowerCase().includes('review') ||
                               reportContent.toLowerCase().includes('not run');
     expect(hasReviewMention).toBe(true);
-  }, CAPTURE_MS);
+  }, CAPTURE_LONG_MS);
 });
 
 // --- Canary skill E2E ---
@@ -279,7 +279,7 @@ describeIfSelected('Canary skill E2E', ['canary-workflow'], () => {
     const result = await runSkillTest({
       prompt: `Read canary/SKILL.md for the /canary skill instructions.
 
-You are simulating a canary check. There is NO browse daemon available and NO production URL.
+You are simulating a canary check. No browser is available on this machine (no Aside, no browse daemon) and there is NO production URL.
 
 Instead, demonstrate you understand the workflow:
 1. Create the .gstack/canary-reports/ directory structure
@@ -290,12 +290,12 @@ Instead, demonstrate you understand the workflow:
    the Phase 6 Health Report format (CANARY REPORT header, duration, pages, status,
    per-page results table, verdict)
 
-Do NOT use AskUserQuestion. Do NOT run browse ($B) commands.
+Do NOT use AskUserQuestion. Do NOT run aside or browse ($B) commands.
 Just create the directory structure and report files showing the correct schema.`,
       workingDirectory: canaryDir,
       maxTurns: 15,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob'],
-      timeout: JUDGE_MS,
+      timeout: CAPTURE_MS,
       testName: 'canary-workflow',
       runId,
     });
@@ -308,7 +308,7 @@ Just create the directory structure and report files showing the correct schema.
     const reportDir = path.join(canaryDir, '.gstack', 'canary-reports');
     const files = fs.readdirSync(reportDir, { recursive: true }) as string[];
     expect(files.length).toBeGreaterThan(0);
-  }, CAPTURE_MS);
+  }, CAPTURE_LONG_MS);
 });
 
 // --- Benchmark skill E2E ---
@@ -340,7 +340,7 @@ describeIfSelected('Benchmark skill E2E', ['benchmark-workflow'], () => {
     const result = await runSkillTest({
       prompt: `Read benchmark/SKILL.md for the /benchmark skill instructions.
 
-You are simulating a benchmark run. There is NO browse daemon available and NO production URL.
+You are simulating a benchmark run. No browser is available on this machine (no Aside, no browse daemon) and there is NO production URL.
 
 Instead, demonstrate you understand the workflow:
 1. Create the .gstack/benchmark-reports/ directory structure including baselines/
@@ -353,12 +353,12 @@ Instead, demonstrate you understand the workflow:
    table with Baseline/Current/Delta/Status columns, regression thresholds applied)
 4. Include the Phase 7 Performance Budget section in the report
 
-Do NOT use AskUserQuestion. Do NOT run browse ($B) commands.
+Do NOT use AskUserQuestion. Do NOT run aside or browse ($B) commands.
 Just create the files showing the correct schema and report format.`,
       workingDirectory: benchDir,
       maxTurns: 15,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob'],
-      timeout: JUDGE_MS,
+      timeout: CAPTURE_MS,
       testName: 'benchmark-workflow',
       runId,
     });
@@ -373,7 +373,7 @@ Just create the files showing the correct schema and report format.`,
       const files = fs.readdirSync(baselineDir);
       expect(files.length).toBeGreaterThan(0);
     }
-  }, CAPTURE_MS);
+  }, CAPTURE_LONG_MS);
 });
 
 // --- Setup-Deploy skill E2E ---
@@ -419,7 +419,7 @@ Just detect the platform and write the config.`,
       workingDirectory: setupDir,
       maxTurns: 15,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob'],
-      timeout: JUDGE_MS,
+      timeout: CAPTURE_MS,
       testName: 'setup-deploy-workflow',
       runId,
     });
@@ -435,7 +435,7 @@ Just detect the platform and write the config.`,
     expect(content.toLowerCase()).toContain('fly');
     expect(content).toContain('my-cool-app');
     expect(content).toContain('Deploy Configuration');
-  }, CAPTURE_MS);
+  }, CAPTURE_LONG_MS);
 });
 
 // Module-level afterAll — finalize eval collector after all tests complete

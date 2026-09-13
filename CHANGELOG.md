@@ -1,5 +1,179 @@
 # Changelog
 
+## [1.84.1.0] - 2026-09-09
+
+### Changed
+- Codex reviews, consultations, and evals now default to GPT-6 Astra. Choose another model with `GSTACK_CODEX_MODEL` or an explicit model in your request; the readiness probe checks that same selection.
+- Claude outside voices and eval capture/judging now default to Fable 5.1. Outside voices accept `GSTACK_CLAUDE_MODEL`; evals retain their explicit and environment model overrides. Warmup and distillation keep their cheaper defaults.
+
+### Fixed
+- Native Codex reviews honor the selected model even when the CLI has a separate review-model pin. Claude judges parse text after thinking blocks, and arm judgments omit the temperature setting Fable does not support.
+- Frontier judges have enough output budget for thinking and JSON. Workflow evals read generated sections in execution order, without duplicated content.
+- Ship and plan reviews keep approval gates with the parent agent, preserve readiness checks, and use project-native test commands. QA scoring and monitoring rules are explicit; Aside drive options wait for a successful readiness probe.
+- Benchmark timing uses the navigation entry's actual fields. Deploy setup collects missing configuration, and failed vendored upgrades restore their backup instead of deleting it.
+- Retro reports distinguish verified merges from PR references, use the session date for snapshots, and define report ordering. The quality eval includes compare-mode instructions instead of cutting them off.
+- Documentation review runs before publication so approved fixes reach the PR. Changelog protection, unavailable-review handling, and raw/enveloped PR-body handling are consistent across the workflow.
+
+## [1.84.0.0] - 2026-09-09
+
+**gstack's design skills now start with 61 deterministic anti-pattern checks, in your voice, then spend their judgment where a detector cannot.**
+**DESIGN.md is written in the open format that impeccable and Google Stitch read, and the AI-slop list lives in one typed catalog instead of four drifting copies.**
+
+If you have [impeccable](https://impeccable.style) installed, `/design-review`, `/design-html`, `/review`, and `/ship` run its engine first and hand you its findings as `FINDING-NNN [rule-id]` rows with file:line and a handoff (`/impeccable typeset`, `layout`, `colorize`, ...) before the LLM pass reads a page. gstack never runs impeccable's installer or launcher. The first time a design skill finds no engine it asks once: download the 16 MB engine binary from impeccable's own GitHub release into `~/.impeccable`, checked against a checksum gstack pins and recorded in your egress ledger first, or not. Say no and nothing changes and nothing nags; `gstack-config set design_detector off` silences every trace. The probe only reads files, the engine runs only from under your home directory, and a checked-out repository can never make gstack execute one of its own files.
+
+On a live URL, `/design-review` scans the rendered page: the DOM is dumped with linked stylesheets inlined and scripts, input values, handlers, and query strings stripped, redaction-checked, kept owner-only, and the engine reads that, so Rule 4 holds on a deployed site. `/design-consultation` writes the open DESIGN.md spec (tokens in front matter, eight canonical sections, your Motion and Decisions Log kept). An existing file is converted only when you say so, once, and the answer is recorded in the file.
+
+### The numbers that matter
+
+Source: `git diff origin/main --shortstat`, `lib/design-catalog.ts` (`bun -e` over the exports), the free-suite log recorded by `gstack-evidence`, and the paid E2E rerun on this branch (`test/skill-e2e-design.test.ts`, `test/skill-e2e-review.test.ts`, 12 cases).
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Deterministic checks in a design review | 0 | 61 rules (impeccable's engine, one consented download away) | evidence before judgment |
+| Places the AI-slop vocabulary lived | 4 files, drifting | 1 typed catalog, 86 entries (57 slop, 29 quality) | `review/design-checklist.md` is generated from it |
+| Skills that run the detector | 0 | 4 (`/design-review`, `/design-html`, `/review`, `/ship`) | same rule ids everywhere |
+| What a scan can read | source files | source files or the rendered DOM of a live URL | works on deployed sites |
+| DESIGN.md format gstack writes | private schema | open DESIGN.md spec | impeccable and Stitch read it |
+| New `test()` declarations (platform-gated ones included) | | 194 across 11 files | free suite: 9,206 tests, 12/12 paid E2E |
+
+The row you feel is the first one: a purple gradient, a kicker above a heading, a nested card, or `Inter` as the display face is a machine finding with a file:line before anyone forms an opinion, so the review's judgment goes to hierarchy, trust, and copy.
+
+What this means for anyone shipping a UI with gstack: say yes once when a design skill offers the engine (or install impeccable yourself), then run `/design-review` as before. The mechanical rows arrive first, tagged, deduplicated against the checklist, and calibrated against your DESIGN.md tokens. Never install it and every design skill behaves as in v1.81, with sharper doctrine.
+
+### Itemized changes
+
+#### Added
+- **Design detector** (`bin/gstack-design-detect.ts`, config key `design_detector: auto|off`): `probe` reports `IMPECCABLE_READY | NOT_CACHED | NOT_AVAILABLE | DISABLED` plus skill, hook, and config-ignore lines without executing anything; `scan` runs the user-installed engine over repository files, changed frontend files (`--changed <base>`, NUL-safe, batched), or DOM dumps under `~/.gstack/projects/<slug>/designs/`, and prints one normalized JSON document plus a fenced, untrusted `DETECT_TOP` block grouped by rule; `rules` lists the mapping. Only an install under HOME (cache, env override, PATH, or the skill's sibling engine) whose real file is named `impeccable` is ever READY; URLs are refused; the engine sees a minimal environment; per-batch and whole-scan timeouts; findings capped and every field sanitized; exit 3 marks a gstack bug.
+- **Consent-gated engine install** (`gstack-design-detect.ts install`): when the probe finds no engine, the design skills ask one question, once, in interactive sessions only (never in spawned or headless runs). Yes downloads the engine version gstack has tested for your platform from github.com/pbakaus/impeccable's releases, verifies it against the checksum pinned in gstack for all five platforms, writes an egress receipt before the fetch (fail-closed), and places the one file under `~/.impeccable/bin/<version>/`: no impeccable skill, no editor hook, no launcher. "Never ask again" is remembered in `design_detector_install_prompted`; "turn it off" is `design_detector off`. gstack never runs `npx impeccable`.
+- **Phase 0 in `/design-review`**: source mode on a feature branch, DOM mode on any URL (Aside first, the bundled browser otherwise) through one shared dump script, `lib/dom-dump.js`; `design-baseline.json` gains per-page detector counts with id-level deltas and an `engine changed` caveat; Phase 10 reports `Detector: N → M`; deferred findings end with the `/impeccable <cmd>` handoff when the skill is installed.
+- **`/review` and `/ship`** design pass: the mechanical scan runs first, its rows bucket by tier (auto-fix, ask, possible), and a detector hit at the same file:line as a checklist hit is one row. **`/design-html`**: a bounded slop gate before screenshots, one fix pass, then accepted-with-reason rows.
+- **Typed design catalog** (`lib/design-catalog.ts`): 86 entries with rule ids, impact, tier, confidence, detection method, handoff, fonts, and the ten `mockupNever` patterns the image-generation prompt now refuses by default. `review/design-checklist.md` is generated from it by `bun run gen:skill-docs`.
+- **Doctrine**: Persuade / Operate / Read / Experience modes (MARKETING and APP UI kept as aliases), craft-floor reflexes (browser surfaces, one authored motion moment, depth with an offset, tinted secondary text, more space above a heading than below, light or dark from the use scene), the three-looks calibration, a font procedure with a role-scoped overused list, and Restrained / Committed / Full palette / Drenched color strategies.
+- **Open DESIGN.md format** (`lib/design-md.ts`, `bin/gstack-design-md.ts`: `check`, `convert`, `tokens`, `mark`): read, write, convert a legacy gstack file (backup kept), flatten tokens for calibration, and persist the one-time format choice as a marker line. `/design-consultation`, `/design-review`, and `/design-html` write and read it; `PRODUCT.md` prefills the consultation's questions.
+- **Attribution**: `NOTICE.md`, `licenses/Apache-2.0.txt`, and changed-file headers for material derived from impeccable and the DESIGN.md specification.
+
+#### Changed
+- `/design-consultation` chooses type by a procedure (name the world, shortlist per role, strike the overused list for that role, verify availability, state loading), varies direction across generations without flipping light and dark, and lists banned faces (Courier New now among them) from the catalog.
+- Landing-page rules ask for one authored motion moment and a brand texture or asset instead of halo, spotlight, stripe, or grid gradients; the universal font rule is scoped to the display voice with body/UI exceptions on Operate and Read surfaces.
+- gstack's own `DESIGN.md` is in the open format, with its intentional exceptions (the live-feed pulse, 11px mono data labels) recorded in the Decisions Log.
+- The design binary's variant set trades its light/dark flip for a drenched-color dial.
+- Repository `.impeccable/config*.json` ignores are surfaced (`IMPECCABLE_IGNORED_RULES`, `_FILES`, `_VALUES`) and treated as evidence in `/review` and `/ship`, settled decisions in your own project.
+
+#### For contributors
+- Real engine captures pin the contract (`test/fixtures/impeccable-*.json`, the dumped slop page, captured with engine 0.1.3 and its 61-rule registry); `test/fixtures/fake-impeccable.ts` drives the unit and E2E suites through env knobs (output file, exit code, sleep, argv log) that pass the wrapper's minimal engine environment.
+- New free suites: `gstack-design-detect`, `design-md`, `design-catalog`, `design-checklist-sync`, `design-detect-contract`, `frontend-scope`, `impeccable-fixtures`, `dom-dump-hygiene` (a real Chromium run, CI or `GSTACK_DOM_DUMP_HYGIENE=1`), plus the brief test for the design binary. Gate E2E: `design-review-detector-shim` (source and DOM); periodic: `design-html-slop-gate`.
+- `design-review`'s eager ceiling moved to 31,319 tokens; the carve guards for `design-html` and `plan-design-review` are re-measured; the `bin/`-and-`lib/` linking rule now carries two more runtime bins.
+
+## [1.83.0.0] - 2026-09-09
+
+**Memorable's workflow memory plugs into Claude Code through gstack, behind a consent key you control.**
+**Every prompt it sees is receipted, secret-scanned and enveloped. The switch is off until you flip it.**
+
+Memorable (memorable.sh) is a third-party CLI that remembers how you did a task and recalls it the next time you ask for something similar. Its own installer registers a Claude Code hook directly. This release lets you register that hook through gstack instead, with `gstack-memorable enable`, and nothing changes until you run it. When you do, gstack records its own consent key (`memorable_recall`, listed by `gstack-egress grants` with its revoke command), writes an egress receipt before every prompt it hands to the vendor binary and skips the hand-off if the receipt cannot be written, refuses to hand over a prompt carrying a live-shaped credential, skips repositories whose trust policy is `deny` or `read-only`, runs the binary in an allowlisted environment inside its own process group under a 4.5 second budget, and wraps whatever comes back in the trust envelope so recalled text can never block a prompt or speak as gstack. `gstack-memorable status` shows the vendor CLI, the gate, who registered the hook (by identity, so it stays correct after Claude Code rewrites `settings.json`), receipt counts and recent errors. `disable` turns it off and verifies both the consent and the registration before it says so. Claude Code only; Windows is refused for now because there are no process groups to contain the vendor.
+
+The numbers that matter. Measured on a Linux sandbox with a fake vendor; the scan rows come from `scan()` in `lib/redact-engine.ts` on a synthetic log-like prompt dense in emails and IP addresses (256 KiB: 5,462 findings; 512 KiB: 10,898 findings), `main` against this release.
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Redaction scan, 256 KiB log-like prompt | 1,573 ms | 65 ms | 24x faster |
+| Redaction scan, 512 KiB log-like prompt | 6,182 ms | 126 ms | 49x faster |
+| Hook cost per prompt with the bridge disabled | no hook | 49 ms | shim, bun, one config read |
+| gstack work per prompt before the vendor runs | no hook | ~25 ms | gate, policy, scan, receipt |
+| Tests in the free suite covering this bridge and the hook manager | 0 | 128 | +128 |
+
+The scan speedup is not bridge-specific. Line and column for each finding used to be computed by walking the text from the start, so a pasted log full of addresses cost time quadratic in its matches; it is a binary search over a line index now, and every caller of the engine (`gstack-redact`, the pre-push hook, the PR-body scan in `/ship`) gets it.
+
+What this means for you: if you use Memorable, run `memorable login`, `memorable enable`, then `gstack-memorable enable`, and look at `gstack-egress list --sink memorable-recall` after a few prompts. If you do not, nothing changes: the key defaults to off, no hook is registered, `./setup` never registers one for you, and upgrading needs no migration. `docs/memorable-workflow-memory.md` says exactly what gstack hands over, what it can attest, and what is Memorable's own claim. Contributed by @AdvaiytSane and @NIkhil-cmd-cmd (#2831).
+
+### Itemized changes
+
+#### Added
+
+- **`bin/gstack-memorable enable | disable | status`**, the Memorable recall bridge (Claude Code only, off by default). `enable` needs the vendor CLI on the machine, registers gstack's hook at the stable install path with a 5 second timeout, refuses when Memorable's own installer already registered its hook (two entries would run the hook twice per prompt), verifies the stable install carries this bridge before touching anything, and sets `memorable_recall=on`. It never runs `memorable enable`: the vendor's capture consent is yours to grant. `disable` flips the key off first, removes gstack's entry by identity (tag or no tag), verifies both, and reports a partial failure as one. `status` never executes the vendor. One lifecycle transition runs at a time (a lock under `~/.gstack/locks`, stale after 30 seconds). Exit codes mirror the hook manager: 1 refused, 3 unparseable `settings.json`, 4 unexpected shape, 5 lock.
+- **`hosts/claude/hooks/memorable-user-prompt-hook`** (bash shim plus `memorable-user-prompt-hook.ts`), the UserPromptSubmit hook the bridge registers. One deadline clock undercuts Claude Code's 5 second hook kill; stdin is capped at 1 MiB; the prompt is scanned for HIGH-tier credential shapes on the raw bytes and on the decoded string values; the vendor sees only `PATH`, `HOME`, identity and locale variables, temp directories, the standard proxy, TLS and `XDG_*` variables and its own `MEMORABLE*` knobs; only a string `additionalContext` is accepted from it (a vendor `decision`, `continue` or `systemMessage` is dropped), control and Unicode format characters are stripped, the text is capped at 8 KiB on a UTF-8 boundary and enveloped. The vendor's whole process group is killed when the hook finishes, hangs past its budget, or is terminated by the host mid-flight (a process the vendor detaches into its own session is outside that guarantee); a vendor that exits but leaves a helper holding its pipes still gets its answer delivered. Every refusal is one rate-limited line in `~/.gstack/hook-errors.log` (created 0600); the hook always exits 0.
+- **`memorable_recall` config key** (`on | off`, default `off`, a typo is rejected and the prior value kept) and a **`memorable-recall` row in `gstack-egress grants`** naming the vendor CLI, the per-prompt receipt sink and the revoke command.
+- **Egress receipts for the `memorable-recall` sink**, fail-closed: no receipt, no hand-off. The receipt records the byte count and sha256 of the exact stdin handed over, the consent key, and `local:<path to the vendor executable>` as the recipient gstack can attest; the outcome records `exit:0 output-written bytes=N gstack_ms=N`, `exit:N injected=no`, `timeout`, `spawn-error:<code>` or `budget-exhausted`. A receipt with no outcome reads as unknown, never as success.
+- **`gstack-settings-hook list-items --event <E> [--owned-by <source>] [--command-regex <js-re>]`**, a read-only identity view: one JSON string literal per matching hook command, identity from the hook table rather than the tag, empty output when nothing matches, exit 3 on unparseable settings and 4 on an unexpected shape, so a caller can decide a mutation from it.
+- **`runExternal` in `hosts/claude/hooks/spawn-bin.ts`**, the contained way for a hook to run a third-party executable: its own process group, a wall-clock limit that kills the group, a stdout cap, a drained stderr tail, stdin write errors kept separate from spawn errors, resolution on the child's exit rather than on the last pipe closing, and a refusal on Windows.
+- **`lockBudgetMs`** on `writeReceipt` and `writeOutcome` in `lib/egress-receipt.ts`, so a caller on a deadline can bound the ledger lock wait (default unchanged at 2.5 seconds), and a **spawn timeout parameter** on `repoPolicyTier` in `lib/gbrain-repo-policy-client.ts`.
+- **`docs/memorable-workflow-memory.md`**: what you get, the two consents (gstack's and Memorable's, neither implies the other), what gstack hands over and what it can attest, what gstack tests and what is the vendor's claim, turning it on and off, and a troubleshooting runbook. A README row, a Docs-table row and a privacy pointer link to it.
+
+#### Changed
+
+- **`gstack-settings-hook remove-source` removes by identity as well as by tag.** Claude Code strips gstack's `_gstack_source` tag when it rewrites `settings.json`; the off switch for every gstack hook used to no-op on exactly those entries. Items the hook table identifies as the requested source are removed whether or not the entry is tagged, other sources' items are never touched, and entries with nothing of the source's stay byte-identical.
+- **`./setup --no-team` keeps the opt-in Memorable hook** when it sweeps stray gstack hooks, alongside the verify gate.
+- **`gstack-uninstall` removes the Memorable hook by name**, sets `memorable_recall` off wherever gstack's config lives (kept state or not, hook manager present or not, and a failed revocation is named), and says that Memorable's own consent is unchanged (`memorable disable`, `memorable forget`).
+- **Redaction findings locate their line and column by binary search** over a per-scan line index, so scan time is linear in the input for every caller of `lib/redact-engine.ts`.
+
+#### For contributors
+
+- New test files: `test/gstack-memorable.test.ts`, `test/memorable-user-prompt-hook.test.ts` (a fake vendor written in sh; the hook's stdin bytes are compared byte for byte with what the vendor received), `test/gstack-config-memorable-key.test.ts`. Extended: `test/gstack-settings-hook-schema-aware.test.ts` (identity removal pinned for every source in the hook table), `test/egress-receipt.test.ts`, `test/egress-receipt-wiring.test.ts` (the `hosts/` tree is now swept for unreceipted sinks), `test/uninstall.test.ts`, `test/gbrain-repo-policy-client.test.ts`, `test/redact-engine.test.ts`, `test/verify-gate.test.ts`, `test/setup-hook-canonical-paths.test.ts`, `test/hooks-windows-paths.test.ts`, `test/gstack-egress-cli.test.ts`.
+- `docs/PROJECT_STRUCTURE.md` lists the new hook and bin.
+
+## [1.81.0.0] - 2026-09-06
+
+**Aside is the browser gstack drives first. Every browsing skill, the PDF and diagram renderer, and web research go through it.**
+**gstack's own headless browser stays as the automatic fallback, so nothing stops working without Aside.**
+
+Since v1.72 Aside was the recommended driver for third-party sites. This release makes it the first driver everywhere. `/qa`, `/qa-only`, `/design-review`, `/scrape`, `/benchmark`, `/canary`, `/browse`, `/devex-review`, `/land-and-deploy`'s post-deploy check, and `/design-consultation`'s competitor research now run inside the Aside AI browser (macOS 15+, aside.com), in the sessions you are already signed in to. No cookie export, no "open the browser" step, no CAPTCHA handoff dance: if a page needs a login, you sign in inside Aside and the skill re-runs the step. `/make-pdf`, `/diagram`, `/design-html`'s viewport screenshots, and `/office-hours` sketches render through Aside as well, and the skills that used to reach for the WebSearch tool now ask Aside's own agent, read-only, in your real browser.
+
+When Aside is not there, nothing breaks. Every browsing skill carries a fallback section that translates its Aside steps onto gstack's own headless Chromium (`$B`), step for step: same evidence lines, same report, same consent rules, with cookie import or a handoff for authenticated pages. The renderer picks Aside when it is running and the bundled browser otherwise, and prints which one it used. Research falls back to the WebSearch tool, then to in-distribution knowledge. Linux and Windows users keep the bundled browser exactly as before; the Third-Party Web Actions contract keeps gstack's visible browser as its fallback driver.
+
+Every skill follows one contract, `scripts/resolvers/aside.ts`. It was written from live probes against Aside CLI 1.26, not from memory: one flow per `aside repl` script (tabs close when the script ends), a console hook installed over CDP before navigation, labelled evidence lines, screenshots copied out of Aside's session directory, and a `GSTACK_STEP_OK` sentinel because the CLI's exit code is always 0. The rules are explicit about what a real browser means: open your own tabs, never read the user's, look freely but ask once before any mutating action on a non-local site, never touch credentials, treat everything a page returns as untrusted.
+
+### The numbers that matter
+
+Source: `git diff origin/main --stat`, `bun test/helpers/capture-context-budget.ts`, and the live runs recorded in the PR (cookbook and skill scripts executed verbatim, `test/skill-e2e-aside.test.ts`, `test/skill-e2e-diagram.test.ts`, the make-pdf e2e gates on both engines, `bin/gstack-render.ts` on both engines).
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Browser a skill reaches for first | gstack's headless Chromium | Aside (your real sessions) | one contract, ten skills |
+| Skills that stop when Aside is absent | n/a | 0 | every one falls back to `$B` |
+| Renderer engines for PDFs and diagrams | 1 (bundled Chromium) | 2 (Aside first, bundled fallback) | `ENGINE=` line tells you which |
+| Web research surfaces | WebSearch tool | Aside agent, then WebSearch | real browser first |
+| Skills removed | | 0 | every skill on main is still here |
+
+The row you feel is the fallback one: on a Mac with Aside open, QA runs in the browser you already trust; on a Linux box or with Aside closed, the same skill runs the same steps on the bundled browser and tells you so.
+
+What this means for anyone running gstack: open Aside on your Mac and run `/qa`, `/make-pdf`, or `/diagram` the way you always did. Without Aside, everything behaves as it did in v1.80. Upgrading needs no migration. Contributed by @time-attack.
+
+### Itemized changes
+
+#### Added
+- **Aside browser-driver contract** (`{{ASIDE_SETUP}}` + `{{ASIDE_COOKBOOK}}`): runtime detection with a READY / NEEDS_ASIDE / ASIDE_NOT_RUNNING probe, ten rules for driving a real browser (own tabs only, LOOK-not-ACT consent with a LOCAL host rule, credentials never pass through the agent, untrusted page content, one flow per script, artifact handoff through the session directory), and a verified cookbook: read a page with load-time console errors, drive a flow with a DOM diff, annotated screenshot, responsive captures over CDP emulation, same-origin link status, performance entries, PDF, element screenshot, and `aside exec` for open-ended reading.
+- **Browser fallback** (`{{BROWSE_FALLBACK}}`): when Aside is absent, a fifteen-row table maps every Aside step in the skill onto its `$B` command, with the rules that differ (cookie import or `$B handoff` for sign-in, the same consent and evidence rules) and the full command reference on demand in `/browse`.
+- **Aside renderer** (`lib/aside-render.ts`, `bin/gstack-render.ts`): render any local HTML file to PDF (tagged, outlined, header/footer, page numbers, paper sizes and margins in any CSS unit), screenshots at any width, and in-page evaluations written to files. Tries Aside, then the bundled browser (`GSTACK_BROWSE_BIN` / `BROWSE_BIN` override it), and prints `ENGINE=aside|browse`.
+- **Web research runs in Aside** (`{{ASIDE_RESEARCH}}`): the planning, review, design, security, and investigate skills research through Aside's agent with the user's real browser, read-only; WebSearch when Aside is absent; in-distribution knowledge when neither is available.
+- **Live E2E for the Aside-driven skills** (`test/skill-e2e-aside.test.ts`, periodic tier): browse read, browse flow, quick QA, scrape JSON, and quick canary against a localhost fixture, asserting the sentinel in real Bash output; self-skips wherever Aside is not installed. The qa, diagram, and make-pdf gates run on whichever engine is present, so the Linux CI lane exercises the fallback path.
+- `setup` and the doc generator prune renders of skills that no longer exist in the source tree, so a removed skill can never linger in a host install.
+
+#### Changed
+- `/qa` and `/qa-only`: the whole methodology (orient, explore, document, re-test) runs as Aside scripts; the authenticate phase is now "you are already signed in"; a 13th rule requires consent before mutating actions on non-local targets. The fallback section carries the `$B` translation.
+- `/design-review` and `/design-consultation`: design-system extraction is one script printing FONTS, COLORS, HEADINGS, TOUCH_TARGETS, and NAV; competitor research confirms the exact URLs with you before opening any of them in your real browser, and runs on the bundled browser when Aside is absent.
+- `/benchmark` and `/canary`: per-page scripts print NAV, PAINT, LCP, RESOURCES, SCRIPTS, CSS, and SUMMARY; the canary loop re-runs the script every 60 seconds because nothing persists between Aside scripts.
+- `/land-and-deploy` Step 7 and `/devex-review`: one Aside script each; the smoke row reads `responseStatus` from the navigation entry.
+- `/make-pdf` prints through Aside first and the bundled browser otherwise; exit 4 now means no browser is available and names both remedies; mermaid fences, oversized-image downscale, and DOCX rasters each run as one render script; `$P setup` reports which engine it found.
+- `/diagram`: the SVG, PNG, and excalidraw triplet is one `gstack-render` call; every diagram type gets an excalidraw export (flowcharts and sequence diagrams as editable scenes, the rest as a single image element).
+- `/scrape`: look-then-extract Aside scripts that build the JSON inside the page; on the fallback the browser-skills runtime (`$B skill list` / `run`, `/skillify`) applies as before.
+- **Third-Party Web Actions** (`/ship`, `/spec`, `/setup-deploy`, `/office-hours`, `/land-and-deploy`): Aside is the recommended first driver; gstack's own visible browser stays as the fallback option, exactly the shape v1.72 introduced, and the contract points at the `/browse` doc for how to drive Aside.
+- `/browse`: the Aside contract, cookbook, mode choice (`aside repl` by default, `aside exec` for reading), report format, the fallback, and the full `$B` command reference on demand.
+- The root router, README, `BROWSER.md`, `docs/skills.md`, `docs/PROJECT_STRUCTURE.md`, `CONTRIBUTING.md`, `CLAUDE.md`, and `ARCHITECTURE.md` describe the Aside-first, bundled-fallback world.
+
+#### Fixed
+- `./setup`'s retired-skill prune is safe by construction: it never deletes a directory that holds your own files (only gstack's SKILL.md, marker and links go), never follows a symlink into someone else's tree, cleans a host's stale links even after the generator already removed the render, and recognizes a skill renamed through its frontmatter `name:`. The generator's own prune keeps any `gstack-*` directory without the generated banner and skips a host whose generation failed. `./setup` also rebuilds when the design or make-pdf binary is missing or when anything under `lib/` changed.
+- Setup's summary is honest about browsers: with Aside installed and a failed Chromium bootstrap it says only the bundled fallback is missing (and that `/pair-agent` needs it); `GSTACK_SKIP_ASIDE=1` is honored by the skills' probe, by setup, and by the renderer alike.
+- The local render server behind `/make-pdf`, `/diagram`, and design previews serves one per-render secret URL, never follows a symlink out of its directory, and refuses malformed requests; page text can no longer forge its control lines; a hung `aside` process is killed instead of waited on forever; if the Aside CLI cannot start mid-run (or its private CDP bridge is missing) the render retries on gstack's own browser and reports which engine actually rendered — a page error or a timeout of a running script is never retried; a shared `/tmp/gstack-render` owned by someone else is never used.
+- Browsing skills check link status only on a LOCAL target (on a real site every HEAD request would carry your cookies); same-origin filtering compares real origins instead of string prefixes; `.local` hosts are no longer treated as your own machine (mDNS names resolve to other devices on the LAN); the Aside readiness probe has a 30-second deadline on stock macOS, which ships neither `timeout` nor `gtimeout`.
+- `aside exec` research requests write an egress receipt before leaving the machine, like every other off-machine send.
+- Rendering through the bundled browser tolerates a cold start: the first tab request retries once while the daemon is still coming up, and a command whose process is slow to exit under heavy load is waited for instead of being reported as failed.
+- `gstack-render --help` exits 0, non-numeric flags are rejected instead of becoming `NaN` timeouts, `--wait-timeout` is documented, and page-derived output (`EVAL`, `PAGE_ERRORS`) is fenced as untrusted content.
+
+#### For contributors
+- `test/aside-driver.test.ts` pins the contract's load-bearing sentences and asserts every browsing skill carries `## BROWSER SETUP (Aside` followed by `## Browser fallback`. `test/aside-render.test.ts` pins the renderer's option mapping and script shapes and runs a live render on each engine that is present. `test/helpers/aside-available.ts` is the shared live-Aside probe for E2E gating; `make-pdf/test/e2e/browser-available.ts` gates the make-pdf gates on either engine.
+- `lib/claude-bin.ts` and `lib/error-handling.ts` are now the canonical copies; `browse/src` re-exports them.
+- New free tests pin the review fixes: `test/setup-prune-stale-generated.test.ts` (host cleanup after the generator pruned, symlink targets survive, renamed skills, foreign links), `test/setup-browser-hint.test.ts` (hint and bootstrap summary across Aside present/absent, bootstrap ok/failed, skip-env), `test/setup-needs-build.test.ts`, `test/gstack-render-cli.test.ts`, `test/aside-render.test.ts` (fake `aside`/`browse` executables: probe classification, stdout contract, server policy, failure paths, timeout kill, engine choice and mid-run fallback), `make-pdf/test/cli-exit-codes.test.ts`, `make-pdf/test/setup-smoke.test.ts`. `renderPdf` returns the engine that rendered; `pickEngine(fresh, deps)` and `serveDir` are exported test seams.
+- Size budget re-baselined to `parity-baseline-v1.81.0.0.json` (the Aside contract plus fallback block ride in every browsing skill); parity ceilings ratcheted with measured values; touchfiles, tiers, coverage matrix, eval baselines, ship goldens, and the context-budget fixture refreshed. Follow-ups in TODOS.md: keep the `$B` translation table in sync with the cookbook, Aside CLI 1.26 lacks the commands its own skill doc lists, a macOS runner for the live E2E, an optional MCP path for a persistent page.
+
 ## [1.80.0.0] - 2026-09-04
 
 **Setup finishes even when Chromium cannot be installed.**

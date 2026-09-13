@@ -24,7 +24,9 @@ triggers:
 
 {{THIRD_PARTY_ACTIONS}}
 
-{{BROWSE_SETUP}}
+{{ASIDE_SETUP}}
+
+{{BROWSE_FALLBACK}}
 
 {{BASE_BRANCH_DETECT}}
 
@@ -157,7 +159,7 @@ gh pr checks --json name,state,status,conclusion
 Parse the output:
 1. If any required checks are **FAILING**: **STOP.** "CI is failing on this PR. Here are the failing checks: {list}. Fix these before deploying — I won't merge code that hasn't passed CI."
 2. If required checks are **PENDING**: Tell the user "CI is still running. I'll wait for it to finish." Proceed to Step 3.
-3. If all checks pass (or no required checks): Tell the user "CI passed." Skip Step 3, go to Step 4.
+3. If all checks pass (or no required checks): Tell the user "CI passed." Skip only Step 3's wait loop; continue to Step 3.4, then Step 3.5 before merging.
 
 Also check for merge conflicts:
 ```bash
@@ -177,7 +179,7 @@ gh pr checks --watch --fail-fast
 
 Record the CI wait time for the deploy report.
 
-If CI passes within the timeout: Tell the user "CI passed after {duration}. Moving to readiness checks." Continue to Step 4.
+If CI passes within the timeout: Tell the user "CI passed after {duration}. Moving to readiness checks." Continue to Step 3.4, then Step 3.5 before merging.
 If CI fails: **STOP.** "CI failed. Here's what broke: {failures}. This needs to pass before I can merge."
 If timeout (15 min): **STOP.** "CI has been running for over 15 minutes — that's unusual. Check the GitHub Actions tab to see if something is stuck."
 
@@ -308,45 +310,48 @@ Use the diff-scope classification from Step 5 to determine canary depth:
 | Diff Scope | Canary Depth |
 |------------|-------------|
 | SCOPE_DOCS only | Already skipped in Step 5 |
-| SCOPE_CONFIG only | Smoke: `$B goto` + verify 200 status |
+| SCOPE_CONFIG only | Smoke: the Aside script below; `responseStatus` in `NAV=` must be 200 |
 | SCOPE_BACKEND only | Console errors + perf check |
 | SCOPE_FRONTEND (any) | Full: console + perf + screenshot |
 | Mixed scopes | Full canary |
 
-**Full canary sequence:**
+**Full canary sequence** — one `aside repl` script does the whole check (console hook first, then load, then evidence):
 
 ```bash
-$B goto <url>
+aside repl '
+const HOOK = `(() => { window.__gstackErrs = window.__gstackErrs || []; const oe = console.error; console.error = (...a) => { window.__gstackErrs.push(a.map(String).join(" ")); oe.apply(console, a); }; window.addEventListener("error", e => window.__gstackErrs.push("uncaught: " + e.message)); window.addEventListener("unhandledrejection", e => window.__gstackErrs.push("unhandledrejection: " + (e.reason && e.reason.message || e.reason))); })()`;
+const pg = await openTab("about:blank");
+await pg._sendToTarget("Page.addScriptToEvaluateOnNewDocument", { source: HOOK });
+await pg.goto("<url>");
+console.log("URL=" + pg.url());
+console.log("CONSOLE_ERRORS=" + JSON.stringify(await pg.evaluate(() => window.__gstackErrs)));
+console.log("NAV=" + await pg.evaluate(() => JSON.stringify(performance.getEntriesByType("navigation")[0])));
+console.log("TEXT_START"); console.log((await pg.evaluate(() => document.body.innerText)).slice(0, 20000)); console.log("TEXT_END");
+await pg.screenshot({ path: "post-deploy.jpg", type: "jpeg", quality: 60, fullPage: true });
+const a = await annotatedScreenshot(pg);
+await fs.writeFile(path.join(pwd, "post-deploy-annotated.png"), Buffer.from(a.base64Image, "base64"));
+console.log("ASIDE_DIR=" + pwd);
+await closeTab(pg);
+console.log("GSTACK_STEP_OK");
+'
 ```
 
-Check that the page loaded successfully (200, not an error page).
+Then copy the evidence out of the printed session directory:
 
 ```bash
-$B console --errors
+mkdir -p .gstack/deploy-reports && cp "<ASIDE_DIR>/post-deploy.jpg" "<ASIDE_DIR>/post-deploy-annotated.png" .gstack/deploy-reports/
 ```
 
-Check for critical console errors: lines containing `Error`, `Uncaught`, `Failed to load`, `TypeError`, `ReferenceError`. Ignore warnings.
+Read the output line by line:
 
-```bash
-$B perf
-```
-
-Check that page load time is under 10 seconds.
-
-```bash
-$B text
-```
-
-Verify the page has content (not blank, not a generic error page).
-
-```bash
-$B snapshot -i -a -o ".gstack/deploy-reports/post-deploy.png"
-```
-
-Take an annotated screenshot as evidence.
+- `URL=` — the page loaded and stayed on the site (not a redirect to an error page). A line starting with `[error` or a missing `GSTACK_STEP_OK` means the load failed.
+- `CONSOLE_ERRORS=` — check for critical errors: entries containing `Error`, `Uncaught`, `Failed to load`, `TypeError`, `ReferenceError`. Ignore warnings.
+- `NAV=` — `responseStatus` is the HTTP status of the document (Chromium PerformanceNavigationTiming) — must be 200. `loadEventEnd` is the page load time. Check that it is under 10 seconds.
+- `TEXT_START` / `TEXT_END` — verify the page has real content (not blank, not a generic error page).
+- `post-deploy.jpg` and the annotated `post-deploy-annotated.png` are the evidence. Read the copied screenshot so the user sees it.
 
 **Health assessment:**
-- Page loads successfully with 200 status → PASS
+- Page loads successfully with 200 status (`responseStatus` in `NAV=`) → PASS
 - No critical console errors → PASS
 - Page has real content (not blank or error screen) → PASS
 - Loads in under 10 seconds → PASS
@@ -378,7 +383,7 @@ git push origin <base>
 If the revert has conflicts: "The revert has merge conflicts — this can happen if other changes landed on {base} after your merge. You'll need to resolve the conflicts manually. The merge commit SHA is `<sha>` — run `git revert <sha>` to try again."
 
 If the base branch has push protections: "This repo has branch protections, so I can't push the revert directly. I'll create a revert PR instead — merge it to roll back."
-Then create a revert PR: `gh pr create --title 'revert: <original PR title>'`
+Keep the local revert commit. Create a new branch at that commit (`git switch -c "revert/pr-<PR_NUMBER>-<timestamp>"`), push it with `git push -u origin HEAD`, then create the revert PR with `gh pr create --base <base> --title 'revert: <original PR title>'`. Report rollback as pending until this PR merges and deploys, not REVERTED.
 
 After a successful revert: Tell the user "Revert pushed to {base}. The deploy should roll back automatically once CI passes. Keep an eye on the site to confirm." Note the revert commit SHA and continue to Step 9 with status REVERTED.
 

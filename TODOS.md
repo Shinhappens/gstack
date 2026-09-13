@@ -2,6 +2,48 @@
 
 ## NEXT PRIORITY
 
+### P2/P3: impeccable interop deferrals (filed 2026-09-08, from the CEO + eng reviews of docs/designs/IMPECCABLE_INTEROP.md)
+
+Each item was weighed during the review and deferred with a reason; none blocks
+the shipped detector, catalog, or open DESIGN.md format.
+
+- **Carve design-review Phases 7-11 into a section (budget lever)** — design-review's
+  eager tokens landed at +2.87K against the review's 2.5K target after every
+  planned lever (ids-only detector rules in category 9, the dump script moved to
+  `lib/dom-dump.js`, trimmed prose); the ceiling in
+  `test/fixtures/context-budget.json` moved to the measured 31,319. The next real
+  lever is carving the fix loop (Phases 7-11) into a section, which touches the
+  E2E copy logic in `test/skill-e2e-design.test.ts`. Effort M. Priority P2.
+- **Bun `.env` auto-load audit across `bin/*.ts`** — Bun loads a cwd `.env` into
+  `process.env` even for a script outside cwd. `gstack-design-detect.ts` and
+  `gstack-design-md.ts` render with `--no-env-file` and ignore in-repo
+  `IMPECCABLE_BIN` / `IMPECCABLE_HOME`; every other `bun run
+  ~/.claude/skills/gstack/bin/*.ts` a skill renders has the same exposure for any
+  env-driven exec path. Audit them, render `--no-env-file` where an env var can
+  name a binary or a path. Effort S. Priority P2.
+- **Kiro install arm links `SKILL.md` and `sections/` only** — every gstack
+  `bin/` path a Kiro render carries (the detector, the DESIGN.md tool, the render
+  CLI, review-log, diff-scope) is a pre-existing gap on that host. Link `bin/`
+  and `lib/` together there like the other arms (`setup` ~2341). Effort S.
+  Priority P2. Collaborative repo, not fixed in the interop PR.
+- **`$D check` slop rubric** — add the catalog's LLM-only tells (hero metrics,
+  identical cards, glassmorphism, content stand-ins) to `design/src/check.ts`'s
+  vision pass once those entries have been exercised in reviews. Open questions:
+  a paid GPT-4o call per variant, and vision misjudging cream palettes and nested
+  cards. Effort M. Priority P3.
+- **Taste-profile interplay for `overused-font`** — downgrade a detector
+  overused-font hit to polish when the face is in the user's approved taste
+  profile. Today `impeccable hooks ignore-value overused-font <face>` covers it
+  without coupling the two schemas. Effort S. Priority P3.
+- **plan-ceo-review Section 11 catalog bullets** — render `{{DESIGN_SLOP_BULLETS}}`
+  into the CEO review's design section. Blocked on the plan-ceo-review doctrine
+  carve (~555 B of skeleton headroom today). Effort S. Priority P3.
+- **Detector scan cache** — cache `gstack-design-detect.ts scan` results under
+  `${GSTACK_HOME}/cache/design-detect/` keyed on engine hash, target-set hash,
+  and `.impeccable/config*.json` hash, so Phase 9's rescan and repeated ship
+  reviews skip unchanged files. Effort S. Priority P3.
+
+
 ### P2: fork-port residual wave deferrals (filed at Wave A, 2026-09-03)
 
 Filed from the time-attack/gstack residual evaluation
@@ -10,15 +52,39 @@ Waves B–E2 of that plan are scheduled work, not TODOs; these are the items the
 reviews deliberately deferred, each with rationale:
 
 - **Shared `_gstack_owned_link` helper** — the ownership gate now exists in
-  six places (setup's `_claude_entry_is_ours` / `_claude_entry_owned_strongly`
+  seven places (setup's `_claude_entry_is_ours` / `_claude_entry_owned_strongly`
   used by link_claude_skill_dirs and _install_alias_skill_md, while
   cleanup_old_claude_symlinks and cleanup_prefixed_claude_symlinks inline their
   own marker/cmp/banner chain and readlink `case`; bin/gstack-relink
-  `_entry_is_ours`; bin/gstack-uninstall's per-entry loop). Extract one sourced
+  `_entry_is_ours`; bin/gstack-uninstall's per-entry loop; and, since the
+  Aside-first wave, setup's `_prune_stale_generated`, which removes a retired
+  host entry behind the banner-only `_owned_for_windows_refresh` check —
+  symlinks outright, real dirs through `_cleanup_weak_dir` — and must route
+  through the same helper). Extract one sourced
   helper so the destructive-path guard cannot drift, and while there: make the
   `.gstack-owned` marker's recorded install path load-bearing (today any marker
   counts, so a Windows fork copy carrying gstack's generated header is still
   treated as ours on a mode flip). Effort S. Priority P2. Depends on: none.
+- **Non-Claude host loops + stale-render prune under the marker rule** — the
+  Codex, Factory, OpenCode, Cursor and Kiro link loops (setup's
+  `link_*_skill_dirs`, the `_owned_for_windows_refresh` gate at each) still
+  `rm -rf` + re-copy a REAL host directory on banner-only proof, and
+  `_prune_stale_generated` routes a bannered real dir through
+  `_cleanup_weak_dir` only because those hosts never receive a `.gstack-owned`
+  marker. Write the marker for every host's copy install, then switch all five
+  loops and the prune to the strong/weak split the Claude host and
+  `gstack-relink` already use (#2119). Effort M (human ~2 days / CC ~1h).
+  Priority P2. Depends on: the shared `_gstack_owned_link` helper above (same
+  code motion; do them together).
+- **Free test: CHANGELOG top heading equals VERSION** — a fork PR that claimed
+  a version main had since shipped auto-merged VERSION, package.json and the
+  digest header with no git conflict (both sides identical); only
+  `bin/gstack-next-version` and the PR-time queue check saw it. A tiny free
+  test asserting the first `## [X]` in CHANGELOG.md equals VERSION would make
+  the collision a red test on any branch. Decide first whether mid-branch
+  VERSION bumps without a CHANGELOG entry are a workflow the suite must
+  tolerate (`/ship` writes both in one step, so probably not). Effort S
+  (human ~2h / CC ~10min). Priority P3. Depends on: none.
 - **Config-key reader tripwire** — `transcript_ingest_mode=off` sat unread for
   months while setup-gbrain advertised it. A free test that asserts every key
   in bin/gstack-config's default table is read by at least one binary (or is
@@ -507,12 +573,148 @@ references — include it in this fix's coverage list.
 - Smoke-test a skill invocation from a non-`gstack` install dir to prove the fix.
 - Sibling of #349 (the `$CLAUDE_CONFIG_DIR` / `~/.claude` path issue).
 
+## Memorable bridge follow-ups (filed via /plan-ceo-review + /plan-eng-review on the Memorable bridge fix-up, #2831)
+
+### P3: gstack-mediated third-party hook seam
+
+**What:** Generalize what the Memorable bridge instantiates: a `mediate <name>`
+verb (or provider table) that gives ANY third-party Claude Code hook a consent
+key, a receipt sink, an envelope, healing and clean removal, with Memorable as
+the first provider.
+
+**Why:** The bridge fixes the interface (config key, sink name, source tag,
+hook basename, gate, envelope). A second vendor today would copy
+`bin/gstack-memorable` and the hook `.ts`; the seam makes it a registration.
+
+**Context:** Deliberately not built with one provider (premature abstraction;
+CEO review D1/ED17). Start from `bin/gstack-memorable`,
+`hosts/claude/hooks/memorable-user-prompt-hook.ts`, and the `KNOWN_HOOKS`
+row shape.
+
+**Effort:** L (human ~1.5 weeks / CC+gstack ~4 h). **Priority:** P3.
+**Depends on:** a second third-party hook actually wanting in.
+
+### P2: Windows support for the Memorable bridge (D21)
+
+**What:** `enable` refuses on Windows and the hook exits 0 there. Bring it up:
+descendant termination (`taskkill /T` or a job object) so a vendor process
+cannot outlive a timeout, `.cmd` and extensionless shim handling for the
+vendor path, the `bash ` command prefix setup uses for registrations, and a
+live verification on the windows lane with a real `npm i -g memorable-cli`.
+
+**Why:** Without process groups the containment guarantee the bridge makes
+cannot be given; refusing was the honest choice for this wave.
+
+**Context:** `runExternal` in `hosts/claude/hooks/spawn-bin.ts` returns
+`EPLATFORM` on win32; the behavioural tests are auto-excluded from the
+windows lane because they spawn `bin/` scripts.
+
+**Effort:** M (human ~2 days / CC+gstack ~1 h). **Priority:** P2.
+**Depends on:** none.
+
+### P3: `lib/tracker-guard.ts` envelope `kind` parameter
+
+**What:** The envelope wraps recall text with the TRACKER banner. Add a
+`kind` so third-party hook content reads as what it is, keeping the pinned
+banner constants intact for tracker callers.
+
+**Effort:** S (human ~2 h / CC+gstack ~10 min). **Priority:** P3.
+**Depends on:** none.
+
+### P3: vendor payload-minimization contract
+
+**What:** Ask Memorable which `UserPromptSubmit` fields `hook user-prompt`
+actually reads, so the bridge can forward fewer (drop `transcript_path` if
+unused). Today it forwards the full JSON because the vendor parses Claude
+Code's documented schema and its EULA forbids finding out otherwise.
+
+**Effort:** S. **Priority:** P3. **Depends on:** vendor response.
+
+### P3: recall latency measurement and timeout revisit
+
+**What:** After a month of use, read `gstack_ms=` and `timeout` outcomes from
+`gstack-egress list --sink memorable-recall` and revisit the 4.5 s ceiling and
+the `--timeout 5` registration.
+
+**Effort:** S. **Priority:** P3. **Depends on:** the bridge in use.
+
+### P3: consolidate the vendor resolvers and extract the canonical-root helper (D24)
+
+**What:** The vendor CLI is resolved twice (bash in `bin/gstack-memorable`, TS
+in the hook); the canonical-root and `IS_WINDOWS` logic is copied from
+`setup` (marked `TODO D24` at each copy). Extract a sourced
+`gstack-canonical-root.sh` used by `setup`, `bin/gstack-memorable` and
+`bin/gstack-relink`, and one resolver for the vendor.
+
+**Context:** `setup`'s text is pinned by `test/setup-hook-canonical-paths.test.ts`;
+the extraction must move those pins with it.
+
+**Effort:** S. **Priority:** P3. **Depends on:** settling the pinned-text tests.
+
+### P3: non-interactive MEDIUM-tier redaction policy for hooks
+
+**What:** The hook refuses HIGH-tier findings only; MEDIUM needs a
+confirmation no hook can ask for. Decide a policy (skip-and-log vs pass) so
+hooks can honor more than HIGH.
+
+**Effort:** S. **Priority:** P3. **Depends on:** none.
+
+### P3: adopt `list-items` at setup's plan-tune "already installed" check
+
+**What:** `setup:2525` decides with `list-sources | grep plan-tune-cathedral`,
+which is tag-only and misses tag-stripped live hooks. `gstack-settings-hook
+list-items --event PostToolUse --owned-by plan-tune-cathedral` is the
+identity-based answer.
+
+**Effort:** S. **Priority:** P3. **Depends on:** none.
+
+### P3: one state-root rule for the bridge's four stores
+
+**What:** The hook, `bin/gstack-config` and `bin/gstack-memorable` resolve
+their root as `GSTACK_STATE_ROOT` > `GSTACK_HOME` > `GSTACK_STATE_DIR`; the
+egress ledger (`lib/egress-receipt.ts`) honors `GSTACK_HOME` >
+`GSTACK_STATE_DIR`; the trust-policy store (`lib/gbrain-repo-policy-client.ts`)
+only `GSTACK_HOME`; `bin/gstack-uninstall` deletes only
+`${GSTACK_STATE_DIR:-$HOME/.gstack}`. Extract one shared rule (a
+`lib/state-root.ts` plus its bash twin) and use it everywhere.
+
+**Why:** With `GSTACK_STATE_ROOT` set, the gate lives under one directory and
+the receipts under another; the tests pin all three variables to one temp dir,
+so the drift is invisible to them. Found by the /ship red team.
+
+**Context:** Uninstall already flips `memorable_recall` off whenever it reads
+`on`, kept state or not (through gstack-config's own resolution), so no config
+can say `on` after the hook is gone; the remaining drift is observability, not
+consent.
+
+**Effort:** S (human ~3 h / CC+gstack ~20 min). **Priority:** P3.
+**Depends on:** none.
+
+### P3: shared hook logging helper
+
+**What:** `stateRoot()` and the `hook-errors.log` appender now exist in five
+hooks (`question-log`, `question-preference`, `auq-error-fallback`,
+`timeline-stop`, `memorable-user-prompt`), with drifting env-var precedence.
+Extract `hosts/claude/hooks/hook-log.ts` (root resolution, 0600 append, the
+rate limiter the memorable hook added) and migrate the five.
+
+**Why:** One place to fix precedence and file modes; the memorable hook's
+rate limiter belongs to every hook that can fail on every prompt.
+
+**Effort:** S (human ~2 h / CC+gstack ~15 min). **Priority:** P3.
+**Depends on:** the state-root rule above.
+
 ## Aside integration follow-ups (filed via /plan-ceo-review + /plan-eng-review on the third-party-actions Aside plan)
 
 ### QA logged-in-evidence path via Aside (Phase 2)
 
-**What:** Consent-gated `aside repl` as an alternative evidence source in /qa,
-/qa-only, and /browse when cookie-import can't reach a session (SSO,
+**Landed (Aside-first):** `aside repl` is now the PRIMARY evidence source for
+/qa, /qa-only, and /browse whenever Aside is installed and running; gstack's own
+browser (with cookie import) is the automatic fallback when it is not. Kept for
+the rationale; the remaining loose ends are under "Aside-first follow-ups".
+
+**What:** Consent-gated `aside repl` as the evidence source in /qa, /qa-only,
+and /browse for sessions a headless browser could never reach (SSO,
 device-bound auth, Safari-side logins Chromium export can't see).
 
 **Why:** Fills the exact gap `docs/designs/CHROME_VS_CHROMIUM_EXPLORATION.md`
@@ -3824,7 +4026,7 @@ path to the fixture during the run.
 
 **What:** Cache rendered diagram SVG/PNG in `~/.gstack/cache/diagram-render/`,
 keyed on `sha256(fence source + bundle version + render options)`, so repeat
-`make-pdf` runs skip the browse render tab for unchanged diagrams.
+`make-pdf` runs skip the render (Aside or the fallback browse tab) for unchanged diagrams.
 
 **Why:** Every run currently re-renders every fence (~150-300ms each). Docs with
 10+ diagrams pay seconds per iteration during write-preview loops. Codex
@@ -4006,3 +4208,189 @@ globs (D). What remains, re-filed individually:
   bounded (GSTACK_PLAYWRIGHT_INSTALL_TIMEOUT, default 600s), lock contention
   is a reason code, skills always register. Close #2233, #1900, #1901, #1902,
   #913 with the receipt (test/setup-playwright-best-effort.test.ts).
+
+## Aside-first follow-ups (filed when Aside became the primary browser)
+
+Every gstack skill that touches a web page drives the Aside AI browser first
+(`scripts/resolvers/aside.ts` is the contract; `lib/aside-render.ts` /
+`bin/gstack-render.ts` render local HTML through it; `{{ASIDE_RESEARCH}}` runs
+web research through it). gstack's own browser engine — the `browse` daemon,
+GStack Browser headed mode, cookie import, `/pair-agent`, browser-skills /
+`/skillify` — is kept as the automatic fallback whenever Aside is not installed
+or not running (Linux, Windows, a closed Aside app), and web research falls
+back to the WebSearch tool when the host provides one. Nothing was removed.
+Loose ends:
+
+### P1: Aside-first fallback parity — keep the `$B` equivalence table in sync with the cookbook
+
+**What:** The fallback block (`BROWSE_FALLBACK` in the browser resolvers) maps
+each verified `aside repl` cookbook shape (read a page, drive a flow, annotated
+screenshot, responsive captures, links + status, performance, PDF, element
+screenshot, `aside exec` research) to its `$B` equivalent so a skill produces
+the same evidence lines on either path. Every time a cookbook shape is added,
+renamed, or changes its output labels (`CONSOLE_ERRORS=`, `DIFF_START`,
+`ASIDE_DIR=`, `GSTACK_STEP_OK`), update the table in the same commit and add a
+pin in `test/aside-driver.test.ts` that the two lists name the same shapes.
+
+**Why:** A skill that reads `DIFF_START` on the Aside path and gets nothing on
+the fallback path "fixes" the missing output blindly. Parity is the whole point
+of keeping the engine; a silent gap is worse than no fallback.
+
+**Effort:** S per change (human ~half day, CC ~15min). **Priority:** P1. **Depends on:** nothing.
+
+### P2: Aside CLI 1.26 lacks subcommands Aside's own skill doc lists
+
+**What:** Aside's skill doc lists `session`, `memory`, `skills`, `host`, and
+`--permission`; Aside CLI 1.26 has none of them (`aside --help`). Skills must
+not depend on them until the CLI ships them. Re-probe on each Aside release;
+when they land, evaluate `session` for multi-script flows and `--permission`
+for the mutating-action consent gate.
+
+**Why:** A skill written against the doc instead of the binary dies at runtime
+on an unknown-command error the agent will then try to "fix" blindly.
+
+**Effort:** S (human ~half day, CC ~20min per re-probe). **Priority:** P2. **Depends on:** Aside releases.
+
+### P2: Aside E2E tests run only where Aside is installed
+
+**What:** The Aside-only E2E lane — `test/skill-e2e-aside.test.ts`, the Aside
+qa/design cases, the live render in `test/aside-render.test.ts` — self-skips
+when `aside` is absent (`asideAvailable()` in `test/helpers/aside-available.ts`),
+so CI's Linux runners never drive Aside; the make-pdf and /diagram render gates
+already run there on the browse binary. The Aside path runs only on macOS dev
+machines.
+Evaluate a self-hosted macOS runner (or a scheduled job on a Mac mini) that
+runs the Aside lane weekly under the same hermetic env as the other E2E lanes.
+
+**Why:** A browser contract nobody runs in CI drifts silently — exactly the
+class `test/aside-driver.test.ts` pins statically but cannot prove live.
+
+**Effort:** M (human ~2 days, CC ~1h plus the machine). **Priority:** P2. **Depends on:** a macOS host with Aside signed in.
+
+### P3: Evaluate `aside mcp` for multi-step flows
+
+**What:** `aside repl` is one flow per script — a fresh session per call, tabs
+closed when it ends. `aside mcp` keeps a persistent REPL page across calls.
+Once the CLI stabilizes, measure whether an MCP path makes long QA audits
+cheaper (no re-navigation per script) without losing the "leave the browser as
+you found it" guarantee.
+
+**Why:** Re-navigating from the URL per script is the honest tax of the current
+model; a persistent page could cut it but adds a session that must be cleaned up.
+
+**Effort:** M (human ~2 days, CC ~1h). **Priority:** P3. **Depends on:** Aside CLI stability.
+
+### P3: Eval that skills treat `aside exec` output as untrusted
+
+**What:** `aside exec "<task>"` returns another agent's answer. Add an LLM-judge
+or E2E eval that plants an instruction inside an `aside exec` result and checks
+the skill takes syntax from it, never scope, permissions, or consent.
+
+**Why:** The rule is pinned as prose; nothing yet proves a skill obeys it when
+the injected text arrives through the one channel that reads like a colleague.
+
+**Effort:** S (human ~1 day, CC ~30min). **Priority:** P3. **Depends on:** the Aside E2E lane above.
+
+### P1: make-pdf renders user documents inside the real browser profile — add a CSP
+
+**What:** `/make-pdf` prints markdown-derived HTML through Aside (the user's
+signed-in browser) on a `127.0.0.1` origin. The only barrier between a hostile
+document (a README from a cloned repo) and script execution in that profile is
+the regex sanitizer in `make-pdf/src/render.ts`, whose header assumes marked
+output is never malformed — raw-HTML passthrough breaks that assumption. Inject
+gstack's own CSP `<meta>` into the print template (`default-src 'none';
+img-src data: 'self'; style-src 'unsafe-inline' 'self'; font-src data: 'self';
+script-src 'nonce-<per-render>'` for Paged.js), since user `<meta>` is stripped
+and gstack's is not; alternatively keep make-pdf on the bundled engine by
+default.
+
+**Why:** Under the old cookieless headless engine a sanitizer bypass was
+near-harmless; in the real profile it is a CSRF-class primitive. Cross-model
+finding (Claude adversarial + Codex).
+
+**Effort:** M (human ~2 days, CC ~1h). **Priority:** P1. **Depends on:** none.
+
+### P1: diagram pre-pass buffers every oversized image before downscaling
+
+**What:** `make-pdf/src/diagram-prepass.ts` caps each image at 64 MB but keeps
+every pending buffer in `downscales` and duplicates it as base64 before the
+batch runs; a document referencing a few dozen large images can take gigabytes.
+Cap total pending bytes (e.g. 256 MB) and process in bounded batches, or
+downscale sequentially.
+
+**Why:** A hostile or merely image-heavy document crashes the tool instead of
+degrading.
+
+**Effort:** S (human ~1 day, CC ~30min). **Priority:** P1. **Depends on:** none.
+
+### P2: fallback renders die after any cookie import in the daemon's lifetime
+
+**What:** `renderWithBrowse` drives readiness and evals through `$B js`, and the
+daemon's cookie-import JS lock (`browse/src/read-commands.ts`) refuses `js` on
+every origin outside the imported set — `127.0.0.1` included, forever (the set
+is add-only). The renderer now names the remedy (`$B stop`), but the real fix is
+a fresh incognito context for local-HTML renders, or a loopback exemption once
+its threat model is written down.
+
+**Why:** On Linux/Windows (no Aside) one `/setup-browser-cookies` run makes
+every later `/diagram` and `/make-pdf` render fail.
+
+**Effort:** M (human ~2 days, CC ~1h). **Priority:** P2. **Depends on:** none.
+
+### P2: carve the Aside contract + fallback block into one shared section
+
+**What:** `{{ASIDE_SETUP}}` (~5.6 KB) plus `{{BROWSE_FALLBACK}}` (~4.1 KB) are
+rendered verbatim into ten browsing skills (~97 KB of identical prose loaded on
+every invocation). Keep the probe and the three decision steps inline; move
+"Rules for driving a real browser" and the Aside-to-`$B` translation table into
+one carved reference (the `browse/sections/command-list.md` pattern), then
+re-run `capture-context-budget.ts` so the ceilings ratchet back down.
+
+**Why:** Every skill invocation pays for prose that is skill-invariant.
+
+**Effort:** M (human ~2 days, CC ~1h). **Priority:** P2. **Depends on:** none.
+
+### P2: `$B js` / `$B eval` output is not wrapped in the untrusted envelope
+
+**What:** `js` and `eval` are not in `PAGE_CONTENT_COMMANDS`
+(`browse/src/commands.ts`), so page-controlled return values reach the agent
+unfenced while the fallback table routes exactly the page-controlled reads
+through them. `gstack-render` now fences its own `EVAL`/`PAGE_ERRORS` lines and
+the fallback prose says `$B js` is unwrapped; the durable fix is to add both
+commands to the envelope set.
+
+**Why:** A hostile page can deliver injection text through the one channel the
+skills were told is fenced.
+
+**Effort:** S (human ~half day, CC ~15min). **Priority:** P2. **Depends on:** none.
+
+### P3: Aside-first renderer follow-ups (perf and DRY)
+
+- **Readiness polling** spawns a `browse js` process every 150 ms; the daemon's
+  `wait <sel>` command blocks server-side in one spawn — use it for
+  `waitFor.selector`. Effort S.
+- **Bundle re-staging:** every `runScript()` batch copies the ~9 MB diagram
+  bundle into a fresh mkdtemp and starts a new loopback server; stage once per
+  run (content-addressed) and, on the browse engine, keep one tab across the
+  fence/downscale/DOCX batches. Effort M.
+- **Probe cost:** `probeAside()` runs two blocking spawns per process and the
+  engine cache is per-process; persist the outcome with a short TTL under
+  `GSTACK_HOME` and lower the repl probe timeout on the code path. Effort S.
+- **DRY:** the console-error `HOOK` IIFE exists in seven copies across
+  `scripts/resolvers/*.ts` and `lib/aside-render.ts` (two divergent variants);
+  cookbook recipes (responsive loop, links, read-a-page) are duplicated across
+  `aside.ts`, `design.ts`, `utility.ts`; the readiness probe is recovered from
+  rendered markdown by regex in two places instead of a shared constant. Export
+  one source for each. Effort S each.
+- **Egress scanner:** `test/egress-receipt-wiring.test.ts` scans `curl`, `git
+  push`, and `fetch`; add `aside exec` as a sink class so a bare call fails CI
+  the way the others do. Effort S.
+- `_browser_hint` treats any `aside` on PATH as the Aside browser (no version
+  check). Effort S.
+- **`gen-skill-docs --dry-run` is not write-free for external hosts:**
+  `processExternalHost` runs `mkdirSync(outputDir)` and writes
+  `agents/openai.yaml` with no `DRY_RUN` guard (only SKILL.md is skipped), so a
+  dry run against an empty `--out-dir` leaves 54 `openai.yaml` files behind.
+  Guard both writes. Effort S.
+
+**Priority:** P3. **Depends on:** none.

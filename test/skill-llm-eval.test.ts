@@ -16,6 +16,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import * as fs from 'fs';
 import * as path from 'path';
 import { callJudge, judge } from './helpers/llm-judge';
+import { readWorkflowExcerpt } from './helpers/workflow-excerpt';
 import type { JudgeScore } from './helpers/llm-judge';
 import { LLM_JUDGE_TOUCHFILES } from './helpers/touchfiles';
 // Runs when EVALS=1 is set (requires ANTHROPIC_API_KEY in env) — the EVALS
@@ -110,7 +111,7 @@ describeIfSelected('LLM-as-judge quality evals', [
     expect(scores.clarity).toBeGreaterThanOrEqual(4);
     expect(scores.completeness).toBeGreaterThanOrEqual(3);
     expect(scores.actionability).toBeGreaterThanOrEqual(4);
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('snapshot flags reference', async () => {
     const t0 = Date.now();
@@ -136,7 +137,7 @@ describeIfSelected('LLM-as-judge quality evals', [
     expect(scores.clarity).toBeGreaterThanOrEqual(4);
     expect(scores.completeness).toBeGreaterThanOrEqual(4);
     expect(scores.actionability).toBeGreaterThanOrEqual(4);
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('browse/SKILL.md reference', async () => {
     const t0 = Date.now();
@@ -160,14 +161,19 @@ describeIfSelected('LLM-as-judge quality evals', [
     expect(scores.clarity).toBeGreaterThanOrEqual(4);
     expect(scores.completeness).toBeGreaterThanOrEqual(4);
     expect(scores.actionability).toBeGreaterThanOrEqual(4);
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('setup block', async () => {
     const t0 = Date.now();
     // P2 (v1.2.0): the browse setup block moved from the root router to browse/SKILL.md.
     const content = fs.readFileSync(path.join(ROOT, 'browse', 'SKILL.md'), 'utf-8');
-    const setupStart = content.indexOf('## SETUP');
-    const setupEnd = content.indexOf('## Core QA Patterns');
+    // The setup block is the Aside contract ('## BROWSER SETUP (Aside ...') with
+    // the browse binary as fallback; older renders headed it '## SETUP'. Slice
+    // from whichever heading is present to the next H2.
+    let setupStart = content.indexOf('## BROWSER SETUP');
+    if (setupStart < 0) setupStart = content.indexOf('## SETUP');
+    const setupEnd = content.indexOf('\n## ', setupStart + 3);
+    if (setupStart < 0 || setupEnd < 0) throw new Error('browse/SKILL.md: setup block not found — regenerate with: bun run gen:skill-docs');
     const section = content.slice(setupStart, setupEnd);
 
     const scores = await judge('setup/binary discovery instructions', section);
@@ -188,7 +194,7 @@ describeIfSelected('LLM-as-judge quality evals', [
     // SKILL_DIR is inferred from context, so judge sometimes scores 3.
     expect(scores.actionability).toBeGreaterThanOrEqual(3);
     expect(scores.clarity).toBeGreaterThanOrEqual(3);
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('regression vs baseline', async () => {
     const t0 = Date.now();
@@ -272,7 +278,7 @@ Scores are 1-5 overall quality.`,
     });
 
     expect(result.b_score).toBeGreaterThanOrEqual(result.a_score);
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // --- Part 7: QA skill quality evals (C6) ---
@@ -313,7 +319,8 @@ describeIfSelected('QA skill quality evals', ['qa/SKILL.md workflow', 'qa/SKILL.
     const scores = await callJudge<JudgeScore>(`You are evaluating the quality of a QA testing workflow document for an AI coding agent.
 
 The agent reads this document to learn how to systematically QA test a web application. The workflow references
-a headless browser CLI ($B commands) that is documented separately — do NOT penalize for missing CLI definitions.
+a browser driver (Aside 'aside repl' scripts, with the headless browse CLI's $B commands as fallback) that is documented
+separately in the skill's BROWSER SETUP section — do NOT penalize for missing driver definitions.
 Instead, evaluate whether the workflow itself is clear, complete, and actionable.
 
 Rate on three dimensions (1-5 scale):
@@ -345,7 +352,7 @@ ${section}`);
     // section (the eval only passes the Workflow section, not the full document).
     expect(scores.completeness).toBeGreaterThanOrEqual(3);
     expect(scores.actionability).toBeGreaterThanOrEqual(4);
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('qa/SKILL.md health rubric', async () => {
     const t0 = Date.now();
@@ -385,7 +392,7 @@ ${section}`);
     expect(scores.clarity).toBeGreaterThanOrEqual(4);
     expect(scores.completeness).toBeGreaterThanOrEqual(3);
     expect(scores.actionability).toBeGreaterThanOrEqual(4);
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('qa/SKILL.md anti-refusal', async () => {
     const t0 = Date.now();
@@ -439,7 +446,7 @@ Rules:
 
     expect(result.would_browse).toBe(true);
     expect(result.confidence).toBeGreaterThanOrEqual(4);
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // --- Part 7: Cross-skill consistency judge (C7) ---
@@ -504,7 +511,7 @@ score (1-5): 5 = perfectly consistent, 1 = contradictory`);
 
     expect(result.consistent).toBe(true);
     expect(result.score).toBeGreaterThanOrEqual(4);
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // --- Part 7: Baseline score pinning (C9) ---
@@ -580,49 +587,14 @@ async function runWorkflowJudge(opts: {
   const defaults = { clarity: 4, completeness: 3, actionability: 4 };
   const thresholds = { ...defaults, ...opts.thresholds };
 
-  // Read the skeleton + sections UNION so carved skills (v2 plan T9) still
-  // expose markers that moved into sections/*.md (e.g. plan-eng's "## Review
-  // Sections" + "## CRITICAL RULE", plan-design's 7 passes). Without this the
-  // slice markers vanish from the skeleton and the judge scores empty content.
-  let content = fs.readFileSync(path.join(ROOT, opts.skillPath), 'utf-8');
-  const secDir = path.join(ROOT, path.dirname(opts.skillPath), 'sections');
-  const sectionBodies: string[] = [];
-  if (fs.existsSync(secDir)) {
-    for (const f of fs.readdirSync(secDir).sort()) {
-      if (f.endsWith('.md') && !f.endsWith('.md.tmpl')) {
-        const body = fs.readFileSync(path.join(secDir, f), 'utf-8');
-        sectionBodies.push(body);
-        content += '\n' + body;
-      }
-    }
-  }
-  const startIdx = content.indexOf(opts.startMarker);
-  if (startIdx === -1) throw new Error(`Start marker not found in ${opts.skillPath}: "${opts.startMarker}"`);
-
-  let section: string;
-  if (opts.endMarker) {
-    const endIdx = content.indexOf(opts.endMarker, startIdx);
-    if (endIdx === -1) throw new Error(`End marker not found in ${opts.skillPath}: "${opts.endMarker}"`);
-    section = content.slice(startIdx, endIdx);
-  } else {
-    section = content.slice(startIdx);
-  }
-
-  // Two carve shapes exist. plan-eng/plan-design moved the MARKERS into the
-  // section files, so the slice above already reaches the carved content.
-  // document-release instead keeps its markers in the skeleton and carves the
-  // workflow BODY (Steps 2-9 → sections/release-body.md) AFTER the endMarker,
-  // so the marker slice drops it. Re-append any carved section the window
-  // excluded, so the judge always sees the full workflow the agent executes.
-  for (const body of sectionBodies) {
-    const head = body.trim().slice(0, 120);
-    if (head && !section.includes(head)) section += '\n' + body;
-  }
-
+  const section = readWorkflowExcerpt(opts.skillPath, opts.startMarker, opts.endMarker);
   const scores = await callJudge<JudgeScore>(`You are evaluating the quality of ${opts.judgeContext} for an AI coding agent.
 
-The agent reads this document to learn ${opts.judgeGoal}. It references external tools and files
-that are documented separately — do NOT penalize for missing external definitions.
+The agent reads this excerpt to learn ${opts.judgeGoal}. Shared preamble definitions and
+external tools/files are documented separately; do not penalize their absence from this excerpt.
+The test harness expands on-demand sections at their read points, so the section index and
+Read instructions refer to the original files, not duplicate work. Judge the actual instructions,
+including contradictory ordering or missing decisions within the excerpt.
 
 Rate on three dimensions (1-5 scale):
 - **clarity** (1-5): Can an agent follow the instructions without ambiguity?
@@ -666,7 +638,7 @@ describeIfSelected('Ship & Release skill evals', ['ship/SKILL.md workflow', 'doc
       judgeContext: 'a ship/release workflow document',
       judgeGoal: 'how to create a PR: merge base branch, run tests, review diff, bump version, update changelog, push, and open PR',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('document-release/SKILL.md workflow', async () => {
     await runWorkflowJudge({
@@ -678,7 +650,7 @@ describeIfSelected('Ship & Release skill evals', ['ship/SKILL.md workflow', 'doc
       judgeContext: 'a post-ship documentation update workflow',
       judgeGoal: 'how to audit and update project documentation after code ships: README, ARCHITECTURE, CONTRIBUTING, CLAUDE.md, CHANGELOG, TODOS',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // Block 2: Plan Review skills
@@ -695,7 +667,7 @@ describeIfSelected('Plan Review skill evals', [
       judgeContext: 'a CEO/founder plan review framework with 4 scope modes',
       judgeGoal: 'how to conduct a CEO-perspective plan review: challenge scope, select a mode (Expansion, Selective Expansion, Hold Scope, Reduction), then review sections interactively',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('plan-eng-review/SKILL.md sections', async () => {
     await runWorkflowJudge({
@@ -707,7 +679,7 @@ describeIfSelected('Plan Review skill evals', [
       judgeContext: 'an engineering plan review framework with 4 review sections',
       judgeGoal: 'how to review a plan for architecture quality, code quality, test coverage, and performance — walking through each section interactively with AskUserQuestion',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('plan-design-review/SKILL.md passes', async () => {
     await runWorkflowJudge({
@@ -719,7 +691,7 @@ describeIfSelected('Plan Review skill evals', [
       judgeContext: 'a design plan review framework with 7 review passes',
       judgeGoal: 'how to review a plan for design quality using a 0-10 rating method: rate each dimension, explain what a 10 looks like, edit the plan to fix gaps, then re-rate',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // Block 3: Design skills
@@ -734,7 +706,7 @@ describeIfSelected('Design skill evals', ['design-review/SKILL.md fix loop', 'de
       judgeContext: 'a design audit triage and fix loop workflow',
       judgeGoal: 'how to triage design issues by severity, fix them atomically in source code, commit each fix, and re-verify with before/after screenshots',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('design-consultation/SKILL.md research', async () => {
     await runWorkflowJudge({
@@ -746,7 +718,7 @@ describeIfSelected('Design skill evals', ['design-review/SKILL.md fix loop', 'de
       judgeContext: 'a design consultation research and proposal workflow',
       judgeGoal: 'how to gather product context, research the competitive landscape, and produce a complete design system proposal with typography, color, spacing, and motion specifications',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // Block 4: Deploy skills
@@ -764,7 +736,7 @@ describeIfSelected('Deploy skill evals', [
       judgeContext: 'a merge-deploy-verify workflow for landing PRs to production',
       judgeGoal: 'how to merge a PR via GitHub CLI, wait for CI and deploy workflows (with platform-specific strategies for Fly.io/Render/Vercel/Netlify), run canary health checks on production, and offer revert if something breaks — with timing data logged for retrospectives',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('canary/SKILL.md monitoring loop', async () => {
     await runWorkflowJudge({
@@ -773,10 +745,10 @@ describeIfSelected('Deploy skill evals', [
       skillPath: 'canary/SKILL.md',
       startMarker: '### Phase 2: Baseline Capture',
       endMarker: '## Important Rules',
-      judgeContext: 'a post-deploy canary monitoring workflow using a headless browser daemon',
+      judgeContext: 'a post-deploy canary monitoring workflow driving a real browser (Aside first, the gstack headless browser as fallback)',
       judgeGoal: 'how to capture baseline screenshots and metrics before deploy, run a continuous monitoring loop checking each page every 60 seconds for console errors and performance regressions, fire alerts with evidence (screenshots), and produce a health report with per-page status and verdict',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('benchmark/SKILL.md perf collection', async () => {
     await runWorkflowJudge({
@@ -785,10 +757,10 @@ describeIfSelected('Deploy skill evals', [
       skillPath: 'benchmark/SKILL.md',
       startMarker: '### Phase 3: Performance Data Collection',
       endMarker: '## Important Rules',
-      judgeContext: 'a performance regression detection workflow using browser-based Web Vitals measurement',
+      judgeContext: 'a performance regression detection workflow using browser-based Web Vitals measurement (Aside first, the gstack headless browser as fallback)',
       judgeGoal: 'how to collect real performance metrics (TTFB, FCP, LCP, bundle sizes, request counts) via performance.getEntries(), compare against baselines with regression thresholds, produce a performance report with delta analysis, and track trends over time',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('setup-deploy/SKILL.md platform setup', async () => {
     await runWorkflowJudge({
@@ -800,7 +772,7 @@ describeIfSelected('Deploy skill evals', [
       judgeContext: 'a deployment configuration setup workflow that detects deploy platforms and writes config to CLAUDE.md',
       judgeGoal: 'how to detect deploy platforms (Fly.io, Render, Vercel, Netlify, Heroku, GitHub Actions, custom), gather platform-specific configuration (URLs, status commands, health checks, custom hooks), and persist everything to CLAUDE.md for future automated use',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // Block 5: Other skills
@@ -813,11 +785,11 @@ describeIfSelected('Other skill evals', [
       suite: 'Other skill evals',
       skillPath: 'retro/SKILL.md',
       startMarker: '## Instructions',
-      endMarker: '## Compare Mode',
+      endMarker: '## Tone',
       judgeContext: 'an engineering retrospective data gathering and analysis workflow',
       judgeGoal: 'how to gather git metrics (commit history, test counts, work patterns), analyze them, produce a structured retro report with praise, growth areas, and trend tracking',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('qa-only/SKILL.md workflow', async () => {
     await runWorkflowJudge({
@@ -829,7 +801,7 @@ describeIfSelected('Other skill evals', [
       judgeContext: 'a report-only QA testing workflow',
       judgeGoal: 'how to systematically QA test a web application and produce a structured report with health score, screenshots, and repro steps — without fixing anything',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 
   testIfSelected('gstack-upgrade/SKILL.md upgrade flow', async () => {
     await runWorkflowJudge({
@@ -841,7 +813,7 @@ describeIfSelected('Other skill evals', [
       judgeContext: 'a version upgrade detection and execution workflow',
       judgeGoal: 'how to detect install type, compare versions, back up current install, upgrade via git or fresh clone, run setup, and show what changed',
     });
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // Voice directive eval — tests that the voice section produces the right tone
@@ -904,7 +876,7 @@ ${voiceSection}`);
     expect(result.avoids_corporate).toBeGreaterThanOrEqual(4);
     expect(result.avoids_ai_vocabulary).toBeGreaterThanOrEqual(4);
     expect(result.connects_user_outcomes).toBeGreaterThanOrEqual(4);
-  }, 30_000);
+  }, JUDGE_MS);
 });
 
 // Module-level afterAll — finalize eval collector after all tests complete
