@@ -153,6 +153,11 @@ the new defaults.
 
 ### Setup
 
+Development and tests require Bun 1.4.0 or newer; CI pins and tests 1.4.0.
+Earlier Linux versions can close unrelated live file descriptors during
+subprocess garbage collection, causing intermittent browser and HTTP fixture
+failures ([upstream diagnosis](https://github.com/oven-sh/bun/issues/34785#issuecomment-5020318035)).
+
 ```bash
 # 1. Copy .env.example and add your API key
 cp .env.example .env
@@ -207,6 +212,7 @@ eval files, and misses the strict classifier. No API keys needed.
 - **Tier-alignment invariant** (`test/e2e-tier-alignment.test.ts`) — For every self-gated `test/skill-e2e-*.test.ts` named in a touchfiles dep list, the file's `EVALS_TIER` self-gate must match its declared tier in `E2E_TIERS`. Kills the "inert demotion" class where a test is re-tiered in `touchfiles.ts` but the file still gates on the old tier and keeps running in the wrong lane. Unmapped or mixed-tier files are reported, never silently skipped.
 - **Catalog budget** (`test/catalog-budget.test.ts`) — Caps the aggregate discovery surface: the sum of every skill's frontmatter `name` + `description` (what every host loads at discovery, every session) must stay under 1,150 token-equivalents, with a 260-byte per-skill cap. Counting goes through the shared census in `test/helpers/skill-census.ts` (physical files vs authored skills vs registry entries — three deliberately different counts). Adding a skill? The failure message carries the re-measure + ratchet protocol.
 - **Context-budget ratchet** (`test/context-budget-ratchet.test.ts`) — CI ceilings on the two token ledgers the catalog budget doesn't cover: the always-on full-frontmatter aggregate and each skill's per-invocation eager tokens (SKILL.md + forced-read references), graded against `test/fixtures/context-budget.json` via `lib/context-bill.ts`. New skills fail until they have a ceiling; ceilings for removed skills must be pruned. Legitimate growth or a landed reduction: re-run `bun test/helpers/capture-context-budget.ts` and commit the refreshed fixture in the same commit, so the change is a visible decision in the diff.
+- **Dependency security regressions** (`test/dependency-security.test.ts`) — Run `bun test test/dependency-security.test.ts` to check the resolved `sharp` and `adm-zip` version floors, load Sharp, verify ordinary ZIP extraction, and reject extraction through destination-file and destination-directory symlinks. The symlink cases skip Windows. These checks complement the OSV scan; they do not change its existing exceptions.
 
 ### Tier 2: E2E via `claude -p` (~$4.20/run)
 
@@ -433,7 +439,7 @@ Each host config (`hosts/*.ts`) controls:
 | Paths | `~/.claude/skills/gstack` vs `$GSTACK_ROOT` |
 | Tool names | "use the Bash tool" vs same (Factory rewrites to "run this command") |
 | Hook skills | `hooks:` frontmatter vs inline safety advisory prose |
-| Suppressed sections | None vs Codex self-invocation sections stripped |
+| Suppressed sections | GBrain blocks vs GBrain blocks and Review Army; Codex retains outside-review sections routed to Claude Code |
 | Model overlay | `claude` vs `gpt` (per-host `defaultModel`; `--model` or, at setup time, the Codex `config.toml` model overrides) |
 
 See `scripts/host-config.ts` for the full `HostConfig` interface.

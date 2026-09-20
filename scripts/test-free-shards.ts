@@ -252,6 +252,34 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
     file: 'browse/test/security-audit-r2.test.ts',
     reason: 'symlink-attack fixtures (evil-link) need Developer Mode CI runners lack; expect(toThrow) fires unhandled on Windows',
   },
+  // CSO comprehensive execution is qualified only for Linux containers behind
+  // the POSIX watchdog and Unix-domain registry broker. Keep the portable
+  // static/parser contracts in the Windows lane while leaving these exact
+  // containment suites to the Linux and macOS gates.
+  {
+    file: 'test/cso-preparation-adversarial.test.ts',
+    reason: 'exercises POSIX prepared-tree and archive-cache containment for qualified Linux Docker execution, which Windows does not admit',
+  },
+  {
+    file: 'test/cso-preparation-container.test.ts',
+    reason: 'asserts POSIX permission and symlink semantics for inert exports consumed by qualified Linux Docker execution',
+  },
+  {
+    file: 'test/cso-preparation-executor.test.ts',
+    reason: 'executes the Linux Docker acquisition path and its Unix-domain registry broker; comprehensive execution is unavailable on Windows',
+  },
+  {
+    file: 'test/cso-verification-cleanup.test.ts',
+    reason: 'spawns the POSIX detached watchdog used by contained repair verification, which Windows intentionally leaves unavailable',
+  },
+  {
+    file: 'test/cso-witness.test.ts',
+    reason: 'tests the contained repair witness with POSIX private-directory and compiled-helper assumptions; comprehensive execution is unavailable on Windows',
+  },
+  {
+    file: 'test/cso-scanner-cli.test.ts',
+    reason: 'drives the prebuilt POSIX CSO launcher with /usr/bin/git and a POSIX-only PATH; native Windows launcher behavior is covered by the dedicated cso-windows-launcher gate',
+  },
 ];
 
 // Force-include overrides: files a WINDOWS_FRAGILE_PATTERNS regex excludes for
@@ -259,6 +287,16 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
 // pattern hit is a false positive — the point of these files is Windows
 // coverage, so auto-excluding them defeats the regression tests they carry.
 const KNOWN_WINDOWS_SAFE: Array<{ file: string; reason: string }> = [
+  {
+    file: 'test/claude-code-windows-job.test.ts',
+    reason: 'invokes Bun directly; verifies Windows job containment at the standalone CLI boundary',
+  },
+  {
+    file: 'test/claude-code-runner.test.ts',
+    // The bin/ path is launched through process.execPath (Bun), never as a
+    // shebang executable. Keep taskkill tree supervision in the Windows lane.
+    reason: 'invokes the runner via Bun argv; fake CLI and timeout descendant assertions cover native Windows taskkill',
+  },
   {
     file: 'test/setup-windows-rerun-refresh.test.ts',
     // Trips the "spawns bin/ shebang script" pattern via path.join(..., 'bin',
@@ -1213,6 +1251,11 @@ export async function runFreeShard(
   env.TMPDIR = childTmp;
   env.TEMP = childTmp;
   env.TMP = childTmp;
+  // CLI renders otherwise attach to the repo's shared .gstack/browse.json,
+  // even with distinct Chromium profiles. Concurrent shards and surviving
+  // daemons from prior runs can then replace or remove each other's state.
+  // Override inherited state too; the shard owns this directory's cleanup.
+  env.BROWSE_STATE_FILE = path.join(stateDir, '.gstack', 'browse.json');
   // Per-shard Chromium profile (same isolation idea as TMPDIR): nine test
   // files launch in-process persistent contexts or daemons that default to
   // the SHARED ~/.gstack/chromium-profile, and two concurrent shards on one

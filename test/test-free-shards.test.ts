@@ -112,12 +112,32 @@ describe('test-free-shards: Windows curation', () => {
     const files = collectFreeTestFiles(ROOT);
     const result = curateWindowsSafe(files, ROOT);
     expect(result.safe.length + result.excluded.length).toBe(files.length);
+    // Its bin/ reference is passed to Bun argv, so it must exercise native
+    // Windows taskkill supervision instead of disappearing behind curation.
+    expect(result.safe).toContain('test/claude-code-runner.test.ts');
+    expect(result.safe).toContain('test/claude-code-windows-job.test.ts');
     // Sanity: at least one excluded entry, since we know test/ship-version-sync.test.ts uses /bin/bash
     expect(result.excluded.length).toBeGreaterThan(0);
     // Every excluded entry has a non-empty reason
     for (const { reason } of result.excluded) {
       expect(reason.length).toBeGreaterThan(0);
     }
+  });
+
+  test('excludes POSIX CSO helper suites while retaining portable image metadata coverage', () => {
+    const posixOnly = [
+      'test/cso-preparation-adversarial.test.ts',
+      'test/cso-preparation-container.test.ts',
+      'test/cso-preparation-executor.test.ts',
+      'test/cso-scanner-cli.test.ts',
+      'test/cso-verification-cleanup.test.ts',
+      'test/cso-witness.test.ts',
+    ];
+    const portable = ['test/cso-image-provisioning.test.ts', 'test/cso-public-ghcr.test.ts'];
+    const result = curateWindowsSafe([...posixOnly, ...portable], ROOT);
+    expect(result.safe).toEqual(portable);
+    expect(result.excluded.map(({ file }) => file).sort()).toEqual(posixOnly.sort());
+    for (const { reason } of result.excluded) expect(reason).toMatch(/Linux|POSIX|Windows/);
   });
 });
 
@@ -313,6 +333,59 @@ describe('test-free-shards: strict shard execution', () => {
       expect(seen.tmpExists).toBe(true);
       expect(seen.tmp).not.toBe(process.env.TMPDIR ?? '');
       expect(fs.existsSync(seen.tmp)).toBe(false);
+    } finally {
+      fs.rmSync(captureDir, { recursive: true, force: true });
+    }
+  });
+
+  test('concurrent shards isolate browser state and remove it on success or failure', async () => {
+    const captureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'free-shard-browse-'));
+    const inheritedState = path.join(captureDir, 'host-browse.json');
+    const parentState = process.env.BROWSE_STATE_FILE;
+    fs.writeFileSync(inheritedState, 'host daemon state');
+    try {
+      const outcomes = await Promise.all([0, 3].map((exitCode, index) => {
+        const dump = path.join(captureDir, `shard-${index}.json`);
+        const script = `
+          const fs = require('fs');
+          const path = require('path');
+          const { resolveConfig } = require(${JSON.stringify(path.join(ROOT, 'browse/src/config.ts'))});
+          const config = resolveConfig();
+          fs.mkdirSync(config.stateDir, { recursive: true });
+          fs.writeFileSync(config.stateFile, ${JSON.stringify(String(index))});
+          fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify({
+            state: process.env.BROWSE_STATE_FILE,
+            resolvedState: config.stateFile,
+            tmp: process.env.TMPDIR,
+            profile: process.env.CHROMIUM_PROFILE,
+            written: fs.readFileSync(config.stateFile, 'utf8'),
+          }));
+          console.log(${JSON.stringify(SUMMARY_1)});
+          process.exit(${exitCode});
+        `;
+        return runFreeShard(['browser-state'], index + 1, 2, {
+          env: { ...process.env, BROWSE_STATE_FILE: inheritedState },
+          commandFor: () => ({ command: process.execPath, args: ['-e', script] }),
+          quiet: true,
+          log: () => {},
+        });
+      }));
+      expect(outcomes.map((outcome) => outcome.status)).toEqual(['passed', 'failed']);
+      const seen = [0, 1].map((index) => JSON.parse(fs.readFileSync(path.join(captureDir, `shard-${index}.json`), 'utf8')));
+      expect(seen[0].state).not.toBe(seen[1].state);
+      expect(seen[0].profile).not.toBe(seen[1].profile);
+      for (const [index, shard] of seen.entries()) {
+        expect(shard.state).not.toBe(inheritedState);
+        expect(shard.resolvedState).toBe(shard.state);
+        expect(shard.written).toBe(String(index));
+        const ownedRoot = path.dirname(shard.tmp);
+        expect(path.relative(ownedRoot, shard.state)).toBe(path.join('.gstack', 'browse.json'));
+        expect(path.dirname(shard.profile)).toBe(ownedRoot);
+        expect(fs.existsSync(ownedRoot)).toBe(false);
+        expect(fs.existsSync(shard.state)).toBe(false);
+      }
+      expect(fs.readFileSync(inheritedState, 'utf8')).toBe('host daemon state');
+      expect(process.env.BROWSE_STATE_FILE).toBe(parentState);
     } finally {
       fs.rmSync(captureDir, { recursive: true, force: true });
     }

@@ -1,6 +1,6 @@
 {
   "name": "gstack",
-  "version": "1.84.1",
+  "version": "1.87.4",
   "description": "Garry's Stack — Claude Code skills + fast headless browser. One repo, one install, entire AI engineering workflow.",
   "license": "MIT",
   "type": "module",
@@ -10,6 +10,10 @@
   },
   "scripts": {
     "build": "bash scripts/build.sh",
+    "build:cso": "bash scripts/build-cso.sh",
+    "test:cso:docker": "bun test --max-concurrency 1 test/cso-docker-integration.test.ts test/cso-node-lifecycle-integration.test.ts test/cso-stack-cold-integration.test.ts",
+    "test:cso:macos": "bun test test/cso-macos-launcher.test.ts test/cso-registry-socket.test.ts",
+    "test:cso:windows": "bun test test/cso-windows-launcher.test.ts",
     "vendor:xterm": "mkdir -p extension/lib && cp node_modules/xterm/lib/xterm.js extension/lib/xterm.js && cp node_modules/xterm/css/xterm.css extension/lib/xterm.css && cp node_modules/xterm-addon-fit/lib/xterm-addon-fit.js extension/lib/xterm-addon-fit.js",
     "dev:make-pdf": "bun run make-pdf/src/cli.ts",
     "dev:design": "bun run design/src/cli.ts",
@@ -82,9 +86,9 @@
     "xterm-addon-fit": "^0.8.0"
   },
   "overrides": {
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "ip-address": "10.3.1",
-    "sharp": "0.35.0"
+    "sharp": "0.35.4"
   },
   "patchedDependencies": {
     "playwright-core@1.62.1": "patches/playwright-core@1.62.1.patch"
