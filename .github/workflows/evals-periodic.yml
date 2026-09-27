@@ -4,7 +4,7 @@ name: Periodic Evals
 # tests can't rot invisibly — the class where the autoplan-dual-voice E2E was
 # silently broken for months until a lucky local diff selected it. Engine:
 # scripts/test-paid-shards.ts (the same runner local eval:bg:periodic uses):
-# one planner manifest, 6 ordinary slices plus dedicated Autoplan slice 7, and a FAIL-CLOSED report — a slice
+# one planner manifest, 6 ordinary slices plus overlay and Autoplan slices, and a FAIL-CLOSED report — a slice
 # whose artifact never landed is a failure, not an absence. The gate-census
 # job is the weekly EVALS_ALL backstop for the gate tier (PR lanes are
 # diff-billed, so without it the full gate census might never execute
@@ -21,6 +21,9 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}/ci
+  EVALS_PROFILE: full
+  EVALS_FRESH: "1"
+  EVALS_CACHE_PURPOSE: periodic
 
 jobs:
   build-image:
@@ -78,29 +81,22 @@ jobs:
 
   plan-slices:
     runs-on: ubicloud-standard-8
-    needs: build-image
     timeout-minutes: 10
     permissions:
       contents: read
-      packages: read
-    container:
-      image: ${{ needs.build-image.outputs.image-tag }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --user runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - name: Restore deps
-        uses: ./.github/actions/restore-deps
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
 
       - name: Emit run manifest (ALL periodic tests minus reasoned excludes)
         env:
           EVALS_ALL: "1"
-        run: EVALS_TIER=periodic bun run scripts/test-paid-shards.ts --tier periodic --emit-plan /tmp/paid-plan/manifest.json --slices 7 --autoplan-slice
+        run: EVALS_TIER=periodic bun --no-install run scripts/test-paid-shards.ts --tier periodic --emit-plan /tmp/paid-plan/manifest.json --slices 8 --autoplan-slice
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -108,13 +104,23 @@ jobs:
           path: /tmp/paid-plan/manifest.json
           retention-days: 30
 
+      - name: Emit gate census manifest (ALL gate tests)
+        env:
+          EVALS_ALL: "1"
+        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/gate-census-plan/manifest.json --slices 7
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gate-census-plan
+          path: /tmp/gate-census-plan/manifest.json
+          retention-days: 30
+
   eval-slices:
     runs-on: ubicloud-standard-8
     needs: [build-image, plan-slices]
-    # Six ordinary slices retain their existing walls and concurrency. Slice 7
-    # runs only Autoplan: its specified 172min two-attempt wall leaves 28min
-    # for setup/upload. This is not a measured latency bound for ordinary work.
-    timeout-minutes: 200
+    # Eight slices retain every registered case and retry. The complete
+    # census needs at most 338 minutes per slice, plus 20 minutes setup/upload.
+    timeout-minutes: 358
     permissions:
       contents: read
       packages: read
@@ -127,7 +133,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slice: [1, 2, 3, 4, 5, 6, 7]
+        slice: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -165,7 +171,7 @@ jobs:
           name: paid-plan
           path: /tmp/paid-plan
 
-      - name: Run slice ${{ matrix.slice }}/7
+      - name: Run slice ${{ matrix.slice }}/8
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -189,6 +195,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: paid-slice-${{ matrix.slice }}-logs
+          include-hidden-files: true
           # The Fix-bun-temp step points TMPDIR at /home/runner/.cache, so the
           # runner's spool lands THERE, not /tmp — the original /tmp glob
           # uploaded nothing and a red slice's diagnostics were unreachable.
@@ -204,8 +211,9 @@ jobs:
   # selector logic has free synthetic-diff contract tests.
   gate-census:
     runs-on: ubicloud-standard-8
-    needs: build-image
-    timeout-minutes: 300
+    needs: [build-image, plan-slices]
+    # Seven slices need at most 304m each, plus 20 minutes setup/upload.
+    timeout-minutes: 352
     permissions:
       contents: read
       packages: read
@@ -215,6 +223,12 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       options: --user runner
+    strategy:
+      # Four file workers total, each retaining two in-file case workers.
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        slice: [1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -234,23 +248,27 @@ jobs:
 
       - run: bun run build
 
-      - name: Run full gate census
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: gate-census-plan
+          path: /tmp/gate-census-plan
+
+      - name: Run gate census slice ${{ matrix.slice }}/7
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
-          EVALS_ALL: "1"
-          EVALS_JOBS: "4"
+          EVALS_JOBS: "1"
           EVALS_CONCURRENCY: "2"
           GSTACK_EVAL_DIR: /tmp/gate-census-results
-        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate
+        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --plan /tmp/gate-census-plan/manifest.json --slice ${{ matrix.slice }}
 
       - name: Upload census results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: gate-census
+          name: gate-census-${{ matrix.slice }}
           path: /tmp/gate-census-results
           retention-days: 90
 
@@ -275,8 +293,6 @@ jobs:
         with:
           bun-version: 1.4.0
 
-      - run: bun install --frozen-lockfile
-
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: paid-plan
@@ -288,22 +304,42 @@ jobs:
           path: /tmp/paid-report
           merge-multiple: true
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: gate-census-plan
+          path: /tmp/gate-census-report
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: gate-census-[0-9]*
+          path: /tmp/gate-census-report
+          merge-multiple: true
+
       - name: Reconcile slices against the manifest (fail-closed)
         id: reconcile
+        if: always()
         run: |
           set +e
-          EVALS_TIER=periodic bun run scripts/test-paid-shards.ts --tier periodic --report /tmp/paid-report | tee /tmp/report.txt
+          EVALS_TIER=periodic bun --no-install run scripts/test-paid-shards.ts --tier periodic --report /tmp/paid-report | tee /tmp/report.txt
           # PIPESTATUS[0], NOT $?: GitHub's default run-step shell is
           # `bash -e {0}` with NO pipefail, so $? after the pipe is tee's
           # exit (always 0) — the fail-closed gate was silently fail-open
           # (caught by the ship review army; the wiring test now pins this).
           echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
+      - name: Reconcile gate census against the manifest (fail-closed)
+        id: gate-reconcile
+        if: always()
+        run: |
+          set +e
+          EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --report /tmp/gate-census-report | tee /tmp/gate-report.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
       # A red weekly lane nobody must action is waste — upsert ONE tracking
       # issue (never a new issue per week) with the reconciliation output, so
       # failures have an owner-visible artifact with history in one place.
       - name: Upsert tracking issue on failure
-        if: steps.reconcile.outputs.exit != '0' || needs.gate-census.result == 'failure'
+        if: always() && (steps.reconcile.outputs.exit != '0' || steps.gate-reconcile.outputs.exit != '0' || needs.eval-slices.result != 'success' || needs.gate-census.result != 'success')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -314,10 +350,16 @@ jobs:
             echo "Automated weekly report — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
             echo "- periodic reconciliation exit: ${{ steps.reconcile.outputs.exit }}"
+            echo "- periodic slices job: ${{ needs.eval-slices.result }}"
+            echo "- gate census reconciliation exit: ${{ steps.gate-reconcile.outputs.exit }}"
             echo "- gate census job: ${{ needs.gate-census.result }}"
             echo
             echo '```'
             tail -c 6000 /tmp/report.txt 2>/dev/null || echo "(no reconciliation output)"
+            echo '```'
+            echo
+            echo '```'
+            tail -c 6000 /tmp/gate-report.txt 2>/dev/null || echo "(no gate census reconciliation output)"
             echo '```'
             echo
             echo "Exclusion policy: test/helpers/periodic-exclude-data.ts (every entry needs reason + tracking; removal re-activates the file next week)."
@@ -331,5 +373,5 @@ jobs:
           fi
 
       - name: Fail the workflow when reconciliation failed
-        if: steps.reconcile.outputs.exit != '0'
+        if: always() && (steps.reconcile.outputs.exit != '0' || steps.gate-reconcile.outputs.exit != '0' || needs.eval-slices.result != 'success' || needs.gate-census.result != 'success')
         run: exit 1

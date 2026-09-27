@@ -1,17 +1,22 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { JUDGE_MS, CAPTURE_MS } from './helpers/eval-budgets';
-import { runSkillTest } from './helpers/session-runner';
+import { runSkillTest, SESSION_DRAIN_GRACE_MS } from './helpers/session-runner';
+import { runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS } from './helpers/office-hours-attempt';
+import { resolveEvalModel } from '../lib/eval-model';
 import {
   ROOT, runId, describeIfSelected, testConcurrentIfSelected,
   logCost, recordE2E, createEvalCollector, finalizeEvalCollector,
 } from './helpers/e2e-helpers';
-import { extractSkillSections, REVIEW_ARMY_E2E_SECTIONS } from './helpers/skill-fixture';
+import { extractSkillSections, REVIEW_ARMY_E2E_SECTIONS, sliceBetween } from './helpers/skill-fixture';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
 const evalCollector = createEvalCollector('e2e-review-army');
+// Let capture cleanup and assertions settle before Bun retries or
+// removes its shared fixture. This adds no model work time.
+const CAPTURE_FINALIZE_MS = SESSION_DRAIN_GRACE_MS + 5_000;
 
 // Helper: create a git repo with a feature branch
 function setupRepo(prefix: string): { dir: string; run: (cmd: string, args: string[]) => void } {
@@ -141,6 +146,8 @@ Write your findings to ${dir}/review-output.md`,
 
 // --- Review Army: N+1 Performance ---
 
+let nPlusOneCaptureSequence = 0;
+
 describeIfSelected('Review Army: N+1 Performance', ['review-army-perf-n-plus-one'], () => {
   let dir: string;
 
@@ -176,21 +183,30 @@ Run Step 4 (Critical pass) then Step 4.5 (Review Army).
 The base branch is main. This is a Ruby backend file, so Performance specialist should activate.
 
 For the specialist dispatch, read review-specialists/performance.md and apply it against the diff.
+The Performance focus does not waive the skill's conditional Red Team dispatch. If a specialist
+produces a CRITICAL finding, dispatch a separate foreground Red Team subagent and merge its findings.
 
-Write your findings to ${dir}/review-output.md`,
+Write all required review outputs to ${dir}/review-output.md. After saving the report,
+finish with a brief acknowledgement rather than repeating the findings in the final response.`,
       workingDirectory: dir,
       maxTurns: 20,
       timeout: CAPTURE_MS,
       testName: 'review-army-perf-n-plus-one',
-      runId,
+      runId: `${process.env.EVALS_RUN_ID ?? runId}-review-n-plus-one-${process.pid}-${++nPlusOneCaptureSequence}`,
     });
 
     logCost('/review army n+1', result);
-    recordE2E(evalCollector, '/review army N+1 detection', 'Review Army', result);
-    expect(result.exitReason).toBe('success');
+    let passed = false;
+    try {
+      expect(result.exitReason).toBe('success');
+      expect(result.toolCalls.some(call =>
+        ['Agent', 'Task'].includes(call.tool)
+        && /\bred[ -]team\b/i.test(call.input.description ?? call.input.subagent_type ?? '')
+        && call.input.run_in_background === false,
+      )).toBe(true);
 
-    const outputPath = path.join(dir, 'review-output.md');
-    if (fs.existsSync(outputPath)) {
+      const outputPath = path.join(dir, 'review-output.md');
+      expect(fs.existsSync(outputPath)).toBe(true);
       const content = fs.readFileSync(outputPath, 'utf-8').toLowerCase();
       const hasN1Finding =
         content.includes('n+1') ||
@@ -201,8 +217,11 @@ Write your findings to ${dir}/review-output.md`,
         content.includes('query') ||
         content.includes('loop');
       expect(hasN1Finding).toBe(true);
+      passed = result.browseErrors.length === 0;
+    } finally {
+      recordE2E(evalCollector, '/review army N+1 detection', 'Review Army', result, { passed });
     }
-  }, CAPTURE_MS);
+  }, CAPTURE_MS + CAPTURE_FINALIZE_MS);
 });
 
 // --- Review Army: Delivery Audit ---
@@ -323,38 +342,51 @@ describeIfSelected('Review Army: Quality Score', ['review-army-quality-score'], 
     repo.run('git', ['commit', '-m', 'initial']);
 
     repo.run('git', ['checkout', '-b', 'feature/add-controller']);
-    // Code with obvious issues for quality score computation
+    // Real source for one defect and one legitimate optional simplification.
     fs.writeFileSync(path.join(dir, 'user_controller.rb'), `class UserController
   def create
-    # SQL injection
     User.where("name = '#{params[:name]}'")
-    # Magic number
-    if users.count > 42
-      raise "too many"
-    end
+  end
+
+  def lookup
+    User.find(NumberParser.parse(params[:id]))
+  end
+end
+`);
+    fs.writeFileSync(path.join(dir, 'number_parser.rb'), `class NumberParser
+  def self.parse(value)
+    Integer(value)
   end
 end
 `);
     repo.run('git', ['add', '.']);
     repo.run('git', ['commit', '-m', 'add user controller']);
 
-    copyReviewFiles(dir);
+    // Use the actual merge stage without copying its classification or score
+    // logic into the prompt. The supplied malformed metadata is the regression.
+    fs.writeFileSync(path.join(dir, 'review-merge.md'), sliceBetween(
+      readReviewSection('review-army.md'), '### Step 4.6: Collect and merge findings', '### Red Team dispatch',
+    ));
+    fs.writeFileSync(path.join(dir, 'specialist-findings.jsonl'), [
+      { severity: 'CRITICAL', advisory: true, confidence: 9, path: 'user_controller.rb', line: 3,
+        category: 'injection', summary: 'Interpolating params[:name] into SQL allows injection.',
+        fix: 'Use a parameterized query.', fingerprint: 'user_controller.rb:3:injection', specialist: 'security' },
+      { severity: 'INFORMATIONAL', advisory: true, confidence: 8, path: 'number_parser.rb', line: 1,
+        category: 'stdlib-wrapper', summary: 'The one-method NumberParser wrapper only forwards to Integer.',
+        fix: 'Optionally call Integer directly in lookup and remove the wrapper.',
+        fingerprint: 'number_parser.rb:1:stdlib-wrapper', specialist: 'simplification', lines_removable: 5 },
+    ].map(finding => JSON.stringify(finding)).join('\n') + '\n');
   });
 
   afterAll(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} });
 
   testConcurrentIfSelected('review-army-quality-score', async () => {
+    const before = ['user_controller.rb', 'number_parser.rb'].map(file => fs.readFileSync(path.join(dir, file), 'utf8'));
     const result = await runSkillTest({
-      prompt: `You are in a git repo with a vulnerable user controller.
-Read review-SKILL.md and review-checklist.md.
-Skip preamble, lake intro, telemetry.
-
-Run the Critical pass (Step 4) against the diff (git diff main...HEAD).
-Then compute the PR Quality Score as described in the Review Army merge step:
-quality_score = max(0, 10 - (critical_count * 2 + informational_count * 0.5))
-
-Write your findings AND the computed quality score to ${dir}/review-output.md
-Include the line: "PR Quality Score: X/10" where X is the computed score.`,
+      prompt: `Replay the completed specialist results in specialist-findings.jsonl through the actual Collect and merge instructions in review-merge.md. Read user_controller.rb and number_parser.rb to verify these findings against the source.
+This capture covers only the merge, classification, and scoring stage: do not dispatch additional reviewers, discover unrelated findings, or enter Fix-First. Do not edit application source.
+Write the standard merged findings report to ${dir}/review-output.md.
+Also write ${dir}/merged-review.json as one JSON object with findings (all final merged finding records, including optional advice), critical_count, informational_count, issues_found (defect count), and quality_score. Preserve each finding's final severity, category, and advisory classification in that artifact.`,
       workingDirectory: dir,
       maxTurns: 15,
       timeout: JUDGE_MS,
@@ -363,17 +395,34 @@ Include the line: "PR Quality Score: X/10" where X is the computed score.`,
     });
 
     logCost('/review army quality', result);
-    recordE2E(evalCollector, '/review army quality score', 'Review Army', result);
-    expect(result.exitReason).toBe('success');
-
-    const outputPath = path.join(dir, 'review-output.md');
-    if (fs.existsSync(outputPath)) {
+    let passed = false, failure: unknown;
+    try {
+      expect(result.exitReason).toBe('success');
+      expect(result.toolCalls.length).toBeGreaterThan(0);
+      const outputPath = path.join(dir, 'review-output.md');
+      expect(fs.existsSync(outputPath)).toBe(true);
       const content = fs.readFileSync(outputPath, 'utf-8');
-      // Should contain a quality score
-      const hasScore =
-        content.toLowerCase().includes('quality score') ||
-        content.match(/\d+\/10/);
-      expect(hasScore).toBeTruthy();
+      const merged = JSON.parse(fs.readFileSync(path.join(dir, 'merged-review.json'), 'utf8'));
+      expect(merged).toMatchObject({ critical_count: 1, informational_count: 0, issues_found: 1, quality_score: 8 });
+      expect(merged.findings).toHaveLength(2);
+      const defect = merged.findings.find((finding: any) => finding.category === 'injection');
+      expect(defect).toMatchObject({ severity: 'CRITICAL', specialist: 'security' });
+      expect(defect.advisory).not.toBe(true);
+      const advice = merged.findings.find((finding: any) => finding.category === 'stdlib-wrapper');
+      expect(advice).toMatchObject({ severity: 'INFORMATIONAL', advisory: true, specialist: 'simplification' });
+      expect(content).toMatch(/SPECIALIST REVIEW:\s*1 findings?\s*\(1 critical, 0 informational\)/i);
+      expect(content).toMatch(/PR Quality Score:\s*8(?:\.0)?\/10/i);
+      expect(content).toContain('[ADVISORY]');
+      expect(['user_controller.rb', 'number_parser.rb'].map(file => fs.readFileSync(path.join(dir, file), 'utf8'))).toEqual(before);
+      passed = true;
+    } catch (cause) {
+      failure = cause;
+      throw cause;
+    } finally {
+      recordE2E(evalCollector, 'review-army-quality-score', 'Review Army', result, {
+        passed, error: failure ? String(failure) : undefined,
+        exit_reason: passed ? 'success' : result.exitReason === 'success' ? 'assertion_failed' : result.exitReason,
+      });
     }
   }, CAPTURE_MS);
 });
@@ -488,8 +537,15 @@ describeIfSelected('Review Army: Red Team', ['review-army-red-team'], () => {
   afterAll(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} });
 
   testConcurrentIfSelected('review-army-red-team', async () => {
-    const result = await runSkillTest({
-      prompt: `You are reviewing a large diff (300+ lines). Read review-SKILL.md.
+    await runRecordedOfficeHoursAttempt({
+      collector: evalCollector,
+      name: '/review army red team',
+      suite: 'Review Army',
+      model: process.env.EVALS_MODEL ?? resolveEvalModel('capture'),
+      budgetMs: CAPTURE_MS,
+      run: (signal) => runSkillTest({
+        signal,
+        prompt: `You are reviewing a large diff (300+ lines). Read review-SKILL.md.
 Skip preamble, lake intro, telemetry.
 
 The diff is large enough to activate the Red Team specialist.
@@ -498,23 +554,24 @@ Focus on finding issues that other specialists might miss.
 
 Write your red team findings to ${dir}/review-output.md
 Start the file with "RED TEAM REVIEW" on the first line.`,
-      workingDirectory: dir,
-      maxTurns: 20,
-      timeout: CAPTURE_MS,
-      testName: 'review-army-red-team',
-      runId,
+        workingDirectory: dir,
+        maxTurns: 20,
+        timeout: CAPTURE_MS,
+        testName: 'review-army-red-team',
+        runId,
+      }),
+      validate: async (result) => {
+        logCost('/review army red-team', result);
+        expect(result.exitReason).toBe('success');
+
+        const outputPath = path.join(dir, 'review-output.md');
+        if (fs.existsSync(outputPath)) {
+          const content = fs.readFileSync(outputPath, 'utf-8');
+          expect(content.toLowerCase()).toMatch(/red team|adversarial/);
+        }
+      },
     });
-
-    logCost('/review army red-team', result);
-    recordE2E(evalCollector, '/review army red team', 'Review Army', result);
-    expect(result.exitReason).toBe('success');
-
-    const outputPath = path.join(dir, 'review-output.md');
-    if (fs.existsSync(outputPath)) {
-      const content = fs.readFileSync(outputPath, 'utf-8');
-      expect(content.toLowerCase()).toMatch(/red team|adversarial/);
-    }
-  }, CAPTURE_MS);
+  }, CAPTURE_MS + OFFICE_HOURS_BUN_GRACE_MS);
 });
 
 // --- Review Army: Consensus (periodic) ---
@@ -594,7 +651,7 @@ Write findings to ${dir}/review-output.md`,
       recordE2E(evalCollector, '/review army consensus', 'Review Army', result, { passed });
     }
     // The runner can drain stderr for 5s after exit; reserve 1s for assertions/recording.
-  }, CAPTURE_MS + 6_000);
+  }, CAPTURE_MS + CAPTURE_FINALIZE_MS);
 });
 
 // --- Review Army: Simplification specialist (activation) ---

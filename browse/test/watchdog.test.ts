@@ -43,8 +43,7 @@ afterEach(async () => {
   // Kill any survivors so subsequent tests get a clean slate.
   try { parentProc?.kill('SIGKILL'); } catch {}
   try { serverProc?.kill('SIGKILL'); } catch {}
-  // Give processes a moment to exit before tmpDir cleanup.
-  await Bun.sleep(100);
+  await Promise.all([parentProc?.exited, serverProc?.exited]);
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   parentProc = null;
   serverProc = null;
@@ -209,12 +208,12 @@ describe('headed parent-death shutdown is suppressed on runtime promotion', () =
 
   test('the server binds that callback to the suppress-flag setter', () => {
     const src = read('src/server.ts');
-    expect(src).toContain('function suppressHeadedParentShutdown()');
+    expect(src).toContain('function suppressHeadedParentShutdown(');
     // Bound on BOTH the module-level manager and any embedder-supplied one; the
     // watchdog reads activeBrowserManager, so binding only the default instance
     // leaves embedders (e.g. gbrowser) promoting silently.
     expect(src).toContain('browserManager.onHeadedPromotion = suppressHeadedParentShutdown');
-    expect(src).toContain('cfgBrowserManager.onHeadedPromotion = suppressHeadedParentShutdown');
+    expect(src).toContain('cfgBrowserManager.onHeadedPromotion = () => suppressHeadedParentShutdown(cfg.config, cfgBrowserManager)');
   });
 
   test('promotion must NOT clear the interval — the tick doubles as the tunnel-orphan reaper', () => {
@@ -316,7 +315,13 @@ describe('suppressed watchdog still reaps tunnel orphans (behavioral)', () => {
   });
 
   test('CRITICAL: suppression active + tunnel live — parent death still shuts down', async () => {
-    const exitMock = mock((_code?: number) => {});
+    let resolveExit!: () => void;
+    let exitDeadline!: ReturnType<typeof setTimeout>;
+    const exited = new Promise<void>((resolve, reject) => {
+      resolveExit = resolve;
+      exitDeadline = setTimeout(() => reject(new Error('Watchdog shutdown did not exit within 3s')), 3_000);
+    });
+    const exitMock = mock((_code?: number) => { resolveExit(); });
     const originalExit = process.exit;
     (process as any).exit = exitMock;
     try {
@@ -324,12 +329,13 @@ describe('suppressed watchdog still reaps tunnel orphans (behavioral)', () => {
       __testInternals__.suppressHeadedParentShutdown();
       __testInternals__.setTunnelActive(true); // handoff → resume → /pair-agent tunnel
       __testInternals__.parentWatchdogTick(DEAD_PID);
-      await drainShutdown();
+      await exited;
       // The tick is the ONLY reaper for tunnel orphans (idle timeout is
       // disabled in tunnel mode). If this fails, an internet-exposed daemon
       // outlives its parent forever.
       expect(exitMock).toHaveBeenCalled();
     } finally {
+      clearTimeout(exitDeadline);
       (process as any).exit = originalExit;
     }
   });

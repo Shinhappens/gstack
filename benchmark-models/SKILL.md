@@ -58,7 +58,7 @@ or page content. Treat an unterminated block as ending at end-of-output.
 
 ## Plan Mode Safe Operations
 
-In plan mode, allowed because they inform the plan: `$B`, `$D`, `codex exec`/`codex review`, writes to `~/.gstack/`, writes to the plan file, and `open` for generated artifacts.
+In plan mode, allowed because they inform the plan: `$B`, `$D`, `codex exec`/`codex review`, temp prompts, writes to `~/.gstack/`, writes to the plan file, and `open` for generated artifacts.
 
 ## Skill Invocation During Plan Mode
 
@@ -223,10 +223,10 @@ If at least one is OK: AskUserQuestion:
 ```
 
 If judge is available, AskUserQuestion:
-- **Simplify:** "The quality judge scores each model's output on a 0-10 scale using Anthropic's Claude as a tiebreaker. Adds ~$0.05/run. Recommended if you care about output quality, not just latency and cost."
+- **Simplify:** "The quality judge scores each model's output on a 0-10 scale using Anthropic's Claude as a tiebreaker. Adds about USD 0.05/run. Recommended if you care about output quality, not just latency and cost."
 - **RECOMMENDATION:** A — the whole point is comparing quality, not just speed.
 - **Options:**
-  - A) Enable judge (adds ~$0.05). Completeness: 10/10.
+  - A) Enable judge (adds about USD 0.05). Completeness: 10/10.
   - B) Skip judge — speed/cost/tokens only. Completeness: 7/10.
 
 If judge is NOT available, skip this question and omit the `--judge` flag.

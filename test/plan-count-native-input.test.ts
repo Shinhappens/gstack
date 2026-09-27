@@ -81,7 +81,7 @@ const pending = (): NativePlanQuestionCall => ({
 describe('native AUQ accepts one action per displayed question', () => {
   test('mode permission history releases a fresh identical viewport grant', () => {
     const seen = new Set<string>();
-    const permission = 'Do you want to create PLAN.md?\n❯1.Yes\n2.Yes, and switch to accept edits\n3.No\nEsc to cancel · Tab to amend\n';
+    const permission = 'Do you want to create PLAN.md?\n❯1.Yes\n2.Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session (shift+tab)\n3.No\nEsc to cancel · Tab to amend\n';
     expect(nextCeoModeNavigation(permission, 'HOLD SCOPE', seen, undefined, '')).toEqual({
       kind: 'permission', input: '1\r',
     });
@@ -234,7 +234,7 @@ describe('native AUQ accepts one action per displayed question', () => {
     const fp = capturePlanCountQuestion(nextScreen, new Set(), 0, false, next)!;
     expect(planCountQuestionInput(nextScreen, fp, 1)).toBe('1');
     const permission =
-      'Do you want to create PLAN.md?\n❯1.Yes\n2.Yes, and switch to accept edits\n3.No\nEsc to cancel · Tab to amend\n';
+      'Do you want to create PLAN.md?\n❯1.Yes\n2.Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session (shift+tab)\n3.No\nEsc to cancel · Tab to amend\n';
     const grant = nextCeoModeNavigation(
       permission,
       'SCOPE EXPANSION',
@@ -360,7 +360,7 @@ const render = () => {
   let screen = '';
   if (permission)
     screen =
-      'Do you want to create PLAN.md?\n❯1.Yes\n2.Yes, and switch to accept edits\n3.No\nEsc to cancel · Tab to amend\n';
+      'Do you want to create PLAN.md?\n❯1.Yes\n2.Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session (shift+tab)\n3.No\nEsc to cancel · Tab to amend\n';
   else if (index < questions.length)
     screen =
       '← ' +
@@ -445,6 +445,7 @@ process.stdin.on('data', (data) => {
 });
 process.on('SIGINT', () => process.exit(0));
 process.stdin.resume();
+process.stdout.write('PTY_READY:' + item.record + '\x1b[2J\x1b[H');
 `,
       );
       fs.chmodSync(fake, 0o755);
@@ -459,6 +460,7 @@ const results = await Promise.all(cases.map(async item => ({
     skillName: 'plan-eng-review',
     slashCommand: '/plan-eng-review',
     followUpPrompt: 'Review only this fixture.',
+    startupReadyMarker: 'PTY_READY:' + item.record,
     isLastStep0AUQ: () => false,
     isReviewAUQ: () => true,
     firstAUQPick: item.designQuestions ? undefined : () => 2,

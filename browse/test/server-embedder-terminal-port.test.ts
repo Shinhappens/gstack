@@ -1,6 +1,7 @@
-import { describe, test, expect, beforeEach, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeEach, beforeAll, afterAll, spyOn } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import * as crypto from 'crypto';
 import {
   buildFetchHandler,
@@ -33,7 +34,11 @@ import { resolveConfig } from '../src/config';
 // Use isProcessAlive's false branch by also testing with a PID that does
 // not exist (negative PID rejected by the OS).
 
-const stateDir = resolveConfig().stateDir;
+const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-server-embedder-'));
+const fixtureConfig = resolveConfig({ BROWSE_STATE_FILE: path.join(fixtureDir, 'state/browse.json') });
+const stateDir = fixtureConfig.stateDir;
+const savedChromiumProfile = process.env.CHROMIUM_PROFILE;
+beforeAll(() => { process.env.CHROMIUM_PROFILE = path.join(fixtureDir, 'chromium-profile'); });
 const PORT_FILE = path.join(stateDir, 'terminal-port');
 const TOKEN_FILE = path.join(stateDir, 'terminal-internal-token');
 const AGENT_RECORD_FILE = path.join(stateDir, 'terminal-agent-pid');
@@ -49,7 +54,7 @@ function makeMinimalConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
   return {
     authToken: token,
     browsePort: 34568,
-    config: resolveConfig(),
+    config: fixtureConfig,
     browserManager: new BrowserManager(),
     startTime: Date.now(),
     ...overrides,
@@ -97,6 +102,9 @@ afterAll(async () => {
   // suite died at file 47 with exit 0 and no summary — twice).
   await new Promise((r) => setTimeout(r, 3500));
   (process as any).exit = TRUE_EXIT;
+  if (savedChromiumProfile === undefined) delete process.env.CHROMIUM_PROFILE;
+  else process.env.CHROMIUM_PROFILE = savedChromiumProfile;
+  fs.rmSync(fixtureDir, { recursive: true, force: true });
 });
 
 async function withStubs(
@@ -143,43 +151,6 @@ function terminationCalls(
 }
 
 describe('buildFetchHandler ownsTerminalAgent gate', () => {
-  // shutdown() reads `path.dirname(config.stateFile)` from module-level config
-  // (composition gap — see TODOS T9). So unlinks target the real state dir,
-  // not a per-test temp dir. If a real gstack daemon is running on this host,
-  // its terminal-port + terminal-internal-token + terminal-agent-pid live
-  // where this test writes. Save + restore real-daemon file contents around
-  // the whole suite so the test never clobbers a developer's running session.
-  let realPortBackup: string | null = null;
-  let realTokenBackup: string | null = null;
-  let realAgentRecordBackup: string | null = null;
-
-  beforeAll(() => {
-    realPortBackup = readIfExists(PORT_FILE);
-    realTokenBackup = readIfExists(TOKEN_FILE);
-    realAgentRecordBackup = readIfExists(AGENT_RECORD_FILE);
-  });
-
-  afterAll(() => {
-    if (realPortBackup !== null) {
-      fs.mkdirSync(stateDir, { recursive: true });
-      fs.writeFileSync(PORT_FILE, realPortBackup);
-    } else {
-      try { fs.unlinkSync(PORT_FILE); } catch {}
-    }
-    if (realTokenBackup !== null) {
-      fs.mkdirSync(stateDir, { recursive: true });
-      fs.writeFileSync(TOKEN_FILE, realTokenBackup);
-    } else {
-      try { fs.unlinkSync(TOKEN_FILE); } catch {}
-    }
-    if (realAgentRecordBackup !== null) {
-      fs.mkdirSync(stateDir, { recursive: true });
-      fs.writeFileSync(AGENT_RECORD_FILE, realAgentRecordBackup);
-    } else {
-      try { fs.unlinkSync(AGENT_RECORD_FILE); } catch {}
-    }
-  });
-
   beforeEach(() => {
     __resetRegistry();
     __resetShuttingDown();
@@ -247,5 +218,84 @@ describe('buildFetchHandler ownsTerminalAgent gate', () => {
     // The pattern looks for the trailing comma and trailing context so the
     // match cannot be satisfied by the JSDoc reference earlier in the file.
     expect(source).toMatch(/ownsTerminalAgent:\s*true,\s*\/\/\s*CLI spawns terminal-agent\.ts/);
+  });
+
+  test('5. shutdown cannot remove a successor published after its current-record read', async () => {
+    writeSentinels();
+    const ready = path.join(fixtureDir, 'competitor-ready');
+    const script = path.join(fixtureDir, 'competitor.ts');
+    fs.writeFileSync(script, `
+      import * as fs from 'fs';
+      import * as path from 'path';
+      import { acquireAgentStateLock } from ${JSON.stringify(path.resolve(import.meta.dir, '../src/terminal-agent-control.ts'))};
+      const stateDir = process.argv[2];
+      fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
+      const release = acquireAgentStateLock(stateDir);
+      try {
+        fs.writeFileSync(path.join(stateDir, 'terminal-port'), 'successor-port');
+        fs.writeFileSync(path.join(stateDir, 'terminal-internal-token'), 'synthetic-successor-token');
+        fs.writeFileSync(path.join(stateDir, 'terminal-agent-pid'), JSON.stringify({ pid: process.pid, gen: 'successor', startedAt: Date.now() }));
+      } finally { release(); }
+    `);
+    const originalRead = fs.readFileSync;
+    let recordReads = 0;
+    let actor: ReturnType<typeof Bun.spawn> | undefined;
+    const reader = spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, options?: any) => {
+      const result = originalRead(file as any, options);
+      if (String(file) === AGENT_RECORD_FILE && ++recordReads === 2) {
+        actor = Bun.spawn([process.execPath, script, stateDir], { stdio: ['ignore', 'ignore', 'ignore'] });
+        const deadline = Date.now() + 3000;
+        while (!fs.existsSync(ready) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        if (!fs.existsSync(ready)) throw new Error('competitor never reached publication');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+      }
+      return result;
+    }) as typeof fs.readFileSync);
+    try {
+      const handle = buildFetchHandler(makeMinimalConfig({ ownsTerminalAgent: true }));
+      await withStubs(async () => runShutdown(handle));
+      expect(recordReads).toBeGreaterThanOrEqual(2);
+      expect(actor).toBeDefined();
+      expect(await Promise.race([actor!.exited.then(() => true), Bun.sleep(5000).then(() => false)])).toBe(true);
+      expect(readIfExists(PORT_FILE)).toBe('successor-port');
+      expect(readIfExists(TOKEN_FILE)).toBe('synthetic-successor-token');
+      expect(JSON.parse(readIfExists(AGENT_RECORD_FILE)!)).toMatchObject({ gen: 'successor' });
+    } finally {
+      reader.mockRestore();
+      try { actor?.kill('SIGKILL'); } catch {}
+      fs.rmSync(ready, { force: true });
+      fs.rmSync(script, { force: true });
+    }
+  }, 15000);
+
+  test('6. unavailable state lock retains agent files rather than guessing ownership', async () => {
+    writeSentinels();
+    const originalOpen = fs.openSync;
+    const opened = spyOn(fs, 'openSync').mockImplementation(((file: fs.PathLike, flags: string | number, mode?: number) => {
+      if (String(file) === path.join(stateDir, 'terminal-agent-pid.lock')) {
+        throw Object.assign(new Error('synthetic lock denial'), { code: 'EACCES' });
+      }
+      return originalOpen(file, flags as any, mode);
+    }) as typeof fs.openSync);
+    try {
+      const handle = buildFetchHandler(makeMinimalConfig({ ownsTerminalAgent: true }));
+      await withStubs(async () => runShutdown(handle));
+      expect(readIfExists(PORT_FILE)).toBe(SENTINEL_PORT);
+      expect(readIfExists(TOKEN_FILE)).toBe(SENTINEL_TOKEN);
+      expect(readIfExists(AGENT_RECORD_FILE)).not.toBeNull();
+    } finally { opened.mockRestore(); }
+  });
+
+  test('7. late state takeover is not removed after browser close', async () => {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(fixtureConfig.stateFile, JSON.stringify({ pid: process.pid }));
+    const successor = { pid: process.pid, instanceId: 'synthetic-late-successor' };
+    const browserManager = new BrowserManager();
+    browserManager.close = async () => { fs.writeFileSync(fixtureConfig.stateFile, JSON.stringify(successor)); };
+    try {
+      const handle = buildFetchHandler(makeMinimalConfig({ browserManager, ownsTerminalAgent: false }));
+      await withStubs(async () => runShutdown(handle));
+      expect(JSON.parse(fs.readFileSync(fixtureConfig.stateFile, 'utf8'))).toEqual(successor);
+    } finally { fs.rmSync(fixtureConfig.stateFile, { force: true }); }
   });
 });

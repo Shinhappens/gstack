@@ -148,6 +148,8 @@ function splitFrontmatter(raw: string, file: string): { frontmatter: string; bod
  * output format, the /context-save checkpoint template), NOT section
  * boundaries. Fences close only on a matching char of >= opening length,
  * per CommonMark, so 4-backtick fences embedding 3-backtick blocks work.
+ * Standalone generated STOP-Read blocks between horizontal rules replace
+ * entire carved steps and end the preceding H2. Nested pointers stay inside it.
  */
 function scanH2Sections(bodyLines: string[]): H2Section[] {
   const sections: H2Section[] = [];
@@ -166,12 +168,23 @@ function scanH2Sections(bodyLines: string[]): H2Section[] {
       }
       continue;
     }
-    if (!fence && line.startsWith('## ')) {
-      sections.push({ heading: line.slice(3).trim(), start: i, end: bodyLines.length });
+    if (!fence) {
+      const heading = line.startsWith('## ');
+      let carvedStep = /^> \*\*STOP\.\*\* Before .+, Read `[^`]+\/sections\/[^`]+\.md` and execute it$/.test(line)
+        && bodyLines[i + 1] === '> in full. Do not work from memory — that section is the source of truth for this step.';
+      if (carvedStep) {
+        let preceding = i - 1;
+        while (preceding >= 0 && !bodyLines[preceding].trim()) preceding--;
+        let following = i + 2;
+        while (following < bodyLines.length && !bodyLines[following].trim()) following++;
+        carvedStep = bodyLines[preceding] === '---' && bodyLines[following] === '---';
+      }
+      if (heading || carvedStep) {
+        const previous = sections.at(-1);
+        if (previous) previous.end = Math.min(previous.end, i);
+        if (heading) sections.push({ heading: line.slice(3).trim(), start: i, end: bodyLines.length });
+      }
     }
-  }
-  for (let s = 0; s < sections.length - 1; s++) {
-    sections[s].end = sections[s + 1].start;
   }
   return sections;
 }
@@ -273,4 +286,17 @@ export function sliceBetween(text: string, start: string, end: string): string {
   const j = text.indexOf(end, i + start.length);
   if (j < 0) throw new Error(`skill fixture: end marker not found after start: ${end}`);
   return text.slice(i, j);
+}
+
+export function extractDesignResearchContract(skill: string): string {
+  const setup = sliceBetween(skill, '## BROWSER SETUP', '### Rules for driving a real browser');
+  const probe = setup.match(/```bash\n[\s\S]*?\n```/)?.[0];
+  if (!probe) throw new Error('skill fixture: design research readiness probe missing');
+  const routing = sliceBetween(skill, '## Web research runs in Aside', '## Phase 2: Research');
+  const search = sliceBetween(skill, '**Step 1: Identify', '**Step 2: Visual research');
+  const prelude = search.match(/^_EG=.*_aside_exec\(\).*$/m)?.[0];
+  if (!prelude) throw new Error('skill fixture: design research egress prelude missing');
+  return ['Run this readiness probe once before research:', probe, routing,
+    'For each Aside research call, include this prelude before invoking `_aside_exec` with the requested query:',
+    '```bash', prelude, '```'].join('\n\n');
 }

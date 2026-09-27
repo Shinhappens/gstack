@@ -4,10 +4,13 @@
 
 ```bash
 bun install          # install dependencies
-bun run test         # run free tests via the strict parallel runner (~90-100s full suite)
+bun run test:quick   # measured fast deterministic subset for edit feedback
+bun run test         # complete free suite via the strict parallel runner
+bun run test:pr      # changed fast live probes + selected judges (CI PR default)
 bun run test:evals   # run paid evals: LLM judge + E2E (diff-based, ~$4.35/run max)
 bun run test:evals:all  # run ALL paid evals regardless of diff
-bun run test:gate    # run gate-tier tests only (CI default, blocks merge)
+bun run test:gate    # broad gate-tier tests (legacy diff-based command)
+bun run test:release # fresh full gate + periodic censuses
 bun run test:periodic  # run periodic-tier tests only (weekly cron / manual)
 bun run test:gate:sharded    # gate tier via the sharded paid runner (one Bun process per test file)
 bun run test:periodic:sharded  # periodic tier via the sharded paid runner (implies EVALS_ALL=1)
@@ -49,9 +52,10 @@ variants to force all tests. Run `eval:select` to preview which tests would run.
 
 **Two-tier system:** Tests are classified as `gate` or `periodic` in `E2E_TIERS`
 (in `test/helpers/touchfiles.ts` — a facade over `touchfiles-data.ts` +
-`test-selection.ts`). CI runs gate tests per PR via evals.yml's sliced lane
+`test-selection.ts`). CI runs the changed fast PR profile and selected judges
+per PR via evals.yml's sliced lane
 (planner manifest → executors → fail-closed report; engine =
-scripts/test-paid-shards.ts, the same runner as local eval:bg:gate); the free
+scripts/test-paid-shards.ts, the same runner as local eval:bg:pr); the free
 suite runs on every PR via `.github/workflows/free-tests.yml` (a REQUIRED
 check, secretless — fork PRs get real signal); ALL periodic tests run weekly
 via evals-periodic.yml (EVALS_ALL, minus the reasoned exclusions in
@@ -71,9 +75,14 @@ in sync.
 ## Testing
 
 ```bash
-bun run test         # run before every commit — free, ~90-100s for the full ~8,700-test suite
-bun run test:evals   # run before shipping — paid, diff-based (~$4.35/run max)
+bun run test         # final full free acceptance after focused repairs and source freeze
+bun run eval:bg:pr   # required changed PR coverage, with explicit deferrals
 ```
+
+Follow [Validation discipline in AGENTS.md](AGENTS.md#validation-discipline):
+prove repairs with focused checks first, complete required selected evaluations,
+then run the full free suite once on the final integrated code. During repairs,
+focused checks replace a full-suite run before every commit.
 
 `bun run test` routes through `scripts/test-free-shards.ts` (N concurrent
 shard processes, serial within each, packed by recorded per-file durations
@@ -88,8 +97,16 @@ walks the whole repo, loading paid eval files and missing the strict
 classifier.
 It covers skill validation, gen-skill-docs quality checks, browse
 integration tests, the Aside contract pins, and the render-wrapper pins.
-`bun run test:evals` runs LLM-judge quality evals and E2E tests via
-`claude -p`. Both must pass before creating a PR. Anything that needs Aside
+`bun run test:pr` runs the selected short live behaviors and quality judges.
+It reports deferred broad coverage; unknown dependencies restore the full gate,
+and an unmapped prompt without registered coverage blocks planning. Full free
+acceptance and required PR checks must pass before publishing. CI can reuse the
+14 workflow-judge passes for 24 hours when their complete consumed inputs and
+runtime match; records preserve original provenance. The other 11 judge cases,
+dynamic agent tests, and local runs without scoped cache configuration stay fresh.
+Scheduled/manual full coverage and `test:release` always run fresh.
+See [testing policy](CONTRIBUTING.md#test-tiers) for commands and measured targets.
+Anything that needs Aside
 itself (`test/skill-e2e-aside.test.ts`, the Aside qa/design E2E cases, the
 live render in `test/aside-render.test.ts`) runs only on a Mac with the Aside
 app open and self-skips elsewhere (`asideAvailable()`). make-pdf's render
@@ -159,7 +176,7 @@ or as a reference doc, (3) only compress carefully-tuned prose as a last resort 
 cuts to the coverage audit, review army, or voice directive have real quality cost.
 
 A second, harder ceiling guards the DISCOVERY surface: `test/catalog-budget.test.ts`
-caps the aggregate frontmatter `name` + `description` across all skills at 1,150
+caps the aggregate frontmatter `name` + `description` across all skills at 1,171
 token-equivalents (260-byte per-skill sub-cap), counted through the shared census
 in `test/helpers/skill-census.ts`. This one is enforced, not a warning — every
 host loads the full catalog every session, so growth here taxes every
@@ -497,30 +514,24 @@ package.json (npm rejects it). Rationale and translation rules live in the
 `lib/version-source.ts` header; `test/gstack-version-bump.test.ts` pins the
 contract.
 
-**Scale-aware bumps — use common sense.** When the diff is big, bump MINOR (or
-MAJOR), not PATCH. PATCH is for bug fixes and small additions; MINOR is for
-substantial new capability or substantial reduction; MAJOR is for breaking
-changes. Rough guideposts (don't treat as rules, treat as smell-checks):
+**Choose versions autonomously; default to PATCH.** Garry delegates release
+version decisions to the agent. Do not ask him to choose or approve a version,
+including when an already-approved version collides with another PR. This policy
+overrides generic version-approval prompts in `/ship` and `/document-release`.
 
-- **PATCH (X.Y.Z+1.0)**: bug fix, doc tweak, small additive change, single
-  test/file added. Net diff under ~500 lines, no new user-facing capability.
-- **MINOR (X.Y+1.0.0)**: new capability shipped (skill, harness, command, big
-  refactor), substantial code reduction (compression, migration), or coordinated
-  multi-file change. Net diff over ~2000 lines added/removed, OR a user-visible
-  feature you'd put in a tweet.
-- **MAJOR (X+1.0.0.0)**: breaking change to public surface (CLI flag rename,
-  skill removed, config format changed), OR a release big enough to be the
-  headline of a blog post.
+Prefer **PATCH (X.Y.Z+1.0)** for ordinary releases, including fixes, additions,
+refactors, test infrastructure and coordinated multi-file work. Diff size alone
+is not a reason to choose MINOR. Choose **MINOR (X.Y+1.0.0)** or **MAJOR
+(X+1.0.0.0)** only when calling the release a patch would be plainly misleading
+("ridiculous"), such as an incompatible public-interface change or a genuinely
+new product-scale release. Make that judgment without another approval question.
 
-If you find yourself debating "is 10K added + 24K removed really a PATCH?" — it
-isn't. Bump MINOR. Same for "this adds a whole new test harness with 6 new E2E
-tests + helper utilities" — MINOR. The bump level is communication to the user
-about what kind of release this is; don't undersell it.
-
-When merging origin/main brings a higher VERSION, re-evaluate the bump level
-against the SCALE of your branch's work, not just whether main moved forward.
-If main bumped MINOR and your branch is also a substantial change, you bump
-MINOR again on top (e.g., main at v1.14.0.0, your branch lands v1.15.0.0).
+Use `bin/gstack-next-version` to check the live release queue before publishing.
+If a slot is claimed, advance to the next available version at the chosen bump
+level and use `bin/gstack-version-bump` to synchronize release metadata. A higher
+base version does not itself require a MINOR bump. Keep the PR ready for Garry to
+merge; autonomous version decisions do not authorize merging, deploying or
+skipping required validation.
 
 **VERSION and CHANGELOG are branch-scoped.** Every feature branch that ships gets its
 own version bump and CHANGELOG entry. The entry describes what THIS branch adds —
@@ -714,7 +725,7 @@ the run can also die to idle-sleep. `gstack-detach` fixes both: a fresh session
   (stray `claude`/`codex` grandchildren included), a per-shard
   `GSTACK_EVAL_DIR=<evalDir>/shards/<slug>/` honored by the `EvalCollector`
   constructor, and an aggregate that separates failed vs timed-out vs
-  never-started shards — the detach timeouts (25200s gate / 37800s periodic;
+  never-started shards — the detach timeouts (28800s gate / 60600s periodic;
   floor enforced against the live shard census by
   test/eval-detach-timeout-floor.test.ts)
   are sized against worst-case shard wall clock. `EVALS_JOBS` sets the shard

@@ -64,13 +64,13 @@ describe('generateAskUserFormat — v1.7.0.0 Pros/Cons format', () => {
 
   test('documents ✅ pro markers with min count + min length rule', () => {
     expect(out).toContain('✅');
-    expect(out).toMatch(/[Mm]inimum 2 pros/);
+    expect(out).toMatch(/(?:[Mm]inimum |≥)2 pros/);
     expect(out).toMatch(/40 characters|≥40 chars/);
   });
 
   test('documents ❌ con markers with min count rule', () => {
     expect(out).toContain('❌');
-    expect(out).toMatch(/1 con per option|minimum.*1 con/i);
+    expect(out).toMatch(/1 con per option|minimum.*1 con|Each real option: [^\n]*≥1 con/i);
   });
 
   test('documents hard-stop escape with exact phrase', () => {
@@ -108,7 +108,7 @@ describe('generateAskUserFormat — v1.7.0.0 Pros/Cons format', () => {
   test('includes self-check before emitting', () => {
     expect(out).toContain('Self-check before emitting');
     expect(out).toMatch(/D<N> header present/);
-    expect(out).toMatch(/Net line closes/);
+    expect(out).toContain("`Net:` closes question text");
   });
 
   test('documents D-numbering as model-level not runtime state', () => {
@@ -156,6 +156,22 @@ describe('generateAskUserFormat — 5+ option split rule (slim inline + docs poi
   test('points to docs/askuserquestion-split.md for the full rule', () => {
     expect(out).toContain('docs/askuserquestion-split.md');
     expect(out).toMatch(/Read on demand when N>4/);
+  });
+
+  test('dependency repair routes to one candidate without approving a package or a broken set', () => {
+    const source = fs.readFileSync(path.resolve(import.meta.dir, '../docs/askuserquestion-split.md'), 'utf8');
+    const repair = source.split('**Step 1 — validate dependencies and capacity.**')[1]?.split('**Step 2')[0] ?? '';
+    const text = repair.replace(/\s+/g, ' ');
+    expect(text).toContain('actual prior answers');
+    expect(text).toContain('This routing answer changes no disposition');
+    expect(text).toContain('For the named candidate, fire one `D<N>.revise-<k>` with the standard **Include / Defer / Cut / Hold** menu');
+    expect(text).toContain("Hold all other candidates' prior answers fixed");
+    expect(text).toContain('Revalidate dependencies and capacity after the answer');
+    expect(text).toContain('never silently cut, swap or include another candidate');
+    expect(text).toContain('A Hold stops the chain');
+    expect(text).toContain('report the unresolved blocking conflict');
+    expect(text).toContain('Do not confirm an incoherent set as ready to implement');
+    expect(text).not.toContain('accept the broken state');
   });
 
   test('regression: orphan "12." prefix removed from CJK rule', () => {
@@ -216,6 +232,13 @@ describe('generateAskUserFormat — runtime-failure prose fallback', () => {
   test('prose fallback tells the user to reply with a letter, then STOP', () => {
     expect(out).toMatch(/reply with a letter/i);
     expect(out).toMatch(/STOP and wait/i);
+  });
+
+  test('prose questions carry their checked identity on the reply line only when tuning is enabled', () => {
+    const layout = out.slice(out.indexOf('Layout:'), out.indexOf('**Continuation'));
+    expect(layout).toContain('listing the offered selectors');
+    expect(layout).toContain('With `QUESTION_TUNING: true`');
+    expect(layout).toContain('append the checked `<gstack-qid:{question_id}>` to the explicit reply line');
   });
 
   // OV2: the former "tool_use, not prose" assertions must carry the qualifier so the

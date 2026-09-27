@@ -1,7 +1,7 @@
 import {test,expect} from 'bun:test';
 import * as fs from 'node:fs';import * as os from 'node:os';import * as path from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {classifyPlanCountFrame,createPlanCountPermissionGuard} from './helpers/claude-pty-runner';
+import {classifyPlanCountFrame,createPlanCountPermissionGuard,isPermissionDialogVisible} from './helpers/claude-pty-runner';
 import capture from './fixtures/plan-count-owned-permission-v.json';
 test('actual V owned-plan Edit pane is a one-time permission, not a review finding',()=>{
  expect(capture.events.map(e=>e.block.type)).toEqual(['tool_use','tool_result','tool_use']);
@@ -12,6 +12,7 @@ test('actual V owned-plan Edit pane is a one-time permission, not a review findi
 test('new permission grammar requires matching file pane and complete native permission footer',()=>{
  const panel=capture.screen.slice(capture.screen.indexOf(' Edit file\n'));
  for(const screen of [panel.replace(' Edit file\n PLAN.md\n',''),panel.replace(' Edit file\n PLAN.md',' Edit file\n OTHER.md'),panel.replace('Esc to cancel · Tab to amend','Esc to cancel'),panel.replace('   3. No','   3. Keep working'),'Example:\n'+panel,'```text\n'+panel,'☐ File policy\n'+panel,panel.replace(' ❯ 1. Yes','   1. Yes')]){
+  expect(isPermissionDialogVisible(screen),screen).toBe(false);
   expect(createPlanCountPermissionGuard()(screen,''),screen).not.toBe('grant');expect(classifyPlanCountFrame(screen),screen).not.toBe('permission');
  }
 });
@@ -39,8 +40,9 @@ process.stdin.setRawMode?.(true);process.stdin.on('data',async data=>{
  if(stage==='plan2'){stage='wait-old-report';await hook('PostToolUse','plan2',plan);paint(item.report);setTimeout(async()=>{await request('report2',item.report);},3200);return;}
  await hook('PostToolUse','report2',item.report);stage='done';const q={header:'Finding',question:'Apply the reviewed fix?',options:[{label:'Fix'},{label:'Keep'}]};native('assistant',[{type:'tool_use',name:'AskUserQuestion',id:'finding',input:{questions:[q]}}]);native('user',[{type:'tool_result',tool_use_id:'finding',content:'Answered'}],{toolUseResult:{answers:{[q.question]:'Fix'}}});process.stdout.write('\x1b[2J\x1b[HDone.\r\n');
 });process.on('SIGINT',()=>process.exit(0));process.stdin.resume();
+process.stdout.write('PTY_READY:'+item.events+'\x1b[2J\x1b[H');
 `);fs.chmodSync(fake,0o755);
- const args={skillName:'plan-ceo-review',slashCommand:'/plan-ceo-review',followUpPrompt:'Review this owned fixture.',expectedPlanPath:report,reviewCountCeiling:1,timeoutMs:37000,env:{OWNED_EPOCH_CASE:JSON.stringify({events,report,screen:capture.screen})}};
+ const args={skillName:'plan-ceo-review',slashCommand:'/plan-ceo-review',followUpPrompt:'Review this owned fixture.',expectedPlanPath:report,reviewCountCeiling:1,timeoutMs:37000,startupReadyMarker:'PTY_READY:'+events,env:{OWNED_EPOCH_CASE:JSON.stringify({events,report,screen:capture.screen})}};
  fs.writeFileSync(worker,`import {runPlanSkillCounting} from ${JSON.stringify(pathToFileURL(path.join(import.meta.dir,'helpers/claude-pty-runner.ts')).href)};const result=await runPlanSkillCounting({...${JSON.stringify(args)},isLastStep0AUQ:()=>false,isReviewAUQ:()=>true});await Bun.write(${JSON.stringify(output)},JSON.stringify(result));`);
  const child=Bun.spawn([process.execPath,worker],{env:{...process.env,BROWSE_TERMINAL_BINARY:fake,EVALS_HERMETIC:'1'},stdout:'pipe',stderr:'pipe'}),killer=setTimeout(()=>child.kill('SIGKILL'),42000);
  try{const [code,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);expect(code,out+err).toBe(0);const result=JSON.parse(fs.readFileSync(output,'utf8'));expect(result.outcome,JSON.stringify(result)).toBe('ceiling_reached');expect(result.reviewCount).toBe(1);const rows=fs.readFileSync(events,'utf8').trim().split('\n').map(l=>JSON.parse(l));expect(rows[0].hookCount).toBe(2);expect(rows.filter(r=>r.type==='input').map(r=>[r.stage,r.input])).toEqual([['startup','/plan-ceo-review\r'],['report1','1\r'],['plan1','1\r'],['plan2','1\r'],['report2','1\r']]);expect(rows.some(r=>r.type==='unexpected')).toBe(false);expect(()=>process.kill(rows[0].pid,0)).toThrow();expect(fs.existsSync(rows[0].cwd)).toBe(false);

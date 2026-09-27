@@ -50,7 +50,7 @@ When qualified CSO runtime images are published, setup gives each automatic prel
 
 Open Claude Code and paste this. Claude does the rest.
 
-> Install gstack: run **`git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup`** then add a "gstack" section to CLAUDE.md that says to use the /browse skill from gstack for all web browsing, never use mcp\_\_claude-in-chrome\_\_\* tools, and lists the available skills: /office-hours, /plan-ceo-review, /plan-eng-review, /plan-design-review, /design-consultation, /design-shotgun, /design-html, /review, /ship, /land-and-deploy, /canary, /benchmark, /browse, /connect-chrome, /qa, /qa-only, /design-review, /scrape, /setup-browser-cookies, /setup-deploy, /setup-gbrain, /retro, /investigate, /document-release, /document-generate, /codex, /cso, /autoplan, /plan-devex-review, /devex-review, /careful, /freeze, /guard, /unfreeze, /gstack-upgrade, /learn. Then ask the user if they also want to add gstack to the current project so teammates get it.
+> Install gstack: run **`git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup`** then add a "gstack" section to CLAUDE.md that says to use the /browse skill from gstack for all web browsing, never use mcp\_\_claude-in-chrome\_\_\* tools, and lists the available skills: /office-hours, /plan-ceo-review, /plan-eng-review, /plan-design-review, /design-consultation, /design-shotgun, /design-html, /review, /deslop-shared-libs, /ship, /land-and-deploy, /canary, /benchmark, /browse, /connect-chrome, /qa, /qa-only, /design-review, /scrape, /setup-browser-cookies, /setup-deploy, /setup-gbrain, /retro, /investigate, /document-release, /document-generate, /codex, /cso, /autoplan, /plan-devex-review, /devex-review, /careful, /freeze, /guard, /unfreeze, /gstack-upgrade, /learn. Then ask the user if they also want to add gstack to the current project so teammates get it.
 
 ### Step 2: Team mode — auto-update for shared repos (recommended)
 
@@ -219,6 +219,7 @@ Each skill feeds into the next. `/office-hours` writes a design doc that `/plan-
 | `/plan-devex-review` | **Developer Experience Lead** | Interactive DX review: explores developer personas, benchmarks against competitors' TTHW, designs your magical moment, traces friction points step by step. Three modes: DX EXPANSION, DX POLISH, DX TRIAGE. 20-45 forcing questions. |
 | `/design-consultation` | **Design Partner** | Build a complete design system from scratch. Researches the landscape, proposes creative risks, generates realistic product mockups. Writes `DESIGN.md` in the open DESIGN.md format, so impeccable, Google Stitch, and any tool that reads it share one file. |
 | `/review` | **Staff Engineer** | Find the bugs that pass CI but blow up in production. Auto-fixes the obvious ones. Flags completeness gaps. Advisory simplification lens flags over-built code — never blocks, never auto-applies. |
+| `/deslop-shared-libs` | **Shared Code Reviewer** | Find worthwhile shared-code extractions in recent work. Compares up to five opportunities and recommends the best three, with source evidence, reliability gains, and total code savings. Recommendations only. |
 | `/investigate` | **Debugger** | Systematic root-cause debugging. Iron Law: no fixes without investigation. Traces data flow, tests hypotheses, stops after 3 failed fixes. |
 | `/design-review` | **Designer Who Codes** | Same audit as /plan-design-review, then fixes what it finds. Atomic commits, before/after screenshots. If you have impeccable installed, its engine runs first and every mechanical finding arrives tagged with its rule id. |
 | `/devex-review` | **DX Tester** | Live developer experience audit. Actually tests your onboarding: navigates docs, tries the getting started flow, times TTHW, screenshots errors. Compares against `/plan-devex-review` scores — the boomerang that shows if your plan matched reality. |
@@ -237,7 +238,7 @@ Each skill feeds into the next. `/office-hours` writes a design doc that `/plan-
 | `/retro` | **Eng Manager** | Team-aware weekly retro. Per-person breakdowns, shipping streaks, test health trends, growth opportunities. `/retro global` runs across all your projects and AI tools (Claude Code, Codex, Gemini). |
 | `/browse` | **QA Engineer** | Give the agent eyes. Drives your [Aside](https://aside.com) browser first — your real sessions, real clicks, real screenshots — through deterministic `aside repl` scripts. No Aside? It falls back to gstack's own Chromium: real clicks, ~100ms per command, and `/open-gstack-browser` shows it headed with sidebar, anti-bot stealth, and auto model routing. Every other browser skill stands on it. |
 | `/scrape` | **Data Extractor** | Pull structured data off a web page — tables, lists, prices — in your Aside browser with the page's real logged-in state. On the fallback browser, `/skillify` turns the flow into a permanent browser-skill that runs in ~200ms next time. |
-| `/setup-browser-cookies` | **Session Manager** | Import cookies from your real browser (Chrome, Arc, Brave, Edge) into gstack's bundled browser so it can test authenticated pages. Only needed on the fallback path — Aside already has your sessions. |
+| `/setup-browser-cookies` | **Session Manager** | Copy selected cookies from Chrome, Chromium, Brave, Edge, or macOS-only Comet, Arc, and Dia into gstack's bundled browser. Choose your profile and domains; copying and sign-in verification are separate. Only needed on the fallback path — Aside already has your sessions. |
 | `/autoplan` | **Review Pipeline** | One command, fully reviewed plan. Runs CEO → design → DX → eng review automatically (eng always last, so the shipping gate reviews the final amended plan) with encoded decision principles. Surfaces only taste decisions for your approval. |
 | `/spec` | **Spec Author** | Turn vague intent into a precise, executable spec in five phases (why, scope, technical with mandatory code-reading, draft, file). Outside-review quality gate before filing (Claude Code on Codex; Codex on other harnesses; blocks below 7/10), fail-closed secret redaction, dedupe against existing issues, archive to `$GSTACK_STATE_ROOT/projects/$SLUG/specs/` for team-corpus recall. `--execute` spawns `claude -p` in a fresh worktree; `/ship` auto-closes the source issue on merge. Plan-mode aware. |
 | `/learn` | **Memory** | Manage what gstack learned across sessions. Review, search, prune, and export project-specific patterns, pitfalls, and preferences. Learnings compound across sessions so gstack gets smarter on your codebase over time. |
@@ -327,10 +328,6 @@ sessions. Every `./setup` run also heals first: `gstack-settings-hook
 prune-stale --repoint` removes dead gstack hook entries, re-points stale ones
 at the stable install, and collapses duplicates, printing one line (and
 writing a backup beside the file) only when it changed something.
-
-### Continuous checkpoint mode (opt-in, local by default)
-
-Set `gstack-config set checkpoint_mode continuous` and skills auto-commit your work as you go with a `WIP:` prefix plus a structured `[gstack-context]` body (decisions, remaining work, failed approaches). Survives crashes and context switches. `/context-restore` reads those commits to reconstruct session state. `/ship` filter-squashes WIP commits before the PR (preserving non-WIP commits) so bisect stays clean. Push is opt-in via `checkpoint_push=true` — default is local-only so you don't trigger CI on every WIP commit.
 
 ### Domain skills + raw CDP escape hatch
 
@@ -620,7 +617,7 @@ linked in, never deleted.
 ## gstack
 Use /browse from gstack for all web browsing. Never use mcp__claude-in-chrome__* tools.
 Available skills: /office-hours, /plan-ceo-review, /plan-eng-review, /plan-design-review,
-/design-consultation, /design-shotgun, /design-html, /review, /ship, /land-and-deploy,
+/design-consultation, /design-shotgun, /design-html, /review, /deslop-shared-libs, /ship, /land-and-deploy,
 /canary, /benchmark, /browse, /open-gstack-browser, /qa, /qa-only, /design-review, /scrape,
 /setup-browser-cookies, /setup-deploy, /setup-gbrain, /sync-gbrain, /retro, /investigate,
 /document-release, /document-generate, /codex, /cso, /autoplan, /pair-agent, /careful, /freeze,

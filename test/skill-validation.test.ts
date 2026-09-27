@@ -1167,12 +1167,17 @@ describe('gstack-slug', () => {
   });
 
   test('no templates or bin scripts use source process substitution for gstack-slug', () => {
+    // Scan project sources, including new untracked templates, without walking
+    // ignored caches, symlinked installations or private evaluation worktrees.
     const result = Bun.spawnSync(
-      ['grep', '-r', 'source <(.*gstack-slug', '--include=*.tmpl', '--include=gstack-review-*', '.'],
-      { cwd: ROOT, stdout: 'pipe', stderr: 'pipe', timeout: 30_000 }
+      ['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', '*.tmpl', 'bin/gstack-review-*'],
+      { cwd: ROOT, stdout: 'pipe', stderr: 'pipe', timeout: 5_000 },
     );
-    // grep returns exit code 1 when no matches found — that's what we want
-    expect(result.stdout.toString().trim()).toBe('');
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    const files = [...new Set(result.stdout.toString().split('\0').filter(Boolean))];
+    expect(files.length).toBeGreaterThan(0);
+    const violations = files.filter(file => /source <\(.*gstack-slug/.test(fs.readFileSync(path.join(ROOT, file), 'utf8')));
+    expect(violations).toEqual([]);
   });
 });
 
@@ -1368,8 +1373,9 @@ describe('ship step numbering', () => {
   // 0.9 (Apple target detection — MUST precede Step 1's branch gate, R2-pinned
   // by test/ship-apple-gate.test.ts), 8.1 (Plan Verification), 8.2 (Scope
   // Drift), 9.1 (Review Army), 9.2 (Findings Merge), 9.3 (Cross-review dedup),
-  // 15.0 (WIP squash — continuous checkpoint), 15.1 (Bisectable commits).
-  const ALLOWED_SUBSTEPS = new Set(['0.9', '8.1', '8.2', '9.1', '9.2', '9.3', '15.0', '15.1']);
+  // 9.4 (Fix-First and persistence), 15.0 (WIP context), 15.1 (Bisectable commits),
+  // 15.2 (safe optional WIP consolidation).
+  const ALLOWED_SUBSTEPS = new Set(['0.9', '8.1', '8.2', '9.1', '9.2', '9.3', '9.4', '15.0', '15.1', '15.2']);
 
   test('ship/SKILL.md.tmpl contains no unexpected fractional step numbers', () => {
     const tmpl = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md.tmpl'), 'utf-8');

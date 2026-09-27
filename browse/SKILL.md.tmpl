@@ -63,8 +63,8 @@ advantage, and never for anything that mutates.
 The loop is always the same: one script → labelled evidence lines → artifacts copied out
 of `ASIDE_DIR` → Read the screenshots → report.
 
-1. Run the setup check above. On `READY`, drive Aside. On `NEEDS_ASIDE` or
-   `ASIDE_NOT_RUNNING`, run the Browser fallback check and drive `$B` instead —
+1. Run the setup check above. On `READY`, drive Aside. On any non-READY
+   result, run the Browser fallback check and drive `$B` instead —
    the steps below still apply, translated through the fallback table.
 2. Write ONE `aside repl` script per flow, following the cookbook skeleton exactly:
    console hook installed before `goto`, evidence printed as labelled lines
@@ -110,6 +110,14 @@ GStack Browser. If a task needs a vendor dashboard or any other third-party site
 goes through the Third-Party Web Actions contract, not through here. Rendering local
 HTML into a PNG or PDF is the render engine's job: use /make-pdf, /diagram, or
 /design-html for that.
+
+On the fallback path, `/setup-browser-cookies` asks the user to choose the source
+browser and account/profile; Dia is macOS-only. Navigate to the matching target
+before a direct `--domain` import. Cookies copied is **not checked**, not proof
+of login. `--verify-auth` requires a daemon-configured exact visible identity
+assertion; HTTP 200 and cookie counts are not enough. Storage stays intact unless
+the user explicitly approves `--clear-storage` for the captured origin on a Chromium target. Other engines reject reset, not ordinary import or auth checks. Do not
+publish cookie values, passwords, profile/account text, or session details.
 
 ## Fallback command reference
 

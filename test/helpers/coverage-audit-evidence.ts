@@ -48,24 +48,43 @@ function readsFile(command: unknown, file: string, cwd: string, output: unknown,
   }
   if (quote) return false;
   parts.push(part.trim());
-  // A final Git display can hide a failed && prefix. Only the two owned reads
-  // with their exact ordered output can establish delivery through this form.
+  // A final Git display can hide a failed && prefix. Require the complete,
+  // ordered owned output; neighboring context and Git displays receive no credit.
   if (andList && semicolons && separators.at(-1) === ';' && separators.slice(0, -1).every(s => s === '&&') &&
-      /^git log --oneline [A-Za-z0-9_][A-Za-z0-9_./~^-]*$/.test(parts.at(-2) ?? '') &&
-      /^git diff [A-Za-z0-9_][A-Za-z0-9_./~^-]* --stat$/.test(parts.at(-1) ?? '')) {
+      /^git log --oneline [A-Za-z0-9_][A-Za-z0-9_./~^-]*(?: 2>\/dev\/null)?$/.test(parts.at(-2) ?? '') &&
+      /^git diff [A-Za-z0-9_][A-Za-z0-9_./~^-]* --stat(?: 2>\/dev\/null)?$/.test(parts.at(-1) ?? '')) {
     const files = [owned.source, owned.tests], readPaths: string[] = [], prefix: string[] = [];
-    for (const segment of parts.slice(0, -2)) {
+    const segments = parts.slice(0, -2);
+    let actual = outputText(output);
+    if (actual.length > 4 * 1024 * 1024) return false;
+    // A single literal Markdown context read may precede labeled owned reads.
+    // Keep its bytes outside the credited block and require both owned files.
+    const context = /^cat (.+)$/.exec(segments[0] ?? ''), contextTarget = context && literal(context[1]!);
+    if (contextTarget) {
+      const relative = path.relative(cwd, path.resolve(cwd, contextTarget));
+      if (path.isAbsolute(contextTarget) || contextTarget.startsWith('-') || !/\.md$/.test(contextTarget) ||
+          !relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative) ||
+          contextTarget.split(/[\\/]/).some(part => !part || part === '.' || part === '..') ||
+          files.some(f => path.resolve(cwd, contextTarget) === f.path) ||
+          !/^echo [-=]{2,} [A-Za-z0-9_.\/-]+ [-=]{2,}$/.test(segments[1] ?? '')) return false;
+      const marker = segments[1]!.slice(5), lines = actual.replace(/\r\n?/g, '\n').split('\n');
+      const boundary = lines.indexOf(marker);
+      if (boundary <= 0 || lines.lastIndexOf(marker) !== boundary) return false;
+      actual = lines.slice(boundary).join('\n');
+      segments.shift();
+    }
+    for (const segment of segments) {
       const read = /^cat -n (.+)$/.exec(segment), target = read && literal(read[1]!);
       if (target) {
         const known = files.find(f => path.resolve(cwd, target) === f.path);
         if (!known || readPaths.includes(known.path)) return false;
         readPaths.push(known.path); prefix.push(known.content.replace(/\r\n?/g, '\n').replace(/\n$/, ''));
-      } else if (/^echo [-=]+$/.test(segment)) prefix.push(segment.slice(5));
+      } else if (/^echo (?:[-=]+|[-=]{2,} [A-Za-z0-9_.\/-]+ [-=]{2,})$/.test(segment)) prefix.push(segment.slice(5));
       else return false;
     }
-    const actual = outputText(output), expected = normalized(prefix.join('\n'));
+    const expected = normalized(prefix.join('\n'));
     const deliveredPrefix = normalized(actual.replace(/^ *\d+(?:\t|→)/gm, ''));
-    return readPaths.length === 2 && readPaths.includes(file) && actual.length <= 4 * 1024 * 1024 &&
+    return readPaths.length >= (contextTarget ? 2 : 1) && readPaths.includes(file) &&
       (deliveredPrefix === expected || deliveredPrefix.startsWith(expected + '\n'));
   }
   const cd = /^cd\s+(.+)$/.exec(parts[0] ?? '');
@@ -78,10 +97,29 @@ function readsFile(command: unknown, file: string, cwd: string, output: unknown,
   // file, or leave a printed old command mistaken for an executed read.
   if (parts.some(p => /^(?:cd|pushd|popd|source|\.|eval|exec|exit|return|function|alias|if|then|else|for|while|until|case)\s/.test(p) ||
       /^(?:exit|return|fi|done)$/.test(p) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(p))) return false;
-  const readTarget = (p: string): string | undefined => {
+  const readTargets = (p: string): string[] => {
     const cat = /^cat(?:\s+-n)?(?:\s+--)?\s+(.+)$/.exec(p);
+    if (cat) {
+      // Whitespace separates whole literal operands, never the inside of a
+      // quoted path. Consume every byte; concatenation/expansion is unsupported.
+      const targets: string[] = [];
+      let remaining = cat[1]!.trim();
+      while (remaining) {
+        const token = /^('[^']*'|"[^"$`\\]*"|[^\s'"$`\\;|&<>]+)(?:\s+|$)/.exec(remaining);
+        const target = token && literal(token[1]!);
+        if (!target) return [];
+        targets.push(target);
+        remaining = remaining.slice(token![0].length);
+      }
+      return targets;
+    }
     const sed = /^sed\s+-n\s+(?:'\d+(?:,\d+)?p'|"\d+(?:,\d+)?p"|\d+(?:,\d+)?p)\s+(.+)$/.exec(p);
-    return literal((cat ?? sed)?.[1] ?? '');
+    const sedTarget = literal(sed?.[1] ?? '');
+    return sedTarget ? [sedTarget] : [];
+  };
+  const readTarget = (p: string): string | undefined => {
+    const targets = readTargets(p);
+    return targets.length === 1 ? targets[0] : undefined;
   };
   // Unrelated reads may precede/follow a delivered file. They cannot mutate it
   // or print replacement content through another interpreter. Only discarded
@@ -90,7 +128,7 @@ function readsFile(command: unknown, file: string, cwd: string, output: unknown,
     // A neighboring optional file read may report absence. It never receives
     // source/test delivery credit; only earlier independent cat/sed segments do.
     const fallback = /^(cat(?:\s+-n)?(?:\s+--)?\s+.+)\s+2>\/dev\/null\s+\|\|\s+echo\s+(.+)$/.exec(part);
-    if (fallback) return readTarget(fallback[1]!) !== undefined && literal(fallback[2]!) !== undefined && !part.includes('\\');
+    if (fallback) return readTargets(fallback[1]!).length > 0 && literal(fallback[2]!) !== undefined && !part.includes('\\');
     const stages: string[] = [];
     let value = '', quoted = '';
     for (const char of part) {
@@ -105,7 +143,7 @@ function readsFile(command: unknown, file: string, cwd: string, output: unknown,
       if (/[<>]/.test(stage.replace(/'[^']*'|"[^"]*"/g, ''))) return false;
       // Backslashes are data only in these closed grep display patterns.
       // In particular, echo -e cannot print replacement fixture bodies.
-      const grepRange = /^grep\s+-n(?:\s+-i)?(?:\s+-B\d{1,4})?(?:\s+-A\d{1,4})?\s+"(?:[^"\\$`]|\\[|.])*"\s+(.+)$/.exec(stage);
+      const grepRange = /^grep\s+-n(?:\s+-i)?(?:\s+-B\d{1,4})?(?:\s+-A\d{1,4})?\s+(?:"(?:[^"\\$`]|\\[|.])*"|'(?:[^'\\$`]|\\[|.])*')\s+(.+)$/.exec(stage);
       const grepInput = grepRange && literal(grepRange[1]!);
       const displayGrep = Boolean(grepInput && !grepInput.startsWith('-'));
       // An awk range without actions only prints matching input lines.
@@ -127,17 +165,18 @@ function readsFile(command: unknown, file: string, cwd: string, output: unknown,
         token === (git[1] === 'log' ? '--oneline' : '--stat') ||
         (git[1] === 'log' && /^-[1-9]\d{0,4}$/.test(token)) || /^[A-Za-z0-9_][A-Za-z0-9_./~^-]*$/.test(token)));
       return /^(?:cat|grep|head|ls|echo)(?:\s|$)/.test(stage) || stage === 'pwd' || stage === 'wc -l' || stage === 'git ls-files' || stage === "sed 's/^/TESTFILES:/'" || /^\[ -f [A-Za-z0-9_.\/-]+ \]$/.test(stage) ||
-        readTarget(stage) !== undefined || gitDisplay || displayAwk;
+        readTargets(stage).length > 0 || gitDisplay || displayAwk;
     });
   };
   if (parts.some(p => p && !readOnly(p))) return false;
   // A successful, unmixed && list may include literal display separators
-  // and a closed diff-stat command. These segments never receive file credit.
+  // and closed Git log/diff-stat commands. These segments receive no file credit.
   const andDisplay = (p: string) => {
     if (p === 'echo' || /^echo\s+[-=]+$/.test(p) || /^echo [-=]{2,} [A-Za-z0-9_.\/-]+ [-=]{2,}$/.test(p)) return true;
     const caption = /^echo\s+(.+)$/.exec(p), value = caption && literal(caption[1]!);
-    if (value && /^[-=]{2,}\s+[A-Za-z0-9_][A-Za-z0-9_./-]*(?:\s+(?:vs|and)\s+[A-Za-z0-9_][A-Za-z0-9_./-]*)?\s+[-=]{2,}$/.test(value)) return true;
-    return /^git\s+diff(?:\s+[A-Za-z0-9_][A-Za-z0-9_./~^-]*)?\s+--stat$/.test(p);
+    if (value && /^[-=]{2,}(?:\s*[A-Za-z0-9_][A-Za-z0-9_./-]*(?:\s+(?:vs|and)\s+[A-Za-z0-9_][A-Za-z0-9_./-]*)?\s*)?[-=]{2,}$/.test(value)) return true;
+    return /^git\s+diff(?:\s+[A-Za-z0-9_][A-Za-z0-9_./~^-]*)?\s+--stat$/.test(p) ||
+      /^git\s+log\s+--oneline\s+[A-Za-z0-9_][A-Za-z0-9_./~^-]*$/.test(p);
   };
   if (andList && semicolons) {
     const caption = /^echo (.+)$/.exec(parts[0] ?? ''), value = caption && literal(caption[1]!);
@@ -146,10 +185,14 @@ function readsFile(command: unknown, file: string, cwd: string, output: unknown,
     // reads in the initial && chain and their exact ordered stdout prefix.
     const prefix: string[] = [], readPaths: string[] = [];
     for (let i = 0; i < parts.length && (i === 0 || separators[i - 1] === '&&'); i++) {
-      const segment = parts[i]!, target = readTarget(segment);
-      const known = target && [owned.source, owned.tests].find(f => path.resolve(cwd, target) === f.path);
-      if (known && /^cat -n /.test(segment) && !readPaths.includes(known.path)) {
-        readPaths.push(known.path); prefix.push(known.content.replace(/\r\n?/g, '\n').replace(/\n$/, ''));
+      const segment = parts[i]!, targets = readTargets(segment);
+      const known = targets
+        .map(target => [owned.source, owned.tests].find(f => path.resolve(cwd, target) === f.path))
+        .filter((file): file is CoverageAuditFiles['source'] => Boolean(file));
+      if (known.length > 0 && /^cat -n /.test(segment) && known.every(file => !readPaths.includes(file.path))) {
+        for (const file of known) {
+          readPaths.push(file.path); prefix.push(file.content.replace(/\r\n?/g, '\n').replace(/\n$/, ''));
+        }
       } else if (andDisplay(segment) && /^echo(?: |$)/.test(segment)) {
         const value = segment.slice(5); prefix.push(literal(value) ?? value);
       } else return false;
@@ -160,10 +203,9 @@ function readsFile(command: unknown, file: string, cwd: string, output: unknown,
     return readPaths.length === 2 && readPaths.includes(file) && actual.length <= 4 * 1024 * 1024 &&
       (deliveredPrefix === expected || deliveredPrefix.startsWith(expected + '\n'));
   }
-  if (andList && parts.some(p => readTarget(p) === undefined && !andDisplay(p))) return false;
+  if (andList && parts.some(p => readTargets(p).length === 0 && !andDisplay(p))) return false;
   return parts.some(p => {
-    const target = readTarget(p);
-    return target !== undefined && path.resolve(cwd, target) === file;
+    return readTargets(p).some(target => path.resolve(cwd, target) === file);
   });
 }
 function delivered(output: unknown, expected: string): boolean {
@@ -254,6 +296,8 @@ function treeRow(line: string): { depth: number; text: string } | undefined {
   return { depth: match[1]!.length, text: match[2]!.split(/ {3,}(?=[├└+|])/, 1)[0]! };
 }
 
+const coverageMapCaption = String.raw`[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]+[\t ]+[—–-][\t ]+(?:test[\t ]+)?coverage[\t ]+map`;
+
 function diagramLegend(lines: string[], firstRow: number): Map<string, boolean> {
   const meanings = new Map<string, boolean>();
   const pair = String.raw`\[([✓✔✗✘])\][\t ]+(TESTED|COVERED|GAP|UNTESTED)`;
@@ -265,7 +309,7 @@ function diagramLegend(lines: string[], firstRow: number): Map<string, boolean> 
     if (index >= firstRow && (treeRow(original) || (!/\bLegend\b/i.test(original) && !bareKey.test(original)))) continue;
     // Decorative branch keys and an explicit GAP explanation do not change
     // the two coverage meanings. All other qualifiers keep the closed grammar.
-    const line = original.replace(/[\t ]+[─-]+►[\t ]+branch$/i, '')
+    const line = original.replace(/[\t ]+[─-]+►?[\t ]+branch$/i, '')
       .replace(/(\[[✓✔✗✘]\][\t ]+(?:GAP|UNTESTED))[\t ]+\((?:no test|GAP)\)$/i, '$1')
       .replace(/(\[[✓✔✗✘]\][\t ]+COVERED)[\t ]+by a test\b/gi, '$1')
       .replace(/(\[[✓✔✗✘]\][\t ]+(?:GAP|UNTESTED))[\t ]+[—–-][\t ]+no test exercises this path$/i, '$1');
@@ -275,7 +319,7 @@ function diagramLegend(lines: string[], firstRow: number): Map<string, boolean> 
     // Only a legend label or a literal file's coverage-map caption may precede
     // the pair. Arbitrary prose must not be discarded into an affirmative key.
     const prefix = line.slice(0, start).trim();
-    if (prefix && !/^(?:Legend:|[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]+[\t ]+[—–-][\t ]+(?:test[\t ]+)?coverage[\t ]+map)$/i.test(prefix)) return new Map();
+    if (prefix && !new RegExp(String.raw`^(?:Legend:?|${coverageMapCaption})$`, 'i').test(prefix)) return new Map();
     const match = legend.exec(line.slice(start).trim());
     if (!match || match[1] === match[3]) return new Map();
     const entries = [[match[1]!, /^(?:TESTED|COVERED)$/i.test(match[2]!)],
@@ -296,10 +340,19 @@ function diagramWordLegend(lines: string[]): Map<string, boolean> | undefined {
   const meanings = new Map<string, boolean>();
   const pair = String.raw`\[\s*(OK|GAP)\s*\]\s+(covered|tested|no test|untested)`;
   const form = new RegExp(String.raw`^\s*Legend:?\s+${pair}(?:\s+[|,;]?\s*|[|,;]\s*)${pair}\s*$`, 'i');
+  // A single coverage key may coexist with the documented quality keys.
+  // Consume those complete clauses too: an extracted status inside arbitrary
+  // qualifiers cannot define an unconditional coverage meaning.
+  const separator = String.raw`(?:\s+[|,;]?\s*|[|,;]\s*)`;
+  const quality = String.raw`(?:★★★\s+(?:edges\s*\+\s*errors|behavior\s*\+\s*edge\s*\+\s*error)|★★\s+happy path(?: only)?|★\s+smoke(?: check)?|\[→E2E\]\s+(?:(?:recommend|needs)\s+)?integration test)`;
+  const single = new RegExp(String.raw`^\s*Legend:?\s+(?:${quality}${separator})*${pair}(?:${separator}${quality})*\s*$`, 'i');
   for (const line of declarations) {
     const match = form.exec(line);
-    if (!match || match[1]!.toUpperCase() === match[3]!.toUpperCase()) return new Map();
-    for (const [name, description] of [[match[1]!, match[2]!], [match[3]!, match[4]!]]) {
+    const singleMatch = !match && single.exec(line);
+    if ((!match && !singleMatch) || (match && match[1]!.toUpperCase() === match[3]!.toUpperCase())) return new Map();
+    const entries = match ? [[match[1]!, match[2]!], [match[3]!, match[4]!]]
+      : [[singleMatch![1]!, singleMatch![2]!]];
+    for (const [name, description] of entries) {
       const key = name.toUpperCase(), covered = /^(?:covered|tested)$/i.test(description);
       if ((key === 'OK') !== covered || (meanings.has(key) && meanings.get(key) !== covered)) return new Map();
       meanings.set(key, covered);
@@ -325,10 +378,12 @@ function currentDiagramLegend(lines: string[]): boolean {
 
 /** Checkbox states are meaningful only under a current key in this block. */
 function diagramCheckboxLegend(lines: string[]): Map<string, boolean> | undefined {
-  const declarations = lines.filter(line => /^\s*Legend\b/i.test(line) && /\[[x ]\]/i.test(line));
+  const heading = String.raw`(?:Legend:?|${coverageMapCaption})`;
+  const declaration = new RegExp(String.raw`^\s*(?:Legend\b|${coverageMapCaption}\b)`, 'i');
+  const declarations = lines.filter(line => declaration.test(line) && /\[[x# ]\]/i.test(line));
   if (!declarations.length) return undefined;
-  const pair = String.raw`\[([x ])\]\s+(covered(?: by an existing test)?|tested|no test(?: reaches this path)?|untested|GAP)`;
-  const form = new RegExp(String.raw`^\s*Legend:?\s+${pair}(?:\s+[|,;]?\s*|[|,;]\s*)${pair}\s*$`, 'i');
+  const pair = String.raw`\[([x# ])\]\s+(covered(?: by an existing test)?|tested|no test(?: reaches this path)?|untested|GAP)`;
+  const form = new RegExp(String.raw`^\s*${heading}\s+${pair}(?:\s+[|,;]?\s*|[|,;]\s*)${pair}\s*$`, 'i');
   const meanings = new Map<string, boolean>();
   for (const original of declarations) {
     const line = original.replace(/[\t ]+[─-] happy path[\t ]+✗ negative path$/i, '');
@@ -336,7 +391,7 @@ function diagramCheckboxLegend(lines: string[]): Map<string, boolean> | undefine
     if (!match || match[1]!.toLowerCase() === match[3]!.toLowerCase()) return new Map();
     for (const [symbol, description] of [[match[1]!, match[2]!], [match[3]!, match[4]!]]) {
       const key = symbol.toLowerCase(), covered = /^(?:covered|tested)\b/i.test(description);
-      if ((key === 'x') !== covered || (meanings.has(key) && meanings.get(key) !== covered)) return new Map();
+      if ((key === 'x' || key === '#') !== covered || (meanings.has(key) && meanings.get(key) !== covered)) return new Map();
       meanings.set(key, covered);
     }
   }
@@ -351,7 +406,7 @@ function seededDiagram(output: string): boolean {
     let owner = -1;
     for (let i = 0; i < lines.length; i++) {
       if (rows[i]) { owner = i; continue; }
-      const continuation = /^([ |│]+)(\[[✓✔✗✘xX ]\].*)$/.exec(lines[i]!);
+      const continuation = /^([ |│]+)(\[[✓✔✗✘xX# ]\].*)$/.exec(lines[i]!);
       if (owner >= 0 && continuation && [4, 6, 8].includes(continuation[1]!.length - rows[owner]!.depth))
         rows[owner]!.text += ' ' + continuation[2]!;
       else if (!/^[ |│]*$/.test(lines[i]!)) owner = -1;
@@ -359,16 +414,16 @@ function seededDiagram(output: string): boolean {
     const legend = diagramLegend(lines, rows.findIndex(row => row !== undefined));
     const wordLegend = diagramWordLegend(lines);
     const checkboxLegend = diagramCheckboxLegend(lines);
-    if (rows.some(row => row && /\[[x ]\]/i.test(row.text)) && checkboxLegend?.size !== 2) continue;
-    const marker = String.raw`(?:\[[✓✔✗✘xX ]\]|\[\s*(?:OK|GAP)\s*\])`;
-    const marked = (line: string) => /\[[✓✔✗✘xX ]\]|\[\s*OK\s*\]/i.test(line) ||
+    if (rows.some(row => row && /\[[x# ]\]/i.test(row.text)) && checkboxLegend?.size !== 2) continue;
+    const marker = String.raw`(?:\[[✓✔✗✘xX# ]\]|\[\s*(?:OK|GAP)\s*\])`;
+    const marked = (line: string) => /\[[✓✔✗✘xX# ]\]|\[\s*OK\s*\]/i.test(line) ||
       (wordLegend !== undefined && /\[\s*GAP\s*\]/i.test(line));
     const symbolMeans = (line: string, covered: boolean) => {
       if (new RegExp(String.raw`\b(?:not|never)\s+${marker}|(?:${marker}|\b(?:marker|symbol))\s+(?:is|are)\s+(?:false|incorrect|wrong)\b`, 'i').test(line)) return false;
       // A status correction [covered]→[gap] carries only its final marker.
       // Unrelated contradictory markers cannot supply both coverage states.
       const corrected = line.replace(new RegExp(marker + String.raw`[\t ]*(?:→|->)[\t ]*(?=` + marker + ')', 'gi'), '');
-      const states = [...corrected.matchAll(/\[([✓✔✗✘])\]|\[\s*(OK|GAP)\s*\]|\[([x ])\]/gi)]
+      const states = [...corrected.matchAll(/\[([✓✔✗✘])\]|\[\s*(OK|GAP)\s*\]|\[([x# ])\]/gi)]
         .map(match => match[1] ? legend.get(match[1]) : match[2] ? wordLegend?.get(match[2].toUpperCase()) : checkboxLegend?.get(match[3]!.toLowerCase()));
       return states.includes(covered) && !states.includes(!covered);
     };

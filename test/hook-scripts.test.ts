@@ -287,6 +287,23 @@ describe('check-careful.sh', () => {
     });
   });
 
+  test.each([
+    ['rm -rf node_modules\nrm -rf /', 'recursive delete'],
+    ['rm${IFS}-rf${IFS}/', 'obfuscation'],
+    ['psql -c "DROP DATABASE production"', 'SQL DROP'],
+    ['psql -c "TRUNCATE users"', 'SQL TRUNCATE'],
+    ['git push --force origin feature', 'force-push'],
+    ['git reset --hard', 'reset --hard'],
+    ['git restore .', 'uncommitted changes'],
+    ['kubectl delete pod app', 'kubectl delete'],
+    ['docker system prune', 'Docker'],
+  ])('keeps %s visible before large multiline content', (command, reason) => {
+    const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput(`${command}\n# ${'x'.repeat(100_000)}`));
+    expect(exitCode).toBe(0);
+    expect(output.hookSpecificOutput?.permissionDecision).toBe('ask');
+    expect(output.hookSpecificOutput?.permissionDecisionReason).toContain(reason);
+  });
+
   // --- Shell obfuscation ---
 
   describe('shell obfuscation', () => {
@@ -675,6 +692,16 @@ describe('check-careful.sh', () => {
     test('a project pattern adds an ask rule', () => {
       withPatternFile('# infra safety\nterraform\\s+destroy\n', (gstackHome) => {
         const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput('terraform destroy -auto-approve'), { GSTACK_HOME: gstackHome });
+        expect(exitCode).toBe(0);
+        expect(output.hookSpecificOutput?.permissionDecision).toBe('ask');
+        expect(output.hookSpecificOutput?.permissionDecisionReason).toContain('Project rule');
+      });
+    });
+
+    test('a project pattern matches before large multiline content', () => {
+      withPatternFile('terraform\\s+destroy\n', (gstackHome) => {
+        const { exitCode, output } = runHook(CAREFUL_SCRIPT,
+          carefulInput(`terraform destroy\n# ${'x'.repeat(100_000)}`), { GSTACK_HOME: gstackHome });
         expect(exitCode).toBe(0);
         expect(output.hookSpecificOutput?.permissionDecision).toBe('ask');
         expect(output.hookSpecificOutput?.permissionDecisionReason).toContain('Project rule');
@@ -1120,8 +1147,8 @@ describe('gstack_hook_log_fire writes under the resolved state root', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-freeze-backstop-'));
     const fakeBin = path.join(base, 'bin');
     fs.mkdirSync(fakeBin);
-    fs.writeFileSync(path.join(fakeBin, 'head'), '#!/bin/sh\nexit 1\n');
-    fs.chmodSync(path.join(fakeBin, 'head'), 0o755);
+    fs.writeFileSync(path.join(fakeBin, 'sed'), '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(path.join(fakeBin, 'sed'), 0o755);
     try {
       withFreezeDir(BOUNDARY, (stateDir) => {
         const { exitCode, output } = runHook(FREEZE_SCRIPT, freezeInput('/Users/dev/project/src/x.ts'),

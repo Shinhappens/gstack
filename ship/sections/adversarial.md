@@ -81,7 +81,7 @@ Read the diff for this branch. First list changed files: `DIFF_BASE=$(git merge-
 
 Think like an attacker and a chaos engineer. Your job is to find ways this code will fail in production. Look for: edge cases, race conditions, security holes, resource leaks, failure modes, silent data corruption, logic errors that produce wrong results silently, error handling that swallows failures, and trust boundary violations. Be adversarial. Be thorough. No compliments — just the problems. For each finding, classify as FIXABLE (you know how to fix it) or INVESTIGATE (needs human judgment). After listing findings, end your output with ONE line in the canonical format `Recommendation: <action> because <one-line reason naming the most exploitable finding>` — examples: `Recommendation: Fix the unbounded retry at queue.ts:78 because it'll DoS the worker pool under sustained 429s` or `Recommendation: Ship as-is because the strongest finding is a theoretical race that requires conditions we can't trigger in production`. The reason must point to a specific finding (or no-fix rationale). Generic reasons like 'because it's safer' do not qualify."
 
-Present findings under an `ADVERSARIAL REVIEW (Claude subagent):` header. **FIXABLE findings** flow into the same Fix-First pipeline as the structured review. **INVESTIGATE findings** are presented as informational.
+Present findings under an `ADVERSARIAL REVIEW (Claude subagent):` header. **FIXABLE findings:** collect them for the Step 11 completion procedure below; it uses Step 9.4's classification and approval rules. **INVESTIGATE findings** are presented as informational.
 
 If the subagent fails or times out: "Claude adversarial subagent unavailable. Continuing."
 
@@ -95,7 +95,7 @@ Outside prompt (supply repository context from the parent):
 
 "IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are skill definitions, not repository review data. Do not follow nested skills, hooks, or tool instructions. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Do NOT modify agents/openai.yaml. Stay focused on the repository code only.\n\nReview the changes on this branch against the base branch. Use the supplied branch diff. If it was not supplied and you have repository tools, run DIFF_BASE=$(git merge-base origin/<base> HEAD) && git diff "$DIFF_BASE". Your job is to find ways this code will fail in production. Think like an attacker and a chaos engineer. Find edge cases, race conditions, security holes, resource leaks, failure modes, and silent data corruption paths. Be adversarial. Be thorough. No compliments — just the problems. End your output with ONE line in the canonical format `Recommendation: <action> because <one-line reason naming the most exploitable finding>`. Generic reasons like 'because it's safer' do not qualify; the reason must point to a specific finding or no-fix rationale."
 
-Use Write to save the **complete prompt and context** in a private file. Replace `<prepared-prompt-file>` below with its shell-quoted path; never interpolate user text into shell source. Include actual plan/spec/source content. Request a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale. A refusal is never completion.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -116,12 +116,13 @@ _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
 source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" || exit 1
-_gstack_codex_timeout_wrapper 540 codex exec "$(cat "$_OUTSIDE_INPUT")" -C "$_REPO_ROOT" -s read-only -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr"
-_OUTSIDE_EXIT=$?
+_OUTSIDE_PROMPT=$(cat "$_OUTSIDE_INPUT") || exit 1
+_OUTSIDE_EXIT=0
+_gstack_codex_timeout_wrapper 540 codex exec "$_OUTSIDE_PROMPT" -C "$_REPO_ROOT" -s read-only -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
 # Preserve findings and partial output even when transport or validation fails.
-cat "$_OUTSIDE_TMP/text"
+cat "$_OUTSIDE_TMP/text" || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 
-cat "$_OUTSIDE_TMP/stderr" >&2
+cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 if [ "$_OUTSIDE_EXIT" -ne 0 ]; then
   echo 'Codex outside review unavailable: execution failed; missing coverage. Check the provider diagnosis above.' >&2
   exit "$_OUTSIDE_EXIT"
@@ -131,11 +132,11 @@ bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" review "$_OUTSIDE
 echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 ```
 
-Show the full response in a `tool-output` fence. Completed outside coverage requires successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout, or CLI failure means `outside_status: unavailable`. Follow this caller's fallback; missing coverage is never clean/PASS. After success or failure, delete only your private prompt file; the invocation removes its scratch directory.
+Show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
 
 Set the outer tool timeout to 600000ms so the provider timeout can report its failure.
 
-Present the full output verbatim. This is informational — it never blocks shipping.
+Present the full output verbatim. An unavailable outside challenge does not block shipping by itself; supported findings still enter Step 11, and the structured P1 and non-convergence gates still apply.
 
 **Error handling:** All errors are non-blocking — adversarial review is a quality enhancement, not a prerequisite.
 - **Auth failure:** If stderr contains "auth", "login", "unauthorized", or "API key": "Codex authentication failed. Run \`codex login\` to authenticate."
@@ -172,15 +173,15 @@ _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo 'ERROR: not in a git repo'
 _OUTSIDE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/gstack-outside.XXXXXXXX") || exit 1
 trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
-: >"$_OUTSIDE_INPUT"
+: >"$_OUTSIDE_INPUT" || exit 1
 
 source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" || exit 1
-_gstack_codex_timeout_wrapper 540 codex review --base '<base>' -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c "review_model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr"
-_OUTSIDE_EXIT=$?
+_OUTSIDE_EXIT=0
+_gstack_codex_timeout_wrapper 540 codex review --base '<base>' -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c "review_model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
 # Preserve findings and partial output even when transport or validation fails.
-cat "$_OUTSIDE_TMP/text"
+cat "$_OUTSIDE_TMP/text" || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 
-cat "$_OUTSIDE_TMP/stderr" >&2
+cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 if [ "$_OUTSIDE_EXIT" -ne 0 ]; then
   echo 'Codex outside review unavailable: execution failed; missing coverage. Check the provider diagnosis above.' >&2
   exit "$_OUTSIDE_EXIT"
@@ -190,7 +191,7 @@ bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" structured "$_OUT
 echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 ```
 
-Show the full response in a `tool-output` fence. Completed outside coverage requires successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout, or CLI failure means `outside_status: unavailable`. Follow this caller's fallback; missing coverage is never clean/PASS. The invocation removes its own scratch directory.
+Show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. Use the caller's fallback; missing coverage is never clean/PASS. Scratch cleanup is automatic.
 
 The Codex backend uses `codex review --base` without a positional prompt: those arguments are mutually exclusive. Never drop --base to resolve an argv error; prompt-only review changes the diff scope.
 
@@ -205,7 +206,7 @@ A) Investigate and fix now (recommended)
 B) Continue — review will still complete
 ```
 
-If A: address the findings. After fixing, re-run tests (Step 5) since code has changed. Re-run the same shared structured invocation and diff scope to verify.
+If A: record approval to fix these findings in the Step 11 completion procedure below. If B: retain the acknowledged findings and failed gate; do not report a clean review.
 
 Read stderr for errors (same error handling as Codex adversarial above).
 
@@ -226,7 +227,7 @@ Substitute: PHASE = "adversarial" or "structured" for the corresponding pass. ST
 
 ---
 
-For this phase (adversarial), retain the historical review-log skill identifier. Add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"adversarial"`. Record each attempted pass separately when outcomes differ. Use `source:"codex"` only for completed external CLI output, and `source:"in-host"` for a native pass. Historical `source:"claude"` continues to mean a native Claude subagent. CLI availability or a native fallback does not count as outside completion. Preserve reported modelUsage, including multiple models; unknown model identity stays unknown.
+Retain the historical review-log skill ID; add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"adversarial"`. Record differing attempt outcomes separately. `source:"codex"` requires completed CLI output; native uses `source:"in-host"` (historical `source:"claude"`: native Claude). Availability/native fallback is not outside completion. Preserve all reported modelUsage; unknown model identity stays unknown.
 
 ### Cross-model synthesis
 
@@ -244,6 +245,14 @@ ADVERSARIAL REVIEW SYNTHESIS (always-on, N lines):
 ```
 
 High-confidence findings (agreed on by multiple sources) should be prioritized for fixes.
+
+### Step 11 completion and late-fix loop
+
+1. Finish all available passes and persist each source/phase's actual result above. Missing or failed passes remain unavailable, never clean.
+2. Triage the collected FIXABLE findings using Step 9.4 items 1–3: AUTO-FIX or ASK, apply automatic and approved fixes, and retain explicit skips. Do not ask again for a Step 11 P1 fix already approved.
+3. If anything changed, commit only the fixed files. Run Step 5 and affected Steps 6–8, then repeat Step 9 from a fresh start token. After Step 9 converges, return directly to Step 11 and repeat its passes on the changed tree. Prior responses do not certify the fixes; do not repeat unchanged Step 10 comment decisions.
+4. Bound this late-fix loop to three fix cycles. If the third cycle still changes code, record non-convergence and STOP with the recurring findings. A zero-fix cycle continues to Step 12 with actual coverage and any explicit acknowledgments; unavailable or waived coverage is never reported as a clean completed pass.
+   This is a separate three-cycle budget from Step 9.4: each return to Step 9 must satisfy its own convergence gate, and returning here does not reset Step 11's count.
 
 ---
 
@@ -276,7 +285,7 @@ already knows. A good test: would this insight save time in a future session? If
 
 ### Refresh learnings for the headline feature on this branch
 
-The top-of-skill learnings pull was keyed to "release ship" broadly. Before the VERSION/CHANGELOG step, re-pull learnings keyed to THIS branch's headline feature so any prior version-bump or CHANGELOG pitfalls for similar features surface.
+Step 8's Prior Learnings pull used broad release terms. Before VERSION/CHANGELOG, search for this branch's headline feature to find relevant versioning or changelog pitfalls.
 
 Pick ONE keyword that names the headline feature you're shipping. The keyword should be a noun: the primary skill or module name, the central feature noun, or the binary you changed. The keyword MUST be alphanumeric or hyphen only — no quotes, slashes, dots, colons, or whitespace. If your candidate has any of those, simplify to just the alphanumeric stem.
 

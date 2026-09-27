@@ -3,10 +3,20 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { readWorkflowJudgeInput } from './helpers/workflow-judge-input';
+import { createHash } from 'node:crypto';
+import { readWorkflowJudgeInput, buildWorkflowJudgePrompt } from './helpers/workflow-judge-input';
+import { ENG_REVIEW_EXCERPT } from './helpers/workflow-excerpt';
 
 const ROOT = resolve(import.meta.dir, '..');
 const scratchRoots: string[] = [];
+
+test('cache extraction preserves every byte of the original workflow request and rubric', () => {
+  // Captured from runWorkflowJudge's pre-cache template literal, not from the
+  // new builder: moving request construction must not change the paid metric.
+  const prompt = buildWorkflowJudgePrompt({ judgeContext: 'test workflow', judgeGoal: 'test goal' },
+    { files: [], text: 'full prompt\nincluding lines' });
+  expect(createHash('sha256').update(prompt).digest('hex')).toBe('71cc9c777bf28ff0efd610259b411e3539852f83a0888fa0e92469331f8b9a43');
+});
 
 afterEach(() => {
   for (const root of scratchRoots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -34,6 +44,22 @@ function sectionPaths(skill: string): string[] {
 }
 
 describe('workflow judge file bundle', () => {
+  test('the actual Eng judge registration includes authorization and the referenced final gate', () => {
+    const source = readFileSync(join(ROOT, 'test/skill-llm-eval.test.ts'), 'utf8');
+    const registration = source.match(/testIfSelected\('plan-eng-review\/SKILL\.md sections',[\s\S]*?await runWorkflowJudge\(\{([\s\S]*?)\n    \}\);/);
+    expect(registration).not.toBeNull();
+    const options = new Function('ENG_REVIEW_EXCERPT', `return ({${registration![1]}});`)(ENG_REVIEW_EXCERPT);
+    const input = readWorkflowJudgeInput({ root: ROOT, ...options });
+    const entry = input.files.find(file => file.kind === 'entrypoint')!;
+    const complete = readFileSync(join(ROOT, options.skillPath), 'utf8');
+    expect(entry.content).toBe(complete.slice(complete.indexOf('# Plan Review Mode')));
+    expect(entry.content).toContain('Do not build features, acceptance suites or benchmarks unless explicitly authorized');
+    expect(entry.content).toContain('## Scope gate');
+    expect(entry.content).toContain('## Section self-check');
+    expect(entry.content).toContain('## EXIT PLAN MODE GATE (BLOCKING)');
+    expect(entry.content.trimEnd()).toMatch(/After success telemetry and cache dispatch, call ExitPlanMode[^\n]*\.$/);
+  });
+
   test('preserves the exact entrypoint excerpt and each complete section in sorted named files', () => {
     const entrypoint = 'excluded preamble\n## Begin\nRead sections/z-last.md when directed.\n## End\nexcluded epilogue';
     const sections = {
@@ -163,17 +189,19 @@ describe('workflow judge file bundle', () => {
   test('generated ship includes base-branch initialization and every lazy section once', () => {
     const skillPath = 'ship/SKILL.md';
     const source = readFileSync(join(ROOT, skillPath), 'utf8');
-    // Read the paid caller's actual slice so changing its marker back to the
-    // title cannot silently drop initialization while this helper test passes.
+    // Bind to the paid caller's actual slice and retain both the opening contract
+    // and initialization, regardless of their ordering in the authored workflow.
     const caller = readFileSync(join(ROOT, 'test/skill-llm-eval.test.ts'), 'utf8');
     const markers = caller.match(/skillPath: 'ship\/SKILL\.md',\s+startMarker: '([^']+)',\s+endMarker: '([^']+)'/);
     expect(markers).not.toBeNull();
     const [, startMarker, endMarker] = markers!;
-    expect(startMarker).toBe('## Step 0: Detect platform and base branch');
+    expect(startMarker).toBe('# Ship:');
     const input = readWorkflowJudgeInput({ root: ROOT, skillPath, startMarker, endMarker });
     const entrypoint = input.files.find(file => file.kind === 'entrypoint');
     expect(entrypoint?.content).toBe(source.slice(source.indexOf(startMarker), source.indexOf(endMarker, source.indexOf(startMarker))));
     expect(entrypoint?.content).toContain('git remote get-url origin');
+    expect(entrypoint?.content).toContain('**Follow every STOP and AskUserQuestion gate**');
+    expect(entrypoint?.content).toContain('## Step 0: Detect platform and base branch');
     expect(entrypoint?.content).toContain('gh pr view --json baseRefName');
     expect(entrypoint?.content).toContain('Print the detected base branch name.');
     expect(occurrences(input.text, startMarker)).toBe(1);
@@ -190,17 +218,20 @@ describe('workflow judge file bundle', () => {
   test('generated engineering review includes the scope choices and readiness probe its steps reference', () => {
     const skillPath = 'plan-eng-review/SKILL.md';
     const caller = readFileSync(join(ROOT, 'test/skill-llm-eval.test.ts'), 'utf8');
-    const markers = caller.match(/skillPath: 'plan-eng-review\/SKILL\.md',\s+startMarker: '([^']+)',\s+endMarker: '([^']+)'/);
-    expect(markers).not.toBeNull();
-    const [, startMarker, endMarker] = markers!;
-    const input = readWorkflowJudgeInput({ root: ROOT, skillPath, startMarker, endMarker });
+    const registration = caller.match(/testIfSelected\('plan-eng-review\/SKILL\.md sections',[\s\S]*?await runWorkflowJudge\(\{([\s\S]*?)\n    \}\);/);
+    expect(registration).not.toBeNull();
+    const options = new Function('ENG_REVIEW_EXCERPT', `return ({${registration![1]}});`)(ENG_REVIEW_EXCERPT);
+    expect(ENG_REVIEW_EXCERPT.skillPath).toBe(skillPath);
+    const input = readWorkflowJudgeInput({ root: ROOT, ...options });
     const entrypoint = input.files.find(file => file.kind === 'entrypoint')!;
     expect(entrypoint.content).toContain('B) A plan or design doc');
     expect(entrypoint.content).toContain('## Scope gate');
     expect(entrypoint.content.indexOf('## Scope gate')).toBeLessThan(entrypoint.content.indexOf('### Step 0: Scope Challenge'));
     expect(entrypoint.content).toContain('## Web research runs in Aside');
     expect(entrypoint.content).toContain('echo "READY: aside');
-    expect(entrypoint.content.indexOf('echo "READY: aside')).toBeLessThan(entrypoint.content.indexOf('4. **Search check:**'));
+    expect(input.text.indexOf('echo "READY: aside')).toBeLessThan(input.text.indexOf('- **Search check:**'));
+    expect(entrypoint.content).not.toContain('- **Search check:**');
+    expect(occurrences(input.text, '- **Search check:**')).toBe(1);
     expect(occurrences(input.text, '## Scope gate')).toBe(1);
     expect(occurrences(input.text, '### 1. Architecture review')).toBe(1);
     const sections = input.files.filter(file => file.kind === 'section');

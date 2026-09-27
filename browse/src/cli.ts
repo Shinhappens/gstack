@@ -527,6 +527,7 @@ async function startServer(extraEnv?: Record<string, string>): Promise<ServerSta
   // Parse as int so stray whitespace ("0\n") still opts out — matches the
   // server's own parseInt at server.ts:760.
   const parentPid = parseInt(process.env.BROWSE_PARENT_PID || '', 10) === 0 ? '0' : String(process.pid);
+  let spawnedServer: { pid: number; startTime: string } | null = null;
 
   if (IS_WINDOWS && NODE_SERVER_SCRIPT) {
     // Windows: Bun.spawn() + proc.unref() doesn't truly detach on Windows —
@@ -561,12 +562,14 @@ async function startServer(extraEnv?: Record<string, string>): Promise<ServerSta
     // (PPID=1, STAT=Ss) and survives the spawning shell's exit. Mirrors
     // the Windows path's rationale — same root cause, different OS API.
     const daemonLogFd = openDaemonLogSink();
-    nodeSpawn('bun', ['run', SERVER_SCRIPT], {
+    const child = nodeSpawn('bun', ['run', SERVER_SCRIPT], {
       detached: true,
       windowsHide: true,
       stdio: ['ignore', daemonLogFd, daemonLogFd],
       env: { ...process.env, BROWSE_STATE_FILE: config.stateFile, BROWSE_PARENT_PID: parentPid, ...extraEnv },
-    }).unref();
+    });
+    child.unref();
+    if (child.pid) spawnedServer = { pid: child.pid, startTime: readPidStartTime(child.pid) };
   }
 
   // Wait for server to become healthy.
@@ -590,6 +593,17 @@ async function startServer(extraEnv?: Record<string, string>): Promise<ServerSta
   const lateState = readState();
   if (lateState && await isServerHealthy(lateState.port)) {
     return lateState;
+  }
+
+  if (spawnedServer?.startTime) {
+    const { pid, startTime } = spawnedServer;
+    const stillOurs = () => readPidStartTime(pid) === startTime && readPidCmdline(pid).split(/\s+/).includes(SERVER_SCRIPT);
+    if (stillOurs()) {
+      safeKill(pid, 'SIGTERM');
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline && stillOurs()) await Bun.sleep(50);
+      if (stillOurs()) safeKill(pid, 'SIGKILL');
+    }
   }
 
   // Server didn't start in time — check the on-disk startup error log.
@@ -809,7 +823,7 @@ export function extractTabId(args: string[]): { tabId: number | undefined; args:
 }
 
 // ─── Command Dispatch ──────────────────────────────────────────
-async function sendCommand(state: ServerState, command: string, args: string[], retries = 0): Promise<void> {
+export async function sendCommand(state: ServerState, command: string, args: string[], retries = 0): Promise<void> {
   // Precedence: CLI --tab-id flag > BROWSE_TAB env var.
   // make-pdf always passes --tab-id; human users typically rely on BROWSE_TAB
   // or the active tab.
@@ -818,6 +832,7 @@ async function sendCommand(state: ServerState, command: string, args: string[], 
   const envTab = process.env.BROWSE_TAB;
   const tabId = extracted.tabId ?? (envTab ? parseInt(envTab, 10) : undefined);
   const body = JSON.stringify({ command, args, ...(tabId !== undefined && !isNaN(tabId) ? { tabId } : {}) });
+  const timeoutMs = command === 'cookie-import-browser' ? 90_000 : 30_000;
 
   try {
     const resp = await fetch(`http://127.0.0.1:${state.port}/command`, {
@@ -827,10 +842,11 @@ async function sendCommand(state: ServerState, command: string, args: string[], 
         'Authorization': `Bearer ${state.token}`,
       },
       body,
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     if (resp.status === 401) {
+      if (command === 'cookie-import-browser') throw new Error('Cookie import authorization changed. Reopen the session and retry manually.');
       // Token mismatch — server may have restarted
       console.error('[browse] Auth failed — server may have restarted. Retrying...');
       const newState = readState();
@@ -857,6 +873,10 @@ async function sendCommand(state: ServerState, command: string, args: string[], 
       process.exit(1);
     }
   } catch (err: any) {
+    if (command === 'cookie-import-browser' && (['AbortError', 'TimeoutError'].includes(err.name)
+      || ['ECONNREFUSED', 'ECONNRESET'].includes(err.code) || err.message?.includes('fetch failed'))) {
+      throw new Error('Cookie import response was lost or timed out. It may have partially completed; inspect the destination before retrying manually. The command was not replayed.');
+    }
     if (err.name === 'AbortError') {
       // #1781: a 30s timeout on a heavy page usually means busy, not dead.
       // Don't kill a live server (that's what triggered the crash-loop) — report
@@ -1521,7 +1541,7 @@ Interaction:    click <sel> | fill <sel> <val> | select <sel> <val>
                 scroll [sel] | wait <sel|--networkidle|--load> | viewport <WxH>
                 upload <sel> <file1> [file2...]
                 cookie-import <json-file>
-                cookie-import-browser [browser] [--domain <d>]
+                cookie-import-browser [browser] [--domain <d> | --all] [--profile <p>] [--clear-storage] [--verify-auth]
 Inspection:     js <expr> | eval <file> | css <sel> <prop> | attrs <sel>
                 console [--clear|--errors] | network [--clear] | dialog [--clear]
                 cookies | storage [set <k> <v>] | perf
@@ -1664,6 +1684,7 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
         const newPid = spawnTerminalAgent({
           stateFile: config.stateFile,
           serverPort: newState.port,
+          ownerPid: newState.pid,
           cwd: config.projectDir,
         });
         if (newPid) {
@@ -1756,6 +1777,7 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
           spawnTerminalAgent({
             stateFile: config.stateFile,
             serverPort: respawned.port,
+            ownerPid: respawned.pid,
             cwd: config.projectDir,
           });
         } catch (err: any) {

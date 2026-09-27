@@ -17,6 +17,8 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { spawnSync } from 'node:child_process';
 
 const WORKFLOW = path.resolve(import.meta.dir, '..', '.github', 'workflows', 'free-tests.yml');
 
@@ -39,19 +41,22 @@ describe('free-tests workflow wiring', () => {
     expect(source).not.toContain('pull_request_target');
   });
 
-  test('if sharded (matrix), the matrix count matches --shards N', () => {
-    // Single-job --parallel mode has no matrix — vacuously fine. If someone
-    // switches to the shard matrix (the V3 fallback), the two encodings of
-    // the shard count must agree or CI silently drops files.
-    const shardsFlag = source.match(/--shards\s+(\d+)/);
-    const matrix = source.match(/shard:\s*\[([^\]]+)\]/);
-    if (shardsFlag || matrix) {
-      expect(shardsFlag, 'matrix present but no --shards N flag').toBeTruthy();
-      expect(matrix, '--shards N present but no shard matrix').toBeTruthy();
-      const count = parseInt(shardsFlag![1], 10);
-      const entries = matrix![1].split(',').map(s => s.trim()).filter(Boolean);
-      expect(entries.length).toBe(count);
-    }
+  test('the isolated matrix consumes one plan and the required aggregate verifies all receipts', () => {
+    const workflow = Bun.YAML.parse(source) as any;
+    const planner = workflow.jobs['free-plan'];
+    const suite = workflow.jobs['free-suite'];
+    const aggregate = workflow.jobs['free-tests'];
+    expect(planner.steps.find((step: any) => step.id === 'plan').run).toContain('--ci-plan');
+    expect(suite.needs).toBe('free-plan');
+    expect(suite.strategy.matrix).toBe('${{ fromJSON(needs.free-plan.outputs.matrix) }}');
+    expect(suite.strategy['fail-fast']).toBe(false);
+    expect(suite.strategy['max-parallel']).toBe(20);
+    expect(suite.steps.find((step: any) => step.name === 'Run free suite').run).toContain('--ci-run');
+    expect(suite.steps.find((step: any) => step.name === 'Upload strict shard result').if).toBe('always()');
+    expect(aggregate.if).toBe('always()');
+    expect(aggregate.needs).toContain('free-suite');
+    expect(aggregate.steps.some((step: any) => step.run?.includes('--ci-verify'))).toBe(true);
+    expect(source).not.toContain('--quick');
   });
 
   test('flake telemetry stays wired: retry flag, single-writer ledger, unconditional artifact', () => {
@@ -63,6 +68,31 @@ describe('free-tests workflow wiring', () => {
     expect(source).toMatch(/GSTACK_FLAKE_LEDGER:\s*\$\{\{ runner\.temp \}\}\/flake-ledger\.jsonl/);
     expect(source).toContain('name: flake-ledger');
     expect(source).toMatch(/name: Upload flake ledger\s*\n\s*if: always\(\)/);
+  });
+
+  test.skipIf(!Bun.which('bash'))('a recovered retry retains its original detailed spool', () => {
+    const steps = (Bun.YAML.parse(source) as any).jobs['free-suite'].steps;
+    const probe = steps.find((step: any) => step.id === 'flake_spool');
+    const upload = steps.find((step: any) => step.with?.name === 'free-test-shard-logs-${{ matrix.shard }}');
+    expect(probe.if).toBe('always()');
+    expect(upload.if).toBe("failure() || steps.flake_spool.outputs.present == 'true'");
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'free spool '));
+    const output = path.join(directory, 'step-output');
+    const ledger = path.join(directory, 'flake-ledger.jsonl');
+    try {
+      for (const contents of [null, '', '{"kind":"flaky-pass","file":"test/example.test.ts"}\n']) {
+        if (contents !== null) fs.writeFileSync(ledger, contents);
+        fs.writeFileSync(output, '');
+        const result = spawnSync('bash', ['-e', '-c', probe.run], {
+          // Git Bash accepts C:/... paths; native backslashes are not shell paths.
+          env: { ...process.env, RUNNER_TEMP: directory.split(path.sep).join('/'),
+            GITHUB_OUTPUT: output.split(path.sep).join('/') },
+          encoding: 'utf8', timeout: 5000,
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(fs.readFileSync(output, 'utf8')).toBe(contents ? 'present=true\n' : '');
+      }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
   test('least-privilege token: contents read-only, credentials not persisted', () => {

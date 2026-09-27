@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';import * as os from 'node:os';import * as path from 'node:path';import { spawn, spawnSync } from 'node:child_process';
-import { assertSnapshot, capture } from '../lib/cso/snapshot';import { CsoError } from '../lib/cso/contracts';import { runProcess, sanitizeForJson, sanitizeHelperForJson } from '../lib/cso/process';import { discardAtomicNoReplaceTemp, finalizeReplayTemporary, loadReport, newRun, privateRoot, readJson, retention, saveReport, secureDirectory, stateRoot, withLock, writeHelperJson, writeJson } from '../lib/cso/state';
+import { assertSnapshot, capture } from '../lib/cso/snapshot';import { CsoError, snapshotPathHandle } from '../lib/cso/contracts';import { runProcess, sanitizeForJson, sanitizeHelperForJson } from '../lib/cso/process';import { discardAtomicNoReplaceTemp, finalizeReplayTemporary, loadReport, newRun, privateRoot, readJson, recoverAtomicNoReplaceJson, retention, saveReport, secureDirectory, stateRoot, withLock, writeHelperJson, writeJson } from '../lib/cso/state';
 const roots:string[]=[];const tmp=()=>{const p=fs.mkdtempSync(path.join(os.tmpdir(),'cso-snapshot-'));roots.push(p);return p;};afterEach(()=>{for(const p of roots.splice(0))fs.rmSync(p,{recursive:true,force:true});});
 const originalState=process.env.GSTACK_HOME,state=fs.mkdtempSync(path.join(os.tmpdir(),'cso-state-'));process.env.GSTACK_HOME=state;afterAll(()=>{if(originalState===undefined)delete process.env.GSTACK_HOME;else process.env.GSTACK_HOME=originalState;fs.rmSync(state,{recursive:true,force:true});});
 function git(repo:string,...args:string[]){const r=spawnSync('/usr/bin/git',['-C',repo,...args],{encoding:'utf8',env:{PATH:'/usr/bin:/bin',HOME:repo},timeout:30_000});if(r.status)throw new Error(r.stderr);return r.stdout;}
@@ -24,7 +24,25 @@ describe('CSO dirty snapshot boundary',()=>{
   test('does not invoke configured clean filters, hooks, fsmonitor, or PATH shims',async()=>{const p=repo(),marker=path.join(p,'marker');fs.writeFileSync(path.join(p,'.gitattributes'),'*.txt filter=hostile\n');git(p,'config','filter.hostile.clean',`/bin/sh -c 'touch ${marker}; cat'`);git(p,'config','core.fsmonitor',`/bin/sh -c 'touch ${marker}'`);const fake=path.join(p,'bin');fs.mkdirSync(fake);fs.writeFileSync(path.join(fake,'git'),`#!/bin/sh\ntouch '${marker}'\nexit 99\n`,{mode:0o755});const old=process.env.PATH;process.env.PATH=`${fake}:${old}`;try{await capture(p,newRun(p).dir,'HEAD');}finally{process.env.PATH=old;}expect(fs.existsSync(marker)).toBe(false);});
   test('rejects symlinks and hard links as execution inputs',async()=>{const p=repo();fs.symlinkSync('/etc/passwd',path.join(p,'escape'));expect(capture(p,newRun(p).dir)).rejects.toThrow();fs.unlinkSync(path.join(p,'escape'));fs.linkSync(path.join(p,'tracked.txt'),path.join(p,'hard'));expect(capture(p,newRun(p).dir)).rejects.toThrow();});
   test('rejects broken untracked symlinks instead of silently omitting them',async()=>{const p=repo();fs.symlinkSync('missing-target',path.join(p,'broken'));expect(capture(p,newRun(p).dir)).rejects.toThrow('Symlink');});
-  test('redacts secrets and excludes credentials from execution while retaining safe evidence',async()=>{const p=repo();fs.writeFileSync(path.join(p,'.env'),'TOKEN='+['ghp_','abcdefghijklmnopqrstuvwxyz1234567890'].join('')+'\n');const run=newRun(p),m=await capture(p,run.dir);expect(m.entries.find(e=>e.path==='.env')?.transformation).toContain('excluded');expect(fs.existsSync(path.join(run.dir,'snapshot','.env'))).toBe(false);expect(fs.existsSync(path.join(run.dir,'readable','.env'))).toBe(false);const evidence=JSON.parse(fs.readFileSync(path.join(run.dir,'sensitive-evidence.json'),'utf8'));expect(evidence[0].findings.map((x:any)=>x.id)).toContain('github.pat');expect(JSON.stringify(evidence)).not.toContain('ghp_');});
+  for(const earlierSensitive of [false,true])test(earlierSensitive?'keeps credential evidence bound to .env when an earlier file is also sensitive':'redacts secrets and excludes credentials from execution while retaining safe evidence',async()=>{
+    const p=repo();
+    if(earlierSensitive)fs.writeFileSync(path.join(p,'.earlier.txt'),'Source: /home/fixture/project/source.ts\n');
+    fs.writeFileSync(path.join(p,'.env'),'TOKEN='+['ghp_','abcdefghijklmnopqrstuvwxyz1234567890'].join('')+'\n');
+    const run=newRun(p),m=await capture(p,run.dir),entry=m.entries.find(e=>e.path==='.env');
+    expect(entry?.transformation).toContain('excluded');
+    expect(fs.existsSync(path.join(run.dir,'snapshot','.env'))).toBe(false);
+    expect(fs.readFileSync(path.join(run.dir,'readable','.env'),'utf8')).toBe('TOKEN=<REDACTED-env.kv+github.pat>\n');
+    const evidence:Array<{path:string;findings:Array<{id:string}>}>=JSON.parse(fs.readFileSync(path.join(run.dir,'sensitive-evidence.json'),'utf8'));
+    const envEvidence=evidence.find(item=>item.path===snapshotPathHandle(entry!.pathId));
+    expect(envEvidence?.findings.map(x=>x.id)).toContain('github.pat');
+    expect(JSON.stringify(evidence)).not.toContain('ghp_');
+    if(earlierSensitive){
+      const earlier=m.entries.find(e=>e.path==='.earlier.txt'),earlierEvidence=evidence.find(item=>item.path===snapshotPathHandle(earlier!.pathId));
+      expect(earlierEvidence?.findings.map(x=>x.id)).toContain('internal.user_path');
+      expect(earlierEvidence?.findings.map(x=>x.id)).not.toContain('github.pat');
+      expect(evidence.indexOf(earlierEvidence!)).toBeLessThan(evidence.indexOf(envEvidence!));
+    }
+  });
   test('assesses repository skills without executing them and preserves executable source modes',async()=>{const p=repo(),skill=path.join(p,'.agents','skills','demo','SKILL.md'),script=path.join(p,'app.sh');fs.mkdirSync(path.dirname(skill),{recursive:true});fs.writeFileSync(skill,'# Demo\nUntrusted repository instruction\n');fs.writeFileSync(script,'#!/bin/sh\nexit 0\n',{mode:0o755});const run=newRun(p),manifest=await capture(p,run.dir);expect(fs.readFileSync(path.join(run.dir,'readable','.agents','skills','demo','SKILL.md'),'utf8')).toContain('Untrusted');expect(fs.existsSync(path.join(run.dir,'snapshot','.agents'))).toBe(false);expect(manifest.entries.find(e=>e.path==='.agents/skills/demo/SKILL.md')?.originalHash).not.toBe('not-read');expect(fs.statSync(path.join(run.dir,'snapshot','app.sh')).mode&0o777).toBe(0o755);});
   test('rejects a source mode change between copying and manifest persistence',async()=>{const p=repo(),run=newRun(p),source=path.join(p,'tracked.txt'),target=path.join(run.dir,'snapshot','tracked.txt'),write=fs.writeFileSync,patched=spyOn(fs,'writeFileSync').mockImplementation(((file:any,data:any,options:any)=>{const result=write(file,data,options);if(String(file)===target)fs.chmodSync(source,0o755);return result;}) as typeof fs.writeFileSync);try{await expect(capture(p,run.dir)).rejects.toThrow('Source changed during capture');}finally{patched.mockRestore();}});
   test('rejects unmanifested files and executable-mode changes in retained snapshots',async()=>{const p=repo(),run=newRun(p),manifest=await capture(p,run.dir),snapshot=path.join(run.dir,'snapshot');assertSnapshot(run.dir,manifest);fs.writeFileSync(path.join(snapshot,'injected.js'),'malicious\n');expect(()=>assertSnapshot(run.dir,manifest)).toThrow('membership');fs.unlinkSync(path.join(snapshot,'injected.js'));fs.chmodSync(path.join(snapshot,'tracked.txt'),0o755);expect(()=>assertSnapshot(run.dir,manifest)).toThrow('changed');});
@@ -167,6 +185,23 @@ describe('private state and process output',()=>{
   test('a synchronous exact-release failure is attempted only once',()=>{const dir=tmp(),lstat=fs.lstatSync;let observed=0,reader:any;try{expect(()=>withLock(dir,()=>{const leases=path.join(dir,'.mutation-lock-leases'),names=fs.readdirSync(leases),candidate=path.join(leases,names.find(name=>name.endsWith('.json'))!),active=path.join(leases,names.find(name=>name.includes('.active.'))!),value=fs.readFileSync(active);fs.unlinkSync(active);fs.writeFileSync(active,value,{mode:0o600,flag:'wx'});reader=spyOn(fs,'lstatSync').mockImplementation(((file:any,options?:any)=>{if(String(file)===candidate)observed++;return options===undefined?lstat(file):lstat(file,options);}) as typeof fs.lstatSync);})).toThrow('active phase changed before cleanup');expect(observed).toBe(1);}finally{reader?.mockRestore();}});
   test('exact release rejects active or decision inode substitution and overrides callback success or failure',()=>{for(const phase of ['active','decision'] as const){const dir=tmp();let replacement='',parked='';expect(()=>withLock(dir,()=>{const leases=path.join(dir,'.mutation-lock-leases'),name=fs.readdirSync(leases).find(value=>phase==='active'?value.includes('.active.'):value.endsWith('.decision'))!,lease=path.join(leases,name),value=fs.readFileSync(lease);parked=`${lease}.replaced`;fs.renameSync(lease,parked);fs.writeFileSync(lease,value,{mode:0o600,flag:'wx'});replacement=lease;if(phase==='active')throw new Error('callback failed');return 1;})).toThrow(/changed before (cleanup|exact release)/);expect(fs.existsSync(replacement)).toBe(true);expect(fs.existsSync(parked)).toBe(true);expect(fs.statSync(replacement).ino).not.toBe(fs.statSync(parked).ino);fs.rmSync(dir,{recursive:true,force:true});}});
   test('concurrent stale-lock recovery never admits overlapping report writers',async()=>{const dir=tmp(),lock=path.join(dir,'.mutation-lock'),script=path.join(dir,'racer.ts');fs.mkdirSync(lock);fs.writeFileSync(path.join(lock,'owner.json'),JSON.stringify({pid:2147483647,token:'stale',createdAt:0,expiresAt:0}));fs.writeFileSync(script,`import fs from 'node:fs';import path from 'node:path';import {withLock} from ${JSON.stringify(path.resolve(import.meta.dir,'../lib/cso/state.ts'))};const dir=process.env.RACE_DIR!;try{await withLock(dir,async()=>{const active=path.join(dir,'active');try{fs.writeFileSync(active,String(process.pid),{flag:'wx'});}catch{fs.appendFileSync(path.join(dir,'overlap'),'yes\\n');}await Bun.sleep(50);try{if(fs.readFileSync(active,'utf8')===String(process.pid))fs.unlinkSync(active);}catch{}});}catch{}`);const children=Array.from({length:8},()=>spawn(process.execPath,[script],{env:{...process.env,RACE_DIR:dir},stdio:'ignore'}));await Promise.all(children.map(child=>new Promise<void>(resolve=>child.on('close',()=>resolve()))));expect(fs.existsSync(path.join(dir,'overlap'))).toBe(false);});
+  test.each(['removed','replaced'] as const)('publication %s during candidate enumeration stays fail-closed',(change)=>{
+    const dir=tmp(),target=path.join(dir,'artifact.json'),temporary=`${target}.tmp.2147483647.cafebabe`,replacement=path.join(dir,'replacement.json');
+    fs.writeFileSync(target,'{"value":"original"}\n',{mode:0o600});fs.linkSync(target,temporary);
+    fs.writeFileSync(replacement,'{"value":"replacement"}\n',{mode:0o600});
+    const readdir=fs.readdirSync;let changed=false;
+    const reader=spyOn(fs,'readdirSync').mockImplementation(((directory:any,options?:any)=>{
+      const entries=options===undefined?readdir(directory):readdir(directory,options);
+      if(String(directory)===dir&&!changed){changed=true;fs.unlinkSync(temporary);if(change==='removed')fs.unlinkSync(target);else fs.renameSync(replacement,target);}
+      return entries;
+    }) as typeof fs.readdirSync);
+    try{
+      let caught:unknown;try{recoverAtomicNoReplaceJson(target,{label:'Test publication',maxBytes:4096});}catch(error){caught=error;}
+      expect(changed).toBe(true);
+      expect(caught).toMatchObject(change==='removed'?{name:'AtomicPublicationTransition',code:'SNAPSHOT_RACE'}:{code:'UNSAFE_PATH'});
+      if(change==='removed')expect(fs.existsSync(target)).toBe(false);else expect(fs.readFileSync(target,'utf8')).toBe('{"value":"replacement"}\n');
+    }finally{reader.mockRestore();}
+  });
   test('concurrent recovery of one dead hard-link publication has a winner and no raw race errors',async()=>{
     const dir=tmp(),barrier=path.join(dir,'barrier'),script=path.join(dir,'recovery-racer.ts');fs.mkdirSync(barrier);expect(withLock(dir,()=>1)).toBe(1);
     const leases=path.join(dir,'.mutation-lock-leases'),token='c'.repeat(32),lease=path.join(leases,`${token}.json`),temporary=`${lease}.tmp.2147483647.deadbeef`;
@@ -210,4 +245,46 @@ let outcome='success';try{withLock(dir,()=>{const active=path.join(barrier,'acti
   test('legacy report imports expire after thirty days without following links',()=>{const old=process.env.GSTACK_HOME,base=tmp();process.env.GSTACK_HOME=base;try{const archive=secureDirectory(path.join(base,'security','cso','legacy-imports')),expired=path.join(archive,'a'.repeat(64)+'.json'),retained=path.join(archive,'b'.repeat(64)+'.json');fs.writeFileSync(expired,'{}');fs.writeFileSync(retained,'{}');const now=Date.now();fs.utimesSync(expired,new Date(now-31*86400_000),new Date(now-31*86400_000));retention(now);expect(fs.existsSync(expired)).toBe(false);expect(fs.existsSync(retained)).toBe(true);const unsafe=path.join(archive,'c'.repeat(64)+'.json');fs.symlinkSync(retained,unsafe);expect(()=>retention(now)).toThrow('unsafe artifact');expect(fs.readFileSync(retained,'utf8')).toBe('{}');}finally{if(old===undefined)delete process.env.GSTACK_HOME;else process.env.GSTACK_HOME=old;}});
   test('an active recheck pins only its expired parent report, never expired repair material',()=>{const now=Date.now(),repo='f'.repeat(24),oldRun=`${now-31*86400_000}-${'a'.repeat(16)}`,childRun=`${now}-${'b'.repeat(16)}`,findingId='c'.repeat(32),repoDir=secureDirectory(path.join(privateRoot(),repo)),parent=secureDirectory(path.join(repoDir,oldRun)),child=secureDirectory(path.join(repoDir,childRun)),bundles=secureDirectory(path.join(parent,'bundles')),reviews=secureDirectory(path.join(parent,'reviews')),attempts=secureDirectory(path.join(parent,'verification-attempts'));writeHelperJson(path.join(parent,'report.json'),{schemaVersion:3,runId:oldRun,repoId:repo,status:'finished',coverage:[],findings:[{id:findingId}]});writeJson(path.join(bundles,'bundle.json'),{schemaVersion:3});writeJson(path.join(reviews,'review.json'),{schemaVersion:3});writeJson(path.join(attempts,'attempt.json'),{schemaVersion:3});writeHelperJson(path.join(child,'report.json'),{schemaVersion:3,runId:childRun,repoId:repo,status:'running',deadline:new Date(now+60_000).toISOString(),coverage:[],findings:[],parent:{runId:oldRun,findingId,kind:'recheck'}});retention(now);expect(fs.existsSync(path.join(parent,'report.json'))).toBe(true);expect(fs.existsSync(bundles)).toBe(false);expect(fs.existsSync(reviews)).toBe(false);expect(fs.existsSync(attempts)).toBe(false);fs.rmSync(child,{recursive:true});retention(now);expect(fs.existsSync(parent)).toBe(false);});
   test('finished, expired, and malformed child reports cannot extend parent retention',()=>{const now=Date.now(),repo='e'.repeat(24),repoDir=secureDirectory(path.join(privateRoot(),repo)),findingId='d'.repeat(32);for(const [index,childValue] of [[0,{status:'finished',repoId:repo,deadline:new Date(now+60_000).toISOString()}],[1,{status:'running',repoId:repo,deadline:new Date(now-1).toISOString()}],[2,{status:'running',repoId:'0'.repeat(24),deadline:new Date(now+60_000).toISOString()}]] as const){const parentRun=`${now-(31+index)*86400_000}-${String(index+1).repeat(16)}`,childRun=`${now-index}-${String(index+4).repeat(16)}`,parent=secureDirectory(path.join(repoDir,parentRun)),child=secureDirectory(path.join(repoDir,childRun));writeHelperJson(path.join(parent,'report.json'),{schemaVersion:3,runId:parentRun,repoId:repo,status:'finished',coverage:[],findings:[{id:findingId}]});writeHelperJson(path.join(child,'report.json'),{schemaVersion:3,runId:childRun,repoId:childValue.repoId,status:childValue.status,deadline:childValue.deadline,coverage:[],findings:[],parent:{runId:parentRun,findingId,kind:'recheck'}});}retention(now);for(const name of fs.readdirSync(repoDir).filter(name=>Number(name.split('-')[0])<now-30*86400_000))expect(fs.existsSync(path.join(repoDir,name))).toBe(false);});
+});
+
+
+describe('CSO public report source-root privacy', () => {
+  const maskedRoot = '<REDACTED-internal.user_path>';
+  const reportFor = (sourceRoot: string): any => ({
+    schemaVersion: 3, runId: '1789450000000-aaaaaaaaaaaaaaaa', repoId: 'b'.repeat(24),
+    createdAt: '2026-09-15T06:00:00.000Z', deadline: '2026-09-15T06:10:00.000Z',
+    status: 'finished', completeness: 'partial',
+    policy: { mode: 'daily', scope: 'default', diff: true, base: 'main', offline: true, budgetSeconds: 600, maxWorkers: 3, maxRepairs: 3 },
+    source: { root: sourceRoot, snapshotHash: 'c'.repeat(64), originalHash: 'd'.repeat(64), baseCommit: 'e'.repeat(40), transformations: [{ path: 'src/root.ts', handling: 'public source' }] },
+    application: { actors: ['root administrator'], assets: ['/source/project'], entrypoints: ['read'], tenantBoundaries: ['tenant'], sensitiveOperations: ['read'], invariants: ['Root access remains restricted.'] },
+    coverage: [{ domain: 'authorization', scope: 'default', status: 'partial', method: 'manual static review', gaps: ['Remaining source review'], exclusions: [], evidence: ['Source read'] }],
+    findings: [], gaps: [], events: [],
+  });
+
+  test.each([
+    ['POSIX temporary', '/tmp/cso-private-project/repo'],
+    ['POSIX custom', '/srv/company-project/repo'],
+    ['Linux home', '/home/alice/company-project'],
+    ['macOS home', '/Users/alice/company-project'],
+    ['Windows custom', String.raw`D:\teams\company-project`],
+    ['Windows home', String.raw`C:\Users\Alice\company-project`],
+  ])('masks %s source roots without changing private identity', (_label, sourceRoot) => {
+    const dir = tmp(), report = reportFor(sourceRoot), original = structuredClone(report);
+    saveReport(dir, report);
+    const file = path.join(dir, 'report.json'), raw = fs.readFileSync(file, 'utf8');
+    expect(raw).not.toContain(sourceRoot);
+    const saved = JSON.parse(raw);
+    expect(saved.source.root).toBe(maskedRoot);
+    expect(saved).toEqual({ ...original, source: { ...original.source, root: maskedRoot } });
+    expect(report).toEqual(original);
+    expect(fs.readFileSync(path.join(dir, 'report.md'), 'utf8')).not.toContain(sourceRoot);
+    // Retained reports from before this fix are projected on read, without
+    // mutating their private file or any identity hashes.
+    const legacy = JSON.stringify(original, null, 2) + '\n';
+    fs.writeFileSync(file, legacy, { mode: 0o600 });
+    expect(loadReport(dir)).toEqual(saved);
+    expect(fs.readFileSync(file, 'utf8')).toBe(legacy);
+    expect(sanitizeHelperForJson({ root: 'administrator', label: 'root access', path: '/source/project' }))
+      .toEqual({ root: 'administrator', label: 'root access', path: '/source/project' });
+  });
 });

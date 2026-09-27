@@ -39,7 +39,7 @@ describe('gen-skill-docs stale-render prune', () => {
     const source = path.join(out, 'source');
     fs.mkdirSync(path.join(source, 'scripts'), { recursive: true });
     fs.copyFileSync(path.join(ROOT, 'scripts', 'gen-skill-docs.ts'), path.join(source, 'scripts', 'gen-skill-docs.ts'));
-    for (const file of ['discover-skills.ts', 'gen-llms-txt.ts', 'gen-agents-digest.ts', 'models.ts']) {
+    for (const file of ['discover-skills.ts', 'external-skill-names.ts', 'gen-llms-txt.ts', 'gen-agents-digest.ts', 'models.ts']) {
       fs.symlinkSync(path.join(ROOT, 'scripts', file), path.join(source, 'scripts', file), 'file');
     }
     fs.symlinkSync(path.join(ROOT, 'scripts', 'resolvers'), path.join(source, 'scripts', 'resolvers'), 'dir');
@@ -102,6 +102,26 @@ describe('gen-skill-docs stale-render prune', () => {
       expect(fs.readdirSync(factorySkills)).toEqual(['gstack-zzz']);
       expect(r.stdout).not.toContain('pruned stale factory');
       expect(r.stdout).not.toContain('gstack-zzz');
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  }, 200_000);
+
+  test('a failed host render keeps generated directories outside its partial inventory', () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-prune-failed-'));
+    const skills = path.join(out, '.agents', 'skills');
+    const stale = path.join(skills, 'gstack-retired-zzz', 'SKILL.md');
+    fs.mkdirSync(path.dirname(stale), { recursive: true });
+    fs.writeFileSync(stale, staleRender('gstack-retired-zzz', 'retain after failure'));
+    // An expected artifact that cannot be written interrupts the host render.
+    fs.mkdirSync(path.join(skills, 'gstack-autoplan', 'SKILL.md'), { recursive: true });
+    try {
+      const r = gen(out);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('ERROR (codex)');
+      expect(r.stderr).toContain('EISDIR');
+      expect(r.stdout).not.toContain('pruned stale');
+      expect(fs.readFileSync(stale, 'utf-8')).toBe(staleRender('gstack-retired-zzz', 'retain after failure'));
     } finally {
       fs.rmSync(out, { recursive: true, force: true });
     }

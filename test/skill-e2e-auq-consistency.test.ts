@@ -4,7 +4,7 @@
  * The user's core anxiety: AUQ is fine one run and broken the next — sometimes
  * no ELI10, sometimes no recommendation, sometimes minimal context. A single
  * snapshot can't see drift. This drives the carved /plan-ceo-review mode-selection
- * AUQ N times via the SDK capture path (clean text, no TTY mangling) and asserts
+ * AUQ N times via the native SDK tool capture (exact public fields, no answer) and asserts
  * the decision-brief format holds EVERY time and substance never craters.
  *
  * Pass bar:
@@ -13,7 +13,7 @@
  *   - Substance: every run >= 3, spread (max-min) <= 2.
  *
  * Reports per-run scores so drift is visible even on a pass. Periodic tier
- * (N SDK runs, ~$0.50-1 each).
+ * (N native SDK captures, ~$0.50-1 each).
  */
 import { test } from 'bun:test';
 import { CAPTURE_MS } from './helpers/eval-budgets';
@@ -35,21 +35,33 @@ describeE2E('AUQ consistency across runs (periodic)', () => {
   test(
     `carved /plan-ceo-review AUQ format + substance stable across ${N_RUNS} runs`,
     async () => {
+      const caseDeadline = Date.now() + N_RUNS * CAPTURE_MS + 60_000;
       const runs: Array<{ i: number; present: Set<string>; substance: number; empty: boolean }> = [];
+      const problems: string[] = [];
+      const dirs: string[] = [];
+      let captures: PromiseSettledResult<string>[];
 
-      for (let i = 0; i < N_RUNS; i++) {
-        const carved = carvedSkill();
-        const dir = setupPlanCeoDir({
-          skillMd: carved.skillMd,
-          sectionsFrom: carved.sectionsFrom,
-          tmpPrefix: `auq-consistency-${i}-`,
-        });
-        let text = '';
-        try {
-          text = await captureModeSelectionAuq({ planDir: dir, testName: `auq-consistency-${i}`, runId });
-        } finally {
-          fs.rmSync(dir, { recursive: true, force: true });
+      try {
+        captures = await Promise.allSettled(Array.from({ length: N_RUNS }, async (_, i) => {
+          const carved = carvedSkill();
+          const dir = setupPlanCeoDir({
+            skillMd: carved.skillMd,
+            sectionsFrom: carved.sectionsFrom,
+            tmpPrefix: `auq-consistency-${i}-`,
+          });
+          dirs.push(dir);
+          return captureModeSelectionAuq({ planDir: dir, testName: `auq-consistency-${i}`, runId, caseDeadline });
+        }));
+      } finally {
+        for (const dir of dirs) {
+          try { fs.rmSync(dir, { recursive: true, force: true }); }
+          catch (error) { problems.push(`fixture cleanup failed: ${error}`); }
         }
+      }
+
+      for (const [i, capture] of captures.entries()) {
+        if (capture.status === 'rejected') problems.push(`run ${i + 1} capture failed: ${capture.reason}`);
+        const text = capture.status === 'fulfilled' ? capture.value : '';
         const present = new Set(AUQ_FORMAT_ELEMENTS.filter(e => e.re.test(text)).map(e => e.field));
         let substance = 0;
         if (text.trim()) {
@@ -65,8 +77,6 @@ describeE2E('AUQ consistency across runs (periodic)', () => {
             `substance=${substance}${runs[i]?.empty ? ' (EMPTY CAPTURE)' : ''}`,
         );
       }
-
-      const problems: string[] = [];
 
       const anyEmpty = runs.filter(r => r.empty).map(r => r.i + 1);
       if (anyEmpty.length > 0) problems.push(`run(s) produced no AUQ at all: ${anyEmpty.join(',')}`);

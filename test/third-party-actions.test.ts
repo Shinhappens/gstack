@@ -21,11 +21,13 @@ import { describe, test, expect } from "bun:test";
 import * as fs from "fs";
 import * as path from "path";
 import { Glob } from "bun";
+import { marked } from "marked";
 import { generateThirdPartyActions } from "../scripts/resolvers/third-party-actions";
 import { generateAsideSetup } from "../scripts/resolvers/aside";
 import { HOST_PATHS } from "../scripts/resolvers/types";
 import { asideDriveOptions } from './helpers/third-party-actions';
 import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
+import recoveryFixture from './fixtures/third-party-actions-recovery-public.json';
 
 const ROOT = path.resolve(import.meta.dir, "..");
 
@@ -69,6 +71,27 @@ D) Defer
     expect(asideDriveOptions('A) Open the Aside app so I can re-run the probe.')).toEqual([]);
     expect(asideDriveOptions('A) Open the Aside app; if READY, I drive the dashboard.')).toHaveLength(1);
   });
+
+  test.each(recoveryFixture.responses)('native recovery response $attempt defers drive consent to a new question', ({ text }) => {
+    expect(asideDriveOptions(text)).toEqual([]);
+    expect(asideDriveOptions(text.replace('option included.', 'option included; then I drive in your Aside browser.'))).toHaveLength(1);
+  });
+
+  test('a future question can name its option without offering the drive now', () => {
+    for (const subject of ["I'll", 'I will', 'We’ll', 'we will']) {
+      for (const question of ['re-ask', 'ask again', 're-ask this question']) {
+        for (const label of ['the Aside drive', 'the "drive it in your Aside browser"', 'the “drive it in your Aside browser”']) {
+          const reference = `${subject} ${question} with ${label} option included`;
+          expect(asideDriveOptions(`A) Open Aside and re-probe; if READY, ${reference}.`)).toEqual([]);
+          expect(asideDriveOptions(`A) I drive in Aside first; ${reference}.`)).toHaveLength(1);
+          expect(asideDriveOptions(`A) Open Aside; ${reference}, then I drive the dashboard.`)).toHaveLength(1);
+          expect(asideDriveOptions(`A) Open Aside; ${reference} and navigate the dashboard before that question.`)).toHaveLength(1);
+        }
+      }
+    }
+    expect(asideDriveOptions('A) I will re-ask after I drive in Aside with the drive option included.')).toHaveLength(1);
+    expect(asideDriveOptions('A) Open Aside; I will re-ask with the Aside drive option, then I browse using that option.')).toHaveLength(1);
+  });
 });
 
 /** Generated skill markdown: every SKILL.md + carved sections at repo root. */
@@ -90,14 +113,15 @@ function generatedSkillDocs(): string[] {
  * (aside.com) never match.
  */
 function asideCommandTokens(text: string): string[] {
+  if (!/\baside\s+(?:--?[A-Za-z]|[a-z][\w-]*)/.test(text)) return [];
   const tokens: string[] = [];
-  const codeChunks = [
-    ...text.matchAll(/`([^`]+)`/g),
-    ...text.matchAll(/```[\s\S]*?```/g),
-  ].map((m) => m[1] ?? m[0]);
+  const codeChunks: string[] = [];
+  marked.walkTokens(marked.lexer(text, { gfm: false }), token => {
+    if (token.type === 'code' || token.type === 'codespan') codeChunks.push(token.text);
+  });
   for (const chunk of codeChunks) {
-    for (const m of chunk.matchAll(/(?:^|[\s;&|(])aside\s+(--?[A-Za-z][\w-]*|[a-z][\w-]*)/g)) {
-      tokens.push(m[1]);
+    for (const m of chunk.matchAll(/(?:^|[\s;&|(])aside\s+(skills[ \t]+[a-z][\w-]*|--?[A-Za-z][\w-]*|[a-z][\w-]*)/g)) {
+      tokens.push(m[1].replace(/[ \t]+/g, ' '));
     }
   }
   // Prose-form drift: an instruction like "then run aside mcp against the
@@ -109,8 +133,47 @@ function asideCommandTokens(text: string): string[] {
   return tokens;
 }
 
-/** The verified Aside surface: the readiness probe (`repl`) and the two cookbook verbs. */
-const ASIDE_ALLOWLIST = ["--version", "--help", "repl", "exec"];
+describe('Aside command extraction boundaries', () => {
+  test.each(['```bash', '````bash', '~~~bash'])('prose after a %s fence is not inline code', fence => {
+    const closing = fence.replace('bash', '');
+    const text = [fence, 'ls DESIGN.md', closing, '',
+      'Set aside prior visual choices; put aside old assumptions.', '',
+      'Continue with `DESIGN.md`.'].join('\n');
+    expect(asideCommandTokens(text)).toEqual([]);
+  });
+
+  test.each([
+    '`aside invented`',
+    '``aside invented `literal` ``',
+    '```bash\naside invented\n```',
+    '````bash\naside invented\n```\n````',
+    '~~~bash\naside invented\n~~~',
+    '- Run:\n\n  ```bash\n  aside invented\n  ```',
+    '> ```bash\n> aside invented\n> ```',
+    '    aside invented',
+    '| Command |\n| --- |\n| `aside invented` |',
+  ])('still detects unsupported commands in %s', text => {
+    expect(asideCommandTokens(text)).toContain('invented');
+  });
+
+  test('retains prose-form drift detection without treating ordinary aside prose as a command', () => {
+    expect(asideCommandTokens('Then run aside mcp against the dashboard.')).toContain('mcp');
+    expect(asideCommandTokens('Set aside prior choices, aside from constraints; visit aside.com.')).toEqual([]);
+  });
+
+  test('the documented read-only skill listing does not allow installation or invented skill actions', () => {
+    for (const command of ['aside skills list', 'aside skills  list']) {
+      expect(asideCommandTokens('`' + command + '`')).toEqual(['skills list']);
+      expect(ASIDE_ALLOWLIST).toContain('skills list');
+    }
+    for (const command of ['aside skills install', 'aside skills invented', 'aside skills']) {
+      expect(asideCommandTokens('`' + command + '`')).toEqual([command.slice('aside '.length)]);
+      expect(ASIDE_ALLOWLIST).not.toContain(command.slice('aside '.length));
+    }
+  });
+});
+
+const ASIDE_ALLOWLIST = ["--version", "--help", "repl", "exec", "skills list"];
 
 describe("THIRD_PARTY_ACTIONS contract pins", () => {
   // (a) Aside is named as the RECOMMENDED driver, with the download pointer +
@@ -127,7 +190,10 @@ describe("THIRD_PARTY_ACTIONS contract pins", () => {
   // timeout guard, three named outcomes, explicit Darwin gate on the pitch.
   test("runtime probe is the BROWSER SETUP probe with a Darwin-gated pitch", () => {
     expect(section).toContain("command -v aside");
-    expect(section).toContain("aside --version");
+    expect(section).not.toContain("aside --version");
+    expect(section).toContain('echo "READY: aside"');
+    expect(section).toContain("ASIDE_UNAVAILABLE");
+    expect(section).toContain("report only the safe status, never raw diagnostics");
     expect(section).toContain("NEEDS_ASIDE");
     expect(section).toContain("ASIDE_NOT_RUNNING");
     expect(section).toContain("ASIDE_READY");
@@ -320,7 +386,7 @@ describe("repo-wide generated output: Aside anti-drift tripwires", () => {
           .toContain(t);
       }
     }
-  });
+  }, 15_000);
 
   test("no Aside-specific installer invocation in any generated skill doc", () => {
     for (const file of generatedSkillDocs()) {

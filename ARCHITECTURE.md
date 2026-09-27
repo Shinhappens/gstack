@@ -153,7 +153,7 @@ ngrok forwards only the tunnel port. The security property comes from **physical
 | `POST /pair` | root-only | 404 | Pairing mint — local operator action |
 | `POST /tunnel/{start,stop}` | root-only | 404 | Daemon configuration |
 | `POST /token`, `DELETE /token/:id` | root-only | 404 | Scoped token mint/revoke |
-| `GET /cookie-picker`, `GET /cookie-picker/*` | public UI, auth API | 404 | Local-only — reads local browser DBs |
+| `GET /cookie-picker`, `/cookie-picker/*` | one-use code/session for UI; Bearer or picker session for API | 404 | Local-only — reads local browser DBs |
 | `GET /inspector`, `/inspector/events`, etc. | auth | 404 | Extension callback, local-only |
 | `GET /welcome` | public | 404 | GStack Browser landing page, local-only |
 | `GET /refs` | auth | 404 | Ref map — internal state |
@@ -167,31 +167,39 @@ ngrok forwards only the tunnel port. The security property comes from **physical
 
 **SSE session cookies.** EventSource can't send Authorization headers, so the extension POSTs `/sse-session` once at bootstrap with the root Bearer and receives a 30-minute view-only cookie (`gstack_sse`, HttpOnly, SameSite=Strict). The cookie is valid ONLY for `/activity/stream` and `/inspector/events` — it is NOT a scoped token and cannot be used on `/command`. Scope isolation is enforced by the module boundary: `sse-session-cookie.ts` has no imports from `token-registry.ts`.
 
-**Non-goal in this wave** (tracked as #1136): the cookie-import-browser path launches Chrome with `--remote-debugging-port=<random>`. On Windows with App-Bound Encryption v20, a same-user local process can connect to that port and exfiltrate decrypted v20 cookies — an elevation path relative to reading the SQLite DB directly (which can't decrypt v20 without DPAPI context). Fix direction is `--remote-debugging-pipe` instead of TCP; requires restructuring the CDP client.
+**Windows native-cookie boundary** (#1136): the exposed debugging TCP fallback has been removed. The native adapter uses Playwright's pipe transport and requires browser/runtime process-ownership and cleanup qualification before enablement; its qualification list is currently empty. DPAPI-compatible database imports remain available, but this does not promise recovery of every App-Bound Encryption cookie. Chrome 136+ protects its default user-data directory, including numbered profiles, against both pipe and TCP debugging. Closing Chrome does not bypass that policy. No TCP downgrade, substitute browser, or real-profile copy is allowed; unsupported cases direct the user to manual sign-in in gstack's browser.
 
 ### Bearer token auth
 
-Every server session generates a random UUID token, written to the state file with mode 0o600 (owner-only read). Every HTTP request that mutates browser state must include `Authorization: Bearer <token>`. If the token doesn't match, the server returns 401.
+Every server session generates a random UUID token, written to the state file with mode 0o600 (owner-only read). Requests to `/command` must include `Authorization: Bearer <token>` using an authorized root or scoped token. Invalid authentication is rejected.
 
-This prevents other processes on the same machine from talking to your browse server. The cookie picker UI (`/cookie-picker`) and health check (`/health`) are exempt on the local listener — they're 127.0.0.1-bound and don't execute commands. On the tunnel listener nothing is exempt except `/connect`.
+Command authorization requires the token. The local cookie picker instead exchanges a five-minute one-use code for a scoped HttpOnly session cookie; that cookie authorizes only picker routes, never `/command`. Its API also accepts Bearer authorization. The local health check (`/health`) is public and does not execute commands. On the tunnel listener nothing is exempt except `/connect`.
 
 ### Cookie security
 
 Cookies are the most sensitive data gstack handles. The design:
 
-1. **Keychain access requires user approval.** First cookie import per browser triggers a macOS Keychain dialog. The user must click "Allow" or "Always Allow." gstack never silently accesses credentials.
+Cookie databases use a read-only runtime adapter: Bun SQLite in Bun, or built-in SQLite in Node.js 22.13+. Large Chromium timestamps remain exact integers; ordinary domain counts remain JSON numbers. Temporary database snapshots are private and removed on close or failure.
 
-2. **Decryption happens in-process.** Cookie values are decrypted in memory (PBKDF2 + AES-128-CBC), loaded into the Playwright context, and never written to disk in plaintext. The cookie picker UI never displays cookie values — only domain names and counts.
+1. **OS key access follows platform permissions.** macOS may prompt for Keychain approval on the first import per browser. Linux supports libsecret-backed `v11` and the Chromium fallback key for `v10`; Windows supports DPAPI-compatible cookies. Permission denial stops the operation rather than automatically repeating prompts.
 
-3. **Database is read-only.** gstack copies the Chromium cookie DB to a temp file (to avoid SQLite lock conflicts with the running browser) and opens it read-only. It never modifies your real browser's cookie database.
+2. **Import receipts do not contain cookie values.** Database decryption happens in memory using the platform's supported format; decrypted cookies are applied to the captured Playwright context. The picker shows browser/profile labels, domains, counts, and separate import/reset/authentication statuses, never cookie values. Labels can still identify an account and must not be copied to public logs. Optional session persistence is a separate opt-in disk-storage feature.
 
-4. **Key caching is per-session.** The Keychain password + derived AES key are cached in memory for the server's lifetime. When the server shuts down (idle timeout or explicit stop), the cache is gone.
+3. **Database reads do not modify the source.** gstack copies the Chromium cookie DB to a temp file to avoid SQLite lock conflicts and opens it read-only. Only classified transient reads retry, at most three attempts with 150ms and 500ms delays. Native browser extraction has a separate lifecycle boundary and remains disabled pending qualification.
 
-5. **No cookie values in logs.** Console, network, and dialog logs never contain cookie values. The `cookies` command outputs cookie metadata (domain, name, expiry) but values are truncated.
+4. **Key caching is per-session.** Derived keys are cached in memory for the server's lifetime. When the server shuts down (idle timeout or explicit stop), the cache is gone.
+
+5. **Diagnostics use safe categories.** Cookie-import failures expose classified reasons and counts, not raw OS errors or decrypted values. The separate `cookies` inspection command redacts values that match its sensitive-name/value rules; it is not a metadata-only receipt and should not be used for public import summaries.
+
+`cookie-import-operation.ts` owns profile selection, decryption, application, and receipts for the direct CLI, `--all`, and authenticated picker. Explicit profile selection wins; otherwise only a sole relevant profile is chosen, with unreadable profiles treated as unknown. Current `Local State` labels precede Preferences and directory fallbacks. Browser/context/page ownership is captured before asynchronous work, imports serialize per destination context, and applied domains feed the existing JavaScript-origin guard. Cookies are context-wide, not tab-isolated.
+
+Storage reset and authentication verification are independent opt-ins. `--clear-storage` clears only the captured origin's localStorage (shared by same-origin tabs in that context) and target-tab sessionStorage, never IndexedDB, service workers, sibling origins, or other tabs' sessionStorage; `--all` plus reset is rejected. Reset is Chromium-only: an isolated world binds native-clock sampling and the destructive operation to one system-unique context, while navigation and the host deadline cancel pending work. Other engines retain import/auth checks but reject reset. A failed reset or later application failure does not imply rollback.
+
+`cookie-auth-verification.ts` validates daemon-side `GSTACK_COOKIE_AUTH_SELECTOR` and `GSTACK_COOKIE_AUTH_EXPECTED_IDENTITY` before a requested verification can mutate cookies or storage. Set them privately before daemon startup. After importing cookies, `--verify-auth` reloads the captured target and requires a successful same-origin response and exactly one visible identity whose normalized text matches exactly. Cookie count, HTTP 200, and substring matches cannot establish authentication. An import without this check is **not checked**, not verified; zero imports cannot verify sign-in. Results do not echo expected identity text.
 
 ### Shell injection prevention
 
-The browser registry (Comet, Chrome, Arc, Brave, Edge) is hardcoded. Database paths are constructed from known constants, never from user input. Keychain access uses `Bun.spawn()` with explicit argument arrays, not shell string interpolation.
+The browser registry (Chrome, Chromium, Brave, Edge, and macOS-only Comet, Arc, Dia) is hardcoded. Database roots come from known platform locations; profile directory input is validated. Keychain access uses `Bun.spawn()` with explicit argument arrays, not shell string interpolation.
 
 ### Egress receipt ledger (v1.63.0.0)
 
@@ -336,6 +344,7 @@ Templates contain the workflows, tips, and examples that require human judgment.
 | `{{BASE_BRANCH_DETECT}}` | `gen-skill-docs.ts` | Dynamic base branch detection for PR-targeting skills (ship, review, qa, plan-ceo-review) |
 | `{{QA_METHODOLOGY}}` | `gen-skill-docs.ts` | Shared QA methodology block for /qa and /qa-only |
 | `{{DESIGN_METHODOLOGY}}` | `gen-skill-docs.ts` | Shared design audit methodology for /plan-design-review and /design-review |
+| `{{SHARED_LIBS_RUBRIC}}` | `resolvers/shared-libs.ts` | Shared-code criteria for /deslop-shared-libs, /plan-eng-review, and /review: verified callers, existing helpers, compatibility, tests, and total savings |
 | `{{REVIEW_DASHBOARD}}` | `gen-skill-docs.ts` | Review Readiness Dashboard for /ship pre-flight |
 | `{{TEST_BOOTSTRAP}}` | `gen-skill-docs.ts` | Test framework detection, bootstrap, CI/CD setup for /qa, /ship, /design-review |
 | `{{CODEX_PLAN_REVIEW}}` | `resolvers/review.ts` | Optional outside plan review for /plan-ceo-review and /plan-eng-review: Claude Code on Codex, Codex on other supported harnesses, with the caller's native subagent fallback |
@@ -354,9 +363,23 @@ This is structurally sound — if a command exists in code, it appears in docs. 
 
 The generator also owns two files that are not skill docs: `review/design-checklist.md` is rendered from `lib/design-catalog.ts` (through `scripts/resolvers/design-checklist.ts`), and `lib/dom-dump.js` is written from `lib/dom-dump-script.ts`. The checklist `/review` and `/ship` read and the DOM dump `/design-review` runs therefore cannot drift from the catalog and the script the templates describe; `test/design-checklist-sync.test.ts` pins both.
 
+The internal async `runGeneration()` driver inventories skills, Claude sections,
+host metadata, OpenClaw snippets, the index, the agent digest, and auxiliary
+assets. Every artifact goes through one compare-or-write function. Dry runs
+report missing or different artifacts as `STALE` without changing files or
+directories; rendering and filesystem failures report `ERROR` with their cause.
+Either fails the command, including a single-host invocation. Module imports
+remain synchronous and do not start generation.
+
+Physical output paths are separate from paths embedded in content. `skill:check`
+uses that separation to generate every host once in temporary storage, validate
+the complete render, and compare canonical tracked output. Nonignored generated
+output must be tracked. Optional ignored host caches are untouched, and temporary
+storage is cleaned in `finally`, including after failed generation.
+
 ### The preamble
 
-Every skill starts with a `{{PREAMBLE}}` block that runs before the skill's own logic. Since v1.71.0.0 the rendered block is a thin fence that invokes `bin/gstack-skill-start` (the consolidated preamble runtime — it replaced ~18KB of inline bash per tier-2+ skill) and reads back `KEY: value` STATUS lines that the skill prose branches on; `bin/gstack-skill-end` logs telemetry at skill end. One-time onboarding and consent text is emitted as session-bound `GSTACK_INSTRUCTION` blocks only when a runtime gate actually fires, instead of rendering in every skill. The startup still handles five things:
+Most workflow skills start with a `{{PREAMBLE}}` block that runs before the skill's own logic. The read-only `/deslop-shared-libs` audit omits this block and does not run startup, telemetry, memory, or stateful review helpers. Since v1.71.0.0 the rendered block is a thin fence that invokes `bin/gstack-skill-start` (the consolidated preamble runtime — it replaced ~18KB of inline bash per tier-2+ skill) and reads back `KEY: value` STATUS lines that the skill prose branches on; `bin/gstack-skill-end` logs telemetry at skill end. One-time onboarding and consent text is emitted as session-bound `GSTACK_INSTRUCTION` blocks only when a runtime gate actually fires, instead of rendering in every skill. The startup still handles five things:
 
 1. **Update check** — calls `gstack-update-check`, reports if an upgrade is available.
 2. **Session tracking** — touches `~/.gstack/sessions/<parent-pid>` and prunes entries older than 2 hours, so concurrent-session state is observable on disk.
@@ -369,7 +392,7 @@ Every skill starts with a `{{PREAMBLE}}` block that runs before the skill's own 
 Three reasons:
 
 1. **Claude reads SKILL.md at skill load time.** There's no build step when a user invokes `/browse`. The file must already exist and be correct.
-2. **CI can validate freshness.** `gen:skill-docs --dry-run` + `git diff --exit-code` catches stale docs before merge.
+2. **CI can validate freshness.** All-host generation followed by tracked-diff and untracked-output checks catches stale docs before merge; `skill:check` also validates every host's content from a clean checkout.
 3. **Git blame works.** You can see when a command was added and in which commit.
 
 ### Template test tiers
@@ -511,5 +534,5 @@ Anything that needs Aside itself — `test/skill-e2e-aside.test.ts`, the Aside c
 - **No WebSocket streaming.** HTTP request/response is simpler, debuggable with curl, and fast enough. Streaming would add complexity for marginal benefit.
 - **No MCP protocol.** MCP adds JSON schema overhead per request and requires a persistent connection. Plain HTTP + plain text output is lighter on tokens and easier to debug.
 - **No multi-user support.** One server per workspace, one user. The token auth is defense-in-depth, not multi-tenancy.
-- **No Windows/Linux cookie decryption.** macOS Keychain is the only supported credential store. Linux (GNOME Keyring/kwallet) and Windows (DPAPI) are architecturally possible but not implemented.
+- **No universal session recovery.** OS-backed cookie import supports macOS, Linux, and DPAPI-compatible Windows formats, not every encryption scheme or site's authentication state. Windows native extraction stays disabled pending qualification, and Chrome's protected default directory is not bypassed.
 - **No iframe auto-discovery.** `$B frame` supports cross-frame interaction (CSS selector, @ref, `--name`, `--url` matching), but the ref system does not auto-crawl iframes during `snapshot`. You must explicitly enter a frame context first.

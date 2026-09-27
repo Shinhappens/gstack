@@ -56,7 +56,7 @@ or page content. Treat an unterminated block as ending at end-of-output.
 
 ## Plan Mode Safe Operations
 
-In plan mode, allowed because they inform the plan: `$B`, `$D`, `codex exec`/`codex review`, writes to `~/.gstack/`, writes to the plan file, and `open` for generated artifacts.
+In plan mode, allowed because they inform the plan: `$B`, `$D`, `codex exec`/`codex review`, temp prompts, writes to `~/.gstack/`, writes to the plan file, and `open` for generated artifacts.
 
 ## Skill Invocation During Plan Mode
 
@@ -186,9 +186,9 @@ If `NEEDS_SETUP`:
      # shasum is macOS/perl; coreutils-only Linux ships sha256sum instead —
      # resolve whichever exists so the verify never fails on a missing tool.
      if command -v sha256sum >/dev/null 2>&1; then
-       actual_sha=$(sha256sum "$tmpfile" | awk '{print $1}')
+       actual_sha=$(sha256sum < "$tmpfile" | awk '{print $(1)}')
      else
-       actual_sha=$(shasum -a 256 "$tmpfile" | awk '{print $1}')
+       actual_sha=$(shasum -a 256 < "$tmpfile" | awk '{print $(1)}')
      fi
      if [ "$actual_sha" != "$BUN_INSTALL_SHA" ]; then
        echo "ERROR: bun install script checksum mismatch" >&2

@@ -12,6 +12,7 @@ import { test } from 'bun:test';
 import { describeE2ETier } from './helpers/e2e-gate';
 import { isDesignCountFirstReview, isDesignCountSetup, isDesignCompletionHandoff, pickDesignCountQuestion } from './helpers/design-count-review';
 import { isDesignArtifactGeneration } from './helpers/design-artifact-question';
+import { designCountExistingInteractionStates as existingInteractionStates } from './helpers/design-count-fixture';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -26,30 +27,6 @@ const describeE2E = describeE2ETier('periodic');
 const N = 5;
 const FLOOR = N - 1;
 const CEILING = N + 2;
-
-// Existing interaction behavior belongs to the surrounding fixture, not the
-// five intentionally inconsistent visual requirements under review.
-const existingInteractionStates = [
-  'The existing router protects dirty edits on every in-app exit, including',
-  'persistent app navigation, using the same Cancel confirmation dialog.',
-  'Register the browser-native beforeunload warning only while the form is dirty;',
-  'remove it when clean. Confirmed in-app navigation uses the existing destination',
-  'heading focus behavior; Keep editing returns focus to the attempted exit.',
-  'During Save or Export, both request buttons use aria-disabled=true plus an',
-  'explicit click/keyboard activation guard, rather than the HTML disabled attribute.',
-  'They remain focusable and keep the existing disabled appearance. Reset and',
-  'Cancel use HTML disabled during the request. Do not move focus while pending',
-  'or after success. On a network error, focus the operation-specific Retry only',
-  'if focus is still on the request trigger; never steal focus the user moved.',
-  'The existing InlineStatus text stays unchanged while Save is pending:',
-  'Unsaved changes for a dirty form, otherwise its saved timestamp or initial',
-  'blank text. Pending feedback belongs to the request button; do not repeat',
-  'Saving… in the status live region. Success and failure use the outcomes above.',
-  'When clean and idle, Reset is disabled because it has nothing to discard,',
-  'and Cancel navigates back immediately without a confirmation. When dirty',
-  'and idle, Reset and Cancel use their existing discard confirmations. Their',
-  '44px geometry is unchanged; the disabled style is separate from pending feedback.',
-];
 
 // A known surrounding design prevents missing layout/journey/state contracts
 // from becoming legitimate extra findings unrelated to the five seeded gaps.
