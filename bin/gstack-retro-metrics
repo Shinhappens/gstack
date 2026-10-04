@@ -12,7 +12,7 @@
 #
 # Conventions mirror bin/gstack-skill-start:
 #   - Paths resolve $0-relative (works for every host + install layout).
-#   - State paths honor ${GSTACK_HOME:-$HOME/.gstack}.
+#   - State paths honor the shared state root (bin/gstack-paths).
 #   - Error style: per-line `|| true`, never `set -e` — a mid-script failure
 #     must not drop later METRIC lines.
 #   - No heredocs (nothing to BASH_COMPAT-guard; see
@@ -45,7 +45,9 @@ done
 # sibling-bin call must go through $_BIN, never bare PATH lookup).
 _SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 _BIN="$_SCRIPT_DIR"
-_GH="${GSTACK_HOME:-$HOME/.gstack}"
+. "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select
+_GH="$_gstack_sr_root"
 
 echo "RETRO_METRICS_PROTO: 1"
 

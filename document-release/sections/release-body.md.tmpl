@@ -1,5 +1,9 @@
 ## Step 2: Per-File Documentation Audit
 
+**Ship-owned documentation mode:** after Steps 1 and 1.5, execute Steps 2–4 and 6 only,
+under audit-scope's edit boundary, then return its JSON result; all standalone
+metadata, review, commit and PR steps below remain unavailable to this child.
+
 Read each documentation file and cross-reference it against the diff. Use these generic heuristics
 (adapt to whatever project you're in — these are not gstack-specific):
 
@@ -27,7 +31,7 @@ Read each documentation file and cross-reference it against the diff. Use these 
 - Are listed commands and scripts accurate?
 - Do build/test instructions match what's in package.json (or equivalent)?
 
-**Any other .md files:**
+**Other relevant docs and authored templates (including nested declared roots):**
 - Read the file, determine its purpose and audience.
 - Cross-reference against the diff to check if it contradicts anything the file says.
 
@@ -42,7 +46,9 @@ For each file, classify needed updates as:
 
 ## Step 3: Apply Auto-Updates
 
-Make all clear, factual updates directly using the Edit tool.
+Make all clear, factual updates directly using the Edit tool after reading the full
+file. In ship-owned read-only mode, propose them as blockers without editing. Preserve
+pre-existing user edits; ambiguity about overlapping content goes back to the parent.
 
 For each file modified, output a one-line summary describing **what specifically changed** — not
 just "Updated README.md" but "README.md: added /new-skill to skills table, updated skill count
@@ -58,6 +64,11 @@ from 9 to 10."
 
 ## Step 4: Ask About Risky/Questionable Changes
 
+In ship-owned mode, record the specific decision and affected paths as blockers for
+the parent, leave the questionable content alone, and finish the remaining safe audit.
+Do not call AskUserQuestion or auto-choose any recommendation. Standalone mode follows
+the existing gate below.
+
 For each risky or questionable update identified in Step 2, use AskUserQuestion with:
 - Context: project name, branch, which doc file, what we're reviewing
 - The specific documentation decision
@@ -70,12 +81,9 @@ Apply approved changes immediately after each answer.
 
 ## Step 5: CHANGELOG Voice Polish
 
-**CRITICAL — NEVER CLOBBER CHANGELOG ENTRIES.**
-
-This step polishes voice. It does NOT rewrite, replace, or regenerate CHANGELOG content.
-
-A real incident occurred where an agent replaced existing CHANGELOG entries when it should have
-preserved them. This skill must NEVER do that.
+This step polishes voice only. It does not rewrite, replace, or regenerate CHANGELOG
+content: the entries are the release record, and a replaced entry loses facts nobody
+notices until after the release.
 
 **Rules:**
 1. Read the entire CHANGELOG.md first. Understand what is already there.
@@ -90,11 +98,11 @@ preserved them. This skill must NEVER do that.
 
 **If CHANGELOG was modified in this branch**, review the entry for voice:
 
-- **Sell test (Diataxis rubric):** Score each CHANGELOG entry 0-3:
-  - **1 point** — answers "What changed?" (reference: names the feature/fix)
-  - **1 point** — answers "Why should I care?" (explanation: user impact, pain removed)
-  - **1 point** — answers "How do I use it?" (how-to: command, flag, or link to docs)
-  - Entries scoring <2 need attention, not replacement. Report missing facts or user impact; polish existing wording only. A score of 3 passes all three checks.
+- **Sell test (Diataxis):** a good entry answers "What changed?" (names the
+  feature/fix), "Why should I care?" (user impact, pain removed) and "How do I use
+  it?" (command, flag, or link to docs). An entry that answers fewer than two of these needs
+  attention, not replacement: report the missing facts or user impact, and polish
+  existing wording only.
 - Lead with what the user can now **do** — not implementation details.
 - "You can now..." not "Refactored the..."
 - Flag commit-message-style entries and polish wording without removing facts.
@@ -115,6 +123,11 @@ After auditing each file individually, do a cross-doc consistency pass:
    should be discoverable from one of the two entry-point files.
 5. Flag any contradictions between documents. Auto-fix clear factual inconsistencies (e.g., a
    version mismatch). Use AskUserQuestion for narrative contradictions.
+
+In ship-owned mode, protected metadata/manifests stay untouched even for factual
+inconsistencies, and narrative contradictions return as blockers. This is the last
+ship-child step: output the doc-health summary and audit-scope's JSON result, then
+STOP. A partial audit or unresolved required correction is `blocked`, never `current`.
 
 ---
 
@@ -141,7 +154,7 @@ If TODOS.md does not exist, skip this step.
 
 ## Step 8: VERSION Bump Question
 
-**CRITICAL — NEVER BUMP VERSION WITHOUT ASKING.**
+**Ask before changing VERSION** — the version number is the user's release decision.
 
 1. **If VERSION does not exist:** Skip silently.
 
@@ -175,7 +188,7 @@ git diff <diff-base> HEAD -- VERSION
 
    **Spawned sessions** (per the spawned-dispatch contract at the top of this skill): the
    recommendation flips — choose C (leave version as-is) and record the uncovered scope in
-   your completion report (the `decisions` array when dispatched from /ship).
+   your completion report. Ship-owned children stopped at Step 6 and never reach this step.
    A spawned run must never change VERSION: the dispatching workflow owns version numbering.
 
    The key insight: a VERSION bump set for "feature A" should not silently absorb "feature B"

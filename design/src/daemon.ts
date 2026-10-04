@@ -87,13 +87,17 @@ let shuttingDown = false;
 let serverRef: ReturnType<typeof Bun.serve> | null = null;
 let idleInterval: ReturnType<typeof setInterval> | null = null;
 const startTime = Date.now();
-const daemonLog = openDaemonLog();
+let daemonLog: fs.WriteStream | null | undefined;
 
 function openDaemonLog(): fs.WriteStream | null {
   try {
     const p = resolveDaemonLogPath();
     fs.mkdirSync(path.dirname(p), { recursive: true });
-    return fs.createWriteStream(p, { flags: "a" });
+    const stream = fs.createWriteStream(p, { flags: "a" });
+    stream.on("error", () => {
+      if (daemonLog === stream) daemonLog = null;
+    });
+    return stream;
   } catch {
     return null;
   }
@@ -101,6 +105,7 @@ function openDaemonLog(): fs.WriteStream | null {
 
 function dlog(...args: unknown[]): void {
   const line = `[${new Date().toISOString()}] ${args.map(String).join(" ")}\n`;
+  if (daemonLog === undefined) daemonLog = openDaemonLog();
   if (daemonLog) daemonLog.write(line);
   process.stderr.write(line);
 }
@@ -533,6 +538,7 @@ export function start(): { port: number } {
     fetch: fetchHandler,
   });
   const actualPort = serverRef.port;
+  if (actualPort === undefined) throw new Error('design daemon did not bind a TCP port');
   const state: DaemonState = {
     pid: process.pid,
     port: actualPort,
@@ -572,7 +578,10 @@ export const __testInternals__ = {
   fetchHandler,
   idleCheckTick,
   markMeaningfulActivity,
+  daemonLog: () => daemonLog,
   resetForTest: (): void => {
+    daemonLog?.end();
+    daemonLog = undefined;
     boards.clear();
     boardMutex.clear();
     lastMeaningfulActivity = Date.now();

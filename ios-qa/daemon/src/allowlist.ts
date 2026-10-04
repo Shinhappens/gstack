@@ -7,13 +7,13 @@
 
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { join, dirname } from 'path';
-import { homedir } from 'os';
 import type { Allowlist, AllowlistEntry, Capability } from './types';
 import { capabilityCovers } from './types';
+import { resolveStateRoot } from '../../../lib/state-root';
 
 export function defaultAllowlistPath(): string {
   return process.env.GSTACK_IOS_ALLOWLIST_PATH
-    ?? join(homedir(), '.gstack', 'ios-qa-allowlist.json');
+    ?? join(resolveStateRoot(), 'ios-qa-allowlist.json');
 }
 
 export async function loadAllowlist(path: string = defaultAllowlistPath()): Promise<Allowlist> {

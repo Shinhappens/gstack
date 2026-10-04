@@ -2,7 +2,7 @@
   "$schema": "https://gstack.dev/schemas/section-manifest.json",
   "skill": "autoplan",
   "version": 1,
-  "note": "PASSIVE registry (v2 plan T9 / CM2). Fields are IDs, file paths, human titles, and human-readable trigger text ONLY. The skeleton's phase sequencing (Sequential Execution + the Phase 0 UI/DX scope detection) is the ONLY place that decides WHEN to read a section \u2014 Phase 2 and Phase 2.5 are conditional and their sections must NOT be read when their scope is absent; required-reads live in the E2E fixtures. No machine predicate here \u2014 see docs/designs/v2_PLAN.md:663.",
+  "note": "PASSIVE registry (v2 plan T9 / CM2). Fields are IDs, file paths, human titles, and human-readable trigger text ONLY. The skeleton's phase sequencing (Sequential Execution + the Phase 0 UI/DX scope detection) is the ONLY place that decides WHEN to read a section \u2014 Phase 2 and Phase 2.5 are conditional and their sections must NOT be read when their scope is absent; no paid eval checks the required section reads since the autoplan chain eval was retired (TODOS.md). No machine predicate here \u2014 see docs/designs/v2_PLAN.md:663.",
   "sections": [
     {
       "id": "ceo-phase",

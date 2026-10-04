@@ -64,6 +64,7 @@ describe('generateGBrainSaveResults — wiring + compression pin', () => {
 
       // Compact: points to docs/gbrain-write-surfaces.md for full template.
       expect(out).toContain('docs/gbrain-write-surfaces.md');
+      expect(out).toContain('Read the saved page back before claiming persistence.');
     },
   );
 
@@ -113,7 +114,8 @@ describe('generateGBrainContextLoad — compression pin', () => {
     expect(out).toContain('Skip this entire section if `gbrain` is not on PATH');
     expect(out).toContain('docs/gbrain-write-surfaces.md');
     expect(out).toContain('gbrain search');
-    expect(out).toContain('gbrain get_page');
+    expect(out).toContain('gbrain get "<slug>"');
+    expect(out).not.toContain('gbrain get_page');
     if (out.length > 500) {
       throw new Error(
         `generateGBrainContextLoad emitted ${out.length} chars (~${Math.round(out.length / 4)} tokens), ` +

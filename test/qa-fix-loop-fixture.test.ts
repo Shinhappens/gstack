@@ -4,14 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
-
 const ROOT = path.resolve(import.meta.dir, '..');
-
-test('QA fixture regressions select only the QA fix loop', () => {
-  expect(selectTests(['test/qa-fix-loop-fixture.test.ts'], E2E_TOUCHFILES).selected).toEqual(['qa-fix-loop']);
-});
-
 test.each(['success', 'bash-edit', 'max-turns', 'no-edit', 'no-commit', 'runner', 'retry', 'directory', 'recording', 'late-timeout'])
   ('QA attempt recording and fixture ownership: %s', scenario => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-fix-body-'));

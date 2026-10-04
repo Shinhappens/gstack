@@ -19,6 +19,7 @@ import * as os from "os";
 import * as path from "path";
 import { createHash } from "crypto";
 import { appendJsonl } from "./jsonl-store";
+import { resolveStateRoot } from "./state-root";
 
 export interface SemanticReviewEntry {
   ts: string;
@@ -30,7 +31,7 @@ export interface SemanticReviewEntry {
 }
 
 function securityDir(): string {
-  const home = process.env.GSTACK_HOME || path.join(os.homedir(), ".gstack");
+  const home = resolveStateRoot();
   return path.join(home, "security");
 }
 

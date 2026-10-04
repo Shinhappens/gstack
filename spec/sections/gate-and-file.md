@@ -164,11 +164,10 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" || exit 1
+source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" && _gstack_codex_select_model exec || exit 1
 _OUTSIDE_PROMPT=$(cat "$_OUTSIDE_INPUT") || exit 1
 _OUTSIDE_EXIT=0
-_gstack_codex_timeout_wrapper 120 codex exec "$_OUTSIDE_PROMPT" -C "$_REPO_ROOT" -s read-only -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
-# Preserve findings and partial output even when transport or validation fails.
+_gstack_codex_timeout_wrapper 120 codex exec "$_OUTSIDE_PROMPT" -C "$_REPO_ROOT" -s read-only -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
 cat "$_OUTSIDE_TMP/text" || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 
 cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
@@ -181,7 +180,7 @@ bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" spec "$_OUTSIDE_T
 echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 ```
 
-Show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
+Use Bash `timeout: 180000`; show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
 
 Missing/broken CLI, authentication failure, timeout, refusal, nonzero exit, invalid JSON, empty response, output overflow, or missing/invalid SCORE and AMBIGUITIES means missing coverage: name Codex, give the emitted diagnosis/setup command, mark unavailable, and continue to Phase 5 under the existing fallback. Never label these outcomes PASS. The CLI's transport success alone cannot pass the quality gate.
 
@@ -202,12 +201,6 @@ Retain the historical review-log skill ID; add `"host":"claude","outside_provide
   - C) One more revision attempt
 
 Max 3 dispatches total. If still <7 after iter 3, AskUserQuestion same options.
-
-
-
-**Audit-sink invariant:** When the redaction gate fires, the raw spec must NOT
-be persisted anywhere downstream (no archive write, no transcript log). The
-`spec-quality-gate-secret-sink.test.ts` enforces this.
 
 ### Phase 5: File the Spec (+ optional --execute)
 
@@ -279,7 +272,7 @@ reuse it; write the exact bytes to `$REDACT_FILE`; `~/.claude/skills/gstack/bin/
 exit-3/2/0 handling. On exit 3, do NOT write the archive; HIGH has no skip. Pass the
 same `$REDACT_FILE` downstream so the bytes scanned are the bytes sent.
 
-**D2 — sanitized body to the archive.** If auto-redact fired, the `<body>` below
+**Sanitized body to the archive.** If auto-redact fired, the `<body>` below
 MUST be the sanitized body (`$REDACT_FILE`), not the original draft — one body for
 all sinks. The user's on-disk source draft keeps the original.
 
@@ -287,8 +280,8 @@ Resolve the archive path via the existing `gstack-paths` helper (handles
 `GSTACK_HOME`, `CLAUDE_PLUGIN_DATA`, Windows fallback):
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
-eval "$(~/.claude/skills/gstack/bin/gstack-slug)"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG)
 ARCHIVE_DIR="$GSTACK_STATE_ROOT/projects/$SLUG/specs"
 mkdir -p "$ARCHIVE_DIR"
 SLUG_TITLE=$(echo "<title>" | tr ' ' '-' | tr -cd 'a-zA-Z0-9-' | tr A-Z a-z | cut -c1-60)
@@ -304,8 +297,6 @@ spec_branch: $(git branch --show-current 2>/dev/null || echo unknown)
 spec_plan_mode: ${GSTACK_PLAN_MODE:-unset}
 spec_executed: ${WILL_EXECUTE:-false}
 spec_worktree_path:
-ttfc_ms: ${TTFC_MS:-}
-tthw_ms: ${TTHW_MS:-}
 ---
 
 # <title>
@@ -320,14 +311,14 @@ The PID suffix and atomic rename prevent collisions when two `/spec` invocations
 run in the same second.
 
 **Sync default:** `/specs/` is auto-excluded from the artifacts-sync allowlist —
-archives stay local unless the user opts in via `--sync-archive` (privacy default
-per codex review). If `--sync-archive` is passed, append `/specs/<archive_name>`
+archives stay local unless the user opts in via `--sync-archive` (privacy default).
+If `--sync-archive` is passed, append `/specs/<archive_name>`
 to the artifacts-sync allowlist (or symlink into the synced dir, depending on
 implementation).
 
 #### Spawn the agent (`--execute` path only)
 
-**E2 dirty-worktree gate:**
+**Dirty-worktree gate:**
 
 ```bash
 DIRTY=$(git status --porcelain 2>/dev/null)
@@ -340,7 +331,7 @@ If `$DIRTY` is non-empty, AskUserQuestion:
 - B) Stash and restore (auto-stash now, restore after spawn returns)
 - C) Cancel spawn (stop here; issue stays filed, archive stays written)
 
-**E2 TOCTOU re-check (F1):** After the user answers, IMMEDIATELY re-run
+**TOCTOU re-check:** After the user answers, IMMEDIATELY re-run
 `git status --porcelain` before any worktree operation. If state diverged
 from the answer, re-prompt the AskUserQuestion. The check must happen INSIDE
 the spawn workflow, not be cached from earlier.
@@ -353,21 +344,21 @@ git stash push -u -m "spec-execute-auto-$$"  # untracked YES, ignored NO
 STASH_REF="spec-execute-auto-$$"
 ```
 
-F2 stash policy: `-u` includes untracked; we deliberately do NOT use `--all`
+Stash policy: `-u` includes untracked; we deliberately do NOT use `--all`
 because ignored files (build artifacts, .env caches) are usually local-by-design
 and should stay in the current worktree.
 
 If C: print "Cancelled spawn. Issue filed: $ISSUE_URL, archive: $ARCHIVE_PATH."
 Exit /spec.
 
-**F4 SHA pin:** Capture the exact SHA AFTER the final dirty check. Use this
+**SHA pin:** Capture the exact SHA AFTER the final dirty check. Use this
 SHA (not "HEAD") for the worktree:
 
 ```bash
 PIN_SHA=$(git rev-parse HEAD)
 ```
 
-**F5 unique branch + worktree path:** Suffix with `$$` to avoid concurrent
+**Unique branch + worktree path:** Suffix with `$$` to avoid concurrent
 collisions:
 
 ```bash
@@ -376,7 +367,7 @@ SPAWN_PATH="${WORKTREE_PARENT:-../worktrees}/${SLUG_TITLE}-$$"
 mkdir -p "$(dirname "$SPAWN_PATH")"
 ```
 
-**D16 mandatory final-confirm gate:** AskUserQuestion: "Spawn agent now? Last
+**Final-confirm gate (required):** AskUserQuestion: "Spawn agent now? Last
 chance to revise the spec." Options: A) Spawn. B) Cancel (issue stays filed,
 archive stays written).
 
@@ -403,22 +394,9 @@ echo "Follow with: cd $SPAWN_PATH && claude --resume"
 Update archive frontmatter with `spec_worktree_path: $SPAWN_PATH` and
 `spec_executed: true` (atomic re-write).
 
-**F3 stash restore safety (when B path was chosen):** Do NOT auto-restore inline
+**Stash restore safety (when B path was chosen):** Do NOT auto-restore inline
 — the spawned agent may take hours. Instead print: "Stash preserved as
 `$STASH_REF`. Restore later with `git stash list` then `git stash apply
 stash^{/$STASH_REF}`. Before restore, re-run `git status` to make sure your
 worktree is clean." Do NOT drop the stash; user owns it.
 
-#### TTHW telemetry (DX11/F7)
-
-Capture timestamps at three checkpoints, write to telemetry envelope at /spec
-exit:
-
-- `T_PHASE1_START` — Phase 1 first AskUserQuestion or first text emit
-- `T_FIRST_CITATION` — first file/symbol reference in Phase 3 prose
-- `T_FILE_OR_SPAWN` — issue filed OR agent spawned, whichever ends Phase 5
-
-Append the captured timestamps to the local analytics line that the preamble's
-end-of-skill telemetry write emits, as `ttfc_ms` (Phase 1 → first citation) and
-`tthw_ms` (Phase 1 → file/spawn) JSON fields. Surfacing the aggregates in
-`/retro` is a separate follow-up.

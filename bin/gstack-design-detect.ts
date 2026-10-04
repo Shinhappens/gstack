@@ -57,7 +57,7 @@
  *
  * Scan hardening: every target, explicit or derived from `--changed`, must be an
  * existing regular file or directory whose realpath lies under the repo root (or
- * cwd) or under ${GSTACK_HOME:-~/.gstack}/projects/<slug>/designs/ (where design-
+ * cwd) or under <state root>/projects/<slug>/designs/ (where design-
  * review keeps rendered-DOM dumps: `designs/<audit>/dom/**` are page dumps and
  * scan with --no-inline-ignores, because an `impeccable-disable` comment there is
  * page-controlled; other designs/ files are gstack-authored artifacts and keep
@@ -77,7 +77,7 @@
  * whose realpath lies inside the repo or cwd are ignored (IMPECCABLE_ENV_IGNORED).
  *
  * Observability: one content-free JSON line per probe/scan appended to
- * ${GSTACK_HOME:-~/.gstack}/analytics/design-detector.jsonl (local file, no egress).
+ * <state root>/analytics/design-detector.jsonl (local file, no egress).
  *
  * Non-sink: this spawns a third-party binary the user installed over local
  * paths; gstack does not audit that engine's network behavior (NOTICE.md).
@@ -94,6 +94,7 @@ import {
   ENGINE_RELEASE_BASE, ENGINE_ASSETS, ENGINE_PINS,
 } from '../lib/design-detect-contract';
 import { writeReceipt, writeOutcome } from '../lib/egress-receipt';
+import { readConfigKey, resolveStateRoot } from '../lib/state-root';
 import { DESIGN_SLOP_CATALOG, entryForImpeccableId } from '../lib/design-catalog';
 import { isFrontendPath } from '../lib/frontend-scope';
 
@@ -104,14 +105,9 @@ const HOME = os.homedir();
 const REAL_HOME = realpathOrNull(HOME) ?? HOME;
 const ENV = process.env;
 
-/** Where config.yaml lives: the same precedence bin/gstack-config uses. */
-function gstackStateDir(): string {
-  return ENV.GSTACK_STATE_ROOT || ENV.GSTACK_HOME || ENV.GSTACK_STATE_DIR || path.join(HOME, '.gstack');
-}
-
-/** Existing local analytics location; design artifacts resolve separately below. */
+/** Config, analytics and design artifacts share the one state root (lib/state-root.ts). */
 function gstackHome(): string {
-  return ENV.GSTACK_HOME || path.join(HOME, '.gstack');
+  return resolveStateRoot(ENV);
 }
 
 function realpathOrNull(p: string): string | null {
@@ -130,23 +126,10 @@ function gitTopLevel(cwd: string): string | null {
   return top ? realpathOrNull(top) : null;
 }
 
-/** One flat key from config.yaml, read the way bin/gstack-config resolves it (same STATE_DIR precedence); '' when unset. */
+/** One flat key from config.yaml via readConfigKey (the bin/gstack-config reader); '' when unset. */
 function configValue(key: string): string {
-  const file = path.join(gstackStateDir(), 'config.yaml');
-  try {
-    const text = fs.readFileSync(file, 'utf-8');
-    let value = '';
-    const re = new RegExp(`^${key}:\\s*(.*?)\\s*$`);
-    for (const line of text.split('\n')) {
-      const m = line.match(re);
-      if (!m) continue;
-      // flat YAML: drop a trailing comment and surrounding quotes
-      value = m[1].replace(/\s+#.*$/, '').trim().replace(/^["'](.*)["']$/, '$1');
-    }
-    return value;
-  } catch {
-    return '';
-  }
+  // flat YAML: drop a trailing comment and surrounding quotes
+  return (readConfigKey(key, ENV) ?? '').replace(/\s+#.*$/, '').trim().replace(/^["'](.*)["']$/, '$1');
 }
 
 /** design_detector: `Off` by hand must not silently re-enable a third-party binary. */
@@ -785,12 +768,7 @@ function refuse(target: string, why: string) {
 }
 
 function designsRoot(): string {
-  // Match the artifact producer's bin/gstack-paths precedence without changing
-  // config or analytics roots. Plugin data belongs to gstack only with its marker.
-  const stateRoot = ENV.GSTACK_HOME
-    || (ENV.CLAUDE_PLUGIN_DATA && /gstack/i.test(ENV.CLAUDE_PLUGIN_ROOT || '') ? ENV.CLAUDE_PLUGIN_DATA : '')
-    || (ENV.HOME ? path.join(ENV.HOME, '.gstack') : '.gstack');
-  return path.join(stateRoot, 'projects');
+  return path.join(resolveStateRoot(ENV), 'projects');
 }
 
 type TargetClass = 'project' | 'artifact' | 'dom-dump';

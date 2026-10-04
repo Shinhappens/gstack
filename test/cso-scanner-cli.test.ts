@@ -32,6 +32,13 @@ describe('compiled scanner evidence persistence', () => {
     const stored = JSON.parse(fs.readFileSync(join(run.dir,out.artifact), 'utf8')); expect(stored.provenance.image).toBeNull(); expect(stored.outcome).not.toHaveProperty('repair');
     expect(run.report().coverage.find((x: any) => x.domain === 'scanner:gitleaks')).toMatchObject({ status: 'not_assessed' });
   });
+  test('trivy SARIF whose ROOTPATH is the started checkout imports its findings (#3011)', () => {
+    const run = start(), doc = JSON.parse(fs.readFileSync(resolve(import.meta.dir, 'fixtures/cso-sarif/trivy-0.75.0-fs.sarif'), 'utf8'));
+    doc.runs[0].originalUriBaseIds.ROOTPATH.uri = `file://${repo}/`;
+    const file = join(root, 'trivy.sarif'); fs.writeFileSync(file, JSON.stringify(doc));
+    const r = command(['import-sarif', run.runId, file]); expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout); expect(out.gaps).toEqual([]); expect(out.candidates.map((c: any) => c.location.path)).toEqual(['Dockerfile', 'Dockerfile']);
+  });
   test('repeated same-content SARIF imports get distinct immutable artifacts and coverage records', () => {
     const run = start(), first = command(['import-sarif', run.runId, sarif]); expect(first.status).toBe(0);
     const firstOut = JSON.parse(first.stdout), before = fs.readFileSync(join(run.dir,firstOut.artifact), 'utf8');

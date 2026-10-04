@@ -86,7 +86,7 @@ test('versioned aggregate keeps false efficacy and cannot overwrite earlier atte
     const original = fs.readFileSync(file, 'utf8');
     expect(JSON.parse(original)).toMatchObject({ ...verdict, contract: OVERLAY_CONTRACT });
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatchObject({ name: 'owned-contract-contract-v2-aggregate', passed: true, cost_usd: 0, duration_ms: 0 });
+    expect(entries[0]).toMatchObject({ name: `owned-contract-contract-v${OVERLAY_CONTRACT.version}-aggregate`, passed: true, cost_usd: 0, duration_ms: 0 });
     expect(() => recorder(deps, 1)({ passed: false })).toThrow('EEXIST');
     expect(fs.readFileSync(file, 'utf8')).toBe(original);
     recorder(deps, 2)({ passed: false, errors: ['task incomplete'] });

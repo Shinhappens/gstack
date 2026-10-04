@@ -27,8 +27,7 @@ test('DX artifact calibrations keep four acknowledged choices and vary only comp
 
 test('the separate DX calibration has a canonical periodic selector and all direct fixture inputs', () => {
   expect(E2E_TIERS[ID]).toBe('periodic');
-  for (const file of [`test/skill-e2e-${ID}.test.ts`, 'test/fixtures/devex-peer-comparison-classification.ts',
-    'test/devex-peer-comparison-calibration.test.ts']) {
+  for (const file of [`test/skill-e2e-${ID}.test.ts`, 'test/fixtures/devex-peer-comparison-classification.ts']) {
     expect(fs.existsSync(path.join(ROOT, file))).toBe(true);
     expect(selectTests([file], E2E_TOUCHFILES, []).selected).toEqual([ID]);
   }

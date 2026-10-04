@@ -61,7 +61,7 @@ console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false
   // payload assertions. The negative case restores only the original typo.
   expect(suiteSource).toContain('env: childEnv,');
   let selectedSource = option === 'env' ? suiteSource : suiteSource.replace('env: childEnv,', 'extraEnv: childEnv,');
-  selectedSource = selectedSource.replace(/from '(\.\/helpers\/[^']+)'/g,
+  selectedSource = selectedSource.replace(/from '((?:\.\/helpers|\.\.\/lib)\/[^']+)'/g,
     (_match, spec: string) => `from ${JSON.stringify(path.resolve(ROOT, 'test', spec))}`);
   const suiteCopy = path.join(dir, 'writeback-suite.ts');
   fs.writeFileSync(suiteCopy, selectedSource);

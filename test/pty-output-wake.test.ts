@@ -3,18 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { isUnknownSlashCommandVisible, launchClaudePty, runPlanSkillCounting, type ClaudePtySession } from './helpers/claude-pty-runner';
-
-test('unknown-command diagnostics identify the invoked slash command, not child tools', () => {
-  for (const command of ['/plan-design-review', '/plan-design-review PLAN.md']) {
-    expect(isUnknownSlashCommandVisible('Unknown command: /plan-design-review\n', command)).toBe(true);
-    expect(isUnknownSlashCommandVisible('Unknown command: /other\nUnknown command: /plan-design-review', command)).toBe(true);
-    expect(isUnknownSlashCommandVisible('Unknown command: --help\n', command)).toBe(false);
-    expect(isUnknownSlashCommandVisible('Unknown command: /plan-design-review-other\n', command)).toBe(false);
-    expect(isUnknownSlashCommandVisible('Unknown command: /other\n', command)).toBe(false);
-  }
-});
-
+import { launchClaudePty, runPlanSkillCounting, type ClaudePtySession } from './helpers/claude-pty-runner';
 test.skipIf(process.platform === 'win32')('PTY output and exit wake observers without leaving deadline timers', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-pty-output-'));
   const fake = path.join(dir, 'fake-claude');
@@ -218,7 +207,7 @@ process.on('SIGINT', () => process.exit(0));
 process.stdin.resume();
 process.stdout.write(${JSON.stringify(ready)} + '\\x1b[2J\\x1b[H');
 `, { mode: 0o755 });
-  const screenUrl = pathToFileURL(path.join(import.meta.dir, 'helpers/pty-screen.ts')).href;
+  const screenUrl = pathToFileURL(path.join(import.meta.dir, 'helpers/pty/screen.ts')).href;
   const runnerUrl = pathToFileURL(path.join(import.meta.dir, 'helpers/claude-pty-runner.ts')).href;
   fs.writeFileSync(worker, `import {mock} from 'bun:test';
 const {createPtyScreen} = await import(${JSON.stringify(screenUrl)});

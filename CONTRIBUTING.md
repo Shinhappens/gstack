@@ -16,6 +16,22 @@ bin/dev-setup                  # activate dev mode
 
 > **Full clone vs shallow.** The README's user-facing install uses `--depth 1` for speed. As a contributor, use a full clone (no `--depth` flag) — you'll need history for `git log`, `git blame`, `git bisect`, and reviewing PRs against earlier versions. If you already have a `--depth 1` clone from following the README, promote it to a full clone with `git fetch --unshallow`.
 
+### First free check (no API key, no browser)
+
+```bash
+bun install --frozen-lockfile
+bun run typecheck        # expect no output and exit 0 (about a second)
+bun run typecheck:test   # expect "test typecheck ratchet: N known diagnostics, none new."
+```
+
+`typecheck` covers product code (`browse/src`, `lib`, `scripts`, `bin`, `hosts`, and the other
+entries in `tsconfig.json`) and must stay at zero errors. `typecheck:test` holds test code to the
+committed `scripts/typecheck-test-baseline.json`: a new or repeated diagnostic fails and names
+the file, TS code and message; fixing diagnostics also fails until you lock the smaller allowance
+in with `bun run typecheck:test --write-baseline`. Editing `lib/cso/*.ts`? Run
+`bun run format:cso` before committing; CI runs `format:cso:check`. All three run in the required
+`free-tests` check.
+
 Now edit any `SKILL.md`, invoke it in Claude Code (e.g. `/review`), and see your changes live. When you're done developing:
 
 ```bash
@@ -52,6 +68,17 @@ No setup needed. Learnings are logged automatically. View them with `/learn`.
 
 This is the best way to contribute: fix gstack while doing your real work, in the
 project where you actually felt the pain.
+
+**What CI does on a fork PR.** GitHub never gives a fork PR this repository's
+secrets, so CI runs everything that needs none: the required `free-tests` check
+(the Linux free suite, typecheck, the macOS and Windows gates), Windows Free
+Tests, Skill Docs Freshness, Workflow Lint, Version Gate, Quality gate, the
+make-pdf gate, and any path-triggered gates your change touches. E2E Evals
+still builds the CI image from your `Dockerfile.ci` without publishing it, and
+skips its paid eval jobs, which need provider API keys. That skip is expected
+and does not block your PR. It is also not a pass: a maintainer runs the paid
+evals from a branch in this repository before merging. A first-time
+contributor's runs wait for a maintainer to approve them.
 
 ### Session awareness
 
@@ -171,6 +198,22 @@ Bun auto-loads `.env` — no extra config. Conductor workspaces inherit `.env` f
 
 ### Test tiers
 
+Functional QA changes need native fixture proof as well as prompt checks. Add declared
+CLI or loopback API/worker contracts in isolated temporary repositories, outside this
+checkout. Exercise success and adverse paths, durable effects, and setup failure.
+Report-only evaluations must leave mutation-capable tools available and independently
+detect forbidden writes, including an edit later restored; a clean final diff is not
+enough. Validate the observer with deliberately bad controls before a paid run.
+
+For exploratory regressions, retain the actual pre-repair failure, post-repair pass,
+original probe and adjacent happy path. Automatic caller tests must enter through
+review/ship, not tell the agent to run the component being tested. Documentation tests
+must prove the real child completed and the parent used its result before publication;
+the existing dispatch-only test is narrower evidence. Register new cases and all
+consumed section/resolver inputs in touchfiles, tiers and the PR profile so they run.
+Share sanitized reproduction commands and fixture evidence when reporting a problem,
+never credentials, private payloads or an entire unreviewed agent transcript.
+
 | Tier | Command | Cost | What it tests |
 |------|---------|------|---------------|
 | 1 — Static | `bun run test` | Free | Command validation, snapshot flags, Aside contract pins, render-wrapper option mapping, SKILL.md correctness, TODOS-format.md refs, observability unit tests |
@@ -182,6 +225,7 @@ Bun auto-loads `.env` — no extra config. Conductor workspaces inherit `.env` f
 bun run test:quick           # Measured fast free subset for ordinary edits; not full acceptance
 bun run eval:bg:pr           # Changed fast live probes + selected quality judges, detached
 bun run test                 # Final full free acceptance after focused repairs and source freeze
+bun run test:ubicloud        # Same suite on an ephemeral 16-vCPU Ubicloud VM; needs UBICLOUD_API_KEY
 bun run test:e2e             # Tier 2: E2E only (needs EVALS=1, can't run inside Claude Code)
 bun run test:evals           # Tier 2 + 3 combined (~$4.35/run)
 ```
@@ -195,10 +239,52 @@ gate and periodic censuses run fresh weekly and on manual
 dispatch of `evals-periodic.yml`; `bun run eval:bg:release` runs both locally.
 Some broad behavioral failures will therefore be found after the PR gate.
 
-CI enables verified first-attempt reuse for the 14 workflow quality judges for
-24 hours within the same PR. The other 11 quality cases and all dynamic agent
-cases stay fresh. Local runs stay fresh unless the complete scoped cache and
-runtime configuration is supplied. The key includes complete prompt bytes, generated inputs,
+Blocking paid lanes (the PR gate and the weekly periodic + gate census) aim to
+finish in about 12 minutes including setup. The planner packs recorded wall
+times (`scripts/paid-test-durations.json`, per tier) into as many ~9-minute
+runners as the work needs, one file or a tightly packed group each; files whose
+cases are short but whose total is long run one case per runner. Matrix size and
+job timeout come from that plan. Preview it for free with
+`bun run scripts/test-paid-shards.ts --tier periodic --list --slice-budget 540 --jobs 2`.
+Complete start-to-finish flows belong to the `marathon` tier
+(`describeE2ETier('marathon')`), which runs only in the non-blocking
+`evals-marathon.yml` lane (weekly and on dispatch) and never gates a merge.
+
+Verdicts: paid evals never retry. Each case's kind in `E2E_KINDS`
+(`test/helpers/touchfiles-data.ts`) fixes its trials before the run, from the
+constants in `EVAL_POLICY` (`test/helpers/periodic-exclude-data.ts`):
+
+- `rule` (the default): one trial; any failed assertion fails the case. Use it
+  when nothing stochastic decides the verdict, or when the verdict checks a
+  contract the product must meet every run (no writes in plan mode, a question
+  before a decision, a skill-mandated step, no leaked secret).
+- `behavior`: a panel of 3 independent trials run as parallel case shards,
+  PASS at 2 or more with no contract violation (`expectContract()`). Use it only
+  when a live model choice decides the verdict and an occasional deviation is
+  acceptable product behavior; the one-line reason goes in `BEHAVIOR_WHY`.
+- `judge`: an LLM judge scoring a fixed input; 3 samples of the same prompt,
+  gated on the per-dimension mean (booleans on a majority) against the
+  unchanged threshold. An erroring sample fails the panel and is never resampled.
+
+A timed-out, crashed or infrastructure-failed trial counts as a failed trial and
+is reported with its class; a missing trial makes the case INCOMPLETE, which
+fails the lane. A 2-of-3 pass is reported as `PASS 2/3` with the failed trial's
+cause, never as a clean pass. Case budgets and thresholds never change with
+this policy. Quarantine (`CASE_QUARANTINE`) and history are described in
+`docs/TESTING_INTERNALS.md`; `bun run eval:pass-rates --case <id>` shows a
+case's per-trial pass rate with its Wilson interval.
+
+CI enables verified first-attempt reuse for 16 workflow quality judges for
+24 hours within the same PR. The cookie workflow's custom input and the other 11
+quality cases stay fresh. PR-profile E2E shards that run once (no retry, so the
+pass is provably a first attempt) reuse a pass from the same PR when every
+consumed input is byte-identical: the test's import closure, every tracked file
+its registered cases' touchfiles and the global touchfiles match, the runner and
+workflow, the child's EVALS_/GSTACK_/CLAUDE_/ANTHROPIC_ environment (secret
+presence only), the CI image and Claude CLI version (`scripts/e2e-shard-reuse.ts`).
+A computed case registration or a touchfile pattern matching nothing keeps the
+shard fresh. The weekly census, marathon and release lanes never reuse. Local runs stay fresh unless
+the complete scoped cache and runtime configuration is supplied. The key includes complete prompt bytes, generated inputs,
 fixtures, runner/rubric code, installed dependencies, model settings and runtime.
 The current assertions validate a reused score again. Records retain the original
 run, revision and time; reuse never renews that time. Failed, retried, partial or
@@ -208,11 +294,20 @@ unknown-input results cannot be reused.
 Timing goals are under one minute for edit feedback, 3–5 minutes for typical PR
 checks, and 60–90 seconds for complete free test execution across isolated CI
 machines. They are targets, not timeout reductions or guarantees. The complete
-local suite uses available CPU affinity, up to six workers; use `test:quick` for
-the shorter edit loop. The historical six-worker result below and the
+local suite uses available CPU affinity, up to 16 workers on Linux and six on
+macOS and Windows; use `test:quick` for the shorter edit loop. On a small dev
+box, container, or cloud sandbox, `bun run test:ubicloud` runs the complete suite
+on a fresh 16-vCPU Ubicloud VM with the CI lane's environment instead (about
+four and a half minutes end to end, including VM boot and setup). The
+historical six-worker result below and the
 [four-CPU portfolio comparison](docs/TEST_PORTFOLIO.md#measurement-contract)
 are machine-specific measurements. CI setup, build and queue time are reported
-separately. Refresh measurements with `bun run test:free --record-durations`;
+separately. Refresh measurements with `bun run test:ubicloud --record-durations`;
+before publication, classify new regressions for quick feedback using that seed
+and the existing `QUICK_CORE` list. Do not classify unknown files as fast or use
+quick results as release acceptance. The runner retains full logs in
+`.context/free-test-logs/` and explains the next repair step on failure; see
+[free-runner recovery](docs/TESTING_INTERNALS.md) for details. For full acceptance,
 the required free CI lane packs the complete inventory across isolated runners,
 then checks every shard's receipt before reporting success. Local worker counts
 remain bounded to avoid browser/process contention.
@@ -225,6 +320,12 @@ Historical measurements from 2026-09-21:
 | Local complete free suite | All 993 files, six workers | 4m 35s |
 | Complete Linux CI | All 993 files, 20 isolated runners | 1m 40s across test steps; 3m 7s including setup and aggregation |
 
+After the 2026-09-29 test audit ([evidence](docs/test-audit-2026-09.md)):
+
+| Run | Coverage | Elapsed |
+|---|---|---|
+| Complete free suite, `bun run test:ubicloud` (standard-16) | All 857 files, 20,302 passing tests | 136 seconds on the VM; 1,738 seconds of recorded serial test time |
+
 The [Linux CI run](https://github.com/garrytan/gstack/actions/runs/35642667809)
 on `25030d68` included one recorded successful retry. Its slowest test step was 77 seconds;
 staggered starts made the complete test span longer. Typical PR paid-gate timing
@@ -232,6 +333,15 @@ still needs measurement on a small change. Explicitly exempt free-only runner
 changes do not select paid work; mapped dependencies take precedence, and unknown
 dependencies retain the broad fallback. See the
 [coverage boundaries](docs/TEST_PORTFOLIO.md#repeated-work-removed).
+
+When a paid eval fails, fix the product or the harness and add the captured case as one row in
+the detector's owner test (the detector → owner table is in
+[TEST_PORTFOLIO.md](docs/TEST_PORTFOLIO.md#detector-owner-tests)); never add a new per-incident file.
+A row is one `describe` block or table entry next to the others, for example a new
+`describe('eng-cache-writes-at', …)` in `test/eng-first-review.test.ts` that loads its fixture and asserts
+`engFirstReviewAUQ` on the captured call. Run `bun test <owner-test>`, then
+`bun test test/test-of-test-ratchet.test.ts`: the ratchet fails on any new test file that imports only
+`test/` code and names the owner test to use instead.
 
 Follow [Validation discipline in AGENTS.md](AGENTS.md#validation-discipline):
 reproduce known failures with focused checks, verify adjacent source and
@@ -254,7 +364,8 @@ flakes; the required CI free lane turns it on and uploads every flaky pass
 in a JSONL ledger artifact that `bun run eval:flake-rank` folds in).
 Working in a cloud sandbox? Run `scripts/sandbox-doctor.sh` once per boot to
 make the suite run green (details in
-[docs/TESTING_INTERNALS.md](docs/TESTING_INTERNALS.md)).
+[docs/TESTING_INTERNALS.md](docs/TESTING_INTERNALS.md)), or skip the sandbox's
+limits entirely with `bun run test:ubicloud`.
 Don't type bare `bun test` for the suite: it walks the whole repo, loads paid
 eval files, and misses the strict classifier. No API keys needed.
 
@@ -276,7 +387,7 @@ Spawns `claude -p` as a subprocess with `--output-format stream-json --verbose`,
 
 ```bash
 # Must run from a plain terminal — can't nest inside Claude Code or Conductor
-EVALS=1 bun test test/skill-e2e-*.test.ts
+EVALS_RUN_ID="local-$(bun -e 'console.log(crypto.randomUUID())')" EVALS=1 bun test test/skill-e2e-*.test.ts
 ```
 
 - Gated by `EVALS=1` env var (prevents accidental expensive runs)
@@ -285,6 +396,11 @@ EVALS=1 bun test test/skill-e2e-*.test.ts
 - Real-time progress to stderr: `[Ns] turn T tool #C: Name(...)`
 - Saves full NDJSON transcripts and failure JSON for debugging
 - Tests live in `test/skill-e2e-*.test.ts` (split by category), runner logic in `test/helpers/session-runner.ts`
+
+Supply a fresh `EVALS_RUN_ID` for each invocation, including detached runs below.
+Functional QA and documentation cases refuse acceptance without it. CI supplies
+its own run/attempt/job/slice identity; see [Testing internals](docs/TESTING_INTERNALS.md)
+for the retained native-capture artifacts.
 
 **Hermetic by default.** Every E2E runner (claude -p, the real-PTY plan-mode
 runner, the Agent SDK runner, plus the codex and gemini runners) spawns its child
@@ -329,7 +445,7 @@ When E2E tests run, they produce machine-readable artifacts in `~/.gstack-dev/`:
 bun run eval:list            # list all eval runs (turns, duration, cost per run)
 bun run eval:compare         # compare two runs — shows per-test deltas + Takeaway commentary
 bun run eval:summary         # aggregate stats + per-test efficiency averages across runs
-bun run eval:flake-rank      # rank tests by flake signal: retried passes first, then failure rate (--json, --dir, --since-days)
+bun run eval:pass-rates      # per-case trial pass rates + Wilson intervals from recent weekly runs (--case, --runs, --dir, --backfill, --json, --gate); eval:flake-rank is an alias
 ```
 
 **Detached runs for agents and long suites.** When an agent (or you, for a run
@@ -377,7 +493,9 @@ Override the judge model per run with `GSTACK_EVAL_MODEL_JUDGE`:
 - **Completeness** — Are all commands, flags, and usage patterns documented?
 - **Actionability** — Can the agent execute tasks using only the information in the doc?
 
-Each dimension is scored 1-5. Threshold: every dimension must score **≥ 4**. There's also a regression test that compares generated docs against the hand-maintained baseline from `origin/main` — generated must score equal or higher.
+Each dimension is scored 1-5 by a panel of 3 samples of the same prompt, drawn
+concurrently; each dimension's panel mean must meet that judge's threshold (≥ 4
+for most dimensions; see each case). An erroring sample fails the panel. There's also a regression test that compares generated docs against the hand-maintained baseline from `origin/main` — generated must score equal or higher.
 
 ```bash
 # Needs ANTHROPIC_API_KEY in .env — included in bun run test:evals
@@ -386,6 +504,34 @@ Each dimension is scored 1-5. Threshold: every dimension must score **≥ 4**. T
 - Resolves the judge model through `lib/eval-model.ts`, using the override order above
 - Tests live in `test/skill-llm-eval.test.ts`
 - Calls the Anthropic API directly (not `claude -p`), so it works from anywhere including inside Claude Code
+
+### Paid-test touchfiles
+
+`test/helpers/touchfiles-data.ts` maps each paid case to the files whose edits select it. Free
+`*.test.ts` files are never listed: editing a free test does not run paid evals. `test/touchfiles.test.ts`
+derives each paid file's static `test/helpers` / `test/fixtures` import closure, plus the fixture and helper
+paths it names in string literals, and fails when that closure is not covered by the case's key. When it
+fails, add the named path to the named key and check selection with
+`bun run scripts/test-paid-shards.ts --tier gate --profile pr --list`. The rule is a lower bound: a fixture
+path the test builds at runtime is not visible to it, so add such paths to the key by hand.
+
+### Add a paid eval
+
+1. **Test file.** Write the case in a paid test file, registered with a literal
+   name (`testIfSelected('<case-id>', ...)`), grading the outcome (files, git
+   state, native questions, exit status) rather than wording, unless the step
+   itself is the contract. Wrap contract assertions in `expectContract()`.
+2. **Touchfiles.** Add `'<case-id>': [...]` to `E2E_TOUCHFILES`; `bun test
+   test/touchfiles.test.ts` names any missing closure path.
+3. **Tier.** Add it to `E2E_TIERS`: `gate` for cheap contracts every PR needs,
+   `periodic` for long or model-quality cases, `marathon` for complete flows.
+4. **Kind.** Add it to `E2E_KINDS` (`rule` unless a live model choice may
+   acceptably deviate; then `behavior` plus a `BEHAVIOR_WHY` line).
+   `bun test test/eval-kinds.test.ts` prints the literal to add.
+5. **PR profile.** If a PR should run it, add it to `scripts/test-pr-profile.ts`
+   and check `bun run scripts/test-paid-shards.ts --tier gate --profile pr --list`.
+6. **Try the panel locally.** `bun run scripts/test-paid-shards.ts --tier <tier>
+   --case <case-id> --trials 3` runs the same panel CI runs, before you push.
 
 ### CI
 
@@ -397,8 +543,9 @@ Supply-chain gates run alongside it:
 - **Dependency review** (`.github/workflows/dependency-review.yml`) — reviews dependency changes on PRs that touch lockfiles or workflow files.
 - **OSV scanner** (`.github/workflows/osv-scanner.yml`) — weekly vulnerability scan against the OSV database. Config lives in `.osv-scanner.toml` and is loaded via an explicit `--config` flag (OSV does not auto-discover that filename); every ignore entry needs a reason and an `ignoreUntil` expiry, enforced by `test/osv-config-wiring.test.ts`.
 - **Dependabot** (`.github/dependabot.yml`) — grouped dependency update PRs.
+- **OpenSSF Scorecard** (`.github/workflows/scorecard.yml`) — weekly and on main pushes; results in the Security tab and api.scorecard.dev.
 
-The supply-chain workflows pin their third-party actions to commit SHAs. The PR template (`.github/PULL_REQUEST_TEMPLATE.md`) asks for evidence — tests run, eval output — not promises.
+Every workflow pins its third-party actions to commit SHAs (`test/workflow-action-pins.test.ts`). The PR template (`.github/PULL_REQUEST_TEMPLATE.md`) asks for evidence — tests run, eval output — not promises.
 
 Tests run against the browse binary directly — they don't require dev mode. Anything that needs Aside itself (`test/skill-e2e-aside.test.ts`, the Aside qa/design cases, the live render in `test/aside-render.test.ts`) runs only on a Mac with the Aside app open and self-skips elsewhere; make-pdf's render gates and the `/diagram` E2E run on whichever engine resolves, so CI runs them on the browse binary it builds with `bun run build:gates`.
 
@@ -455,6 +602,31 @@ is a CLI flag) so every caller gets it on both paths. Exported test seams:
 `pickEngine(fresh, deps)` (inject the probe and the binary resolver),
 `serveDir(root, nonce)`, `SAFE_TMP_DIR`, and `PAGE_NUMBER_FOOTER` (the one
 page-number footer make-pdf, `gstack-render`, and the browse `pdf` command share).
+
+## Prompt audit at each frontier-model release
+
+When a new frontier Claude model ships, audit the text models read for
+instructions the new model over-applies or no longer needs. The audit is
+Anthropic's `/claude-api prompt-audit`, a Claude Code skill you run in your own
+Claude Code session; gstack only prints what to feed it.
+
+```bash
+bun run audit:manifest   # slices of templates, resolvers, overlays, CLAUDE.md and wording-pinning tests (--json for a machine-readable list)
+```
+
+1. In Claude Code, run `/claude-api prompt-audit` with the new model as the
+   target, one slice at a time, giving it that slice's file list. `s01` is the
+   shared text every skill reads (CLAUDE.md, model overlays, preamble
+   resolvers); a skill's template and its sections share one slice.
+2. Fix findings in templates and resolvers, never in generated SKILL.md files,
+   then run `bun run gen:skill-docs --host all`.
+3. Treat safety rules as held: reword one only where an eval shows the model
+   obeys it both before and after the change.
+4. Work through the "tests that pin skill wording" slices last. Where prose
+   changed, replace exact-sentence pins with structural or meaning checks
+   (the prompt-bytes rule in CLAUDE.md's testing section).
+5. `test/archaeology-lint.test.ts` keeps issue numbers and incident stories out
+   of the generated text; its failure names the source file to fix.
 
 ## Jargon list (V1 writing style)
 
@@ -529,13 +701,19 @@ bun run skill:check
 
 See [docs/ADDING_A_HOST.md](docs/ADDING_A_HOST.md) for the full guide. Short version:
 
-1. Create `hosts/myhost.ts` (copy from `hosts/opencode.ts`)
+1. Create `hosts/myhost.ts` (copy from `hosts/opencode.ts`), including its
+   `tier` and `capabilities`
 2. Add to `hosts/index.ts`
 3. Add `.myhost/` to `.gitignore`
 4. Run `bun run gen:skill-docs --host myhost`
 5. Run `bun run test` (parameterized tests auto-cover it)
 
-Zero generator, setup, or tooling code changes needed.
+Rendering needs no generator code. Installing does: an installable host also
+needs a setup install arm, a row in `gstack_host_tier`
+(`bin/gstack-install-registry.sh`), a README host-matrix row, and the
+conformance kit (`test/host-conformance.test.ts`). It ships as `experimental`
+until a dated certification record exists; see "Certify your host" and the
+install ownership rules in the guide.
 
 ### Adding a new skill
 

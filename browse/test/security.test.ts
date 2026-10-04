@@ -243,8 +243,9 @@ describe('canary', () => {
 // /health reported a false-green 'protected' indefinitely. The surfaces they
 // covered (SessionState, read/writeSessionState, getStatus, the /health
 // security field, the sidepanel SEC shield) were dead since the PTY terminal
-// rewrite and are now removed. server-security-surface.test.ts pins the
-// removal + the live L4 wiring.
+// rewrite and are now removed. extension-token.test.ts ("GET /health is
+// liveness-only") pins the removal on the real /health body;
+// pty-inject-scan.test.ts pins the live L4 sidecar wiring behaviorally.
 
 // ─── URL domain extraction ───────────────────────────────────
 

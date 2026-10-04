@@ -132,4 +132,11 @@ describe('pr-title-sync.yml pull_request_target safety', () => {
     expect(content).toMatch(/env:/);
     expect(content).toMatch(/github\.event\.pull_request\.title/);
   });
+
+  test('every action runs at a reviewed commit SHA, not a movable tag', () => {
+    // The job holds a write token; a retagged action would run with it.
+    const uses = [...content.matchAll(/^\s*(?:-\s*)?uses:\s*(\S+)/gm)].map((m) => m[1]);
+    expect(uses.length).toBeGreaterThan(0);
+    for (const ref of uses) expect(ref).toMatch(/^[\w.-]+\/[\w.-]+@[0-9a-f]{40}$/);
+  });
 });

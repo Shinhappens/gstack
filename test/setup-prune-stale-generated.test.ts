@@ -93,8 +93,9 @@ function runPrune(src: string, gen: string, host?: string) {
 describe('setup: _prune_stale_generated', () => {
   test('call sites: every host link + the always-run codex render are pruned', () => {
     for (const site of [
-      '"$SOURCE_GSTACK_DIR/.agents/skills"',
-      '"$SOURCE_GSTACK_DIR/.agents/skills" "$CODEX_SKILLS"',
+      '"$AGENTS_DIR" "$CODEX_SKILLS"',
+      // The Codex arm prunes the render it links from: the source's, or a per-install render (#1882).
+      '"${_CODEX_RENDER_ROOT:-$SOURCE_GSTACK_DIR}/.agents/skills" "$CODEX_SKILLS"',
       '"$SOURCE_GSTACK_DIR/.factory/skills" "$FACTORY_SKILLS"',
       '"$SOURCE_GSTACK_DIR/.opencode/skills" "$OPENCODE_SKILLS"',
       '"$SOURCE_GSTACK_DIR/.cursor/skills" "$CURSOR_SKILLS"',

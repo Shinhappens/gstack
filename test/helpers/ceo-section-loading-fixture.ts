@@ -758,6 +758,40 @@ function hasOrderedStaleFillOperations(text: string, sourceText = text): boolean
 }
 
 /** Explicit copied/example framing owns its section and descendant headings. */
+/**
+ * An arrow-separated execution order establishes the overlap by event roles, not
+ * wording: a reader misses before a writer commits and invalidates, that same
+ * reader then fills its pre-write value, and a reader begun after the write gets it.
+ */
+function hasArrowOrderedStaleFill(block: string): boolean {
+  return block.replace(/[*_`]/g, '').split(/\s*\|\s*|\n/).some(cell => {
+    if (/\b(?:impossible|cannot\s+happen|not\s+(?:a|an)\s+(?:bug|defect|violation|race|gap))\b/i.test(cell)) return false;
+    const events = cell.split(/\s*(?:->|→)\s*/).map(event => event.slice(event.lastIndexOf(':') + 1).trim());
+    if (events.length < 5) return false;
+    const actor = (event: string) => /^(R[1-9]\d*|W[1-9]\d*|W)\b/.exec(event)?.[1];
+    const version = (event: string) => /\b(v[0-9]+)\b/i.exec(event)?.[1]?.toLowerCase();
+    const find = (from: number, test: (event: string, who: string | undefined) => boolean) =>
+      events.findIndex((event, index) => index > from && test(event, actor(event)));
+    const miss = find(-1, (event, who) => /^R/.test(who ?? '') && /\bmiss(?:es)?\b/i.test(event));
+    if (miss < 0) return false;
+    const reader = actor(events[miss]!)!;
+    const commit = find(miss, (event, who) => /^W/.test(who ?? '') && /\bcommit(?:s|ted)?\b/i.test(event));
+    if (commit < 0) return false;
+    const writer = actor(events[commit]!)!;
+    const invalidate = find(commit, (event, who) => who === writer && /\b(?:delete|invalidat\w*|evict\w*)\b/i.test(event));
+    const fill = find(invalidate, (event, who) => who === reader && /\b(?:cache\.set|set|fills?|refills?|stores?|caches)\b/i.test(event));
+    const later = find(fill, (event, who) => /^R/.test(who ?? '') && who !== reader
+      && new RegExp(String.raw`\b(?:begun|began|begins|started|starts)\s+after\s+${writer}\b`).test(event)
+      && /\b(?:hits?|gets?|reads?|sees?|observes?|returns?)\b/i.test(event));
+    if (invalidate < 0 || fill < 0 || later < 0) return false;
+    const old = version(events[fill]!) ?? events.slice(miss, commit).map(version).find(Boolean);
+    const fresh = version(events[commit]!);
+    if (old && fresh && old === fresh) return false;
+    const seen = version(events[later]!);
+    return !(old && seen && seen !== old) && (Boolean(old) || /\b(?:old|stale|pre[- ]write)\b/i.test(events[fill]! + events[later]!));
+  });
+}
+
 function assertedProseOwner(prose: string[], index: number): boolean {
   const owners = [{ level: 0, source: false }];
   for (const line of prose.slice(0, index + 1)) {
@@ -855,7 +889,7 @@ function hasProseStaleFillFinding(report: string): boolean {
     if (!assertedProseOwner(owners, owners.length - 1)) return false;
     const stale = /\b(?:stale|outdated)\b|\b(?:old(?:er)?|pre[- ]write)\s+(?:value|data|result|version|snapshot)\b/i.test(text);
     const inFlight = /\b(?:race|racing|concurrent|concurrency|in[- ]flight|pending)\b/i.test(text)
-      || hasOrderedStaleFillOperations(text, block);
+      || hasOrderedStaleFillOperations(text, block) || hasArrowOrderedStaleFill(block);
     const read = /\b(?:read|fetch)\w*\b/i.test(text);
     const fillPattern = /\b(?:fill|refill|repopulat|populat|insert|stor|restor)\w*\b|\bcache\.set\b|\bcache(?:s|d)?\s+(?:the|an?|old|stale|same)\s+(?:\w+\s+){0,2}(?:value|data|result|snapshot)\b/i;
     const fill = fillPattern.test(text);

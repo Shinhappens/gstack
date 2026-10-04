@@ -294,6 +294,39 @@ describe('init + sync + restore round-trip', () => {
     expect(log.stdout).toMatch(/sync: 1 file/);
   });
 
+  test('staged transcript pages stay queued without transcript consent; other classes still push', () => {
+    run(['gstack-artifacts-init', '--remote', bareRemote]);
+    run(['gstack-config', 'set', 'artifacts_sync_mode', 'full']);
+    fs.mkdirSync(path.join(tmpHome, 'projects', 'p'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, 'projects/p/learnings.jsonl'),
+      '{"skill":"x","insight":"y","ts":"2026-04-22T10:00:00Z"}\n');
+    const page = 'transcripts/run-1-1/session.md';
+    fs.mkdirSync(path.join(tmpHome, 'transcripts', 'run-1-1'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, page), '# Session\n\nhello\n');
+    run(['gstack-brain-enqueue', 'projects/p/learnings.jsonl']);
+    run(['gstack-brain-enqueue', page]);
+    const remoteFiles = () =>
+      spawnSync('git', ['--git-dir=' + bareRemote, 'ls-tree', '-r', '--name-only', 'main'], { encoding: 'utf-8', timeout: 30_000 }).stdout;
+
+    expect(run(['gstack-brain-sync', '--once']).status).toBe(0);
+    expect(remoteFiles()).toContain('projects/p/learnings.jsonl');
+    expect(remoteFiles()).not.toContain(page);
+    expect(spoolText()).toContain(page);
+    expect(fs.existsSync(path.join(tmpHome, page))).toBe(true);
+
+    // A stored off or legacy value is not consent either.
+    for (const value of ['off', 'A']) {
+      fs.appendFileSync(path.join(tmpHome, 'config.yaml'), `transcript_ingest_mode: ${value}\n`);
+      expect(run(['gstack-brain-sync', '--once']).status).toBe(0);
+      expect(remoteFiles()).not.toContain(page);
+    }
+
+    expect(run(['gstack-config', 'set', 'transcript_ingest_mode', 'recent']).status).toBe(0);
+    expect(run(['gstack-brain-sync', '--once']).status).toBe(0);
+    expect(remoteFiles()).toContain(page);
+    expect(spoolText()).not.toContain(page);
+  });
+
   test('restore round-trip: writes on machine A visible on machine B', () => {
     // Machine A.
     run(['gstack-artifacts-init', '--remote', bareRemote]);

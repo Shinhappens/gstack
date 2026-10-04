@@ -14,9 +14,13 @@ import { getHostConfig } from '../../../hosts/index';
  * emitted by the script, for every host render).
  *
  * Divergences from the old inline bash are deliberate and enumerated in the
- * script header (EOV5): $0-relative paths, --parent-pid for session identity,
- * GSTACK_HOME normalization, SKILL_START_PROTO handshake, passthrough
- * sanitization.
+ * script header (EOV5): $0-relative paths, script-derived harness pid for
+ * session identity, GSTACK_HOME normalization, SKILL_START_PROTO handshake,
+ * passthrough sanitization.
+ *
+ * The start is ONE plain command (#2763): worktree-isolated Claude Code
+ * sessions refuse a command named by a variable, a `[ -x ] ||` fallback, or a
+ * trailing `|| echo`. A missing helper is covered by the degraded-mode prose.
  */
 export function generatePreambleBash(ctx: TemplateContext): string {
   const hostConfig = getHostConfig(ctx.host);
@@ -30,10 +34,9 @@ GSTACK_DESIGN="$GSTACK_ROOT/design/dist"
 `
     : '';
   const brainHealthFlag = ctx.host === 'gbrain' || ctx.host === 'hermes' ? ' --brain-health' : '';
-  // A leading ~ inside double quotes never expands in bash — the primary path
-  // would silently fail -x and every run would take the fallback. Interpolate
-  // through $HOME instead (env-var hosts already use $GSTACK_BIN).
-  const shellPath = (p: string) => p.replace(/^~\//, '$HOME/');
+  const startCommand = hostConfig.usesEnvVars
+    ? `"${ctx.paths.binDir}/gstack-skill-start"`
+    : `${ctx.paths.binDir}/gstack-skill-start`;
 
   const entry = ['plan-design-review', 'plan-eng-review'].includes(ctx.skillName)
     ? `## Preamble (after scope gate)
@@ -44,10 +47,7 @@ GSTACK_DESIGN="$GSTACK_ROOT/design/dist"
   return `${entry}
 
 \`\`\`bash
-${runtimeRoot}_SS="${shellPath(ctx.paths.binDir)}/gstack-skill-start"
-[ -x "$_SS" ] || _SS="${shellPath(ctx.paths.localSkillRoot)}/bin/gstack-skill-start"
-"$_SS" --skill "${ctx.skillName}" --model "${ctx.model ?? 'none'}" --parent-pid "$PPID"${brainHealthFlag} \\
-  || echo "SKILL_START: unavailable — stale install; run ./setup or /gstack-upgrade (preamble degraded, continue the user's task)"
+${runtimeRoot}${startCommand} --skill "${ctx.skillName}" --model "${ctx.model ?? 'none'}"${brainHealthFlag}
 \`\`\`
 
 Read the echoed \`KEY: value\` STATUS lines — they drive every preamble rule

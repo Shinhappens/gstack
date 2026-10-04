@@ -81,8 +81,8 @@ Read the review checklist:
 ```bash
 cat ~/.claude/skills/gstack/review/checklist.md 2>/dev/null || echo "Checklist not found"
 ```
-Apply each checklist item to the current diff. This is the same quick review that `/ship`
-runs in its Step 3.5. Auto-fix trivial issues (whitespace, imports). For critical findings
+Apply each checklist item to the current diff. This is the same checklist `/ship`
+applies in its Step 9 review. Auto-fix trivial issues (whitespace, imports). For critical findings
 (SQL safety, race conditions, security), ask the user.
 
 **If any code changes are made during the quick review:** Commit the fixes, then **STOP**.
@@ -103,8 +103,9 @@ this quick-review path; direct the user to `/review` rather than recording a pas
 
 **Free tests — cite fresh evidence or run them now:**
 
-Set `TEST_COMMAND` to the project's exact test command from CLAUDE.md (default
-`bun test 2>&1`); use that same string in both check and run. Check the ledger:
+Set `TEST_COMMAND` to the project's exact test command from CLAUDE.md or AGENTS.md;
+if neither documents one, ask the user with AskUserQuestion rather than assume a
+framework default. Use that same string in both check and run. Check the ledger:
 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-evidence check --label tests --expect-cmd "$TEST_COMMAND" --max-age 24 --allow-paths CHANGELOG.md,VERSION,package.json,agents-digest/gstack-AGENTS.md
@@ -133,14 +134,18 @@ CHECK is never a blocker — it just means run live; a failed RUN is.)
 **E2E tests — check recent results:**
 
 Use this project's configured E2E/judge result source. The paths below are gstack's
-eval store, not a universal test location; use them only for gstack development.
+eval store (`~/.gstack/projects/<slug>/evals/`, its per-shard `shards/*/` directories
+and the legacy `~/.gstack-dev/evals/` fallback), not a universal test location; use
+them only for gstack development.
 For another project, inspect its documented result artifacts/CI instead. If a suite
 is not configured, report N/A. If expected evidence is absent or cannot be tied to
 this project/revision, report unavailable (warning), not a pass or another repo's result.
 
 ```bash
 setopt +o nomatch 2>/dev/null || true  # zsh compat
-ls -t ~/.gstack-dev/evals/*-e2e-*-$(date +%Y-%m-%d)*.json 2>/dev/null | head -20
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+EVAL_DIR=~/.gstack/projects/$SLUG/evals
+ls -t "$EVAL_DIR"/*-e2e-*-$(date +%Y-%m-%d)*.json "$EVAL_DIR"/shards/*/*-e2e-*-$(date +%Y-%m-%d)*.json ~/.gstack-dev/evals/*-e2e-*-$(date +%Y-%m-%d)*.json 2>/dev/null | head -20
 ```
 
 For each eval file from today, parse pass/fail counts. Show:
@@ -158,7 +163,9 @@ Apply the same project/revision and applicability checks as E2E above.
 
 ```bash
 setopt +o nomatch 2>/dev/null || true  # zsh compat
-ls -t ~/.gstack-dev/evals/*-llm-judge-*-$(date +%Y-%m-%d)*.json 2>/dev/null | head -5
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+EVAL_DIR=~/.gstack/projects/$SLUG/evals
+ls -t "$EVAL_DIR"/*-llm-judge-*-$(date +%Y-%m-%d)*.json "$EVAL_DIR"/shards/*/*-llm-judge-*-$(date +%Y-%m-%d)*.json ~/.gstack-dev/evals/*-llm-judge-*-$(date +%Y-%m-%d)*.json 2>/dev/null | head -5
 ```
 
 If found, parse and show pass/fail. If not found, note "No LLM evals run today."
@@ -240,6 +247,7 @@ Build the full readiness report:
 ╠══════════════════════════════════════════════════════════╣
 ║  PR: #NNN — title                                        ║
 ║  Branch: feature → main                                  ║
+║  CI (head <sha7>): PASS / FAIL / PENDING / NO CI RAN     ║
 ║  REVIEWS                                                 ║
 ║  ├─ Eng Review:    CURRENT / STALE (N commits) / —       ║
 ║  ├─ CEO Review:    CURRENT / — (optional)                ║
@@ -258,6 +266,13 @@ Build the full readiness report:
 ║  WARNINGS: N  |  BLOCKERS: N                             ║
 ╚══════════════════════════════════════════════════════════╝
 ```
+
+CI row: ERROR or red/pending `required=y|?` checks are BLOCKERS. Red/pending
+`required=n` checks or NO_CHECKS first need one-way question
+`land-and-deploy-ci-override` / `land-and-deploy-no-ci-confirm`, naming each check
+(or "no CI ran on `<sha>`"): A) exclude exactly these / accept no CI, this head → set
+`CI_OVERRIDE=(--override-head "$PR_HEAD" --exclude "<name>" ...)` or
+`NO_CI_APPROVED_HEAD=$PR_HEAD`, never stored or reused; B) stop (BLOCKER).
 
 If there are BLOCKERS (including failing free tests): show the report and **STOP**
 with repair instructions. Do not offer A or C with blockers.

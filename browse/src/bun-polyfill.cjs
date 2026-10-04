@@ -140,6 +140,9 @@ globalThis.Bun = {
       // respawn until this was forwarded. Forwarded, not hardcoded, so an
       // explicit windowsHide:false survives.
       windowsHide: options.windowsHide !== false,
+      // Without it a Windows child joins the parent's kill-on-close job and
+      // dies with the parent (#2637).
+      detached: options.detached === true,
     });
 
     // Drain stdout/stderr eagerly into in-memory buffers. Bun's spawn buffers

@@ -149,6 +149,8 @@ const SCANNER_EXEMPT: Record<string, string> = {
     'served-page JS talking to its own loopback server (same-origin relative fetch)',
   'design/src/compare.ts':
     'served-page JS talking to its own loopback server (relative ./api fetch)',
+  'scripts/ubicloud':
+    'developer-invoked test infrastructure: Ubicloud API calls (VM create/show/destroy) with the developer\'s own token, the checkout streamed over SSH to that developer\'s own ephemeral VM, and toolchain downloads run on the VM; no installed-gstack user state is sent',
   // Skill prose templates: these render agent-executed instructions (the
   // agent runs git in the USER\'S repo at the user\'s direction), they are
   // not gstack binaries. Includes the preamble-generated brain-sync block —

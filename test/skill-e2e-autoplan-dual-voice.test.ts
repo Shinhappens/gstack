@@ -199,7 +199,8 @@ Before dispatch, Read the bound methodology file completely using these actual
 ranges: ${JSON.stringify(methodology.readRanges)}. They contain the full current
 CEO methodology, not an abridged test rubric. Then execute the following exact
 current preflight and dual-voice section; preserve its native completion barrier,
-input binding, outside fallback and consensus rules.
+input binding, outside fallback and consensus rules. Run each bash block below as
+delivered, alone in one Bash call; run any extra diagnostics as separate calls.
 
 ${principles}${preflight}${dual}`, { mode: 0o444, flag: 'wx' });
   };
@@ -240,14 +241,14 @@ ${principles}${preflight}${dual}`, { mode: 0o444, flag: 'wx' });
         ownedRoots: [workDir, stateDir], cwd: workDir, activePlan, methodologySha256,
         commands: loadAutoplanDualCommandContract(ROOT),
       });
-      expect(evidence.claudeVoiceFired, evidence.reasons.join('; ')).toBe(true);
-      expect(evidence.codexVoiceFired || evidence.codexUnavailable, evidence.reasons.join('; ')).toBe(true);
-      expect(evidence.reviewDispatched).toBe(true);
-
       logCost('autoplan-dual-voice', result);
       recordE2E(evalCollector, 'autoplan-dual-voice', 'Autoplan dual-voice E2E', result, {
         passed: evidence.claudeVoiceFired && (evidence.codexVoiceFired || evidence.codexUnavailable) && evidence.reviewDispatched,
+        ...(evidence.reasons.length ? { error: evidence.reasons.join('; ') } : {}),
       });
+      expect(evidence.claudeVoiceFired, evidence.reasons.join('; ')).toBe(true);
+      expect(evidence.codexVoiceFired || evidence.codexUnavailable, evidence.reasons.join('; ')).toBe(true);
+      expect(evidence.reviewDispatched).toBe(true);
     },
     630_000, // per-test timeout slightly > spawn timeout so cleanup can run
   );

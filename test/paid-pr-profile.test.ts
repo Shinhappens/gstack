@@ -18,7 +18,7 @@ import { resolveModuleSelection } from './helpers/e2e-helpers';
 const ROOT = path.resolve(import.meta.dir, '..');
 const CEO_FILES = [
   'test/skill-e2e-plan.test.ts', 'test/skill-e2e-ask-user-question-format-compliance.test.ts',
-  'test/skill-e2e-opus-47.test.ts', 'test/skill-llm-eval.test.ts',
+  'test/skill-e2e-retro.test.ts', 'test/skill-llm-eval.test.ts', 'test/skill-e2e-plan-ceo-plan-mode.test.ts',
 ];
 const ceoManifest = () => buildRunManifest({ tier: 'gate', profile: 'pr', sliceCount: 1,
   evalsAll: false, env: {}, changedFiles: ['plan-ceo-review/SKILL.md.tmpl'], discovered: CEO_FILES });
@@ -64,15 +64,16 @@ describe('PR profile paid-runner integration', () => {
     }
   });
 
-  test('planner binds E2E and judge IDs and explicitly defers direct-describe broad probes', () => {
+  test('planner binds E2E and judge IDs and plans the CEO plan-mode probe in the PR lane', () => {
     const manifest = ceoManifest();
     expect(manifest.profile).toBe('pr');
-    expect(manifest.selection?.e2e).toContain('plan-ceo-review-benefits');
-    expect(manifest.selection?.e2e).not.toContain('plan-ceo-review-plan-mode');
+    expect(manifest.selection?.e2e).toContain('auq-format-gate');
+    expect(manifest.selection?.e2e).toContain('plan-ceo-review-plan-mode');
     expect(manifest.selection?.judges).toContain('plan-ceo-review/SKILL.md modes');
-    expect(manifest.entries.find(entry => entry.file.includes('opus-47'))?.status).toBe('skipped-by-diff');
+    expect(manifest.entries.find(entry => entry.file.includes('skill-e2e-retro'))?.status).toBe('skipped-by-diff');
     expect(manifest.entries.find(entry => entry.file.includes('ask-user-question'))?.status).toBe('planned');
-    expect(manifest.prCoverage?.deferred.some(item => item.id === 'plan-ceo-review-plan-mode')).toBe(true);
+    expect(manifest.prCoverage?.deferred.some(item => item.id === 'plan-ceo-review-plan-mode')).toBe(false);
+    expect(manifest.entries.find(entry => entry.file === 'test/skill-e2e-plan-ceo-plan-mode.test.ts')?.status).toBe('planned');
     expect(parseRunManifest(JSON.stringify(manifest))).toEqual(manifest);
     const env = paidSelectionEnv('pr', manifest.selection!, manifest.selectionReason);
     expect(JSON.parse(env.EVALS_SELECTION_JSON!).selected).toEqual(manifest.selection!.e2e);
@@ -83,8 +84,8 @@ describe('PR profile paid-runner integration', () => {
     const fallback = computePaidCaseSelection({ profile: 'pr', env: {}, changedFiles: ['lib/unknown-pr-runtime.ts'] });
     expect(fallback.coverage?.mode).toBe('full-fallback');
     expect(fallback.selection.e2e).toContain('qa-only-no-fix');
-    expect(fallback.selection.e2e).not.toContain('autoplan-chain-pty');
-    expect(fallback.coverage?.deferred.some(item => item.id === 'autoplan-chain-pty')).toBe(true);
+    expect(fallback.selection.e2e).not.toContain('autoplan-dual-voice');
+    expect(fallback.coverage?.deferred.some(item => item.id === 'autoplan-dual-voice')).toBe(true);
     expect(() => computePaidCaseSelection({ profile: 'pr', env: {}, changedFiles: ['unregistered/nested/SKILL.md'] })).toThrow('requires full validation');
   });
 
@@ -145,12 +146,13 @@ describe('PR profile paid-runner integration', () => {
     broad.selection!.e2e!.push('qa-only-no-fix'); broad.prCoverage!.e2e.push('qa-only-no-fix');
     expect(() => parseRunManifest(JSON.stringify(broad))).toThrow('broad-only');
     const injected = structuredClone(manifest);
-    injected.entries.find(entry => entry.file.includes('opus-47'))!.status = 'planned';
-    injected.entries.find(entry => entry.file.includes('opus-47'))!.slice = 1;
+    injected.entries.find(entry => entry.file.includes('skill-e2e-retro'))!.status = 'planned';
+    injected.entries.find(entry => entry.file.includes('skill-e2e-retro'))!.slice = 1;
     expect(() => parseRunManifest(JSON.stringify(injected))).toThrow('outside its PR case selection');
     for (const action of ['remove', 'skip', 'duplicate'] as const) {
       const missing = structuredClone(manifest);
-      const file = 'test/skill-e2e-plan.test.ts';
+      // The CEO template's PR case runs from the AskUserQuestion format file.
+      const file = manifest.entries.find(entry => entry.status === 'planned' && entry.file.includes('ask-user-question'))!.file;
       if (action === 'remove') missing.entries = missing.entries.filter(entry => entry.file !== file);
       if (action === 'skip') missing.entries.find(entry => entry.file === file)!.status = 'skipped-by-diff';
       if (action === 'duplicate') missing.entries.push({ ...missing.entries.find(entry => entry.file === file)! });
@@ -184,23 +186,23 @@ describe('PR profile paid-runner integration', () => {
     const judge = new RegExp(prProfileTestNamePattern('test/skill-llm-eval.test.ts', selection));
     expect(judge.test('LLM-as-judge plan-ceo-review/SKILL.md modes')).toBe(true);
     expect(judge.test('LLM-as-judge plan-ceo-review/SKILLxmd modes')).toBe(false);
-    expect(prProfileFileSelected('test/skill-e2e-opus-47.test.ts', selection)).toBe(false);
+    expect(prProfileFileSelected('test/skill-e2e-retro.test.ts', selection)).toBe(false);
   });
 
   test('real Bun child executes only the persisted case through the actual registered helper', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pr-profile-'));
     const file = 'test/skill-e2e-plan.test.ts';
     const receipt = path.join(root, 'receipt.txt');
-    const selection: PaidCaseSelection = { e2e: ['plan-ceo-review-benefits'], judges: [] };
+    const selection: PaidCaseSelection = { e2e: ['plan-review-report'], judges: [] };
     try {
       fs.mkdirSync(path.join(root, 'test'));
       fs.writeFileSync(path.join(root, file), `
         import { test } from 'bun:test';
         import { appendFileSync } from 'node:fs';
         import { describeIfSelected, testIfSelected } from ${JSON.stringify(path.join(ROOT, 'test/helpers/e2e-helpers.ts'))};
-        describeIfSelected('fixture', ['plan-ceo-review-benefits', 'plan-review-report'], () => {
-          testIfSelected('plan-ceo-review-benefits', async () => { appendFileSync(${JSON.stringify(receipt)}, 'selected\\n'); }, 5000);
-          testIfSelected('plan-review-report', async () => { throw new Error('unselected model boundary executed'); }, 5000);
+        describeIfSelected('fixture', ['plan-review-report', 'plan-ceo-review'], () => {
+          test('/plan-eng-review writes GSTACK REVIEW REPORT to plan file', async () => { appendFileSync(${JSON.stringify(receipt)}, 'selected\\n'); }, 5000);
+          testIfSelected('plan-ceo-review', async () => { throw new Error('unselected model boundary executed'); }, 5000);
           test('unexpected raw paid call', () => { throw new Error('raw model boundary executed'); });
         });
       `);
@@ -240,7 +242,7 @@ describe('PR profile paid-runner integration', () => {
     expect(guarded[0].status).toBe('passed-empty');
   });
 
-  test('report distinguishes retained/deferred coverage and final executed/reused outcomes from attempts', () => {
+  test('report distinguishes retained/deferred coverage and counts every executed/reused record', () => {
     const manifest = ceoManifest();
     const lines = formatProfileCoverage(manifest).join('\n');
     expect(lines).toContain('profile=pr mode=pr');
@@ -251,6 +253,7 @@ describe('PR profile paid-runner integration', () => {
       { name: 'retry', suite: 'judge', passed: true, execution: 'executed' },
       { name: 'cached', suite: 'judge', passed: true, execution: 'reused' },
       { name: 'failed', suite: 'native', passed: false },
-    ] }])).toEqual({ executed: 2, reused: 1, passed: 2, failed: 1, manual_accepted: 0, attempts: 4 });
+      // Paid evals never retry: a later pass never replaces an earlier failed record.
+    ] }])).toEqual({ executed: 3, reused: 1, passed: 2, failed: 2, manual_accepted: 0, attempts: 4 });
   });
 });

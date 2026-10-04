@@ -187,7 +187,7 @@ printf '%s\\n' "$*" >> "$GSTACK_TEST_GBRAIN_LOG"
 case "$*" in
   --version) echo 'gbrain 0.42.0.0' ;;
   "sources list --json") echo '{"sources":[{"id":"client-acme-app","local_path":"${link}","page_count":1}]}' ;;
-  "sync --strategy code --source client-acme-app"|"sources attach client-acme-app") ;;
+  "sync --strategy code --source client-acme-app --no-pull"|"sources attach client-acme-app") ;;
   *) echo "unexpected gbrain command: $*" >&2; exit 1 ;;
 esac
 `);
@@ -218,7 +218,7 @@ esac
 
     const commands = readFileSync(commandLog, "utf-8");
     expect(r.status).toBe(0);
-    expect(commands).toContain("sync --strategy code --source client-acme-app");
+    expect(commands).toContain("sync --strategy code --source client-acme-app --no-pull");
     expect(commands).toContain("sources attach client-acme-app");
     expect(commands).not.toMatch(/^sources (add|remove) /m);
     rmSync(repo, { recursive: true, force: true });
@@ -1012,5 +1012,100 @@ describe("sourceLocalPath", () => {
       "sources list --json": { stdout: JSON.stringify({ sources: [] }) },
     });
     expect(sourceLocalPath("missing-id", envWithBindir(bindir))).toBeNull();
+  });
+});
+
+// #2985: managed gbrain (>= 0.51) refuses `gbrain sync` without --no-pull. The
+// fake mirrors that contract; a real (non-dry-run) code stage must pass it,
+// surface gbrain's last stderr line on failure, and never retry without it.
+describe("code stage --no-pull + stderr tail (#2985)", () => {
+  function runCodeStage(syncBody: string, extraArgs: string[] = []) {
+    const home = makeTestHome();
+    const gstackHome = join(home, ".gstack");
+    const repo = mkdtempSync(join(tmpdir(), "gstack-nopull-repo-"));
+    const bindir = mkdtempSync(join(tmpdir(), "gstack-nopull-bin-"));
+    const commandLog = join(home, "gbrain-commands.log");
+    mkdirSync(gstackHome, { recursive: true });
+    mkdirSync(join(home, ".gbrain"), { recursive: true });
+    writeFileSync(join(home, ".gbrain", "config.json"), JSON.stringify({ engine: "pglite", database_url: "pglite:///test" }));
+    spawnSync("git", ["init", "--quiet", "-b", "main"], { cwd: repo, timeout: 30_000 });
+    writeFileSync(join(repo, ".gbrain-source"), "client-acme-app\n");
+    writeFileSync(join(bindir, "gbrain"), `#!/bin/sh
+printf '%s\\n' "$*" >> "$GSTACK_TEST_GBRAIN_LOG"
+case "$1 $2" in
+  "--version ") echo 'gbrain 0.59.0.0' ;;
+  "sources list") echo '{"sources":[{"id":"client-acme-app","local_path":"${repo}","page_count":1}]}' ;;
+  "sources attach") ;;
+  "sync --strategy")
+${syncBody}
+    ;;
+  *) echo "unexpected gbrain command: $*" >&2; exit 1 ;;
+esac
+`);
+    chmodSync(join(bindir, "gbrain"), 0o755);
+    writeFileSync(join(bindir, "pgrep"), "#!/bin/sh\nexit 1\n");
+    chmodSync(join(bindir, "pgrep"), 0o755);
+    const r = spawnSync("bun", [SCRIPT, "--code-only", ...extraArgs], {
+      encoding: "utf-8",
+      timeout: 60000,
+      cwd: repo,
+      maxBuffer: 16 * 1024 * 1024,
+      env: {
+        ...process.env,
+        HOME: home,
+        GSTACK_HOME: gstackHome,
+        GBRAIN_HOME: "",
+        GSTACK_TEST_GBRAIN_LOG: commandLog,
+        PATH: `${bindir}:${process.env.PATH || ""}`,
+      },
+    });
+    const commands = existsSync(commandLog) ? readFileSync(commandLog, "utf-8") : "";
+    const state = existsSync(join(gstackHome, ".gbrain-sync-state.json"))
+      ? JSON.parse(readFileSync(join(gstackHome, ".gbrain-sync-state.json"), "utf-8"))
+      : null;
+    for (const d of [repo, bindir, home]) rmSync(d, { recursive: true, force: true });
+    return { r, commands, state };
+  }
+
+  const MANAGED_SYNC = `    case "$*" in
+      *--no-pull*) echo "Already up to date." ;;
+      *) echo "Managed sync requires --no-pull; Git pull/rebase needs an explicit drained maintenance window." >&2; exit 1 ;;
+    esac`;
+
+  it.skipIf(process.platform === "win32")("passes --no-pull, so a managed brain's code stage succeeds", () => {
+    const { r, commands, state } = runCodeStage(MANAGED_SYNC);
+    expect(r.status).toBe(0);
+    expect(commands).toContain("sync --strategy code --source client-acme-app --no-pull");
+    const code = state.last_stages.find((s: { name: string }) => s.name === "code");
+    expect(code.ok).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("a gbrain that rejects --no-pull fails the stage with the upgrade floor and is never retried without it", () => {
+    const { r, commands, state } = runCodeStage(`    echo "gbrain sync: unknown flag --no-pull for 'gbrain sync'" >&2; exit 1`);
+    expect(r.status).toBe(1);
+    const code = state.last_stages.find((s: { name: string }) => s.name === "code");
+    expect(code.ok).toBe(false);
+    expect(code.summary).toContain("upgrade gbrain to >= 0.20.0");
+    const syncCalls = commands.split("\n").filter((l) => l.startsWith("sync "));
+    expect(syncCalls).toEqual(["sync --strategy code --source client-acme-app --no-pull"]);
+  });
+
+  it.skipIf(process.platform === "win32")("every walk failure summary carries gbrain's last stderr line", () => {
+    const { r, state } = runCodeStage(`    echo "first line" >&2; echo "Cannot connect to database: refused" >&2; exit 3`);
+    expect(r.status).toBe(1);
+    const code = state.last_stages.find((s: { name: string }) => s.name === "code");
+    expect(code.summary).toBe(
+      "gbrain sync --strategy code --source client-acme-app --no-pull exited 3: Cannot connect to database: refused",
+    );
+    // Not quiet: gbrain's stderr is forwarded live, not only kept as a tail.
+    expect(r.stderr).toContain("first line");
+  });
+
+  it.skipIf(process.platform === "win32")("more than 1 MiB of gbrain stderr neither fails the stage nor is buffered whole", () => {
+    const { r, state } = runCodeStage(`    head -c 2200000 /dev/zero | tr '\\\\0' 'x' >&2; echo >&2; echo "walk done" >&2`, ["--quiet"]);
+    expect(r.status).toBe(0);
+    const code = state.last_stages.find((s: { name: string }) => s.name === "code");
+    expect(code.ok).toBe(true);
+    expect(r.stderr.length).toBeLessThan(64 * 1024);
   });
 });

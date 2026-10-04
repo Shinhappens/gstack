@@ -70,6 +70,8 @@ These examples show the difference between soft exploration and rigorous diagnos
 
 Ask these questions **ONE AT A TIME** via AskUserQuestion. Push on each one until the answer is specific, evidence-based, and uncomfortable. Comfort means the founder hasn't gone deep enough.
 
+When a forcing question's options describe the founder's own evidence, the `Recommendation:` still takes a position: recommend the option the founder's own words already support ("zero users" supports the no-evidence-yet answer) because of what that answer means for the next step, and name the evidence that would change it. Never recommend an option only because it would be the best position to be in.
+
 **Smart routing based on product stage — you don't always need all six:**
 - Pre-product → Q1, Q2, Q3
 - Has users → Q2, Q4, Q5

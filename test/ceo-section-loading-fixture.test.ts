@@ -1,10 +1,20 @@
 import lifetimeFixture from './fixtures/ceo-fill-lifetime.json';
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   CACHE_READ_WRITE_SKETCH,
   CEO_SECTION_CACHE_PLAN,
   hasStaleFillRaceFinding,
 } from './helpers/ceo-section-loading-fixture';
+import captured_sdk_columnar_af from './fixtures/sdk-columnar-af.json';
+import captured_sdk_compact_sequence_aj from './fixtures/sdk-compact-sequence-aj.json';
+import captured_sdk_order_b_ag from './fixtures/sdk-order-b-ag.json';
+import fs_sdk_ordered_schedule_ar from 'node:fs';
+import fixture_sdk_ordering_ae from './fixtures/sdk-ordering-ae.json';
+import captured_sdk_original_order_ai from './fixtures/sdk-original-order-ai.json';
+import fixture_sdk_schedule_continuation_ah from './fixtures/sdk-schedule-continuation-ah.json';
+import fixture_sdk_stale_table_ad_v3 from './fixtures/sdk-stale-table-ad-v3.json';
 
 describe('future-reader vocabulary in the actual AA finding', () => {
   const report = require('node:fs').readFileSync(require('node:path').join(import.meta.dir, 'fixtures/ceo-section-aa-report.md'), 'utf8');
@@ -1023,5 +1033,878 @@ describe('section fixture rollout metrics retain final acceptance without an imp
     expect(CEO_SECTION_CACHE_PLAN).toContain('no additional version checks or');
     expect(CEO_SECTION_CACHE_PLAN).toContain(CACHE_READ_WRITE_SKETCH);
     expect(CEO_SECTION_CACHE_PLAN).toContain('repository.read returns\n  an immutable absent-result DTO for a missing record, never undefined');
+  });
+});
+
+describe('sdk-columnar-af', () => {
+const captured = captured_sdk_columnar_af;
+const evidence = () => captured.retryFinding + '\n\n' + captured.retrySchedule;
+function replace(text: string, before: string, after: string) {
+  expect(text).toContain(before);
+  return text.replace(before, after);
+}
+
+test('AF exact retry columnar schedule establishes a post-write stale reader', () => {
+  expect(hasStaleFillRaceFinding(captured.retryReport)).toBe(true);
+  expect(hasStaleFillRaceFinding(captured.firstGuardedEvidence)).toBe(false);
+});
+
+test('AF columnar evidence binds named actors, keys and distinct versions independently of their spelling', () => {
+  expect(hasStaleFillRaceFinding(evidence())).toBe(true);
+  const varied = evidence().replace(/\bR1\b/g, 'R4').replace(/\bR2\b/g, 'R8').replace(/\bW\b/g, 'W3')
+    .replace(/\bK\b/g, 'profileKey').replace(/\bv1\b/g, 'oldVersion').replace(/\bv2\b/g, 'newVersion')
+    .replace(/->/g, '→');
+  expect(hasStaleFillRaceFinding(varied)).toBe(true);
+  expect(hasStaleFillRaceFinding(evidence().replace(/\bv2\b/g, 'v1'))).toBe(false);
+});
+
+test('AF every ordered operation and version witness is required', () => {
+  for (const [before, after] of [
+    ['get(K) -> undefined', 'get(K) -> v1'],
+    ['await repository.read -> v1', 'await repository.read -> v2'],
+    ['await write commits v2', 'await write fails'],
+    ['delete(K) (no entry)', 'keep(K)'],
+    ['| returns                   |', '| still pending             |'],
+    ['resume: set(K, v1); return v1', 'resume: set(K, v2); return v2'],
+    ['get(K) -> v1; return v1', 'get(K) -> v2; return v2'],
+    ['v1 STALE  | v2', 'v1 STALE  | v1'],
+    ['6 | resume:', '8 | resume:'],
+  ]) expect(hasStaleFillRaceFinding(replace(evidence(), before!, after!))).toBe(false);
+  for (let event = 1; event <= 7; event++) {
+    expect(hasStaleFillRaceFinding(evidence().split('\n').filter(line => !line.trim().startsWith(`${event} |`)).join('\n'))).toBe(false);
+  }
+});
+
+test('AF a different key, reader, write or column cannot lend ownership', () => {
+  for (const [before, after] of [
+    ['cache[K]  | DB[K]', 'cache[K]  | DB[J]'],
+    ['delete(K) (no entry)', 'delete(J) (no entry)'],
+    ['set(K, v1)', 'set(J, v1)'],
+    ['get(K) -> v1; return v1', 'get(J) -> v1; return v1'],
+    ['R2 read (begins after W)', 'R1 read (begins after W)'],
+    ['R2 read (begins after W)', 'R2 read (begins after W2)'],
+    ['R2 began after W completed (t5)', 'R1 began after W completed (t5)'],
+    ['R2 began after W completed (t5)', 'R2 began before W completed (t5)'],
+    ['R2 began after W completed (t5)', 'R2 began after W completed (t6)'],
+    ['observes v1 for up to 30 s.', 'observes v2 for up to 30 s.'],
+  ]) expect(hasStaleFillRaceFinding(replace(evidence(), before!, after!))).toBe(false);
+});
+
+test('AF current declarative execution cannot borrow a conditional, negated or quoted schedule', () => {
+  for (const [before, after] of [
+    ['await write commits v2', 'write might commit v2'],
+    ['resume: set(K, v1); return v1', 'resume: no set(K, v1); return v1'],
+    ['VIOLATION t7:', 'If VIOLATION t7:'],
+    ['VIOLATION t7:', 'Quoted VIOLATION t7:'],
+    ['observes v1 for up to 30 s.', 'observes v1 for up to 30 s.?'],
+  ]) expect(hasStaleFillRaceFinding(replace(evidence(), before!, after!))).toBe(false);
+});
+
+test('AF the same named finding and a real top-level fence own the schedule', () => {
+  const text = evidence();
+  for (const value of [
+    captured.retrySchedule,
+    text.replace('(F1 evidence)', '(F2 evidence)'),
+    text.replace('Schedule S1 below', 'Schedule S2 below'),
+    captured.retryFinding + '\n' + text,
+    text.split('\n').map(line => '> ' + line).join('\n'),
+    '````text\n' + text + '\n````',
+    text.replace('```\n t |', '```javascript\n t |'),
+    text.slice(0, text.lastIndexOf('```')),
+    'Example:\n\n' + text,
+    captured.retryFinding + '\n\nTemplate:\n' + captured.retrySchedule,
+  ]) expect(hasStaleFillRaceFinding(value)).toBe(false);
+});
+
+test('AF an original-caller allowance cannot excuse a stale cache or later caller', () => {
+  const allowed = 'Allowed by contract: R1 itself returns v1 (read in progress when write committed).';
+  for (const value of [
+    replace(evidence(), allowed, 'Allowed by contract: R2 itself returns v1 (read in progress when write committed).'),
+    replace(evidence(), allowed, 'The stale-fill behavior is accepted.'),
+    replace(evidence(), allowed, 'There is no stale-fill race.'),
+    replace(evidence(), allowed, 'The trace is impossible.'),
+    evidence() + '\n\nThis is not a violation. No guard is required.',
+  ]) expect(hasStaleFillRaceFinding(value)).toBe(false);
+});
+test('AF every same-row assessment and an unproven source frame remain authoritative', () => {
+  for (const [cell, value] of [
+    [6, 'Rejected: there is no stale-fill race.'],
+    [5, 'The stale-fill behavior is accepted. No guard is required.'],
+    [6, 'Rejected: “There is no stale-fill race.”'],
+    [6, 'Rejected: "The stale-fill behavior is accepted. No guard is required."'],
+  ] as const) {
+    const cells = captured.retryFinding.split('|'); cells[cell] = value;
+    expect(hasStaleFillRaceFinding(cells.join('|') + '\n\n' + captured.retrySchedule)).toBe(false);
+  }
+  expect(hasStaleFillRaceFinding('An unproven hypothesis:\n\n' + evidence())).toBe(false);
+});
+});
+
+describe('sdk-compact-sequence-aj', () => {
+const captured = captured_sdk_compact_sequence_aj;
+const sequence = 'fill starts, write commits, write deletes (no-op), fill sets pre-commit v1, later read hits v1.';
+const report = captured.finding;
+
+test('recognizes the captured current original-plan sequence without borrowing the amended diagram', () => {
+  expect(hasStaleFillRaceFinding(report)).toBe(true);
+  expect(hasStaleFillRaceFinding(report.replaceAll('v1', 'snapshot_A'))).toBe(true);
+  expect(hasStaleFillRaceFinding(report.replace('Schedule Diagram 2b: ', ''))).toBe(true);
+});
+
+test('requires the ordered original fill, commit, invalidation, old cache value and same later value', () => {
+  for (const changed of [
+    sequence.replace('fill starts, ', ''),
+    sequence.replace('write commits, ', ''),
+    sequence.replace('write deletes (no-op), ', ''),
+    sequence.replace('fill sets pre-commit v1, ', ''),
+    sequence.replace(', later read hits v1', ''),
+    sequence.replace('later read hits v1', 'later read hits v2'),
+    sequence.replace('pre-commit v1', 'post-commit v1'),
+    sequence.replace('fill starts, write commits', 'write commits, fill starts'),
+    sequence.replace('write deletes (no-op), fill sets pre-commit v1', 'fill sets pre-commit v1, write deletes (no-op)'),
+    sequence.replace('later read hits', 'another key later read hits'),
+  ]) expect(hasStaleFillRaceFinding(report.replace(sequence, changed))).toBe(false);
+  expect(hasStaleFillRaceFinding(report.replace('Original plan', 'Amended plan'))).toBe(false);
+  expect(hasStaleFillRaceFinding(report.replace(sequence, '"' + sequence + '"'))).toBe(false);
+});
+
+test('preserves accepted-staleness and explicit dismissal boundaries', () => {
+  for (const suffix of [
+    'This is not a gap; no guard is needed.',
+    'This staleness is the accepted consistency model.',
+    'This finding is withdrawn.',
+    'F1 is rejected.',
+  ]) expect(hasStaleFillRaceFinding(report.trimEnd() + '\n\n' + suffix)).toBe(false);
+  expect(hasStaleFillRaceFinding(report.replace('fill starts', 'fill never starts'))).toBe(false);
+});
+
+test('source, quotes and hypothetical framing cannot supply current coverage', () => {
+  for (const text of [
+    '```text\n' + report + '```',
+    report.split('\n').map(line => '> ' + line).join('\n'),
+    report.split('\n').map(line => '    ' + line).join('\n'),
+    '## Historical example\n\n' + report,
+    '## Quoted source\n\n' + report,
+    'An unproven hypothesis.\n\n' + report,
+    'The following is a hypothetical example.\n\n' + report,
+  ]) expect(hasStaleFillRaceFinding(text)).toBe(false);
+  expect(hasStaleFillRaceFinding('## Historical example\nOld material.\n\n## Current review\n' + report)).toBe(true);
+  expect(hasStaleFillRaceFinding(report + '\n## Unrelated issue\nF2 is rejected.')).toBe(true);
+});
+
+test('source framing remains attached to descendant registry headings', () => {
+  for (const prefix of [
+    '## Copied material\nThe following subsections reproduce source examples, not current findings.\n\n',
+    '## Input material\nThe following sections quote historical examples.\n\n',
+    'The following subsections reproduce source examples, not current findings.\n\n',
+  ]) expect(hasStaleFillRaceFinding(prefix + report)).toBe(false);
+  expect(hasStaleFillRaceFinding('## Source notes\nThe following material quotes historical examples.\n\n## Current findings\n' + report)).toBe(true);
+});
+
+test('same finding assessments retain identity across sections and unrelated findings', () => {
+  for (const suffix of [
+    '## F1 assessment\nThis finding is withdrawn.',
+    '## Final assessment\nF1 is rejected.',
+    '## F2\nUnrelated issue accepted.\n\n## Final assessment\nF1 is dismissed.',
+  ]) expect(hasStaleFillRaceFinding(report + '\n\n' + suffix)).toBe(false);
+  for (const suffix of [
+    '## F2 assessment\nThis finding is withdrawn.',
+    '## Final assessment\nF2 is rejected.',
+    '## Quoted source\nF1 is rejected.',
+    '## Source notes\nThe following subsections quote historical examples.\n\n### F1 assessment\nThis finding is withdrawn.',
+  ]) expect(hasStaleFillRaceFinding(report + '\n\n' + suffix)).toBe(true);
+});
+});
+
+describe('sdk-order-b-ag', () => {
+const captured = captured_sdk_order_b_ag;
+const compactFirst = () => `${captured.first.finding}\n\n${captured.first.heading}\n\`\`\`\n${captured.first.trace}\n\`\`\``;
+const compactRetry = () => `${captured.retry.finding}\n\n${captured.retry.heading}\n\`\`\`\n${captured.retry.trace}\n\`\`\``;
+
+test('actual first completed report proves a later stale cache hit', () => {
+  expect(hasStaleFillRaceFinding(captured.first.report)).toBe(true);
+});
+
+test('isolated Order B proves a later stale cache hit', () => {
+  expect(hasStaleFillRaceFinding(compactFirst())).toBe(true);
+});
+
+test('actual retry and its explicit original-sketch override establish the unsafe execution', () => {
+  expect(hasStaleFillRaceFinding(captured.retry.report)).toBe(true);
+  expect(hasStaleFillRaceFinding(compactRetry())).toBe(true);
+});
+
+function replaceOnce(text: string, before: string, after: string): string {
+  expect(text.includes(before)).toBe(true);
+  return text.replace(before, after);
+}
+
+test('original-caller return or flight joining alone cannot supply the later cache reader', () => {
+  for (const [before, after] of [
+    ['  Order B: R2 begins after t5 -> cache hit v1  VIOLATION (until TTL or next write)\n', ''],
+    ['Order B: R2 begins after t5', 'Order B: R1 begins after t5'],
+    ['Order B: R2 begins after t5', 'Order B: R2 begins before t3'],
+    ['Order B: R2 begins after t5', 'Order B: R2 begins after t2'],
+    ['cache hit v1  VIOLATION', 'fresh DB read v2'],
+    ['cache hit v1  VIOLATION', 'cache hit v2  SAFE'],
+  ]) expect(hasStaleFillRaceFinding(replaceOnce(compactFirst(), before!, after!))).toBe(false);
+});
+
+test('all read, commit, invalidation and late-fill operations retain shared key and version ownership', () => {
+  for (const [before, after] of [
+    ['R1 readProfile(k)', 'R1 readProfile(other)'],
+    ['W writeProfile(k, v2)', 'W writeProfile(other, v2)'],
+    ['R2 readProfile(k)', 'R2 readProfile(other)'],
+    ['cache[k]', 'cache[other]'],
+    ['inflight[k]', 'inflight[other]'],
+    ['set(k, v1)', 'set(other, v1)'],
+    ['set(k, v1)', 'set(k, v2)'],
+    ['read resolves v1; set(k, v1)', 'read resolves v2; set(k, v1)'],
+    ['miss; flight f1; await read', 'cache hit v1; return'],
+    ['await write ... commit v2', 'await write ... abort'],
+    ['delete(k) no-op; return', 'delete(other) no-op; return'],
+    ['delete(k) no-op; return', 'write still pending'],
+    ['read resolves v1; set(k, v1)', 'read resolves v1; return to R1 only'],
+    ['v1  BAD  | -', 'v2  SAFE | -'],
+  ]) expect(hasStaleFillRaceFinding(replaceOnce(compactFirst(), before!, after!))).toBe(false);
+});
+
+test('quoted, conditional and impossible schedules are not actual asserted execution', () => {
+  const report = compactFirst();
+  for (const changed of [
+    report.split('\n').map(line => `> ${line}`).join('\n'),
+    `\`\`\`markdown\n${report}\n\`\`\``,
+    `An unproven hypothesis:\n${report}`,
+    replaceOnce(report, 'Schedule below shows', 'An unproven hypothesis: Schedule below shows'),
+    replaceOnce(report, 'Order B: R2 begins', 'Order B: If R2 begins'),
+    replaceOnce(report, 'Order B: R2 begins', 'Order B: R2 never begins'),
+    replaceOnce(report, 'Order B: R2 begins after t5 -> cache hit v1  VIOLATION', 'Order B: R2 begins after t5 -> cache hit v1  VIOLATION?'),
+    report + '\nThis trace is impossible.',
+    report + '\n\nThe trace is impossible.',
+  ]) expect(hasStaleFillRaceFinding(changed)).toBe(false);
+});
+
+test('one finding owns the original trace and every same-row assessment', () => {
+  const report = compactFirst();
+  for (const changed of [
+    replaceOnce(report, 'Async schedule (F1)', 'Async schedule (F9)'),
+    replaceOnce(report, '| F1 |', '| F9 |'),
+    replaceOnce(report, 'Fills overlapping a write are not cached (bounded hit-rate cost, visible in metric)', 'There is no stale-fill race.'),
+    replaceOnce(report, 'Fills overlapping a write are not cached (bounded hit-rate cost, visible in metric)', 'Rejected: "There is no stale-fill race."'),
+    replaceOnce(report, 'D3: single-flight `invalidate(key)` before and after the write; invalidated fills never `set`; `fill_discarded` metric', 'The stale-fill behavior is accepted. No guard is required.'),
+  ]) expect(hasStaleFillRaceFinding(changed)).toBe(false);
+});
+
+test('retry amendment alone and unasserted original-sketch annotations cannot prove a stale fill', () => {
+  const original = 'Original sketch: step 6 fills v1 after step 4 → R2 hits v1 → VIOLATION (S1).';
+  for (const replacement of [
+    '',
+    `"${original}"`,
+    `> ${original}`,
+    `If ${original}`,
+    `Example: ${original}`,
+    original.replace('fills v1', 'does not fill v1'),
+    original.replace('VIOLATION (S1).', 'VIOLATION (S1)?'),
+    original.replace('fills v1', 'fills v2'),
+    original.replace('after step 4', 'before step 4'),
+    original.replace('after step 4', 'after step 3'),
+    original.replace('step 6 fills', 'step 7 fills'),
+    original.replace('R2 hits v1', 'R1 receives v1'),
+    original.replace('R2 hits v1', 'R2 hits v2'),
+    original.replace('(S1)', '(S9)'),
+  ]) expect(hasStaleFillRaceFinding(replaceOnce(compactRetry(), original, replacement))).toBe(false);
+  expect(hasStaleFillRaceFinding(compactRetry() + '\n\nThe trace is impossible.')).toBe(false);
+});
+
+test('retry original override is bound to the same actors, cancelled token and completed write', () => {
+  for (const [before, after] of [
+    ['R1 read (began before commit)', 'R1 read (began after commit)'],
+    ['R2 read (began after W resolves)', 'R2 read (began before W resolves)'],
+    ['R2 read (began after W resolves)', 'R2 read (other key, began after W resolves)'],
+    ['invalidate: cancel t1, detach, delete', 'invalidate: cancel other, detach, delete'],
+    ['writeProfile resolves (write "complete")', 'writeProfile still pending'],
+    ['await repo.write → v2 committed', 'await repo.write → aborted'],
+    ['read resolves v1; t1✗ → no fill', 'read resolves v2; t1✗ → no fill'],
+    ['read resolves v1; t1✗ → no fill', 'read resolves v1; other✗ → no fill'],
+    ['S1: R1 misses, W commits and deletes, R1 fills stale v1, R2 hits v1.', 'S1: R1 misses, W commits and deletes, R1 fills stale v1, R1 receives v1.'],
+    ['### 4. Async schedule (F1)', '### 4. Async schedule (F9)'],
+  ]) expect(hasStaleFillRaceFinding(replaceOnce(compactRetry(), before!, after!))).toBe(false);
+});
+
+test('consistent actor, key, version and pending-identity renaming preserves each causal proof', () => {
+  const names: Record<string, string> = {
+    R1: 'R7', R2: 'R8', W: 'W9', k: 'profile_key', v1: 'oldValue', v2: 'newValue',
+    f1: 'flight_old', f2: 'flight_new', t1: 'token_old', t2: 'token_new',
+  };
+  for (const report of [compactFirst(), compactRetry()]) {
+    const renamed = report.replace(/\b(?:R1|R2|W|k|v1|v2|f1|f2|t1|t2)\b/g, token => names[token]!);
+    expect(hasStaleFillRaceFinding(renamed)).toBe(true);
+  }
+});
+
+test('current findings cannot borrow assertion authority from a hypothetical preceding frame', () => {
+  for (const report of [compactFirst(), compactRetry()]) {
+    for (const prefix of ['An unproven hypothesis.', 'Historical example only.', 'The following is a hypothetical example.']) {
+      expect(hasStaleFillRaceFinding(`${prefix}\n\n${report}`)).toBe(false);
+    }
+    expect(hasStaleFillRaceFinding(`## Prior example\nA completed historical illustration.\n\n## Current findings\n${report}`)).toBe(true);
+  }
+});
+});
+
+describe('sdk-ordered-schedule-ar', () => {
+const fs = fs_sdk_ordered_schedule_ar;
+const report = fs.readFileSync(new URL('./fixtures/sdk-ordered-schedule-ar.md', import.meta.url), 'utf8');
+const row = report.split('\n').find(line => line.startsWith('| F1 |'))!;
+const schedule = 'Schedule: read misses, write commits and deletes (no-op), read resolves and stores the pre-write snapshot. A later read hits the stale value';
+
+test('an actual review supplies the stale-fill ordering without a concurrency keyword', () => {
+  expect(row).toContain(schedule);
+  expect(row).not.toMatch(/\b(?:race|concurrent|in-flight|pending)\b/i);
+  expect(hasStaleFillRaceFinding(row)).toBe(true);
+  expect(hasStaleFillRaceFinding(report)).toBe(true);
+  expect(hasStaleFillRaceFinding(row.replace('Original sketch', 'Original wrapper'))).toBe(true);
+  expect(hasStaleFillRaceFinding(row.replace('pre-write snapshot', 'old value'))).toBe(true);
+  expect(hasStaleFillRaceFinding(row.replace('A later read', 'The subsequent read'))).toBe(true);
+  expect(hasStaleFillRaceFinding(row.replaceAll('"', ''))).toBe(true);
+});
+
+test('every operation and the stale value observed by a later read are required', () => {
+  for (const [from, to] of [
+    ['read misses, ', ''],
+    ['write commits and deletes (no-op), ', ''],
+    ['write commits and deletes', 'write rolls back and deletes'],
+    ['write commits and deletes', 'write commits without deleting'],
+    ['read resolves and stores the pre-write snapshot', 'read resolves and skips the fill'],
+    ['read resolves and stores the pre-write snapshot', 'read resolves and stores the fresh snapshot'],
+    ['A later read hits the stale value', 'The original read returns its own pre-write snapshot'],
+    ['A later read hits the stale value', 'A later read hits the fresh value'],
+    ['write commits and deletes (no-op), read resolves and stores the pre-write snapshot', 'read resolves and stores the pre-write snapshot, write commits and deletes (no-op)'],
+    ['write commits and deletes (no-op), read resolves', 'write commits and deletes (no-op) | read resolves'],
+    ['read resolves and stores', 'another reader resolves and stores'],
+    ['write commits and deletes (no-op)', 'write commits and deletes another key'],
+  ]) {
+    expect(row).toContain(from);
+    expect(hasStaleFillRaceFinding(row.replace(from, to))).toBe(false);
+  }
+});
+
+test('copied, conditional, quoted and hypothetical schedules cannot supply current evidence', () => {
+  for (const text of [
+    '> ' + row,
+    '```text\n' + row + '\n```',
+    '## Historical example\n' + row,
+    'Source:\n' + row,
+    'Earlier review:\n' + row,
+    row.replace('Original sketch fills', 'Original sketch source excerpt only: fills'),
+    row.replace('Original sketch fills', 'Original sketch from an earlier review fills'),
+    row.replace('Schedule:', '\nFinding F2. Schedule:'),
+    '## Source notes\nThe following material is copied from a template.\n' + row,
+    row.replace('Original sketch', 'Quoted original sketch'),
+    row.replace('Schedule: read misses', 'Schedule: if a read misses'),
+    row.replace('Schedule: read misses', 'Hypothetical schedule: read misses'),
+    row.replace('read resolves and stores', 'read never resolves and stores'),
+    row.replace(schedule, '"' + schedule + '"'),
+    row.replace(schedule, '`' + schedule + '`'),
+    row.replace('read resolves and stores the pre-write snapshot', '`read resolves and stores the pre-write snapshot`'),
+    row.replace('Flag flip mid-read has the same shape.', 'This sequence is impossible.'),
+  ]) expect(hasStaleFillRaceFinding(text)).toBe(false);
+});
+
+test('a current dismissal stays a dismissal even when the original schedule is complete', () => {
+  for (const suffix of [
+    'F1 is withdrawn.',
+    'F1 is "withdrawn".',
+    'F1 is “withdrawn”.',
+    'F1 is rejected.',
+    'This finding is dismissed.',
+    'This is not a bug; no fix is needed.',
+    'The stale-fill behavior is permitted.',
+  ]) expect(hasStaleFillRaceFinding(row + '\n\n' + suffix)).toBe(false);
+  expect(hasStaleFillRaceFinding(row + '\n\nF2 is rejected.')).toBe(true);
+  expect(hasStaleFillRaceFinding('## Historical example\nOld material.\n\n## Current findings\n' + row)).toBe(true);
+});
+});
+
+describe('sdk-ordering-ae', () => {
+const fixture = fixture_sdk_ordering_ae;
+const found = hasStaleFillRaceFinding;
+const trace = fixture.f1.split('|')[4]!.trim();
+function withTrace(value: string): string {
+  const cells = fixture.f1.split('|');
+  cells[4] = ` ${value} `;
+  return cells.join('|');
+}
+
+test('actual completed F1 report row supplies ordered stale-fill evidence without a race keyword', () => {
+  expect(found(fixture.f1)).toBe(true);
+  expect(fixture.provenance.historicalOutcome).toContain('timeout480032ms');
+  expect(trace).not.toMatch(/\b(?:race|in-flight|concurrent|pending)\b/i);
+  expect(found(`F1 — P1: ${trace}`)).toBe(true);
+});
+
+test('ordering evidence requires miss, committed invalidation, stale refill and later stale readers', () => {
+  for (const value of [
+    'Reader fills the pre-commit snapshot; write commits and deletes; read misses; every later reader sees stale data.',
+    'Read misses; reader then fills the pre-commit snapshot; write commits and deletes; every later reader sees stale data.',
+    'Write commits and deletes; read misses; reader then fills the pre-commit snapshot; every later reader sees stale data.',
+    'Read misses; reader then fills the pre-commit snapshot; every later reader sees stale data.',
+    'Read misses, write commits; reader then fills the pre-commit snapshot; every later reader sees stale data.',
+    'Read misses, write commits and deletes; every later reader sees stale data.',
+    'Read misses, write commits and deletes; reader then fills the post-commit snapshot; every later reader sees fresh data.',
+    'Read misses, write commits and deletes; the original reader returns its pre-commit snapshot to its own caller; every later reader sees fresh data.',
+  ]) expect(found(withTrace(value))).toBe(false);
+});
+
+test('explicit other cache, key or reader references cannot borrow the anonymous same-read trace', () => {
+  for (const value of [
+    'Read misses cache A, write commits and deletes cache B, reader then fills cache A with the pre-commit snapshot; every later reader sees stale data in cache A.',
+    'Read misses key u1, write commits and deletes key u2, reader then fills key u1 with the pre-commit snapshot; every later reader sees stale data for key u1.',
+    'Read R1 misses, write commits and deletes, reader R2 then fills the pre-commit snapshot; every later reader sees stale data.',
+  ]) expect(found(withTrace(value))).toBe(false);
+});
+
+test('hypothetical, negated and unestablished traces do not assert a current defect', () => {
+  for (const value of [
+    `If ${trace[0]!.toLowerCase()}${trace.slice(1)}`,
+    `A hypothetical example: ${trace}`,
+    `An unproven hypothesis: ${trace}`,
+    `The following trace is impossible: ${trace}`,
+    `An unrelated illustration: ${trace}`,
+    `It is unclear whether this happens: ${trace}`,
+    `This trace did not occur: ${trace}`,
+    trace.replace('Read misses', 'Read may miss'),
+    trace.replace('write commits and deletes', 'write does not commit or delete'),
+    trace.replace('reader then fills', 'reader never fills'),
+    trace.replace('every later reader sees stale data', 'every later reader never sees stale data'),
+    'Read misses, write commits and deletes, reader then fills the pre-commit snapshot; every later reader sees stale data?',
+    'Read misses, write commits and deletes, reader then fills the pre-commit snapshot; every later reader sees stale data. This scenario is impossible.',
+  ]) expect(found(withTrace(value))).toBe(false);
+});
+
+test('copied source and independent rows or cells cannot supply missing ordered operations', () => {
+  for (const value of [`> ${fixture.f1}`, `    ${fixture.f1}`, `\t${fixture.f1}`,
+    `\`\`\`text\n${fixture.f1}\n\`\`\``, `~~~text\n${fixture.f1}\n~~~`]) expect(found(value)).toBe(false);
+  const first = withTrace('Read misses; write commits and deletes.');
+  const last = withTrace('Reader then fills the pre-commit snapshot; every later reader sees stale data.').replace('| F1 |', '| F2 |');
+  expect(found(first + '\n' + last)).toBe(false);
+  const cells = fixture.f1.split('|');
+  cells[4] = ' Read misses; write commits and deletes. ';
+  cells[6] = ' Reader then fills the pre-commit snapshot; every later reader sees stale data. ';
+  expect(found(cells.join('|'))).toBe(false);
+  expect(found(first + '\n\n> ' + trace)).toBe(false);
+  expect(found(withTrace(`"${trace}" is a copied source example, not an observed defect.`))).toBe(false);
+});
+
+test('a real trace still rejects dismissal or acceptance of the later stale consequence', () => {
+  for (const suffix of [' No fix is required.', ' This stale-read behavior is accepted.', ' There is no stale-fill race.',
+    ' Later readers may return stale data and that is permitted.']) expect(found(withTrace(trace + suffix))).toBe(false);
+  expect(found(withTrace(trace + ' Original reader returns v1 to its own caller (allowed: it began before commit).'))).toBe(true);
+  expect(found(withTrace(trace + ' Later reader returns v1 to its own caller (allowed: it began after commit).'))).toBe(false);
+});
+});
+
+describe('sdk-original-order-ai', () => {
+const captured = captured_sdk_original_order_ai;
+const compact = () => `### Findings registry\n\n${captured.finding}\n\n${captured.heading}\n\`\`\`\n${captured.trace}\n\`\`\``;
+const rejects = (changes: Array<[string, string]>) => {
+  for (const [before, after] of changes) {
+    expect(compact()).toContain(before);
+    expect(hasStaleFillRaceFinding(compact().replace(before, after))).toBe(false);
+  }
+};
+
+describe('asserted original order beside an amended cache schedule', () => {
+  test('exact completed report and its owned finding/schedule show the original late-fill violation', () => {
+    expect(hasStaleFillRaceFinding(captured.report)).toBe(true);
+    expect(hasStaleFillRaceFinding(compact())).toBe(true);
+  });
+
+  test('amended behavior or the original caller allowance cannot replace the original stale-fill evidence', () => {
+    const original = 'Original sketch, order A: fill V1 at 6 after delete at 4 -> R2 reads V1 for <=30 s  VIOLATION';
+    rejects([
+      [original, ''], [original, 'Not ' + original], [original, '> ' + original],
+      [original, '"' + original + '"'], [original, 'If ' + original],
+      [original, original.replace('VIOLATION', 'PERMITTED')],
+      [original, original.replace('R2 reads', 'R1 reads')],
+      [original, original.replace('fill V1', 'skip fill V1')],
+      [original, original.replace('after delete at 4', 'before delete at 4')],
+    ]);
+  });
+
+  test('reader, writer, cache key, versions and completion order must all refer to the same execution', () => {
+    rejects([
+      ['inflight[k]', 'inflight[foreign]'], ['R1 (began before W)', 'R1 (began after W)'],
+      ['DB write commits V2', 'DB write commits V1'], ['DB returns V1', 'DB returns V2'],
+      ['resume: invalidate(E1), delete', 'resume: invalidate(E9), delete'],
+      ['settles -> W complete', 'settles -> W pending'],
+      ['resume: E1.stale -> skip fill', 'resume: E9.stale -> skip fill'],
+      ['7 | R2 begins:', '4.5 | R2 begins:'], ['R2 reads V1 for', 'R2 reads V2 for'],
+      ['fill V1 at 6 after delete at 4', 'fill V1 at 3 after delete at 4'],
+      ['cache[k]', 'cache[foreign]'],
+    ]);
+  });
+
+  test('the current finding owns the trace and must independently assert the invariant violation', () => {
+    rejects([
+      ['schedule (F1,', 'schedule (F2,'], ['| F1 | CRITICAL |', '| F2 | CRITICAL |'],
+      ['| F1 | CRITICAL |', '| F1 | LOW |'],
+      ['Schedule in Section 4 shows', 'A hypothetical Schedule in Section 4 shows'],
+      ['filled after `cache.delete`', 'filled before `cache.delete`'],
+      ['every read begun after that write completes must observe the committed version', 'earlier values are accepted for later readers'],
+    ]);
+    expect(hasStaleFillRaceFinding(compact().replace(captured.finding, captured.finding + '\n' + captured.finding))).toBe(false);
+  });
+
+  test('source and hypothetical framing cannot supply the assertion', () => {
+    for (const prefix of ['An unproven hypothesis.', 'Historical example only.', 'The following is a hypothetical example.']) {
+      expect(hasStaleFillRaceFinding(prefix + '\n' + compact())).toBe(false);
+      expect(hasStaleFillRaceFinding(compact().replace(captured.heading, prefix + '\n' + captured.heading))).toBe(false);
+    }
+    expect(hasStaleFillRaceFinding(compact().split('\n').map(line => '> ' + line).join('\n'))).toBe(false);
+    expect(hasStaleFillRaceFinding('````text\n' + compact() + '\n````')).toBe(false);
+    expect(hasStaleFillRaceFinding(compact().replace('### Findings registry', '### Quoted source'))).toBe(false);
+  });
+
+  test('same-finding direct and quoted withdrawals remain authoritative inside or after the trace', () => {
+    for (const withdrawal of ['F1 is withdrawn.', 'F1 is rejected.', 'The original schedule is impossible.', 'There is no stale-fill race.', 'Rejected: "There is no stale-fill race."']) {
+      expect(hasStaleFillRaceFinding(compact() + '\n\n' + withdrawal)).toBe(false);
+      expect(hasStaleFillRaceFinding(compact().replace(captured.trace, captured.trace + '\n' + withdrawal))).toBe(false);
+      expect(hasStaleFillRaceFinding(compact().replace('Ordering tests, both orders + late joiner + sentinel variant', withdrawal))).toBe(false);
+    }
+    expect(hasStaleFillRaceFinding(compact().replace('Readers that began before the write may still see the old snapshot (permitted by contract)', 'Later readers may see old snapshots; this stale-fill behavior is accepted.'))).toBe(false);
+  });
+
+  test('unrelated sections and consistently renamed identities do not change valid evidence', () => {
+    expect(hasStaleFillRaceFinding('### Prior example\nHistorical example only.\n\n### Current review\n' + compact())).toBe(true);
+    expect(hasStaleFillRaceFinding(compact() + '\n\n### Other finding\nF2 is rejected.')).toBe(true);
+    const renamed = compact().replaceAll('R1', 'R7').replaceAll('R2', 'R8').replaceAll('R3', 'R9')
+      .replaceAll('V1', 'oldSnapshot').replaceAll('V2', 'newSnapshot').replaceAll('E1', 'pendingA').replaceAll('E2', 'pendingB')
+      .replaceAll('[k]', '[profileKey]').replace(/\bW\b/g, 'W2');
+    expect(hasStaleFillRaceFinding(renamed)).toBe(true);
+  });
+
+  test('owning source headings and same-finding assessments survive intervening structure', () => {
+    for (const heading of ['## Hypothetical example', '## Quoted source', '## Historical example only']) {
+      expect(hasStaleFillRaceFinding(heading + '\n' + compact())).toBe(false);
+    }
+    expect(hasStaleFillRaceFinding(compact().replace(captured.heading,
+      'F1 is rejected.\n\nUnrelated diagram:\n```\nA -> B\n```\n\n' + captured.heading))).toBe(false);
+    expect(hasStaleFillRaceFinding(compact() + '\n\n### Assessment of F1\nF1 is rejected.')).toBe(false);
+  });
+});
+
+const retry = () => `## Findings Registry\n\n${captured.retry.finding}\n\n${captured.retry.heading}\n\`\`\`\n${captured.retry.trace}\n\`\`\``;
+describe('version-labelled original prose with its owned schedule', () => {
+  test('the exact retry and compact evidence require the original sequence, not amended prevention', () => {
+    expect(hasStaleFillRaceFinding(captured.retry.report)).toBe(true);
+    expect(hasStaleFillRaceFinding(retry())).toBe(true);
+  });
+
+  test('each version and shared key must agree, with write completion before the later reader', () => {
+    for (const [before, after] of [
+      ['DB returns v1', 'DB returns v2'], ['write commits v2 and', 'write commits v1 and'],
+      ['read then fills v1;', 'read then fills v2;'], ['every later read gets v1', 'every later read gets v2'],
+      ['write commits v2 and', 'write commits v3 and'], ['writeGen[key]', 'writeGen[foreign]'],
+      ['cache[key]', 'cache[foreign]'], ['R2 (read, began after W)', 'R2 (read, began before W)'],
+      ['delete (no-op), return', 'delete (no-op), pending'], ['DB SELECT -> v1', 'DB SELECT -> v2'],
+      ['DB UPDATE commits v2', 'DB UPDATE commits v3'], ['promise resolves, set(v1)', 'promise resolves, set(v2)'],
+      ['get -> v1  VIOLATION', 'get -> v2  VIOLATION'], ['6 sketch', '3 sketch'],
+      ['3                                                     DB UPDATE commits v2', '3                       DB UPDATE commits v2'],
+    ]) {
+      expect(retry()).toContain(before);
+      expect(hasStaleFillRaceFinding(retry().replace(before, after))).toBe(false);
+    }
+    expect(hasStaleFillRaceFinding(retry().replace(captured.retry.trace, captured.retry.trace.split('\n').filter(line => !/\b[456] sketch\b/.test(line)).join('\n')))).toBe(false);
+  });
+
+  test('conditional, quoted, obsolete or withdrawn evidence cannot become a current finding', () => {
+    for (const prefix of ['An unproven hypothesis.', 'Historical example only.', 'The following is a hypothetical example.']) {
+      expect(hasStaleFillRaceFinding(prefix + '\n' + retry())).toBe(false);
+      expect(hasStaleFillRaceFinding(retry().replace('Late fill after write.', prefix + ' Late fill after write.'))).toBe(false);
+    }
+    for (const heading of ['## Hypothetical example', '## Quoted source', '## Historical example only']) {
+      expect(hasStaleFillRaceFinding(heading + '\n' + retry().replace('## Findings Registry', '### Findings Registry'))).toBe(false);
+    }
+    for (const withdrawal of ['F1 is rejected.', 'S1 is withdrawn.', 'The original schedule is impossible.', 'There is no stale-fill race.', 'Rejected: "There is no stale-fill race."']) {
+      expect(hasStaleFillRaceFinding(retry() + '\n\n' + withdrawal)).toBe(false);
+      expect(hasStaleFillRaceFinding(retry() + '\n\n### Assessment of F1\n' + withdrawal)).toBe(false);
+      expect(hasStaleFillRaceFinding(retry().replace(' S2 join stale flight', withdrawal + '\n S2 join stale flight'))).toBe(false);
+    }
+    for (const withdrawal of ['S1 is withdrawn.', 'F1 is rejected.']) {
+      expect(hasStaleFillRaceFinding(retry().replace(captured.retry.trace, captured.retry.trace + '\n' + withdrawal))).toBe(false);
+    }
+    expect(hasStaleFillRaceFinding(retry().split('\n').map(line => '> ' + line).join('\n'))).toBe(false);
+    expect(hasStaleFillRaceFinding('````\n' + retry() + '\n````')).toBe(false);
+    expect(hasStaleFillRaceFinding(retry().replace('Late fill after write.', 'If a late fill happens after write.'))).toBe(false);
+  });
+
+  test('consistent versions and independent later findings remain valid', () => {
+    expect(hasStaleFillRaceFinding(retry().replaceAll('v1', 'v7').replaceAll('v2', 'v8').replaceAll('[key]', '[profileKey]').replaceAll('key#1', 'profileKey#1'))).toBe(true);
+    expect(hasStaleFillRaceFinding('## Prior example\nHistorical only.\n\n## Current review\n' + retry().replace('## Findings Registry', '### Findings Registry'))).toBe(true);
+    expect(hasStaleFillRaceFinding(retry() + '\n\n### Other finding\nF9 is rejected.')).toBe(true);
+  });
+});
+});
+
+describe('sdk-reported-coordination-ar', () => {
+const fs = fs_sdk_ordered_schedule_ar;
+const report = fs.readFileSync(new URL('./fixtures/sdk-reported-coordination-ar.md', import.meta.url), 'utf8');
+const paragraph = report.split('\n\n').find(text => text.startsWith('## Proposed wrapper integration'))!.split('\n').slice(1).join('\n');
+const matches = (text = paragraph) => hasStaleFillRaceFinding(text);
+
+test('the actual retry independently reports the original coordination violation', () => {
+  expect(paragraph).toContain('review found that this violates the read-after-write rule above (F1)');
+  expect(paragraph).not.toMatch(/stale|in-flight|race|pending/);
+  expect(matches()).toBe(true);
+  expect(matches(report)).toBe(true);
+  expect(matches(paragraph.replace('proposed no coordination', 'had no coordination'))).toBe(true);
+  expect(matches(paragraph.replace('proposed no coordination', 'has no coordination'))).toBe(true);
+  expect(matches(paragraph.replace('sketch', 'wrapper'))).toBe(true);
+  expect(matches(paragraph.replace('rule above', 'contract'))).toBe(true);
+  expect(matches(paragraph.replace(/ and omits[\s\S]*/, '.'))).toBe(true);
+});
+
+test('missing or hypothetical premise and conclusion cannot become findings', () => {
+  for (const [from, to] of [
+    ['proposed no coordination', 'proposed coordination'],
+    ['proposed no coordination', 'may propose no coordination'],
+    ['review found that this violates', 'review may find that this violates'],
+    ['review found that this violates', 'review found that this does not violate'],
+    ['review found that this violates', 'review hypothesized that this violates'],
+    ['review found that this violates', 'review found that another wrapper violates'],
+    ['read-after-write rule above', 'formatting rule'],
+    ['(F1)', '(unknown)'],
+    ['; the\nreview found', '. Another unrelated finding. The\nreview found'],
+    ['; the\nreview found', '\n\nThe\nreview found'],
+    ['; the\nreview found', ' | The\nreview found'],
+  ]) {
+    expect(paragraph).toContain(from);
+    expect(matches(paragraph.replace(from, to))).toBe(false);
+  }
+});
+
+test('source and quoted evidence cannot assert the current violation', () => {
+  for (const text of [
+    'Source:\n\n' + paragraph,
+    'Hypothetical scenario. ' + paragraph,
+    'Earlier review:\n\n' + paragraph,
+    '## Historical example\n' + paragraph,
+    '> ' + paragraph.replaceAll('\n', '\n> '),
+    '```text\n' + paragraph + '\n```',
+    '~~~text\n' + paragraph + '\n~~~',
+    paragraph.replace('original sketch proposed no coordination between a cache fill and a write', '`original sketch proposed no coordination between a cache fill and a write`'),
+    paragraph.replace('review found that this violates the read-after-write rule above (F1)', '"review found that this violates the read-after-write rule above (F1)"'),
+  ]) expect(matches(text)).toBe(false);
+});
+
+test('the referenced finding owns its later assessment', () => {
+  for (const tail of ['F1 is withdrawn.', 'F1 is "withdrawn".', 'F1 is rejected.', 'This finding is dismissed.', 'No coordination is required.', '| ID | Assessment |\n| F1 | Withdrawn: no coordination is required. |', '| F1 | Withdrawn |', '| F1 | "rejected" |']) {
+    expect(matches(paragraph + '\n\n' + tail)).toBe(false);
+  }
+  expect(matches(paragraph + '\n\nF2 is withdrawn.')).toBe(true);
+  expect(matches(paragraph + '\n\n| F2 | Withdrawn |')).toBe(true);
+  expect(matches(paragraph + '\n\n## Historical assessment\n| F1 | Withdrawn |')).toBe(true);
+  expect(matches('## Earlier material\nSource:\nOld source.\n\n## Current findings\n' + paragraph)).toBe(true);
+});
+});
+
+describe('sdk-schedule-continuation-ah', () => {
+const fixture = fixture_sdk_schedule_continuation_ah;
+const frame = fixture.compact;
+function replace(from: string, to: string, input = frame): string {
+  expect(input.includes(from)).toBe(true);
+  return input.replace(from, to);
+}
+const originalRows = '  S2*   | await read ...             | write commits, delete(noop) |                     | -          |\n'
+  + '        | resolves V0 → set V0       |                             | hit → V0            | V0 (30 s)  | VIOLATION\n';
+
+test('retains both exact public report forms as affirmative original-race findings', () => {
+  expect(hasStaleFillRaceFinding(fixture.report)).toBe(true);
+  expect(hasStaleFillRaceFinding(frame)).toBe(true);
+  expect(fixture.report.includes(frame.trim())).toBe(true);
+});
+
+test('binds consistently renamed actors, shared key, versions and finding/schedule IDs', () => {
+  const renamed = frame.replace(/\bR1\b/g, 'R7').replace(/\bR2\b/g, 'R8').replace(/\bW\b/g, 'W9')
+    .replace(/\bV0\b/g, 'oldValue').replace(/\bV1\b/g, 'freshValue')
+    .replace(/\bkey\b/g, 'profile_key').replace(/\bF1\b/g, 'F9').replace(/\bS2\b/g, 'S9');
+  expect(hasStaleFillRaceFinding(renamed)).toBe(true);
+  expect(hasStaleFillRaceFinding(frame.replace(/→/g, '->'))).toBe(true);
+  const unrelated = '## Historical example\nAn unrelated old example.\n\n## Current findings\n\n';
+  expect(hasStaleFillRaceFinding(unrelated + frame)).toBe(true);
+});
+
+test('amendments, permitted earlier readers and missing continuation do not supply the original race', () => {
+  for (const changed of [
+    replace(originalRows, ''),
+    replace('S2*   | await read', 'S2 A1 | await read'),
+    replace(originalRows, '  S2* | begins before W, joins | delete + forget | — | — | OK: R1 began before W completed (permitted clause)\n'),
+    replace('resolves V0 → set V0', 'resolves V0, slot gone→drop'),
+    replace('hit → V0', 'miss→read V1→set'),
+    replace('hit → V0', ''),
+    replace('VIOLATION\n  S2 A1', 'OK (permitted earlier return)\n  S2 A1'),
+    replace('VIOLATION\n  S2 A1', 'VIOLATION\n        | already guarded | | | | OK\n  S2 A1'),
+  ]) expect(hasStaleFillRaceFinding(changed)).toBe(false);
+});
+
+test('requires the original schedule citation, legend and explicit post-completion boundary', () => {
+  for (const changed of [
+    replace('Schedule S2 makes', 'Schedule S9 makes'),
+    replace('`*` = original sketch.', '`*` = amended sketch.'),
+    replace('`*` = original sketch.', ''),
+    replace('`*` = original sketch.', 'Hypothetically, `*` = original sketch.'),
+    replace('CRITICAL GAP | 1, 2, 4, 5, 6', 'CRITICAL GAP | 1, 2, 5, 6'),
+    replace('Violates retained invariant.', 'No defect in the retained invariant.'),
+    replace('R2 (begins after W)', 'R2 (begins before W)'),
+    replace('after `writeProfile` resolves', 'before `writeProfile` resolves'),
+    replace('after `writeProfile` resolves', 'after `writeProfile` begins'),
+    replace('after `writeProfile` resolves', 'after `readProfile` resolves'),
+  ]) expect(hasStaleFillRaceFinding(changed)).toBe(false);
+});
+
+test('rejects actor, key, value, invalidation and ordering mismatches', () => {
+  for (const changed of [
+    replace('R2 (begins after W)', 'R1 (begins after W)'),
+    replace('R2 (begins after W)', 'R2 (begins after W9)'),
+    replace('`inflight[key]`', '`inflight[other_key]`'),
+    replace('| cache[key] | Result', '| cache[other_key] | Result'),
+    replace('W (commits V1)', 'W (commits V0)'),
+    replace('resolves V0 → set V0', 'resolves V1 → set V0'),
+    replace('resolves V0 → set V0', 'resolves V0 → set V1'),
+    replace('hit → V0', 'hit → V1'),
+    replace('write commits, delete(noop)', 'write begins, delete(noop)'),
+    replace('write commits, delete(noop)', 'write commits'),
+    replace('await read ...', 'await write ...'),
+    replace(originalRows, originalRows.split('\n').slice(0, 2).reverse().join('\n') + '\n'),
+    replace('V0 (30 s)  | VIOLATION', 'V1 (30 s)  | VIOLATION'),
+    replace('see V0 for 30 s;', 'see V1 for 30 s;'),
+  ]) expect(hasStaleFillRaceFinding(changed)).toBe(false);
+});
+
+test('quotes, source introductions and withdrawn findings remain negative', () => {
+  for (const prefix of ['An unproven hypothesis.', 'Historical example only.', 'The following is a hypothetical example.']) {
+    expect(hasStaleFillRaceFinding(prefix + '\n\n' + frame)).toBe(false);
+    expect(hasStaleFillRaceFinding(replace('### Async Ordering Record', prefix + '\n\n### Async Ordering Record'))).toBe(false);
+    expect(hasStaleFillRaceFinding(replace('### Findings Registry\n', '### Findings Registry\n\n' + prefix))).toBe(false);
+  }
+  expect(hasStaleFillRaceFinding(frame.split('\n').map(line => '> ' + line).join('\n'))).toBe(false);
+  expect(hasStaleFillRaceFinding('````text\n' + frame + '\n````')).toBe(false);
+  expect(hasStaleFillRaceFinding(replace('```\n  Sched', '```javascript\n  Sched'))).toBe(false);
+  for (const dismissal of [
+    'The original trace is impossible.', 'This schedule is not a bug.',
+    'The original race is permitted.', 'The stale fill is accepted.',
+    'No coordination is required.',
+  ]) {
+    expect(hasStaleFillRaceFinding(frame + '\n' + dismissal)).toBe(false);
+    expect(hasStaleFillRaceFinding(replace('Violates retained invariant.', 'Violates retained invariant. ' + dismissal))).toBe(false);
+  }
+});
+
+
+test('completed prior decision section is independent; spoofed or withdrawn framing is not', () => {
+  const close = '### Decision Registry (all auto-resolved to recommended option)\n\n| D1 | A | B |\n\nLake Score: 7/7 recommendations chose the complete option.\n\n';
+  expect(hasStaleFillRaceFinding(close + frame)).toBe(true);
+  expect(hasStaleFillRaceFinding(close.replace('### Decision Registry (all auto-resolved to recommended option)', '### Historical example') + frame)).toBe(false);
+  expect(hasStaleFillRaceFinding(close.replace('Lake Score: 7/7 recommendations chose the complete option.', 'An unproven hypothesis.') + frame)).toBe(false);
+  const row = frame.split('\n').find(line => line.startsWith('| F1 |'))!;
+  expect(hasStaleFillRaceFinding(replace(row, row + '\n' + row))).toBe(false);
+});
+test('same finding or schedule tail withdrawals remain authoritative', () => {
+  for (const tail of ['S2 is impossible.', 'F1 is rejected. The original trace is impossible.', 'F1 is rejected.', 'S2 is withdrawn.']) {
+    expect(hasStaleFillRaceFinding(frame + '\n' + tail)).toBe(false);
+  }
+  expect(hasStaleFillRaceFinding(frame + '\nF2 is rejected. The original trace is impossible.')).toBe(true);
+  expect(hasStaleFillRaceFinding(frame + '\nS3 is impossible.')).toBe(true);
+});
+});
+
+describe('sdk-stale-table-ad-v3', () => {
+const fixture = fixture_sdk_stale_table_ad_v3;
+const found = hasStaleFillRaceFinding;
+const allowance='Original reader still returns v1 to its own caller (allowed: it began before commit)';
+test('actual table finding distinguishes forbidden later stale reads from the permitted original caller',()=>{
+ expect(found(fixture.report)).toBe(true);
+ expect(found(fixture.table)).toBe(true);
+ expect(fixture.provenance.noRetroactivePass).toBe(true);
+});
+test('the already-started original read may use a version label without changing ownership',()=>{
+ for(const token of ['v17','VERSION_A','snapshot-A'])expect(found(fixture.table.replaceAll('v1',token))).toBe(true);
+});
+test('allowance cannot migrate to later readers, a post-commit start, or a cache fill',()=>{
+ for(const changed of [
+  'Later readers return v1 (allowed: they began after commit)',
+  'Original reader still returns v1 to its own caller (allowed: it began after commit)',
+  'Original reader still returns v1 to its own caller (allowed: it never began before commit)',
+  'Original reader fills the cache with v1 (allowed: it began before commit)',
+  'Original reader still returns v1 to later readers (allowed: it began before commit)',
+ ])expect(found(fixture.table.replace(allowance,changed))).toBe(false);
+});
+test('a permitted original caller cannot hide acceptance of later stale reads or no required fix',()=>{
+ for(const suffix of [' This stale-read behavior is accepted.',' No fix is required.',' Later readers may return stale data; this is the accepted consistency model.'])
+  expect(found(fixture.table.replace('None against the invariant.','None against the invariant.'+suffix))).toBe(false);
+});
+test('copied table source and absent late-fill evidence cannot provide coverage',()=>{
+ expect(found('```text\n'+fixture.table+'\n```')).toBe(false);
+ expect(found(fixture.table.split('\n').map(x=>'> '+x).join('\n'))).toBe(false);
+ expect(found(fixture.table.split('\n').map(x=>'    '+x).join('\n'))).toBe(false);
+ const rows=fixture.table.split('\n'),cells=rows[2]!.split('|');
+ cells[4]=' There is no stale-fill race; later reads observe the committed value. ';
+ rows[2]=cells.join('|');expect(found(rows.join('\n'))).toBe(false);
+});
+
+
+test('original-caller exception requires asserted chronology for that reader',()=>{
+ for(const changed of [
+  'Original reader still returns v1 to its own caller (allowed: it may have begun before commit)',
+  'Original reader still returns v1 to its own caller (allowed: it did not begin before commit)',
+  'Original reader still returns v1 to its own caller (allowed: it began before commit only if the write failed)',
+  'Original reader still returns v1 to its own caller (allowed: another reader began before commit)',
+  'Original reader still returns v1 to its own caller (allowed: the write began before commit)',
+  'If the original reader still returns v1 to its own caller, that is allowed: it began before commit',
+ ])expect(found(fixture.table.replace(allowance,changed))).toBe(false);
+});
+
+test('an original-return allowance cannot erase another allowed stale consequence',()=>{
+ for(const changed of [
+  allowance+' and stores that v1 in the cache for later readers',
+  allowance+'; later readers may reuse this old value and that is allowed',
+  allowance+'. New readers may reuse this old value and that is permitted',
+  allowance+'. The stale cache refill is acceptable',
+ ])expect(found(fixture.table.replace(allowance,changed))).toBe(false);
+});
+
+test('table rows cannot borrow an ordering defect from another issue or from quoted source',()=>{
+ const rows=fixture.table.split('\n'),cells=rows[2]!.split('|');
+ const originalFailure=cells[4]!;
+ cells[4]=' The original reader receives its pre-commit snapshot; later reads observe the committed version. ';
+ const missing=rows.slice(0,2).concat(cells.join('|')).join('\n');
+ expect(found(missing)).toBe(false);
+ const other=cells.slice();other[1]=' D2 ';other[4]=originalFailure;
+ other[5]=' This stale-read behavior is accepted; no fix is required. ';
+ expect(found(missing+'\n'+other.join('|'))).toBe(false);
+ expect(found('> '+originalFailure+'\n\n'+missing)).toBe(false);
+ expect(found('```text\n'+originalFailure+'\n```\n\n'+missing)).toBe(false);
+});
+});
+
+// Census 36597762183 slice 3: the final PLAN.md (rebuilt from the captured Edits)
+// traced the race as an arrow-ordered execution in its WR-1 ledger row.
+describe('arrow-ordered stale-fill execution', () => {
+  const report = readFileSync(join(import.meta.dir, 'fixtures/ceo-section-loading-36597762183-report.md'), 'utf8');
+  const trace = 'R1 miss -> R1 store read (v1) -> W commit v2 -> W cache.delete -> W fulfills -> R1 cache.set(v1) -> R2 (begun after W) hits v1.';
+  test('the captured report identifies the seeded race', () => {
+    expect(report).toContain(trace);
+    expect(hasStaleFillRaceFinding(report)).toBe(true);
+  });
+  test.each([
+    ['fill before invalidation', trace.replace('W cache.delete -> W fulfills -> R1 cache.set(v1)', 'R1 cache.set(v1) -> W cache.delete -> W fulfills')],
+    ['later reader is the filling reader', trace.replace('R2 (begun after W)', 'R1 (begun after W)')],
+    ['later reader began before the write', trace.replace('begun after W', 'begun before W')],
+    ['fill stores the committed version', trace.replace('R1 cache.set(v1)', 'R1 cache.set(v2)')],
+    ['later reader sees the committed version', trace.replace('hits v1.', 'hits v2.')],
+    ['trace declared impossible', trace + ' This order is impossible here.'],
+  ])('%s is not the seeded race', (_name, mutated) => {
+    expect(hasStaleFillRaceFinding(report.replace(trace, mutated))).toBe(false);
   });
 });

@@ -21,6 +21,8 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { generatePreamble } from '../scripts/resolvers/preamble';
+import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const START = path.join(ROOT, 'bin', 'gstack-skill-start');
@@ -109,17 +111,24 @@ describe('gstack-skill-start contract', () => {
     expect(out.split('\n')[0]).toBe('SKILL_START_PROTO: 1');
   });
 
-  test('every host render invokes gstack-skill-start with a resolvable path shape (E1)', () => {
-    // Claude host: literal interpolated path. Env-var hosts: $GSTACK_BIN.
-    // Every generated SKILL.md that carries a Preamble fence must name the
-    // script through one of those shapes plus the local fallback.
-    const renders = [path.join(ROOT, 'SKILL.md'), path.join(ROOT, 'ship', 'SKILL.md'), path.join(ROOT, 'learn', 'SKILL.md')];
-    for (const r of renders) {
-      const content = fs.readFileSync(r, 'utf-8');
-      expect(content).toContain('gstack-skill-start');
-      expect(content).toMatch(/--skill "[a-z0-9-]+" --model/);
-      expect(content).toContain('--parent-pid "$PPID"');
-      expect(content).toContain('SKILL_START: unavailable');
+  test('every host render starts with ONE plain gstack-skill-start command (E1, #2763)', () => {
+    // Worktree-isolated Claude Code sessions refuse a start command named by a
+    // variable, a `[ -x ] ||` fallback, or a trailing `|| echo` (reproduced
+    // with the pinned CLI). The Claude render is the literal install path;
+    // env-var hosts reach the script through $GSTACK_BIN. A missing helper is
+    // covered by the degraded-mode prose, not a shell fallback.
+    const fence = (text: string) => {
+      const at = text.search(/^## Preamble \((?:run first|after scope gate)\)/m);
+      const open = text.indexOf('```bash\n', at) + '```bash\n'.length;
+      return text.slice(open, text.indexOf('\n```', open));
+    };
+    for (const r of [path.join(ROOT, 'SKILL.md'), path.join(ROOT, 'ship', 'SKILL.md'), path.join(ROOT, 'learn', 'SKILL.md'), path.join(ROOT, 'plan-eng-review', 'SKILL.md')]) {
+      expect(fence(fs.readFileSync(r, 'utf-8'))).toMatch(/^~\/\.claude\/skills\/gstack\/bin\/gstack-skill-start --skill "[a-z0-9-]+" --model "[a-z0-9.-]+"$/);
+    }
+    for (const host of ['codex', 'gbrain']) {
+      const lines = fence(generatePreamble({ skillName: 'ship', tmplPath: 'ship/SKILL.md.tmpl', host, paths: HOST_PATHS[host], preambleTier: 4 } as TemplateContext)).split('\n');
+      expect(lines.at(-1)).toMatch(/^"\$GSTACK_BIN\/gstack-skill-start" --skill "ship" --model "[^"]+"( --brain-health)?$/);
+      expect(lines.join('\n')).not.toMatch(/_SS|\$PPID|\|\| echo|\[ -x/);
     }
   });
 
@@ -168,6 +177,7 @@ describe('gstack-skill-start behavior', () => {
       // Shadow the real bin dir by copying the script next to the poisoned tool.
       fs.copyFileSync(START, path.join(fakeBin, 'gstack-skill-start'));
       fs.chmodSync(path.join(fakeBin, 'gstack-skill-start'), 0o755);
+      fs.copyFileSync(path.join(path.dirname(START), 'gstack-state-root.sh'), path.join(fakeBin, 'gstack-state-root.sh'));
       const out = execFileSync(path.join(fakeBin, 'gstack-skill-start'), ['--skill', 't'], {
         timeout: 30_000,
         encoding: 'utf-8',
@@ -192,6 +202,25 @@ describe('gstack-skill-start behavior', () => {
   test('session file uses --parent-pid identity, not the script shell pid (EOV5)', () => {
     runStart(['--parent-pid', '424242']);
     expect(fs.existsSync(path.join(tmpGstackHome, 'sessions', '424242'))).toBe(true);
+  });
+
+  test('without --parent-pid the script derives the harness pid past tool-call shells (#2763)', () => {
+    // Claude Code runs each Bash call in a fresh `bash -c`; the session must be
+    // the harness (here: this bun process), not that per-call shell, even
+    // through nested shell wrappers. The trailing `; true` keeps bash from
+    // exec-ing the script, as a multi-command tool call does.
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-pid-'));
+    fs.writeFileSync(path.join(state, 'config.yaml'), 'update_check: false\n');
+    try {
+      const env = { PATH: process.env.PATH!, HOME: tmpHome, GSTACK_HOME: state, START };
+      for (const command of ['"$START" --skill t; true', 'sh -c \'"$START" --skill t; true\'; true']) {
+        const out = execFileSync('bash', ['-c', command], { timeout: 30_000, encoding: 'utf-8', cwd: tmpHome, env });
+        expect(out).toMatch(new RegExp(`^SESSION_ID: ${process.pid}-`, 'm'));
+      }
+      expect(fs.readdirSync(path.join(state, 'sessions'))).toEqual([String(process.pid)]);
+    } finally {
+      fs.rmSync(state, { recursive: true, force: true });
+    }
   });
 
   test('headless session suppresses first-task detection and Conductor line', () => {
@@ -368,6 +397,40 @@ describe('gstack-skill-start behavior', () => {
   test('ARTIFACTS_SYNC reports off in a cold home', () => {
     const out = runStart();
     expect(out).toMatch(/^ARTIFACTS_SYNC: off$/m);
+  });
+
+  test('artifacts-sync consent is asked before any artifacts egress, and only in interactive sessions', () => {
+    const gh = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-privacy-'));
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-privacy-bin-'));
+    const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-privacy-remote-'));
+    const git = (args: string[], cwd: string) => execFileSync('git', args, { cwd, timeout: 30_000, stdio: 'pipe' });
+    try {
+      fs.writeFileSync(path.join(bin, 'gbrain'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      git(['init', '-q', '--bare'], remote);
+      git(['init', '-q', '-b', 'main'], gh);
+      git(['remote', 'add', 'origin', remote], gh);
+      const pullStamp = path.join(gh, '.brain-last-pull');
+      const start = (config: string, env: Record<string, string> = {}) => {
+        fs.writeFileSync(path.join(gh, 'config.yaml'), `update_check: false\n${config}`);
+        return runStart([], { GSTACK_HOME: gh, PATH: `${bin}${path.delimiter}${process.env.PATH}`, ...env });
+      };
+      const gates = (out: string) => (out.match(/^GSTACK_INSTRUCTION_BEGIN: privacy-stop-gate/gm) ?? []).length;
+
+      const pending = start('');
+      expect(gates(pending)).toBe(1);
+      expect(pending).toContain('How much should sync?');
+      expect(pending).toMatch(/^ARTIFACTS_SYNC: off$/m);
+      expect(fs.existsSync(pullStamp)).toBe(false);
+
+      expect(gates(start('', { GSTACK_SESSION_KIND: 'spawned' }))).toBe(0);
+      expect(fs.existsSync(pullStamp)).toBe(false);
+
+      const consented = start('artifacts_sync_mode: full\nartifacts_sync_mode_prompted: true\n');
+      expect(gates(consented)).toBe(0);
+      expect(fs.existsSync(pullStamp)).toBe(true);
+    } finally {
+      for (const dir of [gh, bin, remote]) fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

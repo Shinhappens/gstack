@@ -11,9 +11,9 @@
  *      patterns (`/bin/bash`, `sh -c`, raw `/tmp/`, `chmod`, `xargs`). Files
  *      that match are excluded from the Windows-safe subset — they would fail
  *      on `windows-latest` no matter how the runner shards them.
- *   4. Execution. Spawn `bun test` children and refuse to trust their exit
- *      code alone: every byte of output is classified through
- *      scripts/test-strict-output.ts, so a child that exits 0 without bun's
+ *   4. Execution. Run `bun test` children through the shared shard engine
+ *      (scripts/lib/shard-engine.ts runShardChild) and refuse to trust their
+ *      exit code alone: every byte of output is classified strictly, so a child that exits 0 without bun's
  *      terminal summary (a mid-suite process.exit truncation), with `(fail)`
  *      result lines, or with fewer files run than planned is a FAILURE. An
  *      external wall-clock timeout SIGKILLs the child's process group and
@@ -51,7 +51,7 @@
  * on the windows-latest CI job.
  *
  * Output contract (v1.66): the full child stream ALWAYS lands in a per-run
- * log file under os.tmpdir() (path printed once at start and again in the
+ * private log under .context/free-test-logs (path printed at start and in the
  * epilogue). The console is quiet by default — only the runner's own
  * [test:free] lines, `(fail)` result lines, bun error/crash markers
  * (`error:`, `panic:`, `crashed`, `Unhandled error`), and the terminal
@@ -73,6 +73,7 @@
  *   bun run scripts/test-free-shards.ts --wall-timeout 600         # override the kill deadline
  *   bun run scripts/test-free-shards.ts --verbose                  # forward the full child stream
  *   bun run scripts/test-free-shards.ts --quick                    # explicit fast subset, not acceptance
+ *   bun run scripts/test-free-shards.ts --attribute-home           # name real-home writers: each file alone, private HOME
  *   bun run scripts/test-free-shards.ts --ci-plan plan.json --shards 20
  *   bun run scripts/test-free-shards.ts --ci-run plan.json --shard 1 --result result.json
  *   bun run scripts/test-free-shards.ts --ci-verify plan.json --results results/
@@ -83,22 +84,44 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { StringDecoder } from 'node:string_decoder';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isPaidTestFile } from '../test/helpers/paid-test-set';
+import { resolveStateRoot } from '../lib/state-root';
+import { attributeFreeHomeWriters, guardFreeHome, sharedFreeHome, type FreeHomeGuardFactory } from './lib/free-home-guard';
 import {
   BunTestOutputClassifier,
+  createShardSandbox,
   exactTestFileSelectors,
-  installChildSignalForwarding,
+  forEachFileAlone,
   isTerminationRequested,
   killProcessGroup,
   BunFailureSummaryParser,
+  nextShardLogPath,
+  openShardLog,
   parseBunFailureResult,
+  parseCliFlags,
   normalizeRelativePath,
-  strictTestExitCode,
+  readDurationSeed,
+  runShardChild,
+  strictShardStatus,
   stripAnsiLine,
-} from './test-strict-output';
+  writeDurationSeed,
+  zeroExecutionVerdict,
+  type LanePolicy,
+  type ShardChildResult,
+} from './lib/shard-engine';
+export { normalizeRelativePath } from './lib/shard-engine';
 
-export { normalizeRelativePath } from './test-strict-output';
+/**
+ * Free-lane classification policy. Seeds accept zero-duration files (fast
+ * files are real measurements). A shard with zero executed tests passes when
+ * bun's summary still counted every planned file; missing or short file
+ * counts already fail through the strict verdict.
+ */
+export const FREE_LANE_POLICY: LanePolicy = {
+  acceptsSeedDuration: (ms) => ms >= 0,
+  zeroExecution: () => 'passed',
+};
 
 const ROOT = path.resolve(import.meta.dir, '..');
 // design/test was silently absent from BOTH the package.json test script and
@@ -167,6 +190,22 @@ const WINDOWS_FRAGILE_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
 // when possible; this list is for environment-/runtime-specific tests where
 // the failure mode is structural rather than detectable via source-file scan.
 export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }> = [
+  {
+    file: 'test/qa-evidence-producer.test.ts',
+    reason: 'executes the registered Linux native actor and its inotify observer; portable capture and Windows job behavior are covered by qa-evidence.test.ts',
+  },
+  {
+    file: 'test/qa-functional-fixture.test.ts',
+    reason: 'executes graceful POSIX signal cancellation; Bun on Windows uses TerminateProcess and cannot run the fixture SIGTERM cleanup handler',
+  },
+  {
+    file: 'test/qa-functional-observer-atomic.test.ts',
+    reason: 'exercises real Linux inotify inode and directory watches through libc.so.6; Windows has no equivalent kernel interface',
+  },
+  {
+    file: 'test/docsync-report-interface.test.ts',
+    reason: 'executes registered native documentation callbacks with their real Linux inotify write observer before the model boundary',
+  },
   {
     file: 'test/setup-gbrain-fixture.test.ts',
     reason: 'the fixture invokes real POSIX detector/verifier helpers through executable shebang wrappers',
@@ -303,6 +342,10 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
     reason: 'tests the contained repair witness with POSIX private-directory and compiled-helper assumptions; comprehensive execution is unavailable on Windows',
   },
   {
+    file: 'test/shard-engine-equivalence.test.ts',
+    reason: 'its classification golden was recorded from the POSIX runners (process-group wall kill); the win32 engine path is pinned by the mocked-platform case in shard-engine.test.ts',
+  },
+  {
     file: 'test/cso-scanner-cli.test.ts',
     reason: 'drives the prebuilt POSIX CSO launcher with /usr/bin/git and a POSIX-only PATH; native Windows launcher behavior is covered by the dedicated cso-windows-launcher gate',
   },
@@ -313,14 +356,38 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
 // pattern hit is a false positive — the point of these files is Windows
 // coverage, so auto-excluding them defeats the regression tests they carry.
 const KNOWN_WINDOWS_SAFE: Array<{ file: string; reason: string }> = [
+  { file: 'test/ship-hook-windows-paths.test.ts', reason: 'runs bin/ helpers through explicit bash and Bun argv with forward-slash paths; never executes a shebang; the path-spelling simulation is skipIf win32' },
+  {
+    file: 'test/state-root-parity.test.ts',
+    reason: 'runs the bash twin and lib/state-root.ts over an env table with PATH empty; no shebang execution, raw-string comparison is platform-neutral',
+  },
+  {
+    file: 'test/qa-evidence.test.ts',
+    reason: 'invokes the production helper through Bun argv and exercises native Windows job cleanup, private file captures and backpressured receipt output',
+  },
+  {
+    file: 'test/qa-evidence-selection.test.ts',
+    reason: 'bin/ strings are literal dependency and Windows-selection assertions; no native actor or shebang command is launched',
+  },
+  {
+    file: 'test/qa-deadline.test.ts',
+    reason: 'launches the guard through Bun argv; mode assertions and POSIX signal cases are platform-gated, while Windows job cleanup must execute natively',
+  },
+  {
+    file: 'test/qa-deadline-selection.test.ts',
+    reason: 'bin/ strings are dependency-selection inputs; this suite never launches a shebang executable',
+  },
+  {
+    file: 'test/shared-libs-source-reads.test.ts',
+    reason: 'bin/ literal is a mocked launch assertion; actual worktree fingerprinting explicitly invokes Bash on Windows',
+  },
   {
     file: 'test/claude-code-windows-job.test.ts',
     reason: 'invokes Bun directly; verifies Windows job containment at the standalone CLI boundary',
   },
   {
     file: 'test/claude-code-runner.test.ts',
-    // The bin/ path is launched through process.execPath (Bun), never as a
-    // shebang executable. Keep taskkill tree supervision in the Windows lane.
+    // The bin/ path is launched through process.execPath (Bun), never as a shebang; keep taskkill supervision in the Windows lane.
     reason: 'invokes the runner via Bun argv; fake CLI and timeout descendant assertions cover native Windows taskkill',
   },
   {
@@ -426,13 +493,16 @@ export function wallTimeoutForPackedShard(predictedMs: number, baseMs = DEFAULT_
 }
 /**
  * Full-suite parallelism: use all available CPUs, with a floor of one and a
- * cap of MAX_FULL_SUITE_JOBS. Shards stay serial internally; separate shard
- * processes can overlap subprocess and I/O waits without a fixed CPU reserve.
- * Prefer availableParallelism() to honor CPU affinity, falling back to cpus()
- * on runtimes without it. Keep the existing cap: beyond ~6 concurrent bun
- * processes, playwright-heavy shards contended on browser launches in the
- * original M-series measurement. More shards are not a guaranteed speedup;
- * compare complete-suite runs before raising the default further.
+ * per-platform cap (maxFullSuiteJobs). Shards stay serial internally; separate
+ * shard processes can overlap subprocess and I/O waits without a fixed CPU
+ * reserve. Prefer availableParallelism() to honor CPU affinity (Bun also
+ * honors a container's cgroup CPU quota there), falling back to cpus() on
+ * runtimes without it. macOS and Windows keep the cap of 6: beyond that,
+ * playwright-heavy shards contended on browser launches in the original
+ * M-series measurement. Linux caps at 16: on a 16-vCPU Ubicloud VM with the
+ * CI lane's environment (2026-09-28), 16 shards ran the complete suite in
+ * 137s versus 327s for 6. More shards are not a guaranteed speedup; compare
+ * complete-suite runs before raising either cap.
  *
  * GSTACK_FREE_JOBS overrides the computed count (the free runner's analogue
  * of the paid runner's EVALS_JOBS). Exists for syscall-supervised sandboxes:
@@ -442,12 +512,17 @@ export function wallTimeoutForPackedShard(predictedMs: number, baseMs = DEFAULT_
  * `git init` probes in fresh mktemp dirs fail with
  * "Cannot access work tree: Permission denied" while the suite runs, 0/200
  * when idle — access(dir, X_OK) = EACCES under strace). Fewer shards keep
- * the supervisor inside its budget. Not clamped by MAX_FULL_SUITE_JOBS so a
+ * the supervisor inside its budget. Not clamped by maxFullSuiteJobs so a
  * beefy box can also raise it deliberately.
  */
 export const MAX_FULL_SUITE_JOBS = 6;
+export const MAX_LINUX_FULL_SUITE_JOBS = 16;
 
-export function fullSuiteJobs(): number {
+export function maxFullSuiteJobs(platform: NodeJS.Platform = process.platform): number {
+  return platform === 'linux' ? MAX_LINUX_FULL_SUITE_JOBS : MAX_FULL_SUITE_JOBS;
+}
+
+export function fullSuiteJobs(platform: NodeJS.Platform = process.platform): number {
   const raw = process.env.GSTACK_FREE_JOBS;
   if (raw !== undefined && raw !== '') {
     // Strict digits-only: parseInt would silently truncate "2abc" -> 2 and
@@ -458,7 +533,7 @@ export function fullSuiteJobs(): number {
     return Number.parseInt(raw, 10);
   }
   const availableCpus = os.availableParallelism?.() ?? os.cpus().length;
-  return Math.max(1, Math.min(MAX_FULL_SUITE_JOBS, availableCpus));
+  return Math.max(1, Math.min(maxFullSuiteJobs(platform), availableCpus));
 }
 
 /**
@@ -476,24 +551,16 @@ export const WORKER_HOSTILE: Record<string, string> = {
 };
 
 /**
- * TREE-SERIAL files: run in ONE serial shard AFTER the parallel shards.
- * EMPTY since the 2026-08 dissolution — kept as a mechanism, not a museum:
- * a test that must regenerate shared repo artifacts IN PLACE (and cannot
- * render into an out-dir instead) earns an entry here with a reason, and
- * the runner will serialize it again.
- *
- * How it emptied: gen-skill-docs gained a main() guard (imports stopped
- * regenerating 71 files at load) and --out-dir grew to every host, so all
- * eight mutators now render into mkdtemps — the live tree is never written
- * by the suite (pinned by gen-skill-docs-import-purity + each migrated
- * file's own porcelain/mtime assertions). With zero mutators, the four
- * ratchet READERS (parity caps, size budgets, carve parity/ordering) get a
- * quiet tree by construction in any shard, so they rejoined the parallel
- * phase — the ~35-40s serial tail on every full-suite run is gone.
+ * Exclusive host-state fixtures: run in ONE serial shard AFTER the parallel
+ * shards. The public name is retained for callers of the original tree-write
+ * classification. Entries need a concrete shared-state hazard that fixture
+ * directories cannot isolate, such as host-wide procfs visibility.
  * Keys are pinned against the live file census by test-free-shards.test.ts —
  * a renamed file fails the suite instead of silently dropping serialization.
  */
-export const TREE_MUTATING: Record<string, string> = {};
+export const TREE_MUTATING: Record<string, string> = {
+  'test/bootstrap-retention.test.ts': 'Creates nondumpable same-UID processes visible to every host procfs census; must not overlap other native-retention fixtures.',
+};
 
 export function isFreeTestFile(relativePath: string): boolean {
   const normalized = normalizeRelativePath(relativePath);
@@ -633,24 +700,15 @@ export const FREE_TEST_DURATIONS_FILE = 'scripts/free-test-durations.json';
 export function loadFreeTestDurations(rootDir = ROOT): Record<string, number> | null {
   const file = process.env.GSTACK_FREE_TEST_DURATIONS
     ?? path.join(rootDir, FREE_TEST_DURATIONS_FILE);
-  let raw: string;
-  try {
-    raw = fs.readFileSync(file, 'utf-8');
-  } catch {
-    return null; // no seed — hash sharding, silently (fresh checkouts are normal)
-  }
-  try {
-    const parsed = JSON.parse(raw) as { durations?: Record<string, unknown> };
-    const entries = Object.entries(parsed.durations ?? {})
-      .filter((entry): entry is [string, number] =>
-        typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] >= 0);
-    if (entries.length === 0) return null;
-    return Object.fromEntries(entries);
-  } catch (error) {
+  const seed = readDurationSeed(file, FREE_LANE_POLICY.acceptsSeedDuration);
+  // No seed — hash sharding, silently (fresh checkouts are normal).
+  if (seed.status === 'missing') return null;
+  if (seed.status === 'corrupt') {
     // A corrupt seed (bad merge) must cost a warning, never the suite.
-    console.error(`[test:free] WARNING: corrupt durations seed ${file} (${(error as Error).message}) — falling back to hash sharding`);
+    console.error(`[test:free] WARNING: corrupt durations seed ${file} (${seed.error.message}) — falling back to hash sharding`);
     return null;
   }
+  return Object.keys(seed.durations).length === 0 ? null : seed.durations;
 }
 
 export interface PackedShards {
@@ -695,6 +753,23 @@ export function packShardsByDuration(
   return { shards: shards.map((s) => s.sort()), predictedMs: loads };
 }
 
+/**
+ * Files missing from the duration seed are packed at the 75th percentile, so
+ * one slow new file can become the whole run's long pole without anyone
+ * noticing. Name them (on stderr: --ci-plan's stdout is the CI matrix).
+ */
+export function unseededFreeFiles(files: string[], durations: Record<string, number>): string[] {
+  return files.filter((f) => durations[normalizeRelativePath(f)] === undefined);
+}
+
+function warnUnseededFreeFiles(files: string[], durations: Record<string, number>): void {
+  const unseeded = unseededFreeFiles(files, durations);
+  if (unseeded.length === 0) return;
+  const shown = unseeded.slice(0, 5).join(', ') + (unseeded.length > 5 ? `, +${unseeded.length - 5} more` : '');
+  console.error(`[test:free] ${unseeded.length} file(s) have no recorded duration and are packed at the 75th-percentile estimate: ${shown}.`
+    + ' Refresh scripts/free-test-durations.json with `bun run test:ubicloud --record-durations`.');
+}
+
 export interface FreeCiPlan {
   version: 1;
   revision: string;
@@ -708,10 +783,10 @@ const planDigest = (plan: Omit<FreeCiPlan, 'id'>): string =>
 /** One immutable plan is shared by isolated CI machines; never repack per job. */
 export function createFreeCiPlan(files: string[], count: number, durations: Record<string, number>, revision: string): FreeCiPlan {
   const readers = files.filter(file => !(file in TREE_MUTATING));
-  const mutators = files.filter(file => file in TREE_MUTATING).sort();
+  const exclusive = files.filter(file => file in TREE_MUTATING).sort();
   const packed = packShardsByDuration(readers, count, durations);
   const shards = packed.shards.map((files, index) => ({ shard: index + 1, files, predictedMs: packed.predictedMs[index] }));
-  if (mutators.length) shards.push({ shard: shards.length + 1, files: mutators, predictedMs: mutators.reduce((ms, file) => ms + (durations[file] ?? 0), 0) });
+  if (exclusive.length) shards.push({ shard: shards.length + 1, files: exclusive, predictedMs: exclusive.reduce((ms, file) => ms + (durations[file] ?? 0), 0) });
   const body = { version: 1 as const, revision, shards };
   return { ...body, id: planDigest(body) };
 }
@@ -784,8 +859,10 @@ function hasCompleteCiSummary(outcome: FreeShardOutcome): boolean {
 
 export const QUICK_CORE = [
   'test/strict-output.test.ts', 'test/gen-skill-docs.test.ts',
-  'test/skill-check-driver.test.ts', 'test/ceo-native-ledger-replay.test.ts',
+  'test/skill-check-driver.test.ts',
   'test/skill-ceo-section-ordering.test.ts',
+  'test/qa-functional-observer.test.ts', 'test/qa-checkpoint-evidence.test.ts',
+  'test/test-free-shards-capture.test.ts',
 ];
 
 export function selectQuickFreeFiles(files: string[], durations: Record<string, number>): string[] {
@@ -827,6 +904,7 @@ type CliOptions = {
   /** True when --wall-timeout was passed explicitly; full-suite mode only auto-scales the default. */
   wallTimeoutExplicit: boolean;
   quick: boolean;
+  attributeHome: boolean;
   ciPlan: string | null;
   ciRun: string | null;
   ciVerify: string | null;
@@ -834,7 +912,7 @@ type CliOptions = {
   results: string | null;
 };
 
-function parseCliOptions(argv: string[]): CliOptions {
+export function parseCliOptions(argv: string[]): CliOptions {
   let dryRun = false;
   let listOnly = false;
   let recordDurations = false;
@@ -845,56 +923,53 @@ function parseCliOptions(argv: string[]): CliOptions {
   let wallTimeoutMs = DEFAULT_WALL_TIMEOUT_MS;
   let wallTimeoutExplicit = false;
   let quick = false;
+  let attributeHome = false;
   const paths: Record<'ciPlan' | 'ciRun' | 'ciVerify' | 'result' | 'results', string | null> = {
     ciPlan: null, ciRun: null, ciVerify: null, result: null, results: null,
   };
+  const pathFlag = (flag: string, key: keyof typeof paths) => (next: () => string | undefined) => {
+    const value = next();
+    if (!value || value.startsWith('--')) throw new Error(`Missing path for ${flag}`);
+    paths[key] = value;
+  };
 
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === '--dry-run') { dryRun = true; continue; }
-    if (arg === '--list') { listOnly = true; continue; }
-    if (arg === '--record-durations') { recordDurations = true; continue; }
-    if (arg === '--windows-only') { windowsOnly = true; continue; }
-    if (arg === '--verbose') { verbose = true; continue; }
-    if (arg === '--quick') { quick = true; continue; }
-    const pathKey = ({ '--ci-plan': 'ciPlan', '--ci-run': 'ciRun', '--ci-verify': 'ciVerify', '--result': 'result', '--results': 'results' } as const)[arg];
-    if (pathKey) {
-      const value = argv[++index];
-      if (!value || value.startsWith('--')) throw new Error(`Missing path for ${arg}`);
-      paths[pathKey] = value;
-      continue;
-    }
-    if (arg === '--shards') {
-      const value = argv[index + 1];
+  parseCliFlags(argv, {
+    '--dry-run': () => { dryRun = true; },
+    '--list': () => { listOnly = true; },
+    '--record-durations': () => { recordDurations = true; },
+    '--windows-only': () => { windowsOnly = true; },
+    '--verbose': () => { verbose = true; },
+    '--quick': () => { quick = true; },
+    '--attribute-home': () => { attributeHome = true; },
+    '--ci-plan': pathFlag('--ci-plan', 'ciPlan'),
+    '--ci-run': pathFlag('--ci-run', 'ciRun'),
+    '--ci-verify': pathFlag('--ci-verify', 'ciVerify'),
+    '--result': pathFlag('--result', 'result'),
+    '--results': pathFlag('--results', 'results'),
+    '--shards': (next) => {
+      const value = next();
       if (!value) throw new Error('Missing value for --shards');
       shardCount = Number.parseInt(value, 10);
-      index += 1;
-      continue;
-    }
-    if (arg === '--shard') {
-      const value = argv[index + 1];
+    },
+    '--shard': (next) => {
+      const value = next();
       if (!value) throw new Error('Missing value for --shard');
       shardIndex = Number.parseInt(value, 10);
-      index += 1;
-      continue;
-    }
-    if (arg === '--wall-timeout') {
-      const value = Number.parseInt(argv[index + 1] ?? '', 10);
+    },
+    '--wall-timeout': (next) => {
+      const value = Number.parseInt(next() ?? '', 10);
       if (!Number.isInteger(value) || value <= 0) throw new Error('--wall-timeout needs a positive integer (seconds)');
       wallTimeoutMs = value * 1000;
       wallTimeoutExplicit = true;
-      index += 1;
-      continue;
-    }
-    throw new Error(`Unknown argument: ${arg}`);
-  }
+    },
+  });
 
   const ciModes = [paths.ciPlan, paths.ciRun, paths.ciVerify].filter(Boolean).length;
-  if (ciModes > 1 || (ciModes && (quick || listOnly || dryRun || recordDurations || windowsOnly))) throw new Error('CI modes cannot be combined with other selection modes');
+  if (ciModes > 1 || (ciModes && (quick || listOnly || dryRun || recordDurations || windowsOnly || attributeHome))) throw new Error('CI modes cannot be combined with other selection modes');
   if (paths.ciRun && (shardIndex === null || !paths.result)) throw new Error('--ci-run requires --shard and --result');
   if (paths.ciVerify && !paths.results) throw new Error('--ci-verify requires --results');
   if (quick && (recordDurations || windowsOnly || shardIndex !== null)) throw new Error('--quick cannot change recording, Windows or shard selection');
-  return { dryRun, listOnly, recordDurations, windowsOnly, verbose, shardCount, shardIndex, wallTimeoutMs, wallTimeoutExplicit, quick, ...paths };
+  return { dryRun, listOnly, recordDurations, windowsOnly, verbose, shardCount, shardIndex, wallTimeoutMs, wallTimeoutExplicit, quick, attributeHome, ...paths };
 }
 
 function formatShardSummary(shards: string[][]): string[] {
@@ -903,23 +978,6 @@ function formatShardSummary(shards: string[][]): string[] {
     const suffix = files.length > 3 ? ', ...' : '';
     return `Shard ${index + 1}/${shards.length}: ${files.length} files${preview ? ` -> ${preview}${suffix}` : ''}`;
   });
-}
-
-/**
- * True when a shard's output shows the run ended WITHOUT bun's final summary
- * ("Ran N tests across ..."). A process.exit() fired mid-suite skips the
- * summary AND hands back whatever code the caller passed — historically 0,
- * which made a truncated shard indistinguishable from a green one. Exit code
- * alone is therefore not evidence of completion; the summary line is.
- *
- * The runner itself now enforces this (and more) through
- * scripts/test-strict-output.ts inside runFreeShard; this predicate remains
- * the minimal documented primitive that test/exit-propagation.test.ts drives
- * with genuine truncated and genuine complete bun runs.
- */
-export function shardRunLooksTruncated(status: number | null, output: string): boolean {
-  if (status !== 0) return false; // already failing — not the silent case
-  return !/Ran \d+ tests? across \d+ files?/.test(output);
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,7 +1320,7 @@ export function flakeLedgerPath(env: NodeJS.ProcessEnv = process.env): string {
     const slug = spawnSync('bash', ['-c', '~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null'], { stdio: 'pipe', timeout: 3000 })
       .stdout?.toString().match(/^SLUG=(.+)$/m)?.[1];
     if (slug) {
-      const dir = path.join(os.homedir(), '.gstack', 'projects', slug);
+      const dir = path.join(resolveStateRoot(env), 'projects', slug);
       fs.mkdirSync(dir, { recursive: true });
       return path.join(dir, 'flake-ledger.jsonl');
     }
@@ -1338,9 +1396,11 @@ export interface RunFreeShardOptions {
    * Runner-owned [test:free] lines go through `log`, not this sink.
    */
   consoleWrite?: (text: string) => void;
-  /** Per-run full-stream log path (tests inject). Default: a timestamped file under os.tmpdir(). */
+  /** Per-run full-stream log path (tests inject). Default: a private retained file under .context/free-test-logs. */
   logFilePath?: string;
   log?: (line: string) => void;
+  /** Home tripwire for this shard. Default: guard the real home and name this shard's files. */
+  homeGuard?: FreeHomeGuardFactory;
 }
 
 const EPILOGUE_WORD: Record<FreeShardStatus, string> = {
@@ -1348,6 +1408,450 @@ const EPILOGUE_WORD: Record<FreeShardStatus, string> = {
   failed: 'fail',
   'timed-out': 'timed-out',
 };
+
+function trackShardBrowser(stateDir: string, env: NodeJS.ProcessEnv) {
+  class BrowserCleanupError extends Error {}
+  class CaptureStopped extends Error {}
+  type Identity = { pid: number; parent: number; start: string; daemon: number; root: boolean };
+  type Capture = { abort: AbortController; deadline: number; probes: Set<Promise<unknown>>; records?: [string, string] };
+  const identities = new Map<number, Identity>();
+  const nativeStarts = new Map<string, string>();
+  const interrupted = new Set<string>();
+  const errors = new Set<string>();
+  const stateFile = env.BROWSE_STATE_FILE!;
+  let stopping = false;
+  let ready = true;
+  let closed = false;
+  let forced = false;
+  let cancellation = false;
+  let deadline = Infinity;
+  let forceAt = Infinity;
+  let active: Capture | null = null;
+  let pending: Promise<void> | null = null;
+  let observed = false;
+  let alive = true;
+
+  const check = (capture: Capture) => {
+    if (closed || capture.abort.signal.aborted || active !== capture || (!forced && performance.now() >= forceAt)) throw new CaptureStopped();
+    if (performance.now() >= Math.min(capture.deadline, deadline)) throw new BrowserCleanupError('browser ownership deadline exceeded');
+  };
+  const probe = async (capture: Capture, command: string, args: string[], timeout: number) => {
+    check(capture);
+    const remaining = Math.min(timeout, capture.deadline - performance.now() - 100, deadline - performance.now() - 100);
+    if (remaining <= 0) throw new BrowserCleanupError('browser ownership deadline exceeded');
+    const task = new Promise<{ status: number | null; stdout: string }>((resolve, reject) => {
+      const child = spawn(command, args, { detached: true, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      let output = '';
+      let failed = false;
+      let done = false;
+      let reaper: ReturnType<typeof setTimeout> | undefined;
+      const finish = (status: number | null) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        clearTimeout(reaper);
+        capture.abort.signal.removeEventListener('abort', stop);
+        child.stdout?.destroy();
+        child.unref();
+        if (failed) reject(new BrowserCleanupError('browser identity probe did not complete'));
+        else resolve({ status, stdout: output });
+      };
+      const stop = () => {
+        if (done || failed) return;
+        failed = true;
+        killProcessGroup(child, 'SIGKILL');
+        reaper = setTimeout(() => finish(null), 100);
+      };
+      const timer = setTimeout(() => { if (!closed) errors.add('browser identity probe did not complete'); stop(); }, Math.max(1, Math.min(remaining, forced ? Infinity : forceAt - performance.now())));
+      capture.abort.signal.addEventListener('abort', stop, { once: true });
+      child.once('error', () => { failed = true; finish(null); });
+      child.once('close', finish);
+      child.stdout?.on('data', chunk => {
+        output += chunk.toString();
+        if (output.length > 65536) stop();
+      });
+    });
+    capture.probes.add(task);
+    try {
+      const result = await task;
+      check(capture);
+      return result;
+    } finally { capture.probes.delete(task); }
+  };
+
+  const failure = (error: unknown) => {
+    if (error instanceof CaptureStopped) return;
+    const code = (error as NodeJS.ErrnoException)?.code;
+    const file = (error as NodeJS.ErrnoException & { path?: string })?.path;
+    const pid = typeof file === 'string' ? /^\/proc\/(\d+)\//.exec(file)?.[1] : undefined;
+    if (pid && identities.has(Number(pid)) && ['EACCES', 'EPERM', 'ENOENT', 'ESRCH'].includes(code ?? '')) return;
+    errors.add(error instanceof BrowserCleanupError ? error.message : 'browser ownership unavailable');
+  };
+
+  const inspectLinux = (pid: number): Omit<Identity, 'daemon' | 'root'> | null => {
+    try {
+      const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const fields = raw.slice(raw.lastIndexOf(') ') + 2).trim().split(/\s+/);
+      if (!/^\d+$/.test(fields[19] ?? '')) throw new BrowserCleanupError('process start identity unavailable');
+      return fields[0] === 'Z' || fields[0] === 'X' ? null
+        : { pid, parent: Number(fields[1]), start: fields[19] };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ESRCH') return null;
+      throw error;
+    }
+  };
+  const inspect = async (capture: Capture, pid: number): Promise<Omit<Identity, 'daemon' | 'root'> | null> => {
+    check(capture);
+    if (!Number.isSafeInteger(pid) || pid <= 1) throw new BrowserCleanupError('invalid process identity');
+    if (process.platform === 'linux') return inspectLinux(pid);
+    const result = await probe(capture, 'ps', ['-p', String(pid), '-o', 'ppid=,stat=,lstart='], 500);
+    if (result.status === 1 && !result.stdout.trim()) return null;
+    if (result.status !== 0) throw new BrowserCleanupError('process identity unavailable');
+    const fields = result.stdout.trim().split(/\s+/);
+    return fields[1]?.startsWith('Z') ? null : { pid, parent: Number(fields[0]), start: fields.slice(2).join(' ') };
+  };
+  const required = [`BROWSE_STATE_FILE=${stateFile}`, `GSTACK_FREE_SHARD_ID=${env.GSTACK_FREE_SHARD_ID}`];
+  const boundLinux = (pid: number) => {
+    try {
+      const values = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+      return required.every(value => values.includes(value));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+      throw error;
+    }
+  };
+  const bound = async (capture: Capture, pid: number): Promise<boolean> => {
+    check(capture);
+    if (process.platform === 'linux') return boundLinux(pid);
+    const [command, environment] = await Promise.all([
+      probe(capture, 'ps', ['-ww', '-p', String(pid), '-o', 'command='], 500),
+      probe(capture, 'ps', ['eww', '-p', String(pid), '-o', 'command='], 500),
+    ]);
+    if (command.status !== 0 || environment.status !== 0) return false;
+    const prefix = command.stdout.trim();
+    if (!prefix || !environment.stdout.trim().startsWith(prefix + ' ')) return false;
+    const values = ' ' + environment.stdout.trim().slice(prefix.length).trim() + ' ';
+    return required.every(value => values.includes(' ' + value + ' '));
+  };
+  const live = async (capture: Capture, identity: Identity): Promise<boolean> => {
+    const current = await inspect(capture, identity.pid);
+    check(capture);
+    if (!current) return false;
+    if (!current.start || current.start !== identity.start) {
+      errors.add('captured process identity was replaced');
+      return false;
+    }
+    return true;
+  };
+  const record = (file: string): any => {
+    if (!fs.existsSync(file)) return null;
+    const info = fs.lstatSync(file);
+    if (!info.isFile() || info.size > 65536) throw new BrowserCleanupError('unsafe browser state record');
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  };
+  const nativeStart = async (capture: Capture, identity: Identity): Promise<string> => {
+    check(capture);
+    const key = `${identity.pid}:${identity.start}`;
+    const recorded = nativeStarts.get(key);
+    if (recorded) return recorded;
+    if (!await live(capture, identity)) throw new BrowserCleanupError('process exited before its native identity was captured');
+    const result = await probe(capture, 'ps', ['-p', String(identity.pid), '-o', 'lstart='], 2000);
+    const value = result.status === 0 ? result.stdout.trim().replace(/\s+/g, ' ') : '';
+    if (!value || !await live(capture, identity)) throw new BrowserCleanupError('native process identity unavailable');
+    check(capture);
+    nativeStarts.set(key, value);
+    return value;
+  };
+  const remember = (capture: Capture, identity: Identity) => {
+    check(capture);
+    const previous = identities.get(identity.pid);
+    if (previous && previous.start !== identity.start) throw new BrowserCleanupError('captured process identity was replaced');
+    identities.set(identity.pid, identity);
+  };
+  const descendants = async (capture: Capture, parent: Identity, visited: Set<number>): Promise<void> => {
+    check(capture);
+    if (visited.has(parent.pid)) return;
+    visited.add(parent.pid);
+    if (visited.size > 256) throw new BrowserCleanupError('owned browser process limit exceeded');
+    if (!await live(capture, parent)) return;
+    let children: number[];
+    if (process.platform === 'linux') {
+      try {
+        children = fs.readFileSync(`/proc/${parent.pid}/task/${parent.pid}/children`, 'utf8').trim().split(/\s+/).filter(Boolean).map(Number);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+      }
+    } else {
+      const result = await probe(capture, 'pgrep', ['-P', String(parent.pid)], 500);
+      if (result.status !== 0 && result.status !== 1) throw new BrowserCleanupError('owned child identities unavailable');
+      children = result.stdout.trim().split(/\s+/).filter(Boolean).map(Number);
+    }
+    for (const pid of children) {
+      const child = await inspect(capture, pid);
+      if (!child || child.parent !== parent.pid || !await live(capture, parent)) continue;
+      const identity = { ...child, daemon: parent.daemon, root: false };
+      remember(capture, identity);
+      await descendants(capture, identity, visited);
+    }
+  };
+  const capture = async (operation: Capture) => {
+    check(operation);
+    ready = true;
+    if (process.platform === 'win32') return;
+    try {
+      if (fs.realpathSync(stateDir) !== stateDir) throw new BrowserCleanupError('shard directory was replaced');
+      const directory = path.dirname(stateFile);
+      if (fs.existsSync(directory) && (!fs.lstatSync(directory).isDirectory()
+        || fs.lstatSync(directory).isSymbolicLink())) throw new BrowserCleanupError('browser directory was replaced');
+      const state = record(stateFile);
+      if (state?.pid !== undefined) {
+        const current = await inspect(operation, state.pid);
+        if (current) {
+          if (!await bound(operation, current.pid)) {
+            if (!await inspect(operation, current.pid)) return;
+            throw new BrowserCleanupError('daemon is not bound to this shard');
+          }
+          remember(operation, { ...current, daemon: current.pid, root: true });
+        } else if (!identities.has(state.pid)) {
+          throw new BrowserCleanupError('daemon exited before ownership was captured');
+        }
+      }
+      for (const identity of identities.values()) if (identity.root) await descendants(operation, identity, new Set());
+      const validateChild = async (pid: unknown, start: unknown, daemon: unknown) => {
+        check(operation);
+        if (!Number.isSafeInteger(pid) || (pid as number) <= 1) throw new BrowserCleanupError('invalid browser child identity');
+        const identity = identities.get(pid as number);
+        if (!identity || identity.daemon !== daemon || identity.root) throw new BrowserCleanupError('browser child ownership is unconfirmed');
+        if (await live(operation, identity) && (typeof start !== 'string' || !start
+          || await nativeStart(operation, identity) !== start.replace(/\s+/g, ' '))) throw new BrowserCleanupError('browser child identity was replaced');
+      };
+      const agent = record(path.join(directory, 'terminal-agent-pid'));
+      const validations: Promise<unknown>[] = [];
+      if (agent) {
+        const daemon = identities.get(agent.ownerPid);
+        if (!daemon?.root || (state?.pid !== undefined && agent.ownerPid !== state.pid)) throw new BrowserCleanupError('terminal owner is unconfirmed');
+        validations.push(nativeStart(operation, daemon).then(start => {
+          if (start !== agent.ownerStartTime?.replace(/\s+/g, ' ')) throw new BrowserCleanupError('terminal owner is unconfirmed');
+        }));
+        if (agent.pid === 0) ready = false;
+        else validations.push(validateChild(agent.pid, agent.startTime, agent.ownerPid));
+      }
+      if (state?.chromiumPid !== undefined) validations.push(validateChild(state.chromiumPid, state.chromiumStartTime, state.pid));
+      const results = await Promise.allSettled(validations);
+      check(operation);
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
+      operation.records = [JSON.stringify(state), JSON.stringify(agent)];
+    } catch (error) {
+      check(operation);
+      ready = false;
+      failure(error);
+    }
+  };
+  const signalOwned = async (operation: Capture, force: boolean) => {
+    for (const identity of identities.values()) {
+      if (!force && (!identity.root || !ready || errors.size > 0)) continue;
+      const key = `${identity.pid}:${identity.start}`;
+      if (!force && interrupted.has(key)) continue;
+      try {
+        if (!await live(operation, identity)) continue;
+        if (identity.root && !await bound(operation, identity.pid)) {
+          if (!await live(operation, identity)) continue;
+          throw new BrowserCleanupError('daemon environment changed before termination');
+        }
+        if (!await live(operation, identity)) continue;
+        check(operation);
+        if (!force && (!operation.records || JSON.stringify(record(stateFile)) !== operation.records[0]
+          || JSON.stringify(record(path.join(path.dirname(stateFile), 'terminal-agent-pid'))) !== operation.records[1])) {
+          ready = false;
+          continue;
+        }
+        process.kill(identity.pid, force ? 'SIGKILL' : 'SIGINT');
+        if (!force) interrupted.add(key);
+      } catch (error) {
+        check(operation);
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') failure(error);
+      }
+    }
+  };
+  const forceLinux = () => {
+    if (process.platform !== 'linux') return;
+    for (const identity of identities.values()) {
+      try {
+        const current = inspectLinux(identity.pid);
+        if (!current) continue;
+        if (current.start !== identity.start) throw new BrowserCleanupError('captured process identity was replaced');
+        if (identity.root && !boundLinux(identity.pid)) {
+          if (!inspectLinux(identity.pid)) continue;
+          throw new BrowserCleanupError('daemon environment changed before termination');
+        }
+        if (inspectLinux(identity.pid)?.start === identity.start) process.kill(identity.pid, 'SIGKILL');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') failure(error);
+      }
+    }
+  };
+  const enqueue = () => {
+    if (closed || pending || process.platform === 'win32') return;
+    const operation: Capture = { abort: new AbortController(), deadline: Math.min(performance.now() + 10000, deadline), probes: new Set() };
+    active = operation;
+    pending = (async () => {
+      try {
+        if (!forced) await capture(operation);
+        if (stopping) {
+          await signalOwned(operation, forced);
+          let stillAlive = false;
+          for (const identity of identities.values()) if (await live(operation, identity)) stillAlive = true;
+          check(operation);
+          alive = stillAlive;
+          observed = true;
+        }
+      } catch (error) {
+        if (!closed && !operation.abort.signal.aborted) failure(error);
+      } finally {
+        operation.abort.abort();
+        await Promise.allSettled([...operation.probes]);
+        if (active === operation) active = null;
+      }
+    })().finally(() => { pending = null; });
+  };
+  const signal = (force: boolean) => {
+    if (closed) return;
+    if (!cancellation) {
+      cancellation = true;
+      stopping = true;
+      deadline = Math.min(deadline, performance.now() + 5500);
+      forceAt = Math.min(forceAt, performance.now() + 5000);
+      active?.abort.abort();
+    }
+    if (force) {
+      forced = true;
+      active?.abort.abort();
+      forceLinux();
+    }
+    if (pending) void pending.then(enqueue);
+    else enqueue();
+  };
+  const timer = setInterval(enqueue, process.platform === 'darwin' ? 1000 : 250);
+  timer.unref();
+  return {
+    signal,
+    async settle(): Promise<string | null> {
+      clearInterval(timer);
+      if (process.platform === 'win32') { closed = true; return null; }
+      stopping = true;
+      deadline = Math.min(deadline, performance.now() + 10000);
+      forceAt = Math.min(forceAt, performance.now() + 5000);
+      active?.abort.abort();
+      try {
+        while (true) {
+          if (performance.now() >= deadline) {
+            errors.add('owned browser settlement deadline exceeded');
+            break;
+          }
+          if (!forced && performance.now() >= forceAt) {
+            forced = true;
+            active?.abort.abort();
+            forceLinux();
+          }
+          if (pending) await pending;
+          enqueue();
+          if (pending) await pending;
+          if (observed && !alive) break;
+          await new Promise(resolve => setTimeout(resolve, Math.min(50, Math.max(0, deadline - performance.now()))));
+        }
+      } catch {
+        errors.add('owned browser settlement could not be verified');
+      } finally {
+        closed = true;
+        clearInterval(timer);
+        active?.abort.abort();
+        if (pending) await pending;
+      }
+      return errors.size ? [...errors].join('; ') : null;
+    },
+  };
+}
+
+/**
+ * Drain one child pipe into `onChunk`. Capture failures are recorded as data
+ * in `failures`, never thrown: the caller still waits for the child's real exit.
+ */
+function captureFreeStream(
+  stream: NodeJS.ReadableStream | null,
+  origin: StreamOrigin,
+  failures: Map<StreamOrigin, Error>,
+  onChunk: (chunk: Buffer | string) => void,
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (!stream) {
+      failures.set(origin, new Error('configured pipe is missing'));
+      resolve();
+      return;
+    }
+    const readable = stream as NodeJS.ReadableStream & { readableEnded: boolean; destroyed: boolean; errored: Error | null };
+    let ended = readable.readableEnded;
+    const incomplete = (error?: Error | null): void => {
+      // A delayed error replaces the initial destroyed-stream diagnostic
+      // with its original cause.
+      if (error) failures.set(origin, error);
+      else if (!failures.has(origin)) failures.set(origin, new Error('stream closed before end'));
+      resolve();
+    };
+    // Even an already-destroyed pipe can emit error on the next tick.
+    stream.on('error', incomplete);
+    stream.once('end', () => { ended = true; resolve(); });
+    stream.once('close', () => {
+      if (!ended) incomplete(readable.errored);
+      else resolve();
+    });
+    stream.on('data', onChunk);
+    if (ended) resolve();
+    else if (readable.destroyed) incomplete(readable.errored);
+  });
+}
+
+/** Why a shard did not pass, on stderr (the epilogue repeats the names). */
+function explainFreeVerdict(label: string, status: FreeShardStatus, facts: {
+  cleanupError: string | null; stateDir: string; evidenceComplete: boolean; exitCode: number | null;
+  summary: ReturnType<BunTestOutputClassifier['end']>; expectedFiles: number; wallTimeoutMs: number;
+}): void {
+  const { summary, exitCode } = facts;
+  if (facts.cleanupError) console.error(`${label} shard cleanup or home containment failed: ${facts.cleanupError}; retained ${facts.stateDir}`);
+  if (status === 'timed-out') {
+    console.error(
+      `${label} exceeded the ${Math.round(facts.wallTimeoutMs / 1000)}s wall-clock deadline — `
+      + 'killed the process group. Reporting as TIMED-OUT (distinct from failed).',
+    );
+  } else if (status === 'failed' && facts.evidenceComplete && (exitCode ?? 1) === 0) {
+    const reason = summary.failedTests > 0 || summary.unhandledBetweenTests > 0
+      ? `reported ${summary.failedTests} failing test(s) and ${summary.unhandledBetweenTests} unhandled error(s) between tests`
+      : summary.terminalFileCounts.length === 0
+        ? "never printed bun's terminal summary — the run was truncated (a process.exit fired mid-suite)"
+        : `bun's summary reported ${summary.terminalFileCounts.join(', ')} file(s), expected ${facts.expectedFiles}`;
+    console.error(`${label} exited 0 but ${reason}. Treating as FAILED.`);
+  } else if (status === 'failed' && (exitCode ?? 1) !== 0) {
+    console.error(`${label} failed with exit code ${exitCode ?? 'signal'}`);
+  }
+}
+
+/** The recovery step and, only when the failure scope is complete, a focused rerun. */
+function logFreeRecovery(log: (line: string) => void, outcome: FreeShardOutcome, facts: {
+  cleanupError: string | null; logWriteFailed: boolean; captureIncomplete: boolean; rootDir: string;
+}): void {
+  const problem = facts.cleanupError ? 'Owned-process cleanup or home containment is unconfirmed; inspect the reported paths and retained state before another run.'
+    : facts.logWriteFailed ? 'The evidence log could not be retained; repair the log destination before another run.'
+      : facts.captureIncomplete ? 'Evidence capture is incomplete; repair the stream or early exit before another run.'
+        : outcome.status === 'timed-out' ? 'Execution exceeded its deadline; inspect the last completed step before changing code or rerunning.'
+          : 'A test or module failed; the root cause is not established. Inspect the full log and repair the cause first.';
+  log(`[test:free] Recovery: ${problem} See docs/TESTING_INTERNALS.md.`);
+  const focused = outcome.failingFiles.filter(file => outcome.files.includes(file) && fs.existsSync(path.resolve(facts.rootDir, file)));
+  if (!outcome.unattributedFailures && focused.length) {
+    log(`[test:free] After repair, focused check: bun test ${focused.map(file => `'${file.replaceAll("'", "'\\''")}'`).join(' ')}`);
+  } else {
+    log('[test:free] No complete narrower failure scope is available; do not treat a subset rerun as complete coverage.');
+  }
+}
 
 /** One line per shard, printed after the run: `[test:free] shard i/N: M files, XXs, pass|fail|timed-out`. */
 function shardEpilogue(outcome: FreeShardOutcome, totalShards: number): string {
@@ -1404,61 +1908,23 @@ export async function runFreeShard(
   // Full-stream capture: EVERY child byte lands here, whatever the console
   // shows. Printed once at start so a wedged or noisy run is inspectable
   // without a re-run.
-  const logPath = options.logFilePath ?? nextDefaultLogPath();
-  const logStream = fs.createWriteStream(logPath);
-  let logWriteFailed = false;
-  logStream.on('error', (err) => {
-    if (logWriteFailed) return;
-    logWriteFailed = true;
-    console.error(`${label} could not write the full log at ${logPath}: ${err.message}`);
-  });
+  const logPath = options.logFilePath ?? nextDefaultLogPath(rootDir);
+  const shardLog = openShardLog(logPath, label, 0o600);
   log(`[test:free] full log: ${logPath}`);
 
   const { command, args } = options.commandFor
     ? options.commandFor(files)
     : { command: process.execPath, args: buildShardArgs(files, { parallel: options.parallel, rootDir }) };
 
-  const env = { ...(options.env ?? process.env) };
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-free-shard-'));
-  const childTmp = path.join(stateDir, 'tmp');
-  fs.mkdirSync(childTmp);
-  env.TMPDIR = childTmp;
-  env.TEMP = childTmp;
-  env.TMP = childTmp;
-  // CLI renders otherwise attach to the repo's shared .gstack/browse.json,
-  // even with distinct Chromium profiles. Concurrent shards and surviving
-  // daemons from prior runs can then replace or remove each other's state.
-  // Override inherited state too; the shard owns this directory's cleanup.
+  // realpath: the browser tracker refuses a state dir whose path resolves elsewhere.
+  const { stateDir, env } = createShardSandbox('gstack-free-shard-', options.env ?? process.env, { realpath: true });
+  // CLI renders otherwise share the repo's .gstack/browse.json, where concurrent
+  // shards and prior daemons replace each other's state; override inherited state.
   env.BROWSE_STATE_FILE = path.join(stateDir, '.gstack', 'browse.json');
-  // Per-shard Chromium profile (same isolation idea as TMPDIR): nine test
-  // files launch in-process persistent contexts or daemons that default to
-  // the SHARED ~/.gstack/chromium-profile, and two concurrent shards on one
-  // profile dir kill each other's browser — observed live on CI once
-  // duration packing recomposed shards (handoff's launchPersistentContext
-  // died "Target page, context or browser has been closed" while a sibling
-  // shard's daemon logged "Chromium process crashed"). Hash sharding had
-  // masked the collision by chance placement. Within a shard, files run
-  // serially, so sharing the per-shard profile is safe; config tests that
-  // assert resolution order save/restore this env around their assertions.
-  env.CHROMIUM_PROFILE = path.join(stateDir, 'chromium-profile');
+  env.GSTACK_FREE_SHARD_ID = randomUUID();
+  const home = options.homeGuard ? options.homeGuard(files, env, stateDir) : guardFreeHome(files, env);
 
   const startedAt = Date.now();
-  const child = spawn(command, args, {
-    cwd: rootDir,
-    env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: process.platform !== 'win32',
-    windowsHide: true,
-  });
-  const groupPid = child.pid ?? null;
-  // Group-kill on parent SIGINT/SIGTERM too, not just on timeout.
-  const forwarding = installChildSignalForwarding({
-    kill: (signal?: NodeJS.Signals | number) => {
-      killProcessGroup(child, (signal as NodeJS.Signals) ?? 'SIGTERM');
-      return true;
-    },
-  });
-
   const classifier = new BunTestOutputClassifier();
 
   // Console policy: quiet => nothing; verbose => the raw firehose; default =>
@@ -1476,94 +1942,69 @@ export async function runFreeShard(
   const reporter = new FreeRunReporter(files, options.verbose ? undefined : emitToConsole);
 
   const captureFailures = new Map<StreamOrigin, Error>();
-  const consumeStream = (stream: typeof child.stdout, origin: StreamOrigin): Promise<void> =>
-    new Promise((resolve) => {
-      if (!stream) {
-        captureFailures.set(origin, new Error('configured pipe is missing'));
-        resolve();
-        return;
-      }
-      let ended = stream.readableEnded;
-      const incomplete = (error?: Error | null): void => {
-        // A delayed error replaces the initial destroyed-stream diagnostic
-        // with its original cause. Failures are data, never early rejections
-        // while the caller is still waiting for the child's real exit.
-        if (error) captureFailures.set(origin, error);
-        else if (!captureFailures.has(origin)) captureFailures.set(origin, new Error('stream closed before end'));
-        resolve();
-      };
-      // Even an already-destroyed pipe can emit error on the next tick.
-      stream.on('error', incomplete);
-      stream.once('end', () => { ended = true; resolve(); });
-      stream.once('close', () => {
-        if (!ended) incomplete(stream.errored);
-        else resolve();
-      });
-      stream.on('data', (chunk: Buffer | string) => {
-        classifier.write(chunk, origin); // strict verdict ALWAYS sees the full stream
-        if (!logWriteFailed) logStream.write(chunk);
-        reporter.write(chunk, origin);
-        if (options.verbose) emitToConsole(typeof chunk === 'string' ? chunk : chunk.toString('utf8'), origin);
-      });
-      if (ended) resolve();
-      else if (stream.destroyed) incomplete(stream.errored);
-    });
+  const drained = new Set<StreamOrigin>();
+  const consumeStream = (stream: NodeJS.ReadableStream | null, origin: StreamOrigin): Promise<void> =>
+    captureFreeStream(stream, origin, captureFailures, (chunk) => {
+      classifier.write(chunk, origin); // strict verdict ALWAYS sees the full stream
+      shardLog.write(chunk);
+      reporter.write(chunk, origin);
+      if (options.verbose) emitToConsole(typeof chunk === 'string' ? chunk : chunk.toString('utf8'), origin);
+    }).then(() => { drained.add(origin); });
 
-  let timedOut = false;
-  const killTimer = setTimeout(() => {
-    timedOut = true;
-    killProcessGroup(child, 'SIGKILL');
-  }, wallTimeoutMs);
-
-  let exitCode: number | null = null;
+  let child: ShardChildResult = { exitCode: null, timedOut: false, groupPid: null };
+  let cleanupError = null as string | null;
   try {
-    const streams = [consumeStream(child.stdout, 'stdout'), consumeStream(child.stderr, 'stderr')];
-    exitCode = await new Promise<number | null>((resolve, reject) => {
-      child.once('error', reject);
-      child.once('close', (code) => resolve(code));
+    // Shared spawn/detached/group-kill/wall-timer/reap lifecycle. The browser
+    // tracker rides along: forwarded signals reach it, and it settles after
+    // the final group kill.
+    child = await runShardChild({
+      command, args, cwd: rootDir, env, timeoutMs: wallTimeoutMs,
+      attach: () => {
+        const browser = trackShardBrowser(stateDir, env);
+        return { signal: (force) => browser.signal(force), settle: async () => { cleanupError = await browser.settle() ?? home.verify(); } };
+      },
+      hookStreams: (spawned) => [consumeStream(spawned.stdout, 'stdout'), consumeStream(spawned.stderr, 'stderr')],
     });
-    await Promise.all(streams);
+  } catch (error) {
+    child = (error as { shardResult?: ShardChildResult } | null)?.shardResult ?? child;
+    throw error;
   } finally {
-    clearTimeout(killTimer);
-    forwarding.dispose();
-    // Reap survivors of this shard even on the clean path.
-    killProcessGroup(child, 'SIGKILL');
+    // A wall-expired child is not drained: its unread tail is lost evidence.
+    for (const origin of ['stdout', 'stderr'] as const) {
+      if (!drained.has(origin) && !captureFailures.has(origin)) captureFailures.set(origin, new Error('stream did not drain before the wall deadline'));
+    }
     reporter.end();
     for (const [origin, error] of captureFailures) {
       const diagnostic = `${label} ${origin} capture incomplete: ${error.message} `
-        + `(child exit ${exitCode ?? 'signal'}). Full log: ${logPath}`;
+        + `(child exit ${child.exitCode ?? 'signal'}). Full log: ${logPath}`;
       console.error(diagnostic);
-      if (!logWriteFailed) logStream.write(diagnostic + '\n');
+      shardLog.write(diagnostic + '\n');
     }
-    await new Promise<void>((resolve) => logStream.end(() => resolve()));
+    await new Promise<void>((resolve) => shardLog.stream.end(() => resolve()));
     try {
-      fs.rmSync(stateDir, { recursive: true, force: true });
+      if (!cleanupError) fs.rmSync(stateDir, { recursive: true, force: true });
     } catch {
       // Best-effort cleanup of a throwaway temp dir — a locked file on
       // Windows must not turn a real verdict into an exception.
+      if (process.platform !== 'win32') cleanupError = 'could not remove the owned shard directory';
     }
   }
 
+  const { exitCode, timedOut, groupPid } = child;
+  const logWriteFailed = shardLog.failed;
   const summary = classifier.end();
-  const status: FreeShardStatus = timedOut
-    ? 'timed-out'
-    : captureFailures.size === 0 && strictTestExitCode(exitCode ?? 1, summary, files.length) === 0 ? 'passed' : 'failed';
-
-  if (status === 'timed-out') {
-    console.error(
-      `${label} exceeded the ${Math.round(wallTimeoutMs / 1000)}s wall-clock deadline — `
-      + 'killed the process group. Reporting as TIMED-OUT (distinct from failed).',
-    );
-  } else if (status === 'failed' && captureFailures.size === 0 && (exitCode ?? 1) === 0) {
-    const reason = summary.failedTests > 0 || summary.unhandledBetweenTests > 0
-      ? `reported ${summary.failedTests} failing test(s) and ${summary.unhandledBetweenTests} unhandled error(s) between tests`
-      : summary.terminalFileCounts.length === 0
-        ? "never printed bun's terminal summary — the run was truncated (a process.exit fired mid-suite)"
-        : `bun's summary reported ${summary.terminalFileCounts.join(', ')} file(s), expected ${files.length}`;
-    console.error(`${label} exited 0 but ${reason}. Treating as FAILED.`);
-  } else if (status === 'failed' && (exitCode ?? 1) !== 0) {
-    console.error(`${label} failed with exit code ${exitCode ?? 'signal'}`);
+  let status: FreeShardStatus = strictShardStatus({
+    timedOut, exitCode, summary, expectedFiles: files.length,
+    evidenceComplete: !cleanupError && !logWriteFailed && captureFailures.size === 0,
+  });
+  if (status === 'passed' && zeroExecutionVerdict(reporter.report().testsRan, FREE_LANE_POLICY, { promisedAll: true }) === 'passed-empty') {
+    status = 'failed';
   }
+
+  explainFreeVerdict(label, status, {
+    cleanupError, stateDir, exitCode, summary, expectedFiles: files.length, wallTimeoutMs,
+    evidenceComplete: !cleanupError && !logWriteFailed && captureFailures.size === 0,
+  });
 
   const report = reporter.report();
   const failingFiles = status === 'passed' ? [] : [...new Set([
@@ -1575,6 +2016,8 @@ export async function runFreeShard(
       + report.unreportedFailures
       + report.unhandledErrors.length
       + captureFailures.size
+      + (logWriteFailed ? 1 : 0)
+      + (cleanupError ? 1 : 0)
       + (report.sawTerminalSummary ? 0 : 1);
   const outcome: FreeShardOutcome = {
     shard: shardNumber, files, status, exitCode, elapsedMs: Date.now() - startedAt, groupPid, failingFiles, unattributedFailures,
@@ -1582,19 +2025,28 @@ export async function runFreeShard(
   };
   log(shardEpilogue(outcome, totalShards));
   for (const line of buildRunEpilogue(status, report, outcome.elapsedMs, logPath)) log(line);
+  if (status !== 'passed') {
+    logFreeRecovery(log, outcome, {
+      cleanupError, logWriteFailed, rootDir, captureIncomplete: captureFailures.size > 0 || !report.sawTerminalSummary,
+    });
+  }
   return outcome;
 }
 
-let logPathSequence = 0;
-
-/** Timestamped per-run log file under os.tmpdir(); pid+sequence defeat same-ms collisions. */
-function nextDefaultLogPath(): string {
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  logPathSequence += 1;
-  return path.join(os.tmpdir(), `gstack-free-test-${stamp}-${process.pid}-${logPathSequence}.log`);
+/** Retained private log under .context/free-test-logs; never through a link. */
+function nextDefaultLogPath(rootDir: string): string {
+  let directory = fs.realpathSync(rootDir);
+  for (const part of ['.context', 'free-test-logs']) {
+    directory = path.join(directory, part);
+    const existing = fs.lstatSync(directory, { throwIfNoEntry: false });
+    if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) throw new Error('Free-test log directory must not traverse links');
+    if (!existing) fs.mkdirSync(directory, { mode: 0o700 });
+  }
+  fs.chmodSync(directory, 0o700);
+  return nextShardLogPath(directory, 'gstack-free-test');
 }
 
-function exitCodeFor(status: FreeShardStatus): number {
+export function exitCodeFor(status: FreeShardStatus): number {
   if (status === 'passed') return 0;
   return status === 'timed-out' ? 124 : 1;
 }
@@ -1609,47 +2061,27 @@ async function recordFreeTestDurations(files: string[], jobs: number): Promise<n
   const durations: Record<string, number> = {};
   const failed: string[] = [];
   const expectedCount = files.length;
-  let cursor = 0;
   console.log(`[test:free] recording per-file durations: ${files.length} files across ${jobs} workers`);
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      if (isTerminationRequested()) return;
-      const index = cursor;
-      cursor += 1;
-      if (index >= files.length) return;
-      const file = files[index];
-      const outcome = await runFreeShard([file], index + 1, files.length, {
-        wallTimeoutMs: wallTimeoutForShard(1),
-        quiet: true,
-      });
-      durations[normalizeRelativePath(file)] = outcome.elapsedMs;
-      if (outcome.status !== 'passed') failed.push(file);
-    }
-  };
-  // As in full-suite mode, finish readers before any checkout-mutating tests.
-  const mutators = files.filter(file => file in TREE_MUTATING);
-  files = files.filter(file => !(file in TREE_MUTATING));
-  await Promise.all(Array.from({ length: Math.max(1, jobs) }, () => worker()));
-  files = mutators;
-  cursor = 0;
-  await worker();
+  const phaseHome = guardFreeHome(files, process.env, { kind: 'concurrent', shards: jobs });
+  // As in full-suite mode, finish parallel work before exclusive host-state fixtures.
+  await forEachFileAlone(files.filter(file => !(file in TREE_MUTATING)), files.filter(file => file in TREE_MUTATING), jobs, async (file, index) => {
+    const outcome = await runFreeShard([file], index + 1, files.length, {
+      wallTimeoutMs: wallTimeoutForShard(1), quiet: true, homeGuard: sharedFreeHome,
+    });
+    durations[normalizeRelativePath(file)] = outcome.elapsedMs;
+    if (outcome.status !== 'passed') failed.push(file);
+  });
+  const homeChange = phaseHome.verify();
+  if (homeChange) console.error(`[test:free] ${homeChange}`);
   if (Object.keys(durations).length !== expectedCount) {
     throw new Error('Duration recording was interrupted; the seed was not replaced.');
   }
 
   const target = process.env.GSTACK_FREE_TEST_DURATIONS ?? path.join(ROOT, FREE_TEST_DURATIONS_FILE);
-  const payload = {
-    version: 1,
-    recordedAt: new Date().toISOString(),
-    durations: Object.fromEntries(Object.entries(durations).sort(([a], [b]) => (a < b ? -1 : 1))),
-  };
-  // Atomic temp+rename (capture-context-budget's pattern): a killed recorder
-  // must never leave a truncated seed for loadFreeTestDurations to warn on.
-  const tmp = `${target}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`);
-  fs.renameSync(tmp, target);
+  // Atomic: a killed recorder never leaves a truncated seed behind.
+  writeDurationSeed(target, durations);
   console.log(`[test:free] wrote ${Object.keys(durations).length} durations to ${path.relative(ROOT, target)}`);
-  if (failed.length > 0) {
+  if (failed.length > 0 || homeChange) {
     // Failures still recorded (a red file's duration is still a real cost),
     // but surfaced loudly — recording from a broken tree deserves a look.
     console.error(`[test:free] WARNING: ${failed.length} file(s) failed while recording:`);
@@ -1749,7 +2181,9 @@ async function main(): Promise<number> {
       fs.renameSync(temporary, file);
     };
     if (options.ciPlan) {
-      const plan = createFreeCiPlan(allFiles, options.shardCount, loadFreeTestDurations() ?? {}, revision);
+      const durations = loadFreeTestDurations() ?? {};
+      warnUnseededFreeFiles(allFiles, durations);
+      const plan = createFreeCiPlan(allFiles, options.shardCount, durations, revision);
       validateFreeCiPlan(plan, allFiles, revision);
       writeJson(options.ciPlan, plan);
       console.log(JSON.stringify({ shard: plan.shards.map(shard => shard.shard) }));
@@ -1807,6 +2241,8 @@ async function main(): Promise<number> {
   if (options.recordDurations) {
     return recordFreeTestDurations(files, fullSuiteJobs());
   }
+  if (options.attributeHome) return attributeFreeHomeWriters(files.filter(file => !(file in TREE_MUTATING)), files.filter(file => file in TREE_MUTATING),
+    fullSuiteJobs(), (file, index, homeGuard) => runFreeShard([file], index + 1, files.length, { wallTimeoutMs: wallTimeoutForShard(1), quiet: true, log: () => {}, homeGuard }));
 
   if (options.dryRun) {
     const shards = assignFilesToShards(files, options.shardCount);
@@ -1814,7 +2250,7 @@ async function main(): Promise<number> {
     console.log(
       `\nWould run ${files.length} files across ${shards.length} shards (${occupied} occupied). `
       + 'Without --shard, the full suite runs as N concurrent shard processes '
-      + '(plus a serial tree-mutating shard) instead.',
+      + '(plus an exclusive host-state shard) instead.',
     );
     for (const line of formatShardSummary(shards)) console.log(line);
     return 0;
@@ -1847,17 +2283,18 @@ async function main(): Promise<number> {
   // wedge only ever costs its own shard. WORKER_HOSTILE files are moot in
   // process shards (no workers) and fold back into normal assignment.
   const jobs = fullSuiteJobs();
-  // Phase split: tree-mutating tests run AFTER the parallel shards, in one
-  // serial shard, so no concurrent shard ever reads a half-regenerated tree.
-  const mutators = files.filter((f) => f in TREE_MUTATING);
+  // Phase split: exclusive host-state fixtures run AFTER the parallel shards,
+  // so their shared process or filesystem state cannot interfere with readers.
+  const exclusive = files.filter((f) => f in TREE_MUTATING);
   const readers = files.filter((f) => !(f in TREE_MUTATING));
   const durations = loadFreeTestDurations();
+  if (durations) warnUnseededFreeFiles(files, durations);
   const packed = durations ? packShardsByDuration(readers, jobs, durations) : null;
   const shards = packed ? packed.shards : assignFilesToShards(readers, jobs);
-  const totalShards = jobs + (mutators.length > 0 ? 1 : 0);
+  const totalShards = jobs + (exclusive.length > 0 ? 1 : 0);
   console.log(`[test:free] full suite: ${readers.length} files across ${jobs} shard processes`
     + (packed ? ' (duration-packed)' : '')
-    + (mutators.length > 0 ? `, then ${mutators.length} tree-mutating file(s) serially` : ''));
+    + (exclusive.length > 0 ? `, then ${exclusive.length} exclusive host-state file(s) serially` : ''));
   if (packed) {
     // One line per shard so a packing regression is diagnosable from any log.
     packed.predictedMs.forEach((ms, i) => {
@@ -1866,8 +2303,10 @@ async function main(): Promise<number> {
   }
   const shardTimeout = (fileCount: number): number =>
     options.wallTimeoutExplicit ? options.wallTimeoutMs : wallTimeoutForShard(fileCount, options.wallTimeoutMs);
+  const phaseHome = guardFreeHome(readers, process.env, { kind: 'concurrent', shards: shards.length });
   const outcomes = await Promise.all(
     shards.map((shardFiles, index) => runFreeShard(shardFiles, index + 1, totalShards, {
+      homeGuard: sharedFreeHome,
       // Packed shards get duration-aware walls: LPT decouples file count from
       // cost BY DESIGN, so the 5s/file heuristic would undersize a shard
       // holding few expensive files.
@@ -1877,34 +2316,34 @@ async function main(): Promise<number> {
       verbose: options.verbose,
     })),
   );
-  let worst = Math.max(...outcomes.map((o) => exitCodeFor(o.status)));
-  // Cancellation stops the run: don't launch the serial tree-mutating shard
+  const homeChange = phaseHome.verify();
+  if (homeChange) console.error(`[test:free] ${homeChange}`);
+  // Cancellation stops the run: don't launch the exclusive host-state shard
   // after a SIGINT/SIGTERM already killed the parallel phase.
-  if (mutators.length > 0 && !isTerminationRequested()) {
-    const mutatorOutcome = await runFreeShard(mutators, totalShards, totalShards, {
-      wallTimeoutMs: shardTimeout(mutators.length),
+  if (exclusive.length > 0 && !isTerminationRequested()) {
+    const exclusiveOutcome = await runFreeShard(exclusive, totalShards, totalShards, {
+      wallTimeoutMs: shardTimeout(exclusive.length),
       verbose: options.verbose,
     });
-    worst = Math.max(worst, exitCodeFor(mutatorOutcome.status));
-    if (mutatorOutcome.status !== 'passed') {
-      // Mutator safety rests on each test restoring default state itself; a
+    if (exclusiveOutcome.status !== 'passed') {
+      // Fixture safety rests on each test restoring default state itself; a
       // SIGKILL at the wall deadline (or a mid-regeneration crash) defeats
       // that by construction. Say so, loudly, before someone commits
       // regenerated SKILL.md / .agents artifacts by accident.
       const dirty = spawnSyncGitStatusGenerated();
       if (dirty.length > 0) {
-        console.error('[test:free] ⚠ tree-mutating shard did not finish cleanly — generated artifacts may be mid-regeneration:');
+        console.error('[test:free] ⚠ exclusive host-state shard did not finish cleanly — generated artifacts are dirty:');
         for (const line of dirty.slice(0, 20)) console.error(`[test:free]   ${line}`);
         console.error('[test:free]   restore with: bun run gen:skill-docs (or git checkout -- <paths>)');
       }
     }
-    outcomes.push(mutatorOutcome);
+    outcomes.push(exclusiveOutcome);
   }
 
-  return (await retryFailedFreeFiles(outcomes, totalShards, options)).exitCode;
+  return Math.max(homeChange ? 1 : 0, (await retryFailedFreeFiles(outcomes, totalShards, options)).exitCode);
 }
 
-/** Dirty generated artifacts (SKILL.md / host outputs) after a failed mutator shard. */
+/** Dirty generated artifacts (SKILL.md / host outputs) after a failed exclusive shard. */
 function spawnSyncGitStatusGenerated(): string[] {
   const result = spawnSync('git', ['status', '--porcelain'], { cwd: ROOT, encoding: 'utf8' });
   if (result.status !== 0 || !result.stdout) return [];

@@ -4,8 +4,8 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
-import { readWorkflowJudgeInput, buildWorkflowJudgePrompt } from './helpers/workflow-judge-input';
-import { ENG_REVIEW_EXCERPT } from './helpers/workflow-excerpt';
+import { readWorkflowJudgeInput, buildWorkflowJudgePrompt, QA_DISCOVERY_REFERENCES, WORKFLOW_JUDGE_RESPONSE_SCHEMA, WORKFLOW_JUDGE_REASONING_WORD_LIMIT } from './helpers/workflow-judge-input';
+import { ASK_QUESTIONS_HEADING, ENG_REVIEW_EXCERPT } from './helpers/workflow-excerpt';
 
 const ROOT = resolve(import.meta.dir, '..');
 const scratchRoots: string[] = [];
@@ -16,6 +16,43 @@ test('cache extraction preserves every byte of the original workflow request and
   const prompt = buildWorkflowJudgePrompt({ judgeContext: 'test workflow', judgeGoal: 'test goal' },
     { files: [], text: 'full prompt\nincluding lines' });
   expect(createHash('sha256').update(prompt).digest('hex')).toBe('71cc9c777bf28ff0efd610259b411e3539852f83a0888fa0e92469331f8b9a43');
+});
+
+test.each(['ship', 'review'])('%s clarity targets frontier readers without excusing missing decisions or authority', skill => {
+  const source = readFileSync(join(ROOT, 'test/skill-llm-eval.test.ts'), 'utf8');
+  const registration = source.match(new RegExp(`testIfSelected\\('${skill}/SKILL\\.md workflow',[\\s\\S]*?await runWorkflowJudge\\(\\{([\\s\\S]*?)\\n    \\}\\);`));
+  expect(registration).not.toBeNull();
+  const options = new Function('QA_DISCOVERY_REFERENCES', `return ({${registration![1]}});`)(QA_DISCOVERY_REFERENCES);
+  expect(options.agentCapability).toBe('frontier');
+  expect(options.thresholds).toBeUndefined();
+  const input = readWorkflowJudgeInput({ root: ROOT, ...options });
+  const prompt = buildWorkflowJudgePrompt(options, input);
+  expect(prompt).toContain('GPT-5.6 Sol-level capability or stronger');
+  expect(prompt).toContain('Length, technical vocabulary and multiple explicit recovery paths alone are not clarity defects');
+  expect(prompt).toContain('Do not invent missing policies, permissions or evidence');
+  expect(prompt).toContain('Clarity 4 means the target agent can determine the next permitted action on each applicable path');
+  expect(prompt).toContain('Score clarity 3 or lower when execution still requires guessing');
+  expect(prompt).toContain('conflicting order, undefined decisions, unclear authority or missing input/output handling');
+  expect(prompt).toContain('cite the specific file/step and explain the competing actions or missing decision');
+  expect(prompt.endsWith(input.text)).toBe(true);
+  expect(prompt).toContain('"clarity": N, "completeness": N, "actionability": N, "reasoning": "brief explanation"');
+});
+
+test('frontier calibration bounds reporting without reducing the evaluated source bundle', () => {
+  const input = { files: [], text: 'Entire source bundle remains present.' };
+  const prompt = buildWorkflowJudgePrompt({ judgeContext: 'a workflow', judgeGoal: 'how to finish', agentCapability: 'frontier' }, input);
+  expect(prompt).toContain('Evaluate the whole workflow, but keep the JSON reasoning under 120 words with at most two decisive examples');
+  expect(prompt).toContain('For a clarity defect, cite the specific file/step and explain the competing actions or missing decision');
+  expect(prompt).not.toContain('For each clarity defect');
+  expect(prompt.endsWith(input.text)).toBe(true);
+});
+
+test('judges are asked for 120 words while the enforced reasoning limit stays below 150', () => {
+  const prompt = buildWorkflowJudgePrompt({ judgeContext: 'a workflow', judgeGoal: 'how to finish', agentCapability: 'frontier' }, { files: [], text: '' });
+  expect(prompt).toContain('keep the JSON reasoning under 120 words');
+  expect(prompt).not.toContain('150 words');
+  expect(WORKFLOW_JUDGE_RESPONSE_SCHEMA.properties.reasoning.description).toStartWith('Under 120 words');
+  expect(WORKFLOW_JUDGE_REASONING_WORD_LIMIT).toBe(150);
 });
 
 afterEach(() => {
@@ -109,6 +146,56 @@ describe('workflow judge file bundle', () => {
     expect(text).toContain('STOP and read sections/step.md.');
   });
 
+  test('cross-skill references retain complete bytes once and fail on missing assets', () => {
+    const root = fixture({
+      'example/SKILL.md': '## Begin\nRead the shared resource.\n## End',
+      'example/sections/local.md': 'Complete local section.',
+      'shared/sections/method.md': 'Shared prefix\n## End\nShared suffix',
+    });
+    const options = { root, skillPath: 'example/SKILL.md', startMarker: '## Begin', endMarker: '## End',
+      references: ['example/sections/local.md', 'shared/sections/method.md', 'shared/sections/method.md'] };
+    const input = readWorkflowJudgeInput(options);
+    expect(input.files.filter(file => file.kind === 'reference')).toEqual([
+      { path: 'shared/sections/method.md', kind: 'reference', content: 'Shared prefix\n## End\nShared suffix', startLine: 1, endLine: 3 },
+    ]);
+    expect(input.files.filter(file => file.path === 'example/sections/local.md')).toHaveLength(1);
+    expect(occurrences(input.text, 'Shared prefix')).toBe(1);
+    expect(() => readWorkflowJudgeInput({ ...options, references: ['shared/missing.md'] })).toThrow();
+    expect(() => readWorkflowJudgeInput({ ...options, references: ['../outside.md'] })).toThrow('Reference outside root');
+  });
+
+  for (const skill of ['ship', 'qa-only', 'document-release', 'review']) {
+    test(`actual ${skill} judge includes all referenced QA or documentation sections`, () => {
+      const caller = readFileSync(join(ROOT, 'test/skill-llm-eval.test.ts'), 'utf8');
+      const name = `${skill}/SKILL.md workflow`;
+      const start = caller.indexOf(`testIfSelected('${name}'`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const registration = caller.slice(start).match(/await runWorkflowJudge\(\{([\s\S]*?)\n    \}\);/);
+      expect(registration).not.toBeNull();
+      const options = new Function('QA_DISCOVERY_REFERENCES', `return ({${registration![1]}});`)(QA_DISCOVERY_REFERENCES);
+      const input = readWorkflowJudgeInput({ root: ROOT, ...options });
+      for (const file of options.references ?? []) {
+        expect(input.files.find(item => item.path === file)?.content).toBe(readFileSync(join(ROOT, file), 'utf8'));
+      }
+      if (skill === 'ship') {
+        expect(input.files.map(file => file.path)).toContain('ship/sections/documentation.md');
+        expect(input.files.map(file => file.path)).toContain('qa/sections/exploratory.md');
+      } else if (skill === 'qa-only') {
+        expect(input.files.map(file => file.path)).toContain('qa/sections/system-functional.md');
+        expect(input.files.filter(file => file.path.endsWith('/exploratory.md'))).toHaveLength(1);
+        expect(input.files.find(file => file.kind === 'entrypoint')?.content).toContain('Never fix bugs or write product tests');
+      } else if (skill === 'document-release') {
+        expect(input.files.map(file => file.path)).toContain('document-release/sections/audit-scope.md');
+        expect(input.text).toContain('Ship-owned documentation mode');
+      } else {
+        expect(input.files.map(file => file.path)).toContain('qa/sections/exploratory.md');
+        expect(input.files.map(file => file.path)).toContain('review/checklist.md');
+        expect(input.text).toContain('test_stub');
+        expect(input.text).toContain('## Step 5: Fix-First Review');
+      }
+    });
+  }
+
   test('retains section prelude and suffix exactly once when both markers are inside a section', () => {
     // Generated comments made the old 120-character prefix heuristic append
     // this whole file after its partial slice, duplicating every review pass.
@@ -200,7 +287,16 @@ describe('workflow judge file bundle', () => {
     const entrypoint = input.files.find(file => file.kind === 'entrypoint');
     expect(entrypoint?.content).toBe(source.slice(source.indexOf(startMarker), source.indexOf(endMarker, source.indexOf(startMarker))));
     expect(entrypoint?.content).toContain('git remote get-url origin');
-    expect(entrypoint?.content).toContain('**Follow every STOP and AskUserQuestion gate**');
+    expect(entrypoint?.content).toContain('STOP blocks advancement until the stated repair/resume route clears; without one, end this attempt');
+    const flow = entrypoint!.content.replace(/\s+/g, ' ');
+    expect(flow).toContain('Every new invocation repeats Steps 1–16, including both reviews and the docs audit');
+    expect(flow).toContain('children return evidence, not permission to proceed');
+    expect(flow).toContain('Follow the saved work list');
+    expect(flow).not.toContain('| At step | Outcome |');
+    expect(flow).toContain('`gstack-wtree` prints a Git tree hash');
+    expect(flow).toContain('Offline output without that fallback, failure, malformed output or an empty version is unusable');
+    expect(entrypoint?.content).toContain('Answer each AskUserQuestion before continuing');
+    expect(entrypoint?.content).toContain('Routine authorization never waives those gates or their required user decisions');
     expect(entrypoint?.content).toContain('## Step 0: Detect platform and base branch');
     expect(entrypoint?.content).toContain('gh pr view --json baseRefName');
     expect(entrypoint?.content).toContain('Print the detected base branch name.');
@@ -267,14 +363,14 @@ describe('workflow judge file bundle', () => {
 
   test('generated plan-design passes retain their full section without duplicating Pass 1', () => {
     const input = readWorkflowJudgeInput({
-      root: ROOT, skillPath: 'plan-design-review/SKILL.md', startMarker: '## Review Sections', endMarker: '## CRITICAL RULE',
+      root: ROOT, skillPath: 'plan-design-review/SKILL.md', startMarker: '## Review Sections', endMarker: ASK_QUESTIONS_HEADING,
     });
     expect(input.files.filter(file => file.kind === 'entrypoint')).toHaveLength(0);
     expect(input.files.map(file => file.path)).toEqual(sectionPaths('plan-design-review'));
     const section = input.files.find(file => file.path === 'plan-design-review/sections/review-sections.md');
     expect(section?.content).toBe(readFileSync(join(ROOT, 'plan-design-review/sections/review-sections.md'), 'utf8'));
     expect(section?.content).toStartWith('<!-- AUTO-GENERATED');
-    expect(section?.content).toContain('## CRITICAL RULE');
+    expect(section?.content).toMatch(ASK_QUESTIONS_HEADING);
     expect(section?.content).toContain('## Formatting Rules');
     expect(occurrences(input.text, '### Pass 1: Information Architecture')).toBe(1);
   });

@@ -1106,6 +1106,7 @@ export async function qualifyDia(isolation: { root: string; configFile: string }
       comparisonAttempted = true;
       comparisonSource = await runDiaLaunchComparison(account, 'source', { assetRoot: root, executableName, executableSha256: receipt.artifact.executableSha256 },
         undefined, deadline - performance.now());
+      if (!comparisonSource) throw new Error('diagnostic_source_launch_returned_no_result');
       receipt.launchComparison = { mode: 'launch-only', qualificationCredit: false, source: comparisonSource };
       receipt.browsers.source = { stage: 'delegated_comparison', launchReturned: comparisonSource.launchReturned,
         timedOut: comparisonSource.timedOut ?? false, error: comparisonSource.error ?? null };

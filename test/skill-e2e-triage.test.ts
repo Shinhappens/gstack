@@ -32,6 +32,7 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { triageLabels } from './helpers/ship-triage-labels';
 
 const evalCollector = createEvalCollector('e2e-triage');
 
@@ -175,6 +176,7 @@ For each failing test, classify it as:
 Use git diff origin/main...HEAD (or git diff main...HEAD since there's no remote) to determine which files changed on this branch.
 
 Output your classification for each failure clearly, labeling each as "IN-BRANCH" or "PRE-EXISTING" with your reasoning.
+End with one JSON object mapping each failing test file to "in-branch" or "pre-existing".
 
 This is a solo repo (REPO_MODE=solo). For pre-existing failures, recommend fixing now.`,
       workingDirectory: triageDir,
@@ -188,49 +190,20 @@ This is a solo repo (REPO_MODE=solo). For pre-existing failures, recommend fixin
     logCost('/ship triage', result);
 
     const output = result.output || '';
-    const outputLower = output.toLowerCase();
-
-    // The triage should identify the string/truncate failure as in-branch
-    const hasInBranch = outputLower.includes('in-branch') || outputLower.includes('in branch') || outputLower.includes('introduced');
-    // The triage should identify the math/divide failure as pre-existing
-    const hasPreExisting = outputLower.includes('pre-existing') || outputLower.includes('pre existing') || outputLower.includes('existed before');
-
-    console.log(`Output identifies IN-BRANCH failures: ${hasInBranch}`);
-    console.log(`Output identifies PRE-EXISTING failures: ${hasPreExisting}`);
-
-    // Check that the string/truncate bug is classified as in-branch
-    const mentionsTruncate = outputLower.includes('truncate') || outputLower.includes('string');
-    const mentionsDivide = outputLower.includes('divide') || outputLower.includes('math');
-
-    console.log(`Mentions truncate/string (in-branch bug): ${mentionsTruncate}`);
-    console.log(`Mentions divide/math (pre-existing bug): ${mentionsDivide}`);
-
-    // Verify BOTH failure classes are exercised (not just detected):
-    // The test runner must have actually run both test files
-    const ranMathTest = output.includes('math.test') || output.includes('FAIL: divide');
-    const ranStringTest = output.includes('string.test') || output.includes('FAIL: truncate');
-    console.log(`Ran math test file (pre-existing failure): ${ranMathTest}`);
-    console.log(`Ran string test file (in-branch failure): ${ranStringTest}`);
+    // Outcome: each seeded failure carries the right label, and the suite actually ran.
+    const labels = triageLabels(output);
+    const ranTests = result.toolCalls.some(call => call.tool === 'Bash'
+      && /test\/run\.js|test\/(?:math|string)\.test\.js/.test(String(call.input?.command ?? '')));
+    console.log(`Triage labels: ${JSON.stringify(labels)}; ran tests: ${ranTests}`);
 
     recordE2E(evalCollector, '/ship triage', 'Test Failure Triage E2E', result, {
-      passed: result.exitReason === 'success' && hasInBranch && hasPreExisting,
-      has_in_branch_classification: hasInBranch,
-      has_pre_existing_classification: hasPreExisting,
-      mentions_truncate: mentionsTruncate,
-      mentions_divide: mentionsDivide,
-      ran_both_test_files: ranMathTest && ranStringTest,
+      passed: result.exitReason === 'success' && ranTests && labels.string === 'in-branch' && labels.math === 'pre-existing',
     });
 
     expect(result.exitReason).toBe('success');
-    // Must classify at least one failure as in-branch AND one as pre-existing
-    expect(hasInBranch).toBe(true);
-    expect(hasPreExisting).toBe(true);
-    // Must mention the specific bugs
-    expect(mentionsTruncate).toBe(true);
-    expect(mentionsDivide).toBe(true);
-    // Must have actually run both test files (exercises both failure classes)
-    expect(ranMathTest).toBe(true);
-    expect(ranStringTest).toBe(true);
+    expect(ranTests, 'the agent must run the test suite').toBe(true);
+    expect(labels.string, 'truncate/string failure is in-branch').toBe('in-branch');
+    expect(labels.math, 'divide/math failure is pre-existing').toBe('pre-existing');
   }, CAPTURE_MS);
 });
 

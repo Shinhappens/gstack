@@ -1,9 +1,9 @@
 # gstack memory ingest — what it does, what stays local, what you can do with it
 
-This is the user-facing reference for the V1 transcript + memory ingest
-feature in `/setup-gbrain`. If you ran `/setup-gbrain` and it asked
-"Ingest THIS repo's transcripts into gbrain?", this doc explains what
-happens after you say yes.
+This is the user-facing reference for the transcript + memory ingest
+feature in `/setup-gbrain` and `/sync-gbrain`. If either asked whether to
+ingest your coding-agent sessions into gbrain, this doc explains what each
+answer does.
 
 ## What gets ingested
 
@@ -19,6 +19,105 @@ happens after you say yes.
 | Design docs | `design-doc` | `~/.gstack/projects/<slug>/*-design-*.md` | Medium |
 | Retros | `retro` | `~/.gstack/projects/<slug>/retros/*.md` | Medium |
 | Builder profile | `builder-profile-entry` | `~/.gstack/builder-profile.jsonl` | Low |
+
+## Transcripts
+
+Curated memory (learnings, timeline, plans, designs, retros, eureka, builder
+profile) syncs on every `/sync-gbrain`. Session transcripts sync only after
+you choose to share them. The choice is the `transcript_ingest_mode` config
+key, optionally narrowed by the `transcript_repos` allowlist:
+
+| Value | What `/sync-gbrain` ingests |
+|---|---|
+| `recent` | Sessions from the last 90 days |
+| `all` | All history (`--full` walks every session file) |
+| `new@2026-10-03T17:00:00Z` | Only sessions whose first record is at or after that UTC time. A session that started earlier stays out even when it is appended to later. A session with no start timestamp stays out. |
+| `off` | No transcripts; other memory still syncs |
+| `recent+repos`, `all+repos`, `new@…+repos` | The same window, only for the repos in `transcript_repos`. gstack adds and removes `+repos` itself. |
+
+Both sources are covered: Claude Code sessions (`~/.claude/projects/`) and
+Codex sessions (`~/.codex/sessions/`), from every project on this machine
+that your per-remote trust policy allows, not only the current repo. Pages go
+to your brain: the local engine (PGLite or Supabase) in local-stdio mode, or
+the artifacts repo the remote brain pulls from in remote-http mode.
+
+Set or change it:
+
+```bash
+gstack-config set transcript_ingest_mode recent   # or all, or off
+gstack-config set transcript_ingest_mode "new@$(date -u +%Y-%m-%dT%H:%M:%SZ)"   # only sessions from now on
+gstack-config set transcript_repos github.com/acme/app,github.com/acme/api       # only these repos
+gstack-config unset transcript_repos                                             # every repo again
+gstack-config has transcript_ingest_mode && gstack-config get transcript_ingest_mode
+bun run lib/transcript-consent.ts --describe                                     # the effective consent in words
+```
+
+`gstack-config set` rejects any other value and keeps the stored one. The
+cutoff takes only the `Z` (UTC) form, to the second. `transcript_repos`
+accepts any git remote spelling (`https://…`, `git@…:…`, with or without
+`.git`) and stores its canonical form; an empty list is rejected. Setting
+or clearing the allowlist updates the `+repos` marker in the same write.
+`gstack-config set transcript_ingest_mode <base>` keeps the marker while an
+allowlist exists, and `off` never carries it.
+
+**Several config roots.** When gstack reads more than one state root (for
+example `GSTACK_HOME` plus `~/.gstack`), the most restrictive answer wins:
+`off` in any root means off, the latest cutoff and any 90-day window both
+apply, and only repos in every root's allowlist count. The resolved root
+must hold the consent itself.
+
+**Not set.** Until you choose, transcripts are skipped. Each sync prints one
+line saying so, even with `--quiet`, and the next interactive `/sync-gbrain`
+asks once. Older values from previous gate versions (`A`-`E`, `incremental`)
+and values this version does not recognize also count as not chosen and get
+the question again. A stored `off` prints `transcripts off (your choice)`
+without `--quiet` and is never asked again.
+
+**One-run override.** A `--sources` list (or `GSTACK_MEMORY_INGEST_SOURCES`)
+that names `transcript` ingests transcripts for that run whatever the mode;
+the sync still prints the mode notice. An override never widens a scoped
+consent: a `new@` cutoff and the `transcript_repos` allowlist still apply.
+`--sources all`, an empty list, or a list with no valid types does not
+override.
+
+```bash
+bun run bin/gstack-gbrain-sync.ts --incremental --sources transcript
+```
+
+**What each sync tells you.** Without `--quiet` the sync prints the consent
+in words (window or cutoff, up to three repos, the config roots it came
+from). The ingest summary counts sessions left out by reason: before the
+cutoff, no start time, not in the allowlist, and repo policy deny. A sync
+under `new@` that ingests nothing says so and says new sessions will appear
+on the next sync.
+
+**Interrupted imports.** If a sync was interrupted mid-import and your
+transcript choice changed before the next run (the mode, the cutoff or the
+allowlist), the next sync restages memory from scratch once instead of
+resuming, and prints a line saying so.
+
+**Staged pages.** Transcript pages already staged under
+`~/.gstack/transcripts/` (remote-http mode) wait while the mode is not
+`recent`, `all` or `new@…`: they stay on disk and are not pushed by
+`gstack-brain-sync`. Other artifacts keep pushing. When you narrow a scoped
+consent (a later cutoff, a smaller allowlist), the next sync removes the
+staged pages that are now out of scope and prints `removed N staged
+transcript pages outside the new scope`; widening again re-stages them from
+the original sessions. Before every push, `gstack-brain-sync` also checks
+its own unpushed commits and rewrites them without any page outside your
+consent (`removed N excluded transcript pages from unpublished sync
+commits`). The removal covers staged and unpushed pages only.
+
+**Already-ingested transcripts stay.** Switching to `off` or narrowing the
+scope stops new ingests; it does not remove pages already in the brain or
+already pushed. Delete them there (see "Delete a page" below).
+
+**Downgrading gstack.** A gstack that predates `new@` and `transcript_repos`
+reads those values as unrecognized and ingests no transcripts
+automatically. It does honour an explicit transcript override without any
+scope, so before downgrading: remove `--sources transcript` and
+`GSTACK_MEMORY_INGEST_SOURCES=transcript` from scripts, and let pending sync
+publish, or run `gstack-config set transcript_ingest_mode off`.
 
 ## What stays local
 
@@ -130,8 +229,8 @@ replaceable from disk on each Mac.
 
 - **Browse by type:**
   ```bash
-  gbrain list_pages --type transcript --limit 10
-  gbrain list_pages --type ceo-plan
+  gbrain list --type transcript --limit 10
+  gbrain list --type ceo-plan
   ```
 
 - **Read a specific page:**
@@ -148,8 +247,8 @@ replaceable from disk on each Mac.
   on the brain remote.
 
 - **Bulk-delete by criteria** (V1.0.1 follow-up — `gstack-transcript-prune`
-  helper). For V1.0, use `gbrain delete_page <slug>` per-page or write
-  a small loop over `gbrain list_pages` output.
+  helper). For V1.0, use `gbrain delete <slug>` per-page or write
+  a small loop over `gbrain list` output.
 
 - **Disable entirely:**
   ```bash

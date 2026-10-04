@@ -33,8 +33,8 @@ const RESOLVER_NAMES = new Set(Object.keys(RESOLVERS));
 // ─── hosts/index.ts ─────────────────────────────────────────
 
 describe('hosts/index.ts', () => {
-  test('ALL_HOST_CONFIGS has 10 hosts', () => {
-    expect(ALL_HOST_CONFIGS.length).toBe(10);
+  test('ALL_HOST_CONFIGS has 11 hosts', () => {
+    expect(ALL_HOST_CONFIGS.length).toBe(11);
   });
 
   test('ALL_HOST_NAMES matches config names', () => {
@@ -114,6 +114,8 @@ describe('validateHostConfig', () => {
       displayName: 'Test Host',
       cliCommand: 'testcli',
       defaultModel: 'claude',
+      tier: 'experimental',
+      capabilities: { toolExecution: true, questions: 'prose', planMode: false, delegation: false, browser: true, safetyHooks: 'advisory' },
       globalRoot: '.test/skills/gstack',
       localSkillRoot: '.test/skills/gstack',
       hostSubdir: '.test',
@@ -562,7 +564,10 @@ describe('host config correctness', () => {
 
   test('codex has boundary instruction', () => {
     expect(codex.boundaryInstruction).toBeDefined();
-    expect(codex.boundaryInstruction).toContain('Do NOT read');
+    expect(codex.boundaryInstruction).toMatch(/do not read or execute any files under/i);
+    for (const glob of ['~/.claude/', '~/.agents/', '.claude/skills/', 'agents/']) {
+      expect(codex.boundaryInstruction).toContain(glob);
+    }
   });
 
   test('openclaw has tool rewrites for exec/read/write', () => {
@@ -613,6 +618,175 @@ describe('host config correctness', () => {
       expect(config.runtimeRoot.globalSymlinks.length).toBeGreaterThan(0);
       expect(config.runtimeRoot.globalSymlinks).toContain('bin');
       expect(config.runtimeRoot.globalSymlinks).toContain('ETHOS.md');
+    }
+  });
+});
+
+// ─── Host contract: tier + capabilities (docs/ADDING_A_HOST.md) ─────────────
+
+describe('host contract: one tier vocabulary everywhere', () => {
+  const setupSrc = fs.readFileSync(path.join(ROOT, 'setup'), 'utf8');
+  const registrySrc = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-install-registry.sh'), 'utf8');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const hostDoc = fs.readFileSync(path.join(ROOT, 'docs', 'ADDING_A_HOST.md'), 'utf8');
+  const byTier = (tier: string) => ALL_HOST_CONFIGS.filter(c => c.tier === tier).map(c => c.name);
+
+  test('every host declares a tier and coherent capabilities', () => {
+    for (const c of ALL_HOST_CONFIGS) {
+      expect(['full', 'experimental', 'instruction-only']).toContain(c.tier);
+      expect(validateHostConfig(c, RESOLVER_NAMES)).toEqual([]);
+    }
+    expect(validateHostConfig({ ...ALL_HOST_CONFIGS[0], capabilities: { ...ALL_HOST_CONFIGS[0].capabilities, toolExecution: false } }))
+      .toContain('capabilities.browser requires toolExecution');
+    expect(validateHostConfig({ ...ALL_HOST_CONFIGS[0], tier: 'beta' as never })).toContain("tier 'beta' must be one of full, experimental, instruction-only");
+  });
+
+  test('only hosts that run gstack hooks claim enforced safety', () => {
+    for (const c of ALL_HOST_CONFIGS) {
+      expect(c.capabilities.safetyHooks).toBe(c.name === 'claude' ? 'enforced' : 'advisory');
+    }
+  });
+
+  test('instruction-only hosts have no install arm; installable hosts do', () => {
+    const start = setupSrc.indexOf('case "$HOST" in');
+    const block = setupSrc.slice(start, setupSrc.indexOf('\nesac', start));
+    const installList = block.match(/^\s*([a-z|]+)\) ;;/m)![1].split('|').filter(h => h !== 'auto');
+    expect(installList.sort()).toEqual([...byTier('full'), ...byTier('experimental')].sort());
+    for (const name of byTier('instruction-only')) expect(installList).not.toContain(name);
+  });
+
+  test('gstack_host_tier (setup summaries, --status) matches hosts/index.ts', () => {
+    for (const c of ALL_HOST_CONFIGS) {
+      const r = Bun.spawnSync(['bash', '-c', `. "${path.join(ROOT, 'bin', 'gstack-install-registry.sh')}"; gstack_host_tier ${c.name}`], { timeout: 30_000 });
+      expect(r.stdout.toString().trim()).toBe(c.tier);
+    }
+    expect(registrySrc).toContain('gstack_host_tier()');
+  });
+
+  test('./setup --help lists every host under its tier', () => {
+    const r = Bun.spawnSync(['bash', path.join(ROOT, 'setup'), '--help'], { timeout: 30_000 });
+    const help = r.stdout.toString();
+    for (const tier of ['full', 'experimental', 'instruction-only']) {
+      const line = help.split('\n').find(l => l.trim().startsWith(`${tier}:`));
+      expect(line, `--help has a ${tier}: line`).toBeTruthy();
+      const listed = line!.split(':')[1].split(',').map(s => s.trim()).filter(Boolean);
+      expect(listed.sort()).toEqual(byTier(tier).sort());
+    }
+    expect(help).toContain('Default: claude');
+    expect(help).toContain('--host auto');
+  });
+
+  test('README host matrix has one row per host with its tier and install command', () => {
+    const start = readme.indexOf('| Agent | Tier |');
+    expect(start, 'README has the host matrix').toBeGreaterThan(-1);
+    const rows = readme.slice(start).split('\n').slice(2).filter(l => l.startsWith('|'));
+    for (const c of ALL_HOST_CONFIGS) {
+      const row = rows.find(r => r.includes(`\`--host ${c.name}\``));
+      expect(row, `README matrix row for ${c.name}`).toBeTruthy();
+      expect(row!.split('|')[2].trim().toLowerCase()).toBe(c.tier);
+      const safety = c.capabilities.safetyHooks === 'enforced' ? 'enforced' : 'advisory';
+      expect(row!.toLowerCase()).toContain(safety);
+    }
+  });
+
+  test('every full-tier host has a dated certification record', () => {
+    const section = hostDoc.slice(hostDoc.indexOf('## Certify your host'));
+    expect(section.length).toBeGreaterThan(20);
+    for (const name of byTier('full')) {
+      expect(section, `certification row for ${name}`).toMatch(new RegExp(`\\| ${name} \\|[^\\n]*\\d{4}-\\d{2}-\\d{2}`));
+    }
+  });
+
+  test('ADDING_A_HOST.md no longer claims zero setup code changes', () => {
+    expect(hostDoc).not.toMatch(/zero code changes to setup/i);
+    expect(readme).not.toMatch(/one TypeScript config file, zero code changes/i);
+  });
+});
+
+describe('hookless hosts render an honest "not enforced" safety line', () => {
+  const OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-advisory-'));
+  beforeAll(() => {
+    const r = Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'opencode', '--out-dir', OUT], { cwd: ROOT, timeout: 120_000 });
+    if (r.exitCode !== 0) throw new Error(r.stderr.toString());
+  });
+  afterAll(() => fs.rmSync(OUT, { recursive: true, force: true }));
+
+  for (const skill of ['careful', 'freeze', 'guard']) {
+    test(`${skill}: advisory, not blocked`, () => {
+      const md = fs.readFileSync(path.join(OUT, '.opencode', 'skills', `gstack-${skill}`, 'SKILL.md'), 'utf8');
+      expect(md).toContain('not enforced on OpenCode');
+      expect(md).toContain('advisory, not blocked');
+      expect(md.split('\n').slice(0, 12).join('\n')).not.toContain('hooks:');
+      const claude = fs.readFileSync(path.join(ROOT, skill, 'SKILL.md'), 'utf8');
+      expect(claude).not.toContain('not enforced on');
+    });
+  }
+});
+
+describe('Copilot host render (#393)', () => {
+  const OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-copilot-'));
+  beforeAll(() => {
+    const r = Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'copilot', '--out-dir', OUT], { cwd: ROOT, timeout: 120_000 });
+    if (r.exitCode !== 0) throw new Error(r.stderr.toString());
+  });
+  afterAll(() => fs.rmSync(OUT, { recursive: true, force: true }));
+  const read = (skill: string) => fs.readFileSync(path.join(OUT, '.copilot', 'skills', skill, 'SKILL.md'), 'utf8');
+
+  test('paths name the Copilot install, never Claude or Codex', () => {
+    for (const skill of ['gstack-review', 'gstack-ship', 'gstack-careful', 'gstack-upgrade']) {
+      const md = read(skill);
+      expect(md).not.toContain('~/.claude/skills/gstack');
+      expect(md).not.toContain('$HOME/.claude/skills/gstack');
+      expect(md).not.toContain('.codex/skills');
+    }
+    expect(read('gstack-upgrade')).toContain('$HOME/.copilot/skills/gstack/.source-path');
+    expect(read('gstack-upgrade')).toContain('./setup --host copilot --refresh-registered');
+  });
+
+  test('the tool-name glossary lands ahead of the preamble STATUS rules', () => {
+    const md = read('gstack-review');
+    const glossary = md.indexOf('**GitHub Copilot tool names:**');
+    expect(glossary).toBeGreaterThan(-1);
+    expect(glossary).toBeLessThan(md.indexOf('Read the echoed `KEY: value` STATUS lines'));
+  });
+
+  test('sensitive skills are not model-invocable', () => {
+    expect(read('gstack-ship')).toMatch(/^disable-model-invocation: true$/m);
+  });
+});
+
+describe('host renders name the host\'s own tools and identities (#2626, #2015, #2825, #2338)', () => {
+  const OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-host-tools-'));
+  beforeAll(() => {
+    for (const host of ['opencode', 'hermes', 'codex']) {
+      const r = Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', host, '--out-dir', OUT], { cwd: ROOT, timeout: 120_000 });
+      if (r.exitCode !== 0) throw new Error(r.stderr.toString());
+    }
+  });
+  afterAll(() => fs.rmSync(OUT, { recursive: true, force: true }));
+  const read = (subdir: string, skill: string) => fs.readFileSync(path.join(OUT, subdir, 'skills', skill, 'SKILL.md'), 'utf8');
+
+  test.each([['.opencode', '`question` tool'], ['.hermes', '`clarify` tool']])('%s preamble maps AskUserQuestion to %s', (subdir, tool) => {
+    const md = read(subdir, 'gstack-review');
+    const glossary = md.indexOf(tool);
+    expect(glossary).toBeGreaterThan(-1);
+    expect(glossary).toBeLessThan(md.indexOf('Read the echoed `KEY: value` STATUS lines'));
+  });
+
+  test('every Hermes skill\'s frontmatter name equals its directory (#2825)', () => {
+    const dir = path.join(OUT, '.hermes', 'skills');
+    const names = fs.readdirSync(dir).filter(d => fs.existsSync(path.join(dir, d, 'SKILL.md')));
+    expect(names.length).toBeGreaterThan(20);
+    for (const name of names) {
+      expect(fs.readFileSync(path.join(dir, name, 'SKILL.md'), 'utf8').match(/^name:\s*(\S+)/m)![1]).toBe(name);
+    }
+  });
+
+  test('Codex renders never name a ~/.Codex path (#2338)', () => {
+    const dir = path.join(OUT, '.agents', 'skills');
+    for (const name of fs.readdirSync(dir)) {
+      const md = path.join(dir, name, 'SKILL.md');
+      if (fs.existsSync(md)) expect(fs.readFileSync(md, 'utf8')).not.toMatch(/\.Codex\//);
     }
   });
 });

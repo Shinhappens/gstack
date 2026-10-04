@@ -1,5 +1,6 @@
 import type { TemplateContext } from './types';
 import { asideExecPrelude } from './aside';
+import { generateTestValueBar, degradedMessage, REASON_CODES, SWEEP_POINTER, type TestValueBarMode } from './test-value';
 
 export function generateTestBootstrap(ctx: TemplateContext): string {
   return `## Test Framework Bootstrap
@@ -59,7 +60,9 @@ Store conventions as prose context for use in ${ctx.skillName === 'ship' ? 'Step
 
 Absent config files and absent \`tests/\` directories are NOT evidence of "no tests": Django keeps tests in \`<app>/tests.py\`, Go in \`*_test.go\` beside the source, Rust in \`#[test]\` blocks inside \`src/\`. A green \`python manage.py test\` with no \`pytest.ini\` is a tested project, not a bootstrap candidate.
 
-**If BOOTSTRAP_DECLINED** appears: Print "Test bootstrap previously declined — skipping." **Skip the rest of bootstrap.**
+${ctx.skillName === 'ship'
+  ? '**If BOOTSTRAP_DECLINED** appears:\n- Step 5\'s explicit Add tests choice overrides that marker for this invocation only: continue to runtime detection and B2–B3, including framework approval.\n- Otherwise print "Test bootstrap previously declined — skipping" and **skip the rest of bootstrap**.'
+  : '**If BOOTSTRAP_DECLINED** appears: Print "Test bootstrap previously declined — skipping." **Skip the rest of bootstrap.**'}
 
 **If NO ecosystem marker matched:** Use AskUserQuestion:
 "I couldn't detect your project's language. What runtime are you using?"
@@ -113,7 +116,7 @@ If multiple runtimes detected (monorepo) → ask which runtime to set up first, 
 3. Create directory structure (test/, spec/, etc.)
 4. Create one example test matching the project's code to verify setup works
 
-If package installation fails → debug once. If still failing → revert with \`git checkout -- package.json package-lock.json\` (or equivalent for the runtime). Warn user and continue without tests.
+Record existing files and edits before installing. If package installation fails → debug once. If still failing → undo only the changes this bootstrap made and preserve the user's edits; never blanket-checkout. Warn user and continue without tests.
 
 ### B4.5. First real tests
 
@@ -122,7 +125,7 @@ Generate 3-5 real tests for existing code:
 1. **Find recently changed files:** \`git log --since=30.days --name-only --format="" | sort | uniq -c | sort -rn | head -10\`
 2. **Prioritize by risk:** Error handlers > business logic with conditionals > API endpoints > pure functions
 3. **For each file:** Write one test that tests real behavior with meaningful assertions. Never \`expect(x).toBeDefined()\` — test what the code DOES.
-4. Run each test. Passes → keep. Fails → fix once. Still fails → delete silently.
+4. Run each test. Passes → keep. Fails → fix an invalid test or fixture once. Still fails → drop it and name it, with its failure output, in the bootstrap summary; a failure in the code under test is a finding for the user, never a silent deletion.
 5. Generate at least 1 test, cap at 5.
 
 Never import secrets, API keys, or credentials in test files. Use environment variables or test fixtures.
@@ -134,7 +137,7 @@ Never import secrets, API keys, or credentials in test files. Use environment va
 {detected test command}
 \`\`\`
 
-If tests fail → debug once. If still failing → revert all bootstrap changes and warn user.
+If tests fail → debug once. If still failing → undo only this bootstrap's own changes, preserve the user's edits, and warn user with the failure.
 
 ### B5.5. CI/CD pipeline
 
@@ -185,7 +188,7 @@ Append a \`## Testing\` section:
 git status --porcelain
 \`\`\`
 
-Only commit if there are changes. Stage all bootstrap files (config, test directory, TESTING.md, CLAUDE.md, .github/workflows/test.yml if created):
+Only commit if there are changes. Stage the bootstrap's own files by name (config, test directory, TESTING.md, CLAUDE.md, .github/workflows/test.yml if created); if unrelated edits are already staged, stop and ask before committing:
 \`git commit -m "chore: bootstrap test framework ({framework name})"\`
 
 ---`;
@@ -194,38 +197,59 @@ Only commit if there are changes. Stage all bootstrap files (config, test direct
 // ─── Test Coverage Audit ────────────────────────────────────
 //
 // Shared methodology for codepath tracing, ASCII diagrams, and test gap analysis.
-// Three modes, three placeholders, one inner function:
+// Two modes, one inner function; both embed the test value bar (test-value.ts):
 //
 //   {{TEST_COVERAGE_AUDIT_PLAN}}   → plan-eng-review: adds missing tests to the plan
-//   {{TEST_COVERAGE_AUDIT_SHIP}}   → ship: auto-generates tests, coverage summary
-//   {{TEST_COVERAGE_AUDIT_REVIEW}} → review: generates tests via Fix-First (ASK)
+//   {{TEST_COVERAGE_AUDIT_SHIP}}   → ship: generates tests, coverage summary
+//   {{TEST_COVERAGE_GATE_SHIP}}    → ship: parent-owned coverage gate
 //
-//   ┌────────────────────────────────────────────────┐
-//   │  generateTestCoverageAuditInner(mode)          │
-//   │                                                │
-//   │  SHARED: framework detect, codepath trace,     │
-//   │    ASCII diagram, quality rubric, E2E matrix,  │
-//   │    regression rule                             │
-//   │                                                │
-//   │  plan:   edit plan file, write artifact        │
-//   │  ship:   auto-generate tests, write artifact   │
-//   │  review: Fix-First ASK, INFORMATIONAL gaps     │
-//   └────────────────────────────────────────────────┘
+// /review uses its static testing specialist (review/specialists/testing.md).
 
-type CoverageAuditMode = 'plan' | 'ship' | 'review';
+export type CoverageAuditMode = Extract<TestValueBarMode, 'plan' | 'ship'>;
 
-function generateTestCoverageAuditInner(mode: CoverageAuditMode, part: 'audit' | 'gate' = 'audit'): string {
+function generateBaseControl(ctx: TemplateContext): string {
+  return `**Red-first proof.** Apply the value bar's Regression proof to every regression test: the diff at HEAD is the pre-fix code, so run the new test at HEAD before any repair. Then, unless the parent says \`Base control: off\`, run this base control once per regression test in diff order, within a 3-minute total per /ship run (\`Base control budget:\` seconds per test, default 90). Past the total, record "base control unavailable: budget" and report "N of M regression tests got base control". The block is one shell invocation; it installs nothing and runs no build or postinstall.
+
+\`\`\`bash
+# Set: BASE = the base branch this /ship run resolved; TEST = the test file; FIXTURES = new
+# test-only fixtures it imports (repo-relative, may be empty); RUN = the detected
+# runner for one file (e.g. "bun test $TEST"); BUDGET = seconds for this run (default 90).
+ROOT=$(git rev-parse --show-toplevel)
+CTL_TMP=$(mktemp -d "\${TMPDIR:-/tmp}/gstack-base-control.XXXXXX")
+cleanup() { git -C "$ROOT" worktree remove --force "$CTL_TMP/wt" >/dev/null 2>&1; rm -rf "$CTL_TMP"; [ -e "$CTL_TMP" ] && echo "BASE_CONTROL_LEFTOVER: $CTL_TMP (run: git worktree prune)"; }
+trap cleanup EXIT INT TERM
+(
+  [ -f "$ROOT/package.json" ] || { echo "BASE_CONTROL: unavailable (ecosystem)"; exit 0; }
+  git -C "$ROOT" remote get-url origin >/dev/null 2>&1 || { echo "BASE_CONTROL: unavailable (no base remote)"; exit 0; }
+  timeout 30 git -C "$ROOT" fetch --quiet origin "$BASE" || { echo "BASE_CONTROL: unavailable (base not fetched)"; exit 0; }
+  git -C "$ROOT" worktree add --quiet --detach "$CTL_TMP/wt" "origin/$BASE" >/dev/null 2>&1 || { echo "BASE_CONTROL: unavailable (worktree add failed)"; exit 0; }
+  for f in $TEST $FIXTURES; do mkdir -p "$CTL_TMP/wt/$(dirname "$f")" && cp "$ROOT/$f" "$CTL_TMP/wt/$f"; done
+  [ -d "$ROOT/node_modules" ] && ln -s "$ROOT/node_modules" "$CTL_TMP/wt/node_modules"
+  cd "$CTL_TMP/wt" && timeout "\${BUDGET:-90}" sh -c "$RUN" > "$CTL_TMP/out" 2>&1; rc=$?
+  tail -n 40 "$CTL_TMP/out"
+  if [ "$rc" -eq 0 ]; then echo "BASE_CONTROL: passes at base"
+  elif [ "$rc" -eq 124 ]; then echo "BASE_CONTROL: unavailable (budget)"
+  else echo "BASE_CONTROL: fails at base (exit $rc)"; fi
+)
+\`\`\`
+
+Classify "fails at base" from the output: a failure in the test's own assertion marks it invalid (correct once or drop it); an import, collection, missing generated artifact or dependency failure is "base control unavailable: collection error" and the test stays. Print each unavailable result as: ${degradedMessage(ctx, 'baseControlUnavailable')}
+
+Return \`"regression_proof":{"red_at_head":N,"base_green":N,"base_unavailable":N}\` counts in the JSON and each test's record line in the diagram.`;
+}
+
+const COVERAGE_GOAL = 'Coverage goal: every changed behavior is protected by a test that would catch a real regression. Test count is not a goal.';
+
+export function generateTestCoverageAuditInner(ctx: TemplateContext, mode: CoverageAuditMode, part: 'audit' | 'gate' = 'audit'): string {
   const sections: string[] = [];
   const subheading = mode === 'plan' ? '####' : '###';
   let gate = '';
 
   // ── Intro (mode-specific) ──
   if (mode === 'ship') {
-    sections.push(`100% coverage is the goal — every untested path is a path where bugs hide and vibe coding becomes yolo coding. Evaluate what was ACTUALLY coded (from the diff), not what was planned.`);
-  } else if (mode === 'plan') {
-    sections.push(`100% coverage is the goal. Identify the tests each planned codepath needs. Add required proof for an exact approved behavior without asking again; take new policies or optional verification depth through the decision gate before treating their tests as accepted work. Review the requirements here; do not build the proposed tests.`);
+    sections.push(`${COVERAGE_GOAL} Evaluate what was ACTUALLY coded (from the diff), not what was planned.`);
   } else {
-    sections.push(`100% coverage is the goal. Evaluate every codepath changed in the diff and identify test gaps. Gaps become INFORMATIONAL findings that follow the Fix-First flow.`);
+    sections.push(`${COVERAGE_GOAL} Identify the tests each planned codepath needs. Add required proof for an exact approved behavior without asking again; take new policies or optional verification depth through the decision gate before treating their tests as accepted work. Review the requirements here; do not build the proposed tests.`);
   }
 
   // ── Test framework detection (shared) ──
@@ -255,7 +279,7 @@ ls jest.config.* vitest.config.* playwright.config.* cypress.config.* .rspec pyt
 git ls-files | grep -cE '(^|/)(tests?|spec|__tests__)/|(^|/)tests?\\.py$|(^|/)test_[^/]+\\.py$|_test\\.(go|py|rb|ts|js|exs)$|\\.(test|spec)\\.[jt]sx?$|_spec\\.rb$|Test\\.(java|kt)$' | sed 's/^/TESTFILES:/'
 \`\`\`
 
-3. **If no framework detected:**${mode === 'ship' ? ' use the bootstrap decision already made in Step 4; report diagram-only coverage if setup was declined. Do not restart bootstrap from this audit.' : mode === 'plan' ? ' State that the framework is unknown; continue the diagram and planned assertions. If proposing a new framework, settle that choice through Decision procedure in Test step 5. Reuse an exact prior approval; with no selection proposed, ask no framework question. Do not install a framework or write the proposed tests during this review.' : ' still produce the coverage diagram, but skip test generation.'}`);
+3. **If no framework detected:**${mode === 'ship' ? ' use the bootstrap decision already made in Step 4; report diagram-only coverage if setup was declined. Do not restart bootstrap from this audit.' : ' State that the framework is unknown; continue the diagram and planned assertions. If proposing a new framework, settle that choice through Decision procedure in Test step 5. Reuse an exact prior approval; with no selection proposed, ask no framework question. Do not install a framework or write the proposed tests during this review.'}`);
 
   // ── Before/after count (ship only) ──
   if (mode === 'ship') {
@@ -275,12 +299,12 @@ Store this number for the PR body.`);
     ? `**Step 1. Trace every codepath in the plan:**
 
 Read the plan document. For each new feature, service, endpoint, or component described, trace how data will flow through the code — don't just list planned functions, actually follow the planned execution:`
-    : `**${mode === 'ship' ? '1' : 'Step 1'}. Trace every codepath changed** using \`git diff origin/<base>${mode === 'ship' ? '' : '...HEAD'}\`:
+    : `**1. Trace every codepath changed** using \`git diff origin/<base>\`:
 
 Read every changed file. For each one, trace how data flows through the code — don't just list functions, actually follow the execution:`;
 
   const traceStep1 = mode === 'plan'
-    ? `1. **Read the plan.** For each planned component, understand what it does and how it connects to existing code. When grounded in concrete source and test files, read them in a dedicated tool call before drawing the diagram. Do not mix diff, grep, package/config, git, or commentary into that read; use separate calls for context. Base the diagram on that read.`
+    ? `1. **Read the plan.** For each planned component, see how it connects to existing code. When grounded in concrete source and test files, read them in a dedicated tool call before drawing the diagram (\`cat -n src/f && echo -- && cat -n test/f\`). Do not mix diff, grep, config, git or commentary into that read; use separate calls for context. Base the diagram on that read.`
     : `1. **Read the diff.** For each changed file, read the full file (not just the diff hunk) to understand context.`;
 
   sections.push(`
@@ -317,7 +341,7 @@ context. Base the diagram on that read.
    - Every call to another function (trace into it — does IT have untested branches?)
    - Every edge: what happens with null input? Empty array? Invalid type?
 
-This is the critical step — you're building a map of every line of code that can execute differently based on input. Every branch in this diagram needs a test.`);
+This is the critical step — you're building a map of every line of code that can execute differently based on input. Every branch in this diagram needs coverage that would catch a real regression; the test value bar below decides whether that is a new test, an extension of an existing one, or already covered.`);
 
   // ── User flow coverage (shared) ──
   sections.push(`
@@ -325,7 +349,7 @@ This is the critical step — you're building a map of every line of code that c
 
 Code coverage isn't enough — you need to cover how real users interact with ${mode === 'plan' ? 'the selected target. For each existing or proposed feature' : 'the changed code. For each changed feature'}, think through:
 
-- **User flows:** What sequence of actions does a user take that touches this code? Map the full journey (e.g., "user clicks 'Pay' → form validates → API call → success/failure screen"). Each step in the journey needs a test.
+- **User flows:** What sequence of actions does a user take that touches this code? Map the full journey (e.g., "user clicks 'Pay' → form validates → API call → success/failure screen"). Each step in the journey needs coverage.
 - **Interaction edge cases:** What happens when the user does something unexpected?
   - Double-click/rapid resubmit
   - Navigate away mid-operation (back button, close tab, click another link)
@@ -355,7 +379,9 @@ Go through your diagram branch by branch — both code paths AND user flows. For
 Quality scoring rubric:
 - ★★★  Tests behavior with edge cases AND error paths
 - ★★   Tests correct behavior, happy path only
-- ★    Smoke test / existence check / trivial assertion (e.g., "it renders", "it doesn't throw")`);
+- ★    Smoke test / existence check / trivial assertion (e.g., "it renders", "it doesn't throw"); weak, never counts as coverage
+
+${generateTestValueBar(ctx, [mode])}`);
 
   // ── E2E test decision matrix (shared) ──
   sections.push(`
@@ -394,7 +420,9 @@ A regression is when:
 - The existing test suite (if any) doesn't cover the changed path
 - The change introduces a new failure mode for existing callers
 
-When uncertain whether a change is a regression, err on the side of writing the test.${mode === 'review' ? '\n\nFormat: commit as `test: regression test for {what broke}`' : ''}`);
+When uncertain whether a change is a regression, err on the side of writing the test.
+
+${generateBaseControl(ctx)}`);
 
   // ── ASCII coverage diagram (shared) ──
   sections.push(`
@@ -430,7 +458,7 @@ Avoid bare \`[ ]\` or \`[x]\` in diagrams unless the block includes
 \`Legend: [x] tested | [ ] no test\`. Prefer \`[GAP]\`, \`[★★ TESTED]\`,
 \`[→E2E]\`, \`[→EVAL]\`; keep user-flow markers off code-path rows.
 
-**Fast path:** All paths covered → "${mode === 'ship' ? 'Step 7' : mode === 'review' ? 'Step 4.75' : 'Test review'}: All new code paths have test coverage ✓" ${mode === 'plan' ? 'Still check LLM/eval scope and produce the Test Plan Artifact below.' : 'Continue.'}`);
+**Fast path:** All paths covered → "${mode === 'ship' ? 'Step 7' : 'Test review'}: All new code paths have test coverage ✓" ${mode === 'plan' ? 'Still check LLM/eval scope and produce the Test Plan Artifact below.' : 'Continue.'}`);
 
   // ── Mode-specific action section ──
   if (mode === 'plan') {
@@ -445,7 +473,10 @@ Collect the requirements for each GAP and the LLM/eval scope above. Carry forwar
 - What test file to create (match existing naming conventions)
 - What the test should assert (specific inputs → expected outputs/behavior)
 - Whether it's a unit test, E2E test, or eval (use the decision matrix)
+- Its value card (test value bar above)
 - For regression risks: flag as **CRITICAL** and name the behavior to protect
+
+A proposal that fails the value bar becomes "extend <existing test>" or is dropped with a one-line reason. Also list **Tests made obsolete by this plan** (proposal only; retiring one still needs a complete retirement card at implementation time, see /test-audit).
 
 Run the decision gate for this section's new or reopened choices. **STOP for each pending decision.** Wait for its answer before applying that remedy, moving to the next section or calling ExitPlanMode.
 
@@ -458,14 +489,16 @@ ${subheading} Test Plan Artifact
 After resolving the Test review decisions, record the approved test requirements in an artifact for \`/qa\` and \`/qa-only\`. List any unresolved choices separately as pending, not required implementation. Update this artifact if later approved decisions change the tests. Use the Review record and write policy above.
 
 \`\`\`bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" && mkdir -p ~/.gstack/projects/$SLUG  # sets SLUG and BRANCH
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "\${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+BRANCH=$(~/.claude/skills/gstack/bin/gstack-slug --get BRANCH 2>/dev/null)
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null) && mkdir -p "$GSTACK_STATE_ROOT/projects/$SLUG" && echo "PROJECT_DIR: $GSTACK_STATE_ROOT/projects/$SLUG"  # sets SLUG and BRANCH
 TEST_PLAN_USER=$(whoami)
 DATETIME=$(date +%Y%m%d-%H%M%S)
 \`\`\`
 
 Use \`SLUG\` and the sanitized \`BRANCH\` from gstack-slug, \`TEST_PLAN_USER\` for {user}, and \`DATETIME\` for {datetime}. Set {date} to today. Read the local origin URL with \`git remote get-url origin\` and use its owner/repo; without an origin, write \`local-only\`. No network request is needed.
 
-Write to \`~/.gstack/projects/{slug}/{user}-{branch}-eng-review-test-plan-{datetime}.md\`:
+Write to \`<PROJECT_DIR>/{user}-{branch}-eng-review-test-plan-{datetime}.md\` (\`PROJECT_DIR\` printed above):
 
 \`\`\`markdown
 # Test Plan
@@ -484,10 +517,16 @@ Repo: {owner/repo}
 
 ## Critical Paths
 - {end-to-end flow that must work}
+  Value: protects={...}; fails_when={...}; why_new={...}; seam=none
+
+## Tests to Retire
+- {existing test made obsolete by this plan and why, or none}
 
 ## Pending Decisions
 - {unapproved test requirement and its ledger row, or none}
 \`\`\`
+
+Give each Edge Case and Critical Path entry its value card line. \`/test-audit\` reads \`## Tests to Retire\` from the newest artifact for the branch as seed candidates.
 
 This file is consumed by \`/qa\` and \`/qa-only\` as primary test input. Include only the information that helps a QA tester know **what to test and where** — not implementation details.`);
   } else if (mode === 'ship') {
@@ -495,16 +534,21 @@ This file is consumed by \`/qa\` and \`/qa-only\` as primary test input. Include
 **5. Generate tests for uncovered paths:**
 
 If test framework detected (or bootstrapped in Step 4):
+- Apply the test value bar before writing each test. Extend an existing test (a new table row, fixture case or assertion) before creating a file. Record every proposal you decline in \`tests_rejected\` with a \`reason_code\` from \`${REASON_CODES.join(', ')}\`.
+- Never add a production seam for a test; a seam that is not \`none\` names its non-test callers: \`seam=<name> (non-test callers: N, via <search command>)\`.
+- Write the value card as a header comment in each generated or extended test.
 - Prioritize error handlers and edge cases first (happy paths are more likely already tested)
 - Read 2-3 existing test files to match conventions exactly
-- Generate unit tests. Mock all external dependencies (DB, API, Redis).
+- Generate the smallest native test for each path: unit tests for logic, mocking only services unrelated to the behavior under test (integration points where mocking hides real failures go to [→E2E]).
 - For paths marked [→E2E]: generate integration/E2E tests using the project's E2E framework (Playwright, Cypress, Capybara, etc.)
 - For paths marked [→EVAL]: generate eval tests using the project's eval framework, or flag for manual eval if none exists
 - Write tests that exercise the specific uncovered path with real assertions
 - Run each test. Passes → keep the change and report its path; the parent commits in Step 15.
-- Fails → fix once. Still fails → revert, note gap in diagram.
+- Fails → diagnose whether the test/fixture is invalid or a declared product contract is broken. Correct a demonstrated test defect once; preserve a valid red regression and route the reproduced product failure through the parent's fix/approval flow. Never delete or weaken it to manufacture green; retain unresolved coverage in the diagram.
 
-Caps: 30 code paths max, 20 tests generated max (code + user flow combined), 2-min per-test exploration cap.
+Caps: 30 code paths max; 5 tests per generation pass (code + user flow combined; the parent's \`Generation cap:\` overrides 5); an extension uses one slot and a rejection uses none; 2-min per-test exploration cap. List each remaining gap below the diagram (inside \`diagram\`) as a proposed test with its value card.
+
+Do not rate stars for tests you wrote in this pass: count them as unrated (weak, reason \`unrated\`). The parent's read-only rating dispatch rates them. Counts are disjoint, precedence extended > added > rejected: one gap lands in at most one of \`tests_extended\`, \`tests_added\`, \`tests_rejected\`.
 
 If no test framework AND user declined bootstrap → diagram only, no generation. Note: "Test generation skipped — no test framework configured."
 
@@ -518,41 +562,50 @@ git ls-files 2>/dev/null | grep -E '(\\.test\\.|\\.spec\\.|_test\\.|_spec\\.)' |
 \`\`\`
 
 For PR body: \`Tests: {before} → {after} (+{delta} new)\`
-Coverage line: \`Test Coverage Audit: N new code paths. M covered (X%). K tests generated, awaiting parent commit.\``);
+Coverage line: \`Test Coverage Audit: N new code paths. M covered (Y% any test, X% value-weighted). K tests generated, awaiting parent commit.\``);
 
     gate = `
 **7. Coverage gate:**
 
-The parent owns this gate after receiving the audit result, including after an inline fallback. Generated tests stay uncommitted until Step 15. Any further generation uses the same audit prompt with the remaining gaps and pass count supplied.
+The parent owns this gate, including after inline fallback. Generated tests stay uncommitted until Step 15. The gate only asks; it never hard-fails. Use Step 7's remaining generation allowance; supply it and the remaining gaps to the same audit prompt. At the cap, omit A's generation pass and recommend stopping; A then only lists proposals and the listed risk choices remain available.
 
-Before proceeding, check CLAUDE.md for a \`## Test Coverage\` section with \`Minimum:\` and \`Target:\` fields. If found, use those percentages. Otherwise use defaults: Minimum = 60%, Target = 80%.
+Read CLAUDE.md's \`## Test Coverage\` section for \`Minimum:\` and \`Target:\`; otherwise use defaults: Minimum = 60%, Target = 80%. Also read the optional \`Generation cap:\` (tests per pass, default 5), \`Base control:\` (\`auto\` default, or \`off\`), \`Base control budget:\` (seconds per run, default 90) and \`Star rating:\` (\`auto\` default, or \`off\`). Missing keys use the defaults.
 
-Using the coverage percentage from the diagram in substep 4 (the \`COVERAGE: X/Y (Z%)\` line):
+**Gate number X.** Take the first matching row; never substitute 0:
 
-- **>= target:** Pass. "Coverage gate: PASS ({X}%)." Continue.
+| Step 7 result | Gate number | Print |
+|---|---|---|
+| Rating dispatch failed or timed out | skip the gate | ${degradedMessage(ctx, 'ratingUnavailable')} |
+| Zero paths, test-only diff, or \`coverage_pct\` null or unparseable | skip the gate | "Coverage gate: could not determine percentage — skipping." |
+| \`Star rating: off\` | \`coverage_pct\` | "Star rating off: gate uses coverage_pct; weak paths still listed." |
+| \`coverage_pct_value\` missing, not a number, or outside 0..100 | \`coverage_pct\` | ${degradedMessage(ctx, 'valueCoverageUnavailable')} |
+| \`coverage_pct_value\` > \`coverage_pct\` | \`coverage_pct\` (clamped) | ${degradedMessage(ctx, 'inconsistentCoverage')} |
+| Otherwise | \`coverage_pct_value\` | — |
+
+Y is \`coverage_pct\`; W is \`weak_gaps.length\`; N is \`gaps\`. Remaining slots = 2 × generation cap − tests added or extended so far, and 0 once both passes are used. Option A reads "A) Strengthen the existing ★ test for each weak path and generate tests for true gaps ({slots} of {2 × cap} generation slots remaining)"; at 0 slots it reads "A) List the remaining gaps as proposed tests in the PR body" and dispatches nothing.
+
+- **>= target:** Pass. "Coverage gate: PASS ({X}% value-weighted)." Continue; list weak paths in the PR body as proposed strengthening.
 - **>= minimum, < target:** Use AskUserQuestion:
-  - "AI-assessed coverage is {X}%. {N} code paths are untested. Target is {target}%."
-  - RECOMMENDATION: Choose A because untested code paths are where production bugs hide.
+  - "Value-weighted coverage is {X}% ({Y}% including {W} weakly covered paths). {W} paths have only weak tests and {N} have none. Target is {target}%."
+  - RECOMMENDATION: Choose A because weakly covered and untested paths are where regressions slip through.
   - Options:
-    A) Generate more tests for remaining gaps (recommended)
+    A) (as above, recommended)
     B) Ship anyway — I accept the coverage risk
-    C) These paths don't need tests — mark as intentionally uncovered
-  - If A: Dispatch one more generation pass targeting remaining gaps, then re-evaluate the result here. Maximum 2 generation passes total. At the cap, offer only B/C or stop; do not offer another generation pass.
+    C) These paths don't need tests — mark as intentionally uncovered. ${SWEEP_POINTER}
+  - If A and allowance remains: dispatch one generation pass with the weak paths and gaps, then re-evaluate here. At the cap, offer only B/C or stop, plus A as the proposals list; never another generation pass.
   - If B: Continue. Include in PR body: "Coverage gate: {X}% — user accepted risk."
   - If C: Continue. Include in PR body: "Coverage gate: {X}% — {N} paths intentionally uncovered."
 
 - **< minimum:** Use AskUserQuestion:
-  - "AI-assessed coverage is critically low ({X}%). {N} of {M} code paths have no tests. Minimum threshold is {minimum}%."
-  - RECOMMENDATION: Choose A because less than {minimum}% means more code is untested than tested.
+  - "Value-weighted coverage is critically low ({X}%; {Y}% including {W} weakly covered paths). {N} of {M} code paths have no tests. Minimum threshold is {minimum}%."
+  - RECOMMENDATION: Choose A because less than {minimum}% means more behavior is unprotected than protected.
   - Options:
-    A) Generate tests for remaining gaps (recommended)
+    A) (as above, recommended)
     B) Override — ship with low coverage (I understand the risk)
-  - If A: Dispatch one more generation pass. Maximum 2 passes total. At the cap, offer only B or stop; do not offer another generation pass.
+  - If A and allowance remains: dispatch one generation pass, then re-evaluate here. At the cap, offer only B or stop, plus A as the proposals list; never another generation pass.
   - If B: Continue. Include in PR body: "Coverage gate: OVERRIDDEN at {X}%."
 
-**Coverage percentage undetermined:** If the coverage diagram doesn't produce a clear numeric percentage (ambiguous output, parse error), **skip the gate** with: "Coverage gate: could not determine percentage — skipping." Do not default to 0% or block.
-
-**Test-only diffs:** Skip the gate (same as the existing fast-path).
+**Spawned or non-interactive session** (the preamble echoed \`SESSION_KIND: spawned\` or \`headless\`): ask nothing. Take A restricted to true \`gaps\` within the remaining slots; never edit tests for weak paths there. List weak paths in the PR body as proposed strengthening.
 
 **100% coverage:** "Coverage gate: PASS (100%)." Continue.`;
 
@@ -563,12 +616,13 @@ ${subheading} Test Plan Artifact
 After producing the coverage diagram, write a test plan artifact so \`/qa\` and \`/qa-only\` can consume it:
 
 \`\`\`bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" && mkdir -p ~/.gstack/projects/$SLUG
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "\${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null) && mkdir -p "$GSTACK_STATE_ROOT/projects/$SLUG" && echo "PROJECT_DIR: $GSTACK_STATE_ROOT/projects/$SLUG"
 USER=$(whoami)
 DATETIME=$(date +%Y%m%d-%H%M%S)
 \`\`\`
 
-Write to \`~/.gstack/projects/{slug}/{user}-{branch}-ship-test-plan-{datetime}.md\`:
+Write to \`<PROJECT_DIR>/{user}-{branch}-ship-test-plan-{datetime}.md\` (\`PROJECT_DIR\` printed above):
 
 \`\`\`markdown
 # Test Plan
@@ -588,51 +642,19 @@ Repo: {owner/repo}
 ## Critical Paths
 - {end-to-end flow that must work}
 \`\`\``);
-  } else {
-    // review mode
-    sections.push(`
-**Step 5. Generate tests for gaps (Fix-First):**
-
-If test framework is detected and gaps were identified:
-- Classify each gap as AUTO-FIX or ASK per the Fix-First Heuristic:
-  - **AUTO-FIX:** Simple unit tests for pure functions, edge cases of existing tested functions
-  - **ASK:** E2E tests, tests requiring new test infrastructure, tests for ambiguous behavior
-- For AUTO-FIX gaps: generate the test, run it, commit as \`test: coverage for {feature}\`
-- For ASK gaps: include in the Fix-First batch question with the other review findings
-- For paths marked [→E2E]: always ASK (E2E tests are higher-effort and need user confirmation)
-- For paths marked [→EVAL]: always ASK (eval tests need user confirmation on quality criteria)
-
-If no test framework detected → include gaps as INFORMATIONAL findings only, no generation.
-
-**Diff is test-only changes:** Skip Step 4.75 entirely: "No new application code paths to audit."
-
-### Coverage Warning
-
-After producing the coverage diagram, check the coverage percentage. Read CLAUDE.md for a \`## Test Coverage\` section with a \`Minimum:\` field. If not found, use default: 60%.
-
-If coverage is below the minimum threshold, output a prominent warning **before** the regular review findings:
-
-\`\`\`
-⚠️ COVERAGE WARNING: AI-assessed coverage is {X}%. {N} code paths untested.
-Consider writing tests before running /ship.
-\`\`\`
-
-This is INFORMATIONAL — does not block /review. But it makes low coverage visible early so the developer can address it before reaching the /ship coverage gate.
-
-If coverage percentage cannot be determined, skip the warning silently.`);
   }
 
   return part === 'gate' ? gate : sections.join('\n');
 }
 
-export function generateTestCoverageAuditPlan(_ctx: TemplateContext): string {
-  return generateTestCoverageAuditInner('plan');
+export function generateTestCoverageAuditPlan(ctx: TemplateContext): string {
+  return generateTestCoverageAuditInner(ctx, 'plan');
 }
 
-export function generateTestCoverageAuditShip(_ctx: TemplateContext): string {
-  return generateTestCoverageAuditInner('ship');
+export function generateTestCoverageAuditShip(ctx: TemplateContext): string {
+  return generateTestCoverageAuditInner(ctx, 'ship');
 }
 
-export function generateTestCoverageGateShip(_ctx: TemplateContext): string {
-  return generateTestCoverageAuditInner('ship', 'gate');
+export function generateTestCoverageGateShip(ctx: TemplateContext): string {
+  return generateTestCoverageAuditInner(ctx, 'ship', 'gate');
 }

@@ -17,6 +17,24 @@
 import type { Model } from './models';
 import { validateModel } from './models';
 
+export type HostTier = 'full' | 'experimental' | 'instruction-only';
+export const HOST_TIERS: readonly HostTier[] = ['full', 'experimental', 'instruction-only'];
+
+export interface HostCapabilities {
+  /** Runs shell commands, so bin/ helpers and preambles execute. */
+  toolExecution: boolean;
+  /** 'native': a structured question tool; 'prose': questions are plain text. */
+  questions: 'native' | 'prose';
+  /** Has plan-mode transitions (enter/exit plan mode). */
+  planMode: boolean;
+  /** Can delegate work to sub-agents. */
+  delegation: boolean;
+  /** Can drive gstack's browser (needs toolExecution). */
+  browser: boolean;
+  /** 'enforced': hooks can block a tool call; 'advisory': safety skills only warn. */
+  safetyHooks: 'enforced' | 'advisory';
+}
+
 export interface HostConfig {
   /** Unique host identifier (e.g., 'opencode'). Must match filename in hosts/. */
   name: string;
@@ -29,6 +47,17 @@ export interface HostConfig {
 
   /** Model overlay used when generation does not receive an explicit --model. */
   defaultModel: Model;
+
+  // --- Support Contract (docs/ADDING_A_HOST.md "Host tiers and capabilities") ---
+  /**
+   * full: installs, renders, and has a dated certification record (a real
+   * workflow run plus an upgrade from an existing install).
+   * experimental: installs and renders; not certified by a real run.
+   * instruction-only: no install arm; setup prints instructions and changes nothing.
+   */
+  tier: HostTier;
+  /** What the host runtime offers. Rendering and docs must not claim more. */
+  capabilities: HostCapabilities;
 
   // --- Path Configuration ---
   /** Global install path relative to $HOME (e.g., '.config/opencode/skills/gstack'). */
@@ -54,6 +83,12 @@ export interface HostConfig {
     descriptionLimitBehavior?: 'error' | 'truncate' | 'warn';
     /** Additional frontmatter fields to inject (host-wide). */
     extraFields?: Record<string, unknown>;
+    /**
+     * Write the installed directory name (gstack-<skill>) into `name:`. For
+     * hosts that index and de-duplicate skills by frontmatter name, where a
+     * bare `review` would be shadowed by any other `review` skill (#2825).
+     */
+    nameMatchesDirectory?: boolean;
     /** Rename fields from template (e.g., { 'voice-triggers': 'triggers' }). */
     renameFields?: Record<string, string>;
     /** Conditionally add fields based on template frontmatter values. */
@@ -131,6 +166,20 @@ export function validateHostConfig(config: HostConfig, validResolverNames?: Read
         errors.push(`cliAlias '${alias}' contains invalid characters`);
       }
     }
+  }
+  if (!HOST_TIERS.includes(config.tier)) {
+    errors.push(`tier '${config.tier}' must be one of ${HOST_TIERS.join(', ')}`);
+  }
+  const caps = config.capabilities;
+  if (!caps) {
+    errors.push('capabilities are required');
+  } else {
+    if (caps.browser && !caps.toolExecution) errors.push('capabilities.browser requires toolExecution');
+    if (!['native', 'prose'].includes(caps.questions)) errors.push(`capabilities.questions must be 'native' or 'prose'`);
+    if (!['enforced', 'advisory'].includes(caps.safetyHooks)) errors.push(`capabilities.safetyHooks must be 'enforced' or 'advisory'`);
+  }
+  if (config.tier === 'instruction-only' && !config.install.instructionTier && config.name !== 'slate' && config.name !== 'gbrain') {
+    errors.push('instruction-only hosts must declare install.instructionTier (what setup tells the user to copy)');
   }
   const modelError = validateModel(config.defaultModel);
   if (modelError) {

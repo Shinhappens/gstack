@@ -56,6 +56,8 @@ function setupMockInstall(skills: string[]): void {
   fs.mkdirSync(mockBin, { recursive: true });
   fs.copyFileSync(path.join(BIN, 'gstack-config'), path.join(mockBin, 'gstack-config'));
   fs.chmodSync(path.join(mockBin, 'gstack-config'), 0o755);
+  // A real install always ships the state-root twin beside the bins that source it.
+  fs.copyFileSync(path.join(BIN, 'gstack-state-root.sh'), path.join(mockBin, 'gstack-state-root.sh'));
   if (fs.existsSync(path.join(BIN, 'gstack-relink'))) {
     fs.copyFileSync(path.join(BIN, 'gstack-relink'), path.join(mockBin, 'gstack-relink'));
     fs.chmodSync(path.join(mockBin, 'gstack-relink'), 0o755);

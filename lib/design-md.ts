@@ -179,7 +179,7 @@ export class DesignMdEditRefused extends Error {
 }
 
 /** Does a section heading name the requested section? By canonical name when the request has one, else by exact (case-insensitive) heading. */
-function headingMatches(heading: string, wanted: string, canonical: CanonicalSection | null): boolean {
+function headingMatches(heading: string, wanted: string, canonical: CanonicalSection | null | undefined): boolean {
   return canonical ? canonicalFor(heading) === canonical : heading.trim().toLowerCase() === wanted.trim().toLowerCase();
 }
 

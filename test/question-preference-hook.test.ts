@@ -24,6 +24,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { spawnSync } from 'child_process';
+import { slugCacheFile } from '../lib/bin-context';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const HOOK = path.join(ROOT, 'hosts', 'claude', 'hooks', 'question-preference-hook');
@@ -38,9 +39,16 @@ beforeEach(() => {
   cwdSlug = 'fixture-slug';
   fs.mkdirSync(path.join(stateRoot, 'projects', cwdSlug), { recursive: true });
   // Real directory that the hook can chdir() into. gstack-slug derives the
-  // slug from the basename of this cwd (no .git => basename fallback path).
+  // slug from the basename of this cwd (no .git => basename fallback path),
+  // so the auto-decided event log (written via gstack-question-log) lands in
+  // the same bucket the cache entry below names.
   fixtureCwd = path.join(stateRoot, cwdSlug);
   fs.mkdirSync(fixtureCwd, { recursive: true });
+  // The hook reads the project bucket from gstack-slug's versioned slug-cache
+  // entry (#2901), which the skill preamble writes before any question.
+  const cacheFile = slugCacheFile(stateRoot, fixtureCwd);
+  fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+  fs.writeFileSync(cacheFile, `v2:${cwdSlug}`);
 });
 
 afterEach(() => {
@@ -703,7 +711,7 @@ describe('Conductor spawned deny (#2733)', () => {
       path.join(ROOT, 'hosts', 'claude', 'hooks', 'auq-error-fallback-hook.ts'),
       path.join(ROOT, 'scripts', 'resolvers', 'preamble', 'generate-ask-user-format.ts'),
       path.join(ROOT, 'bin', 'gstack-skill-start'),
-      path.join(ROOT, 'ship', 'sections', 'pr-body.md.tmpl'),
+      path.join(ROOT, 'ship', 'sections', 'documentation.md.tmpl'),
     ];
     for (const f of surfaces) {
       const src = fs.readFileSync(f, 'utf-8');
@@ -784,5 +792,91 @@ describe('auto-decided event tagging', () => {
     });
     const markerPath = path.join(stateRoot, 'sessions', 's14', '.auto-decided-tu-14');
     expect(fs.existsSync(markerPath)).toBe(true);
+  });
+});
+
+// ----------------------------------------------------------------------
+// Project bucket = gstack-slug's versioned cache (#2901)
+// ----------------------------------------------------------------------
+
+describe('project bucket follows gstack-slug (#2901)', () => {
+  const askPayload = (id: string) => ({
+    session_id: `s-slug-${id}`,
+    tool_name: 'AskUserQuestion',
+    tool_use_id: `tu-slug-${id}`,
+    tool_input: {
+      questions: [{ question: '<gstack-qid:ship-pre-landing-review-fix> Fix it?', options: ['A) Fix (recommended)', 'B) Skip'] }],
+    },
+  });
+
+  function originRepo(dirName: string, origin: string): string {
+    const dir = path.join(stateRoot, 'repos', dirName);
+    fs.mkdirSync(dir, { recursive: true });
+    spawnSync('git', ['init', '-q'], { cwd: dir, timeout: 30_000 });
+    spawnSync('git', ['remote', 'add', 'origin', origin], { cwd: dir, timeout: 30_000 });
+    return dir;
+  }
+
+  function writePrefViaBin(cwd: string): string {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+    env.GSTACK_STATE_ROOT = stateRoot;
+    delete env.GSTACK_HOME;
+    delete env.GSTACK_PROJECT_SLUG;
+    const r = spawnSync(
+      path.join(ROOT, 'bin', 'gstack-question-preference'),
+      ['--write', JSON.stringify({ question_id: 'ship-pre-landing-review-fix', preference: 'never-ask', source: 'plan-tune' })],
+      { cwd, env, encoding: 'utf-8', timeout: 30_000 },
+    );
+    expect(r.status).toBe(0);
+    return r.stdout + r.stderr;
+  }
+
+  test('never-ask written by gstack-question-preference in an origin-remote repo is enforced', () => {
+    for (const [dirName, origin, bucket] of [
+      ['LovedVoice-checkout', 'git@github.com:kvzn/LovedVoice.git', 'kvzn-LovedVoice'],
+      ['nested-checkout', 'https://gitlab.com/customer-a/product/repo.git', 'product-repo-5eca1fe041984543'],
+    ] as const) {
+      const repo = originRepo(dirName, origin);
+      writePrefViaBin(repo);
+      expect(fs.existsSync(path.join(stateRoot, 'projects', bucket, 'question-preferences.json'))).toBe(true);
+      const r = runHook(askPayload(dirName), repo);
+      expect(r.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(r.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain('[plan-tune auto-decide] ship-pre-landing-review-fix → A) Fix');
+    }
+  });
+
+  test('unresolved identity asks (even with a global never-ask) and records why', () => {
+    writeGlobalPref('ship-pre-landing-review-fix', 'never-ask');
+    const unknownCwd = path.join(stateRoot, 'never-resolved');
+    fs.mkdirSync(unknownCwd, { recursive: true });
+    expectPassThrough(runHook(askPayload('unresolved'), unknownCwd));
+    const log = fs.readFileSync(path.join(stateRoot, 'hook-errors.log'), 'utf-8');
+    expect(log).toContain('never-ask not applied to ship-pre-landing-review-fix, asking instead: project identity unresolved');
+    expect(log).toContain(unknownCwd);
+  });
+
+  test('an unversioned (pre-upgrade) cache entry is not trusted: asks', () => {
+    writeProjectPref('ship-pre-landing-review-fix', 'never-ask');
+    fs.writeFileSync(slugCacheFile(stateRoot, fixtureCwd), cwdSlug);
+    expectPassThrough(runHook(askPayload('unversioned')));
+  });
+
+  test('GSTACK_PROJECT_SLUG pins the bucket; "." and ".." pins are ignored', () => {
+    const pinnedCwd = path.join(stateRoot, 'pinned-cwd');
+    fs.mkdirSync(pinnedCwd, { recursive: true });
+    fs.mkdirSync(path.join(stateRoot, 'projects', 'pinned'), { recursive: true });
+    fs.writeFileSync(
+      path.join(stateRoot, 'projects', 'pinned', 'question-preferences.json'),
+      JSON.stringify({ 'ship-pre-landing-review-fix': 'never-ask' }),
+    );
+    const pinned = runHook(askPayload('pinned'), pinnedCwd, { GSTACK_PROJECT_SLUG: 'pinned' });
+    expect(pinned.parsed?.hookSpecificOutput?.permissionDecision).toBe('deny');
+
+    // Where a ".." pin would point (projects/../): must never be read.
+    fs.writeFileSync(path.join(stateRoot, 'question-preferences.json'), JSON.stringify({ 'ship-pre-landing-review-fix': 'never-ask' }));
+    for (const pin of ['..', '.']) {
+      expectPassThrough(runHook(askPayload(`dots${pin.length}`), pinnedCwd, { GSTACK_PROJECT_SLUG: pin }));
+    }
   });
 });

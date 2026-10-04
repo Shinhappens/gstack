@@ -31,6 +31,6 @@ Applies to AskUserQuestion, user replies, and findings. AskUserQuestion Format i
 - User-turn override wins: if the current message asks for terse / no explanations / just the answer, skip this section.
 - Terse mode (EXPLAIN_LEVEL: terse): no glosses, no outcome-framing layer, shorter responses.
 
-Curated jargon list lives at \`${jargonPath}\` (80+ terms). On the first jargon term you encounter this session, Read that file once; treat the \`terms\` array as the canonical list. The list is repo-owned and may grow between releases.
+Curated jargon list lives at \`${jargonPath}\`. On the first jargon term you encounter this session, Read that file once; treat the \`terms\` array as the canonical list. The list is repo-owned and may grow between releases.
 `;
 }

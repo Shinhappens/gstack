@@ -1,5 +1,5 @@
 /**
- * Static-grep tripwire for PTY slash-command skill seeding. Free tier — no API.
+ * Tripwire for PTY slash-command skill seeding. Free tier — no API.
  *
  * The default hermetic config dir registers NO skills, so a PTY test that
  * TYPES a /skill slash command against it gets "Unknown command" before any
@@ -8,14 +8,19 @@
  * either route through a runPlanSkill* helper (which opts in for you) or pass
  * `seedSkills: true` in its own launchClaudePty options.
  *
- * Pattern mirrors test/hermetic-wiring.test.ts: read sources as text, assert
- * invariants on their contents. Brittle by design — changing the seeding
- * wiring must force the author to look here.
+ * The first check scans test sources for slash-command sends; the helper and
+ * launcher checks run the real runners (fake PTY driver) and the real
+ * launcher (fake CLI) instead of reading harness source text.
  */
 
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import { runPlanSkillObservation, runPlanSkillCounting, runPlanSkillFloorCheck, type PtyDriver } from './helpers/claude-pty-runner';
+import { createFakePtyDriver } from './helpers/pty/fake-session';
 
 const ROOT = path.resolve(import.meta.path, '..', '..');
 
@@ -58,20 +63,53 @@ describe('PTY skill-seeding tripwire', () => {
     ).toEqual([]);
   });
 
-  test('the runPlanSkill* helpers all opt in via seedSkills: true', () => {
+  test('the runPlanSkill* helpers all opt in via seedSkills: true', async () => {
     // The helper family types slash commands on behalf of ~20 test files;
     // dropping the opt-in there silently un-measures all of them at once.
-    const src = fs.readFileSync(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'), 'utf-8');
-    const optIns = src.match(/seedSkills: true/g) ?? [];
-    expect(optIns.length).toBeGreaterThanOrEqual(3);
+    // Each helper runs through the fake PTY driver (the child exits at once).
+    const common = { skillName: 'plan-eng-review', slashCommand: '/plan-eng-review', followUpPrompt: '# Plan',
+      isLastStep0AUQ: () => false, reviewCountCeiling: 1, timeoutMs: 20_000 };
+    for (const run of [runPlanSkillObservation, runPlanSkillCounting, runPlanSkillFloorCheck] as Array<(opts: typeof common & { driver: PtyDriver }) => Promise<{ outcome: string }>>) {
+      const fake = createFakePtyDriver({ frames: [{ screen: 'exiting', exit: 1 }] });
+      await run({ ...common, driver: fake.driver });
+      expect(fake.launches.map(opts => opts.seedSkills), run.name).toEqual([true]);
+    }
   });
 
-  test('launchClaudePty wires seedSkills to hermeticSkillsConfigDir()', () => {
-    const src = fs.readFileSync(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'), 'utf-8');
+  test.skipIf(process.platform === 'win32')('launchClaudePty wires seedSkills to hermeticSkillsConfigDir()', () => {
     // Gated on hermetic (EVALS_HERMETIC=0 must keep the operator config) and
-    // on the per-test env override (explicit CLAUDE_CONFIG_DIR wins).
-    const wired =
-      /if\s*\(opts\.seedSkills && hermetic && !opts\.env\?\.CLAUDE_CONFIG_DIR\)\s*\{\s*\n\s*childEnv\.CLAUDE_CONFIG_DIR = hermeticSkillsConfigDir\(\);/.test(src);
-    expect(wired, 'launchClaudePty must set CLAUDE_CONFIG_DIR from hermeticSkillsConfigDir() when seedSkills && hermetic && no per-test override').toBe(true);
-  });
+    // on the per-test env override (explicit CLAUDE_CONFIG_DIR wins). A fake
+    // CLI reports the CLAUDE_CONFIG_DIR its real PTY launch received.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pty-seed-wiring-'));
+    try {
+      const fake = path.join(dir, 'fake-claude');
+      fs.writeFileSync(fake, `#!${process.execPath}\nprocess.stdout.write('CFG=' + process.env.CLAUDE_CONFIG_DIR + ';');\nsetInterval(() => {}, 1000);\n`, { mode: 0o755 });
+      const custom = path.join(dir, 'custom-config');
+      const worker = path.join(dir, 'worker.ts');
+      fs.writeFileSync(worker, `import { launchClaudePty } from ${JSON.stringify(pathToFileURL(path.join(ROOT, 'test/helpers/claude-pty-runner.ts')).href)};
+import { hermeticSkillsConfigDir } from ${JSON.stringify(pathToFileURL(path.join(ROOT, 'test/helpers/hermetic-env.ts')).href)};
+const seen = async (opts) => {
+  const session = await launchClaudePty({ cwd: ${JSON.stringify(dir)}, timeoutMs: 5000, ...opts });
+  try { await session.waitFor(/CFG=[^;]*;/, { timeoutMs: 4000, pollMs: 20 }); return /CFG=([^;]*);/.exec(session.visibleText())[1]; }
+  finally { await session.close(); }
+};
+const result = { skills: hermeticSkillsConfigDir(), seeded: await seen({ seedSkills: true }),
+  override: await seen({ seedSkills: true, env: { CLAUDE_CONFIG_DIR: ${JSON.stringify(custom)} } }),
+  unseeded: await seen({}) };
+process.stdout.write(JSON.stringify(result));
+`);
+      const run = (hermetic: string) => {
+        const result = spawnSync(process.execPath, [worker], { cwd: ROOT, encoding: 'utf8', timeout: 30_000,
+          env: { ...process.env, BROWSE_TERMINAL_BINARY: fake, EVALS_HERMETIC: hermetic } });
+        expect(result.status, result.stderr).toBe(0);
+        return JSON.parse(result.stdout.trim().split('\n').at(-1)!);
+      };
+      const hermetic = run('1');
+      expect(hermetic.seeded).toBe(hermetic.skills);
+      expect(hermetic.override).toBe(custom);
+      expect(hermetic.unseeded).not.toBe(hermetic.skills);
+      const operator = run('0');
+      expect(operator.seeded).not.toBe(operator.skills);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
 });

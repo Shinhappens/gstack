@@ -33,6 +33,11 @@ describe('setup-gbrain documented lock acquisition', () => {
         fs.mkdirSync(parent);
         fs.writeFileSync(lock, 'preserve lock file');
       }
+      // The block resolves the state root through the installed gstack-paths.
+      const installBin = path.join(home, '.claude', 'skills', 'gstack', 'bin');
+      fs.mkdirSync(installBin, { recursive: true });
+      for (const b of ['gstack-paths', 'gstack-state-root.sh']) fs.copyFileSync(path.join(import.meta.dir, '..', 'bin', b), path.join(installBin, b));
+      fs.chmodSync(path.join(installBin, 'gstack-paths'), 0o755);
       const source = fs.readFileSync(path.join(import.meta.dir, '..', 'setup-gbrain', 'SKILL.md.tmpl'), 'utf8');
       const script = source.match(/\*\*Concurrent-run lock\.\*\*[\s\S]*?```bash\n([\s\S]*?)\n  ```/)?.[1];
       expect(script).toBeDefined();
@@ -169,7 +174,7 @@ describe('setup-gbrain owned Path 4 fixture', () => {
           pathToClaudeCodeExecutable: '/nonexistent/free-test-never-spawn-claude',
           signal: controller.signal,
         }, () => { validated = true; }, mode === 'deadline' ? 250 : 1000, {
-          collector: { addTest: (row: EvalTestEntry) => rows.push(row) } as EvalCollector,
+          collector: { addTest: (row: EvalTestEntry) => rows.push(row) } as unknown as EvalCollector,
           name: 'setup-gbrain-path4-local-pglite', suite: 'setup-gbrain',
         });
       } catch (error) { failure = String(error); }
@@ -214,7 +219,7 @@ describe('setup-gbrain owned Path 4 fixture', () => {
         await Promise.resolve();
         controller.abort(new Error('caller cancelled during validation'));
       }, 1000, {
-        collector: { addTest: (row: EvalTestEntry) => rows.push(row) } as EvalCollector,
+        collector: { addTest: (row: EvalTestEntry) => rows.push(row) } as unknown as EvalCollector,
         name: 'setup-gbrain-path4-local-pglite', suite: 'setup-gbrain',
       })).rejects.toThrow('caller cancelled during validation');
       expect(rows).toHaveLength(1);
@@ -288,7 +293,7 @@ describe('setup-gbrain owned Path 4 fixture', () => {
               throw new Error(`assertion diagnostic ${fixture.token} ${credentialUrl}`);
             }
           }, undefined, {
-            collector: { addTest: (row: EvalTestEntry) => rows.push(row) } as EvalCollector,
+            collector: { addTest: (row: EvalTestEntry) => rows.push(row) } as unknown as EvalCollector,
             name: 'setup-gbrain-path4-local-pglite', suite: 'setup-gbrain',
           });
         } catch (error) { thrown = String(error); }

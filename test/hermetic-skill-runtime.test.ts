@@ -8,17 +8,10 @@ import { getHermeticDirs, hermeticSkillsConfigDir } from './helpers/hermetic-env
 import { refreshHermeticSkillRuntime, questionCompanionReadSettings, hermeticSkillRuntime } from './helpers/hermetic-skill-runtime';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
 const ROOT = path.resolve(import.meta.dir, '..');
 const digest = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 describe('hermetic seeded PTY runtime', () => {
-  test('runtime helper and regression select every PTY consumer', () => {
-    const consumers = Object.entries(E2E_TOUCHFILES).filter(([, files]) => files.includes('test/helpers/claude-pty-runner.ts')).map(([name]) => name).sort();
-    expect(consumers.length).toBeGreaterThan(15);
-    for (const file of ['test/helpers/hermetic-skill-runtime.ts', 'test/hermetic-skill-runtime.test.ts'])
-      expect(selectTests([file], E2E_TOUCHFILES).selected.sort()).toEqual(consumers);
-  });
   test.skipIf(process.platform === 'win32')('uses current lazy files and tools with scoped access, preserving auth, caches, and explicit overrides', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-runtime-probe-'));
     const operatorHome = path.join(dir, 'operator-home');

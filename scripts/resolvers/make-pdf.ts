@@ -46,7 +46,7 @@ Core commands:
 Output contract:
 - \`stdout\`: ONLY the output path on success. One line.
 - \`stderr\`: progress (\`Rendering HTML... Generating PDF...\`) unless \`--quiet\`.
-- Exit 0 success / 1 bad args / 2 render error / 3 Paged.js timeout / 4 no browser available (open the Aside app, or run \`./setup\` to build gstack's own browser).
+- Exit 0 success / 1 bad args / 2 render error / 3 TOC page numbers failed / 4 no browser available (open the Aside app, or run \`./setup\` to build gstack's own browser).
 
 PDFs print through Aside when it is running and through gstack's own headless browser otherwise; the stderr progress line says which (\`Rendering PDF through Aside\` / \`through gstack's browser\`).`;
 }

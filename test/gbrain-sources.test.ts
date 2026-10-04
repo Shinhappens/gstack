@@ -11,6 +11,9 @@ import { describe, it, expect } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync, chmodSync, symlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { usePrivateStateRoot } from "./helpers/private-state-root";
+
+usePrivateStateRoot();
 
 import { ensureSourceRegistered, probeSource, sourcePageCount } from "../lib/gbrain-sources";
 

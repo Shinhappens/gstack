@@ -371,6 +371,22 @@ describe('bun-polyfill', () => {
     expect(result.stdout.toString().trim()).toBe('windowsHide:true');
   });
 
+  // #2637: a non-detached Windows child is killed with its parent's job, so
+  // the shim must forward detached instead of dropping it.
+  test('Bun.spawn forwards detached and leaves it off by default', () => {
+    const result = Bun.spawnSync(['node', '-e', `
+      const cp = require('child_process');
+      const orig = cp.spawn;
+      const seen = [];
+      cp.spawn = (c, a, o) => { seen.push(o.detached); return orig(c, a, o); };
+      require(${JSON.stringify(polyfillPath)});
+      Bun.spawn(['node', '-e', ''], { stdio: ['ignore', 'ignore', 'ignore'], detached: true });
+      Bun.spawn(['node', '-e', ''], { stdio: ['ignore', 'ignore', 'ignore'] });
+      console.log('detached:' + seen.join(','));
+    `], { stdout: 'pipe', stderr: 'pipe', timeout: 30_000 });
+    expect(result.stdout.toString().trim()).toBe('detached:true,false');
+  });
+
   test('an explicit windowsHide:false is honored', () => {
     const result = Bun.spawnSync(['node', '-e', `
       const cp = require('child_process');

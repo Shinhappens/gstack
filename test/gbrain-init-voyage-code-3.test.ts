@@ -1,21 +1,20 @@
 /**
- * Tests the voyage-code-3 default contract in setup-gbrain's PGLite init
- * sequences. The contract lives in the skill TEMPLATE (.tmpl), not in a TS
- * helper — the skill follows AI-readable instructions.
+ * setup-gbrain's local PGLite init sequences, executed from the TEMPLATE.
  *
- * Contract (asserted here):
- *   1. When VOYAGE_API_KEY is set, gstack's PGLite init passes
- *      --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
- *   2. When VOYAGE_API_KEY is unset, those flags are omitted (gbrain's
- *      auto-selected provider chain takes over)
+ * The contract lives in skill template prose the model executes, not in a TS
+ * helper, so this file extracts each fenced bash block that runs
+ * `gbrain init --pglite --json "$@"` from the .tmpl files and runs it against
+ * a fake `gbrain` in a sandboxed HOME. A template edit changes what runs here;
+ * there is no hand-copied shell to drift.
  *
- * Why a separate file from gbrain-init-rollback.test.ts: that file owns the
- * .bak-rollback contract (Step 1.5 / 4.5 plan D7). This file owns the
- * embedding-model selection contract. Both extract bash from the skill
- * template and execute it against a fake gbrain.
- *
- * The fake gbrain records argv to a sentinel file so the test can assert
- * exact flags. No Voyage API calls are made.
+ * Contracts:
+ *   1. voyage-code-3 default: with VOYAGE_API_KEY set, every init site passes
+ *      --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024 as
+ *      separate argv words (also under zsh, #1798); unset or empty omits them.
+ *   2. .bak rollback (plan D7): the two rollback-wrapped sites move an existing
+ *      ~/.gbrain/config.json aside, restore it byte-for-byte when init fails
+ *      (leaving a partial PGLite dir alone), and keep the backup for audit when
+ *      init succeeds.
  */
 
 import { describe, it, expect } from "bun:test";
@@ -24,6 +23,7 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
   rmSync,
   chmodSync,
@@ -32,230 +32,188 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { spawnSync } from "child_process";
 
-interface FakeEnv {
-  tmp: string;
+const SETUP_GBRAIN = join(import.meta.dir, "..", "setup-gbrain");
+const TEMPLATES = {
+  skeleton: join(SETUP_GBRAIN, "SKILL.md.tmpl"),
+  brainInit: join(SETUP_GBRAIN, "sections", "brain-init.md.tmpl"),
+  remediation: join(SETUP_GBRAIN, "sections", "engine-remediation.md.tmpl"),
+};
+const INIT_CALL = 'gbrain init --pglite --json "$@"';
+
+function initBlocks(tmplPath: string): string[] {
+  const src = readFileSync(tmplPath, "utf-8");
+  return [...src.matchAll(/```bash\n([\s\S]*?)```/g)]
+    .map((m) => m[1])
+    .filter((block) => block.includes(INIT_CALL));
+}
+
+const PATH3_BLOCK = initBlocks(TEMPLATES.brainInit).find((b) => !b.includes("gstack-bak"));
+const PATH4_BLOCK = initBlocks(TEMPLATES.brainInit).find((b) => b.includes("gstack-bak"));
+const REMEDIATION_BLOCK = initBlocks(TEMPLATES.remediation).find((b) => b.includes("gstack-bak"));
+const ROLLBACK_SITES = { "Path 4 local code search": PATH4_BLOCK, "engine remediation": REMEDIATION_BLOCK };
+const ALL_SITES = { "Path 3 PGLite": PATH3_BLOCK, ...ROLLBACK_SITES };
+
+interface Sandbox {
   home: string;
   bindir: string;
+  configPath: string;
   argvLog: string;
   cleanup: () => void;
 }
 
-function makeFakeEnv(): FakeEnv {
-  const tmp = mkdtempSync(join(tmpdir(), "gbrain-voyage-init-"));
+function makeSandbox(opts: { initFails?: boolean; seedConfig?: boolean } = {}): Sandbox {
+  const tmp = mkdtempSync(join(tmpdir(), "gbrain-pglite-init-"));
   const home = join(tmp, "home");
+  const gbrainDir = join(home, ".gbrain");
   const bindir = join(tmp, "bin");
+  const configPath = join(gbrainDir, "config.json");
   const argvLog = join(tmp, "gbrain-argv.log");
-  mkdirSync(join(home, ".gbrain"), { recursive: true });
+  mkdirSync(gbrainDir, { recursive: true });
   mkdirSync(bindir, { recursive: true });
-
-  // Fake gbrain logs every argv invocation to argvLog (one line per call),
-  // succeeds on init (writes a sentinel pglite config), and returns canned
-  // output for --version. Nothing else is needed for the shape test.
-  const fake = `#!/bin/sh
-echo "$@" >> "${argvLog}"
-echo "$#" >> "${argvLog}.argc"
-case "$1" in
-  --version)
-    echo "gbrain 0.37.1.0"
-    exit 0
-    ;;
-  init)
-    cat > "${home}/.gbrain/config.json" <<JSON
-{"engine":"pglite","database_path":"${home}/.gbrain/brain.pglite"}
-JSON
-    echo '{"status":"success","engine":"pglite","pages":0}'
-    exit 0
-    ;;
-esac
-exit 0
-`;
-  writeFileSync(join(bindir, "gbrain"), fake);
+  const installer = join(home, ".claude", "skills", "gstack", "bin", "gstack-gbrain-install");
+  mkdirSync(join(installer, ".."), { recursive: true });
+  writeFileSync(installer, "#!/bin/sh\nexit 0\n");
+  chmodSync(installer, 0o755);
+  if (opts.seedConfig) {
+    writeFileSync(configPath, JSON.stringify({ engine: "postgres", database_url: "postgresql://stale@localhost/gbrain" }));
+  }
+  const onInit = opts.initFails
+    ? `mkdir -p "${gbrainDir}/pglite" && : > "${gbrainDir}/pglite/partial-write.tmp"; echo "Error: disk full" >&2; exit 1`
+    : `printf '{"engine":"pglite"}' > "${configPath}"; echo '{"status":"success"}'; exit 0`;
+  writeFileSync(
+    join(bindir, "gbrain"),
+    `#!/bin/sh\necho "$@" >> "${argvLog}"\necho "$#" >> "${argvLog}.argc"\nif [ "$1" = "init" ]; then ${onInit}; fi\nexit 0\n`,
+  );
   chmodSync(join(bindir, "gbrain"), 0o755);
-
-  return {
-    tmp,
-    home,
-    bindir,
-    argvLog,
-    cleanup: () => rmSync(tmp, { recursive: true, force: true }),
-  };
+  return { home, bindir, configPath, argvLog, cleanup: () => rmSync(tmp, { recursive: true, force: true }) };
 }
 
-/**
- * Verbatim reimplementation of the skill template's voyage-code-3
- * conditional. The template (setup-gbrain/sections/brain-init.md.tmpl Path 3, Step 1.5
- * inside the rollback wrapper, Step 4.5 Path 4 Yes branch) instructs the
- * model to execute this bash; we execute the same bash here and assert the
- * argv passed to gbrain matches the contract.
- *
- * If the template changes the flag set or the env-var name, this test
- * should fail until the shell here is updated too — by design.
- */
-function runInitWithVoyageGate(
-  env: FakeEnv,
-  voyageKey: string | undefined,
-  shell: "bash" | "zsh" = "bash",
-): string[] {
-  // The template's #1798 shape: flags ride the positional params, because an
-  // unquoted $VAR does NOT word-split under zsh — the whole flag string
-  // arrived as ONE argv word and gbrain silently fell back to its default
-  // embedding model.
-  const script = `
-set -u
-set --
-if [ -n "\${VOYAGE_API_KEY:-}" ]; then
-  set -- --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
-fi
-gbrain init --pglite --json "$@"
-`;
-  const baseEnv: Record<string, string> = {
-    ...process.env,
-    HOME: env.home,
-    PATH: `${env.bindir}:/usr/bin:/bin`,
-  };
-  if (voyageKey === undefined) {
-    delete baseEnv.VOYAGE_API_KEY;
-  } else {
-    baseEnv.VOYAGE_API_KEY = voyageKey;
-  }
-  const result = spawnSync(shell, ["-c", script], {
-    encoding: "utf-8",
-    env: baseEnv,
-    timeout: 30_000,
-  });
-  if (result.status !== 0) {
-    throw new Error(`init script exited ${result.status}: ${result.stderr}`);
-  }
-  return readFileSync(env.argvLog, "utf-8").trim().split("\n");
+function runBlock(sb: Sandbox, block: string, opts: { voyageKey?: string; shell?: "bash" | "zsh" } = {}) {
+  const env: Record<string, string> = { ...process.env, HOME: sb.home, PATH: `${sb.bindir}:/usr/bin:/bin` };
+  delete env.VOYAGE_API_KEY;
+  if (opts.voyageKey !== undefined) env.VOYAGE_API_KEY = opts.voyageKey;
+  const r = spawnSync(opts.shell ?? "bash", ["-c", block], { encoding: "utf-8", env, timeout: 30_000 });
+  const argv = existsSync(sb.argvLog) ? readFileSync(sb.argvLog, "utf-8").trim().split("\n") : [];
+  const argc = existsSync(`${sb.argvLog}.argc`)
+    ? readFileSync(`${sb.argvLog}.argc`, "utf-8").trim().split("\n").map(Number)
+    : [];
+  return { status: r.status, stderr: r.stderr ?? "", argv, argc };
 }
 
-function lastArgc(env: FakeEnv): number {
-  const lines = readFileSync(`${env.argvLog}.argc`, "utf-8").trim().split("\n");
-  return parseInt(lines[lines.length - 1], 10);
+function backups(sb: Sandbox): string[] {
+  return readdirSync(join(sb.home, ".gbrain")).filter((f) => f.includes(".gstack-bak-"));
 }
 
 const HAVE_ZSH = spawnSync("zsh", ["-c", "true"], { timeout: 30_000 }).status === 0;
 
-describe("voyage-code-3 default for gstack-driven PGLite init", () => {
-  it("passes voyage-code-3 flags when VOYAGE_API_KEY is set", () => {
-    const env = makeFakeEnv();
+describe("template extraction", () => {
+  it("finds all three PGLite init blocks (a template restructure must update this file)", () => {
+    expect(PATH3_BLOCK).toBeDefined();
+    expect(PATH4_BLOCK).toBeDefined();
+    expect(REMEDIATION_BLOCK).toBeDefined();
+    expect(initBlocks(TEMPLATES.skeleton)).toEqual([]);
+  });
+});
+
+describe("voyage-code-3 default at every PGLite init site", () => {
+  for (const [site, block] of Object.entries(ALL_SITES)) {
+    it(`${site}: passes voyage-code-3 flags when VOYAGE_API_KEY is set`, () => {
+      const sb = makeSandbox();
+      try {
+        const r = runBlock(sb, block!, { voyageKey: "vk_test_set" });
+        expect(r.argv).toEqual(["init --pglite --json --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024"]);
+        expect(r.argc).toEqual([7]);
+      } finally {
+        sb.cleanup();
+      }
+    });
+
+    it(`${site}: omits voyage flags when VOYAGE_API_KEY is unset or empty`, () => {
+      for (const voyageKey of [undefined, ""]) {
+        const sb = makeSandbox();
+        try {
+          const r = runBlock(sb, block!, { voyageKey });
+          expect(r.argv).toEqual(["init --pglite --json"]);
+        } finally {
+          sb.cleanup();
+        }
+      }
+    });
+
+    it(`${site}: zsh passes the flags as SEPARATE argv words (#1798)`, () => {
+      if (!HAVE_ZSH) return;
+      const sb = makeSandbox();
+      try {
+        expect(runBlock(sb, block!, { voyageKey: "vk_test_set", shell: "zsh" }).argc).toEqual([7]);
+      } finally {
+        sb.cleanup();
+      }
+    });
+  }
+});
+
+describe(".bak rollback contract (plan D7)", () => {
+  for (const [site, block] of Object.entries(ROLLBACK_SITES)) {
+    it(`${site}: failed init restores the original config and leaves partial PGLite state alone`, () => {
+      const sb = makeSandbox({ initFails: true, seedConfig: true });
+      try {
+        const original = readFileSync(sb.configPath, "utf-8");
+        const r = runBlock(sb, block!);
+        expect(r.stderr).toContain("restored");
+        expect(readFileSync(sb.configPath, "utf-8")).toBe(original);
+        expect(backups(sb)).toEqual([]);
+        expect(existsSync(join(sb.home, ".gbrain", "pglite", "partial-write.tmp"))).toBe(true);
+      } finally {
+        sb.cleanup();
+      }
+    });
+
+    it(`${site}: successful init installs the new config and keeps the backup for audit`, () => {
+      const sb = makeSandbox({ seedConfig: true });
+      try {
+        const r = runBlock(sb, block!);
+        expect(r.status).toBe(0);
+        expect(JSON.parse(readFileSync(sb.configPath, "utf-8")).engine).toBe("pglite");
+        expect(backups(sb).length).toBe(1);
+      } finally {
+        sb.cleanup();
+      }
+    });
+  }
+
+  it("Path 4 continues setup after a failed init; engine remediation stops with exit 1", () => {
+    const path4 = makeSandbox({ initFails: true, seedConfig: true });
+    const remediation = makeSandbox({ initFails: true, seedConfig: true });
     try {
-      const calls = runInitWithVoyageGate(env, "vk_test_set");
-      expect(calls.length).toBe(1);
-      const argv = calls[0];
-      expect(argv).toContain("init --pglite --json");
-      expect(argv).toContain("--embedding-model voyage:voyage-code-3");
-      expect(argv).toContain("--embedding-dimensions 1024");
+      const p4 = runBlock(path4, PATH4_BLOCK!);
+      expect(p4.status).toBe(0);
+      expect(p4.stderr).toContain("Continuing setup without local code search");
+      expect(runBlock(remediation, REMEDIATION_BLOCK!).status).toBe(1);
     } finally {
-      env.cleanup();
+      path4.cleanup();
+      remediation.cleanup();
     }
   });
 
-  it("omits voyage flags when VOYAGE_API_KEY is unset", () => {
-    const env = makeFakeEnv();
+  it("Path 4 with no existing config: failed init creates no backup and no config", () => {
+    const sb = makeSandbox({ initFails: true });
     try {
-      const calls = runInitWithVoyageGate(env, undefined);
-      expect(calls.length).toBe(1);
-      const argv = calls[0];
-      expect(argv).toContain("init --pglite --json");
-      expect(argv).not.toContain("voyage");
-      expect(argv).not.toContain("--embedding-model");
-      expect(argv).not.toContain("--embedding-dimensions");
+      runBlock(sb, PATH4_BLOCK!);
+      expect(backups(sb)).toEqual([]);
+      expect(existsSync(sb.configPath)).toBe(false);
     } finally {
-      env.cleanup();
-    }
-  });
-
-  it("zsh: flags arrive as SEPARATE argv words (#1798 — the shell that broke)", () => {
-    if (!HAVE_ZSH) return; // zsh ships on macOS; skip quietly elsewhere
-    const env = makeFakeEnv();
-    try {
-      const calls = runInitWithVoyageGate(env, "vk_test_set", "zsh");
-      expect(calls.length).toBe(1);
-      expect(calls[0]).toContain("--embedding-model voyage:voyage-code-3");
-      // init --pglite --json + 4 flag words = 7 argv entries. The pre-#1798
-      // unquoted-var shape produced 4 under zsh (the whole flag string as one
-      // word), and gbrain silently fell back to its default embedding model.
-      expect(lastArgc(env)).toBe(7);
-    } finally {
-      env.cleanup();
-    }
-  });
-
-  it("demonstrates the #1798 collision: an unquoted flags var is ONE word under zsh", () => {
-    if (!HAVE_ZSH) return;
-    const env = makeFakeEnv();
-    try {
-      const brokenShape = `
-set -u
-GBRAIN_EMBED_FLAGS="--embedding-model voyage:voyage-code-3 --embedding-dimensions 1024"
-gbrain init --pglite --json $GBRAIN_EMBED_FLAGS
-`;
-      const result = spawnSync("zsh", ["-c", brokenShape], {
-        encoding: "utf-8",
-        env: { ...process.env, HOME: env.home, PATH: `${env.bindir}:/usr/bin:/bin` },
-        timeout: 30_000,
-      });
-      expect(result.status).toBe(0);
-      expect(lastArgc(env)).toBe(4); // init, --pglite, --json, "<entire flag string>"
-    } finally {
-      env.cleanup();
-    }
-  });
-
-  it("template uses the positional-params shape, not an unquoted flags var", () => {
-    // Carved (token-reduction Phase 4): count across the tmpl UNION — one
-    // PGLite init site stays in the skeleton, the Path-3/4 sites live in the
-    // brain-init section.
-    const tmpl = readFileSync(
-      join(import.meta.dir, "..", "setup-gbrain", "SKILL.md.tmpl"),
-      "utf-8",
-    ) + readFileSync(
-      join(import.meta.dir, "..", "setup-gbrain", "sections", "brain-init.md.tmpl"),
-      "utf-8",
-    ) + readFileSync(
-      join(import.meta.dir, "..", "setup-gbrain", "sections", "engine-remediation.md.tmpl"),
-      "utf-8",
-    );
-    expect(tmpl).not.toContain("$GBRAIN_EMBED_FLAGS");
-    const sites = tmpl.match(/gbrain init --pglite --json "\$@"/g) || [];
-    expect(sites.length).toBe(3);
-    const setSites = tmpl.match(/set -- --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024/g) || [];
-    expect(setSites.length).toBe(3);
-  });
-
-  it("treats empty-string VOYAGE_API_KEY the same as unset (no false positive)", () => {
-    const env = makeFakeEnv();
-    try {
-      const calls = runInitWithVoyageGate(env, "");
-      expect(calls.length).toBe(1);
-      expect(calls[0]).not.toContain("voyage");
-    } finally {
-      env.cleanup();
+      sb.cleanup();
     }
   });
 });
 
-describe("template alignment: the .tmpl actually contains the voyage gate", () => {
-  // Belt-and-suspenders: if someone edits the template and drops the
-  // VOYAGE_API_KEY conditional without updating the test above, this catches
-  // it. The shell snippet under test must literally appear in the .tmpl.
-  // Carved union — see comment above.
-  const tmpl = readFileSync(join(import.meta.dir, "..", "setup-gbrain", "SKILL.md.tmpl"), "utf-8")
-    + readFileSync(join(import.meta.dir, "..", "setup-gbrain", "sections", "brain-init.md.tmpl"), "utf-8")
-    + readFileSync(join(import.meta.dir, "..", "setup-gbrain", "sections", "engine-remediation.md.tmpl"), "utf-8");
+describe("template alignment", () => {
+  const tmpl = Object.values(TEMPLATES).map((p) => readFileSync(p, "utf-8")).join("\n");
 
-  it("setup-gbrain template gates the embedding-model flag on VOYAGE_API_KEY", () => {
-    // Should appear at least once (currently 3 init sites use the same gate).
-    expect(tmpl).toContain('if [ -n "${VOYAGE_API_KEY:-}" ]; then');
-    expect(tmpl).toContain("--embedding-model voyage:voyage-code-3");
-    expect(tmpl).toContain("--embedding-dimensions 1024");
-  });
-
-  it("setup-gbrain template uses the conditional gate at all 3 PGLite init sites", () => {
-    // Count the gate occurrences. If a future edit adds/removes a PGLite
-    // init site, update this expectation deliberately.
-    const matches = tmpl.match(/if \[ -n "\$\{VOYAGE_API_KEY:-\}" \]; then/g);
-    expect(matches?.length).toBe(3);
+  it("uses the positional-params shape at all 3 init sites, never an unquoted flags var", () => {
+    expect(tmpl).not.toContain("$GBRAIN_EMBED_FLAGS");
+    expect(tmpl.match(/gbrain init --pglite --json "\$@"/g)?.length).toBe(3);
+    expect(tmpl.match(/set -- --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024/g)?.length).toBe(3);
+    expect(tmpl.match(/if \[ -n "\$\{VOYAGE_API_KEY:-\}" \]; then/g)?.length).toBe(3);
   });
 });

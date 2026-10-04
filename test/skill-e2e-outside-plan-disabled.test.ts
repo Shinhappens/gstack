@@ -38,7 +38,7 @@ describeLive('Disabled outside plan review', () => {
       fs.writeFileSync(path.join(repo, 'PLAN.md'), '# Accepted plan\n\nAdd a documented --json flag to the existing status command. Preserve the text output by default, and test both formats. Native review is complete.\n');
       // The parent must discover the control through the actual preflight.
       // Do not tell it the expected branch or forbid Agent in the prompt/tools.
-      const prompt = 'The native engineering review of PLAN.md is complete. Read OUTSIDE-PLAN.md and execute that final workflow section for this plan, following its actual configuration and branch rules. Then return the workflow completion summary, including outside-review attribution. This is an isolated review fixture; all required reviewer tools are authorized.';
+      const prompt = 'The native engineering review of PLAN.md is complete. Read OUTSIDE-PLAN.md and execute that final workflow section for this plan, following its actual configuration and branch rules. Then return the workflow completion summary, including outside-review attribution, and end with one JSON line {"outside_review_this_run": "completed" | "disabled" | "unavailable" | "skipped"}. This is an isolated review fixture; all required reviewer tools are authorized.';
       fs.writeFileSync(path.join(evidenceDir, 'instructions.md'), fixture.instructions);
       const result = await runSkillTest({
         workingDirectory: repo, prompt, testName, runId,

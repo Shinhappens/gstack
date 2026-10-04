@@ -22,12 +22,12 @@ import { resolveEvalModel } from '../lib/eval-model';
 const evalCollector = createEvalCollector('e2e');
 const CASES = [
   { id: 'review-coverage-audit', skill: 'review', suite: 'Review Coverage Audit E2E',
-    instructions: `Read review/SKILL.md and review/sections/review-army.md for the current review workflow.
-Apply ONLY the testing specialist checklist in review/specialists/testing.md to the supplied source and tests.
+    instructions: (dir: string) => `Read ${dir}/review/SKILL.md and ${dir}/review/sections/review-army.md for the current review workflow.
+Apply ONLY the testing specialist checklist in ${dir}/review/specialists/testing.md to the supplied source and tests.
 This is a targeted --testing request, even though this fixture has no branch diff.
 Run that checklist directly; do not dispatch other specialists or perform fixes.` },
   { id: 'plan-eng-coverage-audit', skill: 'plan-eng-review', suite: 'Plan Eng Review Coverage Audit E2E',
-    instructions: `Read plan-eng-review/SKILL.md and plan-eng-review/sections/review-sections.md.
+    instructions: (dir: string) => `Read ${dir}/plan-eng-review/SKILL.md and ${dir}/plan-eng-review/sections/review-sections.md.
 Run ONLY section "3. Test review": codepath tracing and the ASCII coverage diagram.
 For this targeted audit, treat the two supplied billing functions as the proposed codepaths.
 Skip architecture, code quality, performance, test generation and all other workflow steps.` },
@@ -57,7 +57,7 @@ for (const entry of CASES) describeIfSelected(entry.suite, [entry.id], () => {
             return { path: file, content: fs.readFileSync(file, 'utf8') };
           });
           return runSkillTest({
-            prompt: `${entry.instructions}
+            prompt: `${entry.instructions(cwd!)}
 
 You are on the feature/billing branch. The base branch is main.
 This is a test project — there is no remote, no PR to create.
@@ -66,6 +66,8 @@ Existing tests are in ${cwd}/test/billing.test.ts.
 
 Produce the ASCII coverage diagram showing which code paths are tested and which have gaps.
 Output the diagram directly, name both billing functions, and include a coverage summary.
+End with one JSON line listing the functions with and without test coverage:
+{"tested": ["<function>", ...], "untested": ["<function>", ...]}
 Do not modify the supplied source or tests.`,
             workingDirectory: cwd, maxTurns: 15,
             allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],

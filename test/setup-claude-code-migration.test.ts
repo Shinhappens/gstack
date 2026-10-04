@@ -23,14 +23,14 @@ function fixture(copy: boolean) {
   const shims = path.join(temp, 'shims');
   // Real setup, generator, resolver and migration code; only dependency
   // installation and binary compilation are stubbed to keep this test free.
-  for (const dir of ['scripts', 'hosts', 'lib', 'model-overlays', 'browse/src', 'design/src', 'openclaw/templates']) {
+  for (const dir of ['scripts', 'hosts', 'lib', 'model-overlays', 'browse/src', 'design/src', 'openclaw/templates', 'qa']) {
     fs.cpSync(path.join(ROOT, dir), path.join(root, dir), { recursive: true });
   }
   fs.copyFileSync(path.join(ROOT, 'setup'), path.join(root, 'setup'));
   put(path.join(root, 'VERSION'), '2.0.0.0\n');
   put(path.join(root, 'ETHOS.md'), 'Fixture ethos\n');
   put(path.join(root, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'gen:skill-docs': 'bun run scripts/gen-skill-docs.ts' } }));
-  for (const bin of ['gstack-config', 'gstack-patch-names', 'gstack-relink', 'gstack-migrate-claude-code', 'gstack-claude-code']) {
+  for (const bin of ['gstack-config', 'gstack-patch-names', 'gstack-relink', 'gstack-migrate-claude-code', 'gstack-claude-code', 'gstack-state-root.sh', 'gstack-install-registry.sh', 'gstack-render-claude.sh']) {
     const target = path.join(root, 'bin', bin);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(path.join(ROOT, 'bin', bin), target);

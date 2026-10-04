@@ -51,7 +51,7 @@ function modeField(line: string): { value: string; completed: boolean } | null {
   // unfinished and unknown statuses also invalidate an earlier declaration.
   const { label, status, value: rawValue } = match.groups!;
   const completeStatus = !status || /^(?:done|complete|completed)$/i.test(status.trim());
-  const explicitMode = /^(?:the )?(?:review )?mode\b(?:\s+is\b|:)?\s*/i;
+  const explicitMode = /^(?:the )?(?:review )?mode\b(?:\s+is\b|:|\s*=(?!=))?\s*/i;
   // An unqualified Decision field owns a review mode only when its value
   // names that vocabulary. Keep unrelated decisions out of withdrawal checks;
   // partial/negated mode names still own a field and therefore fail closed.

@@ -71,10 +71,19 @@ describe('runShardChild', () => {
       hookStreams: () => [],
     });
     expect(result.timedOut).toBe(true);
-    expect(Date.now() - startedAt).toBeLessThan(30_000);
+    expect(Date.now() - startedAt).toBeLessThan(2_200);
     if (process.platform !== 'win32') {
-      // The whole group is gone, not left to burn a core.
-      expect(() => process.kill(result.groupPid as number, 0)).toThrow();
+      const reaped = (pid = result.groupPid as number) => {
+        try { process.kill(pid, 0); return false; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+          throw error;
+        }
+      };
+      const observationDeadline = Date.now() + 1_000;
+      while (!reaped() && Date.now() < observationDeadline) await Bun.sleep(10);
+      expect(reaped()).toBe(true);
+      expect(reaped(-(result.groupPid as number))).toBe(true);
     }
   }, 30_000);
 

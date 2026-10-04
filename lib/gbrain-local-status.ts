@@ -49,6 +49,7 @@ import { atomicWriteSync } from "./fs-atomic";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { buildGbrainEnv, gbrainConfigDir, isExecTimeout, NEEDS_SHELL_ON_WINDOWS } from "./gbrain-exec";
+import { resolveStateRoot } from "./state-root";
 
 export type LocalEngineStatus =
   | "ok"
@@ -116,10 +117,7 @@ function userHome(env?: NodeJS.ProcessEnv): string {
 
 /** Cache path computed fresh on each call so tests can mutate GSTACK_HOME per case. */
 export function cacheFilePath(): string {
-  return join(
-    process.env.GSTACK_HOME || join(userHome(), ".gstack"),
-    ".gbrain-local-status-cache.json",
-  );
+  return join(resolveStateRoot(), ".gbrain-local-status-cache.json");
 }
 
 /**

@@ -64,40 +64,36 @@ gstack_hook_decision() {
 }
 
 # gstack_hook_state_root
-#   Print the gstack state root, resolved with EXACTLY the chain bin/gstack-paths
-#   uses (GSTACK_STATE_ROOT): GSTACK_HOME, then CLAUDE_PLUGIN_DATA only when
-#   CLAUDE_PLUGIN_ROOT names gstack (a CLAUDE_PLUGIN_DATA leaked from another
-#   plugin via CLAUDE_ENV_FILE must not redirect our state), then $HOME/.gstack,
-#   then a project-local .gstack. Hooks run on every Edit/Bash call, so this is
-#   pure bash — never spawn gstack-paths from a hook. The writers (/freeze,
-#   /guard, /unfreeze, /investigate) resolve through gstack-paths; a reader that
-#   used a different chain failed OPEN whenever GSTACK_HOME was set (#1459).
-#   test/hook-scripts.test.ts pins parity against gstack-paths.
+#   Print the gstack state root: a thin wrapper over gstack_state_root from
+#   bin/gstack-state-root.sh, the one bash implementation of the chain
+#   bin/gstack-paths uses (docs/state-root.md). Hooks run on every Edit/Bash
+#   call, so the twin is pure bash — never spawn gstack-paths from a hook. The
+#   writers (/freeze, /guard, /unfreeze, /investigate) resolve through
+#   gstack-paths; a reader that used a different chain failed OPEN whenever
+#   GSTACK_HOME was set (#1459). test/hook-scripts.test.ts pins parity.
 #   Printed WITHOUT a trailing newline: callers capture with a sentinel
 #   (`r="$(gstack_hook_state_root; printf x)"; r="${r%x}"`) so a root that
-#   itself ends in a newline round-trips exactly as gstack-paths' %q does —
-#   otherwise writer and reader would again disagree on the directory.
+#   itself ends in a newline round-trips exactly as gstack-paths' %q does.
+#   When the twin is missing (partial upgrade) the wrapper is removed, so
+#   callers take their own fallback: careful asks, freeze fails closed.
 gstack_hook_state_root() {
-  if [ -n "${GSTACK_HOME:-}" ]; then
-    printf '%s' "$GSTACK_HOME"
-  elif [ -n "${CLAUDE_PLUGIN_DATA:-}" ] && printf '%s' "${CLAUDE_PLUGIN_ROOT:-}" | grep -qi "gstack"; then
-    printf '%s' "$CLAUDE_PLUGIN_DATA"
-  elif [ -n "${HOME:-}" ]; then
-    printf '%s' "$HOME/.gstack"
-  else
-    printf '%s' ".gstack"
-  fi
+  gstack_state_root
 }
+_ghsr_twin="${BASH_SOURCE[0]%/*}/../../bin/gstack-state-root.sh"
+if ! { [ -f "$_ghsr_twin" ] && . "$_ghsr_twin" 2>/dev/null; } || ! command -v gstack_state_root >/dev/null 2>&1; then
+  unset -f gstack_hook_state_root
+fi
 
 # gstack_hook_log_fire SKILL PATTERN
 #   Append a hook_fire analytics record (pattern name only, never command
-#   content). Respects GSTACK_HOME so tests never pollute the operator's real
-#   analytics file. Deliberately NOT gstack_hook_state_root: every other
+#   content) under the resolved state root, the same root every other
 #   analytics writer and reader (gstack-skill-start, gstack-retro-metrics,
-#   gstack-analytics) uses this two-step chain, and the usage log must stay one
-#   file. Best-effort: failures never affect the hook decision.
+#   gstack-analytics) uses, so the usage log stays one file and tests never
+#   pollute the operator's real analytics file. Best-effort: failures (or a
+#   missing twin) never affect the hook decision.
 gstack_hook_log_fire() {
-  _ghlf_dir="${GSTACK_HOME:-$HOME/.gstack}/analytics"
+  command -v gstack_state_root >/dev/null 2>&1 || return 0
+  _ghlf_dir="$(gstack_state_root; printf x)"; _ghlf_dir="${_ghlf_dir%x}/analytics"
   mkdir -p "$_ghlf_dir" 2>/dev/null || true
   # Fields are JSON-encoded (a repo basename can carry quotes/backslashes) —
   # same rule this file states for decisions: never raw-interpolate into JSON.

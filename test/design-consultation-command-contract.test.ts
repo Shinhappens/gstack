@@ -80,10 +80,10 @@ test('actual CLI quality check distinguishes failure from skipped coverage despi
   try {
     const failed = f.run(['check', '--image', f.image, '--brief', 'Readable title'], { MODE: 'check' });
     expect(failed.status, failed.stderr).toBe(0);
-    expect(JSON.parse(failed.stdout)).toEqual({ pass: false, issues: 'illegible title' });
+    expect(JSON.parse(failed.stdout)).toEqual({ pass: false, status: 'fail', issues: 'illegible title' });
     const unavailable = f.run(['check', '--image', f.image, '--brief', 'Readable title'], { MODE: 'unavailable' });
     expect(unavailable.status, unavailable.stderr).toBe(0);
-    expect(JSON.parse(unavailable.stdout)).toEqual({ pass: true, issues: 'Vision check unavailable — skipped' });
+    expect(JSON.parse(unavailable.stdout)).toEqual({ pass: true, status: 'skipped', issues: 'Vision check unavailable — skipped' });
   } finally { f.cleanup(); }
 });
 

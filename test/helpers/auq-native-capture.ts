@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveEvalModel } from '../../lib/eval-model';
 import { launchClaudePty, capturePlanCountQuestion, parseNumberedOptions, type ClaudePtySession } from './claude-pty-runner';
+import { API_ERROR_PANEL } from './pty/screen';
 import { buildSeedConfig, isHermeticEnabled } from './hermetic-env';
 import { getProjectEvalDir } from './eval-store';
 import { readFirstPendingQuestionForDisplay, pendingQuestionRecorderStatus } from './plan-count-pending-question';
@@ -241,7 +242,7 @@ export function displayedNativeAuq(screen: string, call: NativePlanQuestionCall 
 
 /** Read only a public CLI error panel; never inspect private journal blocks. */
 export function nativeAuqPublicError(screen: string): string | undefined {
-  const match = /(?:^|\n)[\t │┃]*(?:[⎿●⏺]\s*)?API Error:[\s\S]*/i.exec(screen);
+  const match = new RegExp(`${API_ERROR_PANEL.source}[\\s\\S]*`, 'i').exec(screen);
   return match?.[0].trim().slice(0, 2000);
 }
 

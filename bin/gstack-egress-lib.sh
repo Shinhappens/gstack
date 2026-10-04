@@ -43,13 +43,13 @@ case "${BASH_SOURCE[0]}" in
   *) _gstack_egress_lib_dir="$(pwd)" ;;
 esac
 
+# State root from the shared twin (bin/gstack-state-root.sh, builtins only),
+# sourced lazily on first use.
 _gstack_egress_home() {
-  if [ -n "${GSTACK_HOME:-}" ]; then
-    printf '%s' "$GSTACK_HOME"
-  elif [ -n "${GSTACK_STATE_DIR:-}" ]; then
-    printf '%s' "$GSTACK_STATE_DIR"
+  if command -v gstack_state_root >/dev/null 2>&1 || { [ -f "$_gstack_egress_lib_dir/gstack-state-root.sh" ] && . "$_gstack_egress_lib_dir/gstack-state-root.sh"; }; then
+    gstack_state_root
   else
-    printf '%s' "$HOME/.gstack"
+    printf '%s' "<gstack state root: $_gstack_egress_lib_dir/gstack-state-root.sh is missing; reinstall with ./setup or /gstack-upgrade>"
   fi
 }
 

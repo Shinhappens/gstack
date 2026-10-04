@@ -1,4 +1,4 @@
-import {expect, test} from 'bun:test';
+import {describe, expect, test} from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -6,6 +6,7 @@ import {createFilePermissionRecorder, recordFilePermission, currentFilePermissio
 import {readPlanCountTranscript} from './helpers/plan-count-transcript';
 import {createPlanCountPermissionGuard} from './helpers/claude-pty-runner';
 import captures from './fixtures/plan-create-combined-permission-70b.json';
+import croppedTitle from './fixtures/plan-create-cropped-title-batching.json';
 
 function fixture(captured: typeof captures[number]) {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'create-combined-'));
@@ -101,3 +102,50 @@ for(const captured of captures) {
     }finally{f.close();}
   });
 }
+
+describe('Create pane cropped below its title (plan-eng-multi-finding-batching, CLI 2.1.284)', () => {
+  function cropped() {
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),'create-cropped-'));
+    const cwd=path.join(dir,path.basename(croppedTitle.cwd)), config=path.join(dir,'config');fs.mkdirSync(cwd);
+    const originalDir=path.dirname(croppedTitle.event.input.file_path);
+    const expected=path.join(dir,path.basename(originalDir),path.basename(croppedTitle.event.input.file_path));
+    fs.mkdirSync(path.dirname(expected));
+    const {sessionId,toolUseId:id}=croppedTitle.event, timestamp=new Date().toISOString();
+    const journal=path.join(config,'projects','owned',sessionId+'.jsonl');fs.mkdirSync(path.dirname(journal),{recursive:true});
+    const recorder=createFilePermissionRecorder(cwd,config,expected)!;
+    const input={...croppedTitle.event.input,file_path:expected};
+    fs.writeFileSync(journal,JSON.stringify({cwd,sessionId,isSidechain:false,timestamp,
+      message:{role:'assistant',content:[{type:'text',text:'Writing the review report.'},{type:'tool_use',id,name:'Write',input}]}})+'\n');
+    recordFilePermission(JSON.stringify({hook_event_name:'PreToolUse',tool_name:'Write',session_id:sessionId,
+      tool_use_id:id,cwd,transcript_path:journal,tool_input:input}),recorder.file,cwd,config,expected);
+    // The relative file row keeps its captured sibling layout; only the footer's
+    // absolute directory is rebound to this fixture.
+    const screen=croppedTitle.screen.replaceAll(originalDir,path.dirname(expected));
+    const read=(s=screen)=>currentFilePermissionEpoch(recorder.file,expected,cwd,config,Date.now()-1000,readPlanCountTranscript(config,cwd),s);
+    return {screen,read,id:`${sessionId}:${id}`,close(){recorder.dispose();fs.rmSync(dir,{recursive:true,force:true});}};
+  }
+
+  test('the captured pane shows its file row and rule but not the Create file title', () => {
+    expect(croppedTitle.screen).not.toMatch(/(?:^|\n) {0,3}Create file[ \t]*\n/);
+    expect(croppedTitle.screen.split('\n')[0]).toBe(' ../gstack-e2e-plan-eng-batching-DINQ9m/gstack-test-plan-eng-batching.md');
+  });
+
+  test('the owned file row binds the pending Write and grants it once', () => {
+    const f=cropped();try {
+      const epoch=f.read();expect(epoch?.pendingId).toBe(f.id);
+      const guard=createPlanCountPermissionGuard();
+      expect(guard(f.screen,'',epoch)).toBe('grant');
+      expect(guard(f.screen,'',epoch)).toBe('handled');
+    }finally{f.close();}
+  });
+
+  for(const [name,change] of [
+    ['a file row naming another file',(s:string)=>s.replace('/gstack-test-plan-eng-batching.md\n','/other.md\n')],
+    ['a file row in another directory',(s:string)=>s.replace(' ../gstack-e2e-plan-eng-batching-DINQ9m/',' ../elsewhere/')],
+    ['an edited preview row',(s:string)=>s.replace('We will leave the','We will fix the')],
+  ] as const) test(`the cropped pane rejects ${name}`,()=>{
+    const f=cropped();try {
+      const screen=change(f.screen);expect(screen).not.toBe(f.screen);expect(f.read(screen)).toBeFalsy();
+    }finally{f.close();}
+  });
+});

@@ -35,8 +35,8 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { runBin } from './spawn-bin';
+import { logHookError as sharedLogHookError } from './hook-log';
 
 interface HookStdin {
   session_id?: string;
@@ -69,19 +69,7 @@ const MARKER_RE = /<gstack-qid:([a-z0-9-]{1,64})>/i;
 const RECOMMENDED_LABEL_RE = /\(recommended\)\s*$/i;
 
 function logHookError(msg: string): void {
-  try {
-    const stateRoot =
-      process.env.GSTACK_STATE_ROOT ||
-      process.env.GSTACK_HOME ||
-      path.join(os.homedir(), '.gstack');
-    fs.mkdirSync(stateRoot, { recursive: true });
-    fs.appendFileSync(
-      path.join(stateRoot, 'hook-errors.log'),
-      `${new Date().toISOString()} question-log-hook: ${msg}\n`,
-    );
-  } catch {
-    // Last-resort: swallow. Hook must not block.
-  }
+  sharedLogHookError('question-log-hook', msg);
 }
 
 function readStdin(): Promise<string> {

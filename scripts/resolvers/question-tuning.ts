@@ -27,7 +27,7 @@ export function generateQuestionTuning(ctx: TemplateContext): string {
   const registry = `${ctx.paths.skillRoot}/scripts/question-registry.ts`;
   return `## Question Tuning (skip entirely if \`QUESTION_TUNING: false\`)
 
-Before each decision brief (AskUserQuestion or Conductor/fallback prose), choose \`question_id\` from \`${registry}\` or \`{skill}-{slug}\`, then run \`printf '%s' "<question summary>" | ${bin}/gstack-question-preference --check "<id>" --summary-stdin\` (piped summary feeds the one-way keyword net, #2024). \`AUTO_DECIDE\` means choose the recommended option and say "Auto-decided [summary] → [option] (your preference). Change with /plan-tune." \`ASK_NORMALLY\` means ask.
+Before each decision brief (AskUserQuestion or Conductor/fallback prose), choose \`question_id\` from \`${registry}\` or \`{skill}-{slug}\`, then run \`printf '%s' "<question summary>" | ${bin}/gstack-question-preference --check "<id>" --summary-stdin\` (so the one-way-door keyword check sees the text). \`AUTO_DECIDE\` means choose the recommended option and say "Auto-decided [summary] → [option] (your preference). Change with /plan-tune." \`ASK_NORMALLY\` means ask.
 
 **Embed the question_id as a marker in every asked brief**, including ad hoc IDs. Use the same ID for its preference check, question marker, and log. Include \`<gstack-qid:{question_id}>\` once in the question text itself, not only a command or log. On prose paths, use the explicit reply line. Without the marker, the PreToolUse hook treats AskUserQuestion as observed-only and never auto-decides.
 

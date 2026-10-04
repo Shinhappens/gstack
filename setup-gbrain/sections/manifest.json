@@ -2,7 +2,7 @@
   "$schema": "https://gstack.dev/schemas/section-manifest.json",
   "skill": "setup-gbrain",
   "version": 1,
-  "note": "PASSIVE registry (v2 plan T9 / CM2). Fields are IDs, file paths, human titles, and human-readable trigger text ONLY. The skeleton's detect (Step 1) + path picker (Step 2) are the ONLY places that decide WHEN a section is read (the install routes are branch-exclusive — at most one init route runs per invocation); required-reads live in the E2E fixtures. No machine predicate here — see docs/designs/v2_PLAN.md:663.",
+  "note": "PASSIVE registry (v2 plan T9 / CM2). Fields are IDs, file paths, human titles, and human-readable trigger text ONLY. The skeleton's detect (Step 1) + path picker (Step 2) are the ONLY places that decide WHEN a section is read (the install routes are branch-exclusive — at most one init route runs per invocation); required section reads are checked by test/carve-section-loading-setup-gbrain.test.ts. No machine predicate here — see docs/designs/v2_PLAN.md:663.",
   "sections": [
     {
       "id": "engine-remediation",
@@ -19,14 +19,14 @@
     {
       "id": "transcript-gate",
       "file": "transcript-gate.md",
-      "title": "Step 7.5: transcript & memory ingest gate (probe, thresholds, ingest AskUserQuestion)",
+      "title": "Step 7.5: transcript ingest consent (has-check, probe, recent/all/off AskUserQuestion)",
       "trigger": "running the Step 7.5 transcript & memory ingest gate on Paths 1, 2a, 2b, or 3 (Path 4 skips this section entirely — see the skeleton's skip note)"
     },
     {
       "id": "claude-md-persist",
       "file": "claude-md-persist.md",
-      "title": "Step 8: persist the GBrain Configuration + Search Guidance blocks in CLAUDE.md",
-      "trigger": "persisting the Step 8 `## GBrain Configuration` block to CLAUDE.md (and the Search Guidance block after Step 9 passes)"
+      "title": "Step 8: persist the GBrain Configuration block in CLAUDE.md",
+      "trigger": "persisting the Step 8 `## GBrain Configuration` block to CLAUDE.md"
     }
   ]
 }

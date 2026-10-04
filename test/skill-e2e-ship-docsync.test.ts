@@ -1,288 +1,134 @@
-/**
- * /ship Step 18 doc-sync dispatch E2E — proves a live agent executing the
- * ship tail (Step 17 push → Step 19 PR creation) actually dispatches the
- * /document-release subagent BEFORE creating the PR. This is the behavioral
- * guardrail for the wiring pinned statically by
- * test/ship-document-release-dispatch.test.ts: the v1.54 carve made the
- * dispatch invisible once; this test makes that class of regression loud.
- *
- * Gating: whole-file gate-tier self-gate (describeE2ETier) COMPOSED with
- * diff-based selection (describeIfSelected). The self-gate keeps this file
- * out of the periodic shard census (near its ceiling) and under the hard
- * tier-alignment invariant. DELIBERATE TRADEOFF: tierless runs (`bun run
- * test:evals` / `test:e2e`) skip every tier-gated file, so this test does
- * NOT run there even when ship/** changed — use the gate lane locally:
- *   EVALS_TIER=gate bun run test:evals            # diff-selected gate lane
- *   EVALS=1 EVALS_TIER=gate EVALS_ALL=1 bun test test/skill-e2e-ship-docsync.test.ts
- *
- * Fixture layout (non-obvious — fake HOME + planted skill tree):
- *
- *   <workDir>/                            (passed as env HOME)
- *   ├── repo/               bare-remote git fixture, feature branch,
- *   │                       Steps 0-16 already "done" (VERSION bumped,
- *   │                       CHANGELOG entry, change committed, not pushed)
- *   ├── ship/SKILL-tail.md  sliced Step 17 → Step 20 from the generated
- *   │                       skeleton (live worktree, extract-don't-copy)
- *   ├── ship/sections/pr-body.md          planted copy (relative-resolution
- *   │                                     insurance)
- *   ├── gstack-home/.redact-prepush-prompted   marker + env GSTACK_HOME →
- *   │                       Step 17's credential pre-push guard takes its
- *   │                       silent "continue" branch instead of its
- *   │                       AskUserQuestion branch (gstack-config is absent
- *   │                       so REDACT_PREPUSH falls back to "false")
- *   └── .claude/skills/gstack/
- *       ├── ship/sections/pr-body.md      ← the STOP pointer's literal
- *       │                       `~/.claude/...` path resolves HERE via the
- *       │                       HOME override (CLAUDE_CONFIG_DIR is already
- *       │                       hermetic, so overriding HOME is safe)
- *       └── document-release/SKILL.md     ← stub: instructs the dispatched
- *                               subagent to emit the empty-result JSON
- *                               contract in 2-3 turns (the DISPATCH is what
- *                               is under test; Step 18 is non-blocking)
- *
- * The prompt is deliberately neutral — it does NOT command STOP-Read
- * compliance and does NOT name document-release. Priming the behavior under
- * test would make the assert tautological (and the prompt echoes into the
- * transcript, which is why asserts only ever read result.toolCalls).
- *
- * Cost: observed $0.63-1.04/run, 234-319s (9/9 burn-in + review runs passed;
- * gate tier confirmed).
- */
-import { expect, beforeAll, afterAll } from 'bun:test';
-import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import { spawnSync } from 'child_process';
+import { expect, afterAll } from 'bun:test';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { CAPTURE_LONG_MS, CAPTURE_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
-import {
-  ROOT, runId,
-  describeIfSelected, testConcurrentIfSelected,
-  createEvalCollector, recordE2E, finalizeEvalCollector, logCost,
-} from './helpers/e2e-helpers';
+import { runId, describeIfSelected, testConcurrentIfSelected, createEvalCollector, recordE2E, finalizeEvalCollector, logCost } from './helpers/e2e-helpers';
 import { describeE2ETier } from './helpers/e2e-gate';
+import { docsDispatchIndex, parseDocsCompletion, vetDocsCompletion } from './helpers/docsync-contract';
+import { fixtureDocs, repoSnapshot, changedFiles, DOC_PATH, preserveDocsEvidence, sawSpawnedMarker, type DocsScenario } from './helpers/docsync-fixture';
+import { observeDocsWrites, docsWriteFailures, docsShipPhase, docsToolFailures, docsCompletedRead, docsSessionOptions } from './helpers/docsync-observer';
+import type { SkillTestResult } from './helpers/session-runner';
+import { runShipDocsFault } from './helpers/docsync-fault-eval';
 
 const describeE2E = describeE2ETier('gate');
-const evalCollector = createEvalCollector('e2e-ship-docsync');
+const collector = createEvalCollector('e2e-ship-docsync');
 
-const DOC_RELEASE_STUB = `---
-name: document-release
-description: Post-ship documentation update (E2E stub).
----
-
-# Document Release (E2E stub)
-
-You are running the documentation-sync workflow after a code push.
-For this environment: compare the docs to the diff briefly; nothing needs
-updating. Do NOT edit any files. Do NOT push.
-
-Output EXACTLY this JSON object on the LAST line of your response, with no
-text after it:
-
-{"files_updated":[],"commit_sha":null,"pushed":false,"documentation_section":null}
-`;
-
-describeE2E('Ship doc-sync dispatch E2E (gate)', () => {
-  describeIfSelected('Ship doc-sync dispatch E2E', ['ship-docsync'], () => {
-    let workDir: string;
-    let repoDir: string;
-    let remoteDir: string;
-
-    beforeAll(() => {
-      workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-docsync-home-'));
-      remoteDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-docsync-remote-'));
-      repoDir = path.join(workDir, 'repo');
-
-      // Bare remote + clone; Steps 0-16 "already done": feature branch with a
-      // committed change, VERSION bumped, CHANGELOG entry written. Not pushed —
-      // Step 17 (the slice's first step) does that.
-      // Branch pinned with -b main / -c init.defaultBranch=main so operator git
-      // config never leaks into the fixture (default-config machines would
-      // otherwise create master and the later `push -u origin main` would fail).
-      // Every setup command asserts status — a broken fixture must fail loud
-      // and free here, never burn a paid run downstream.
-      const assertOk = (r: ReturnType<typeof spawnSync>, what: string) => {
-        if (r.status !== 0) {
-          throw new Error(
-            `ship-docsync fixture setup failed: ${what} → exit ${r.status}\n${r.stderr?.toString() ?? ''}`
-          );
-        }
-        return r;
-      };
-      assertOk(
-        spawnSync('git', ['init', '--bare', '-b', 'main'], { cwd: remoteDir, stdio: 'pipe', timeout: 15000 }),
-        'git init --bare -b main'
-      );
-      assertOk(
-        spawnSync('git', ['-c', 'init.defaultBranch=main', 'clone', remoteDir, repoDir], { stdio: 'pipe', timeout: 15000 }),
-        'git clone'
-      );
-      const run = (cmd: string, args: string[]) =>
-        assertOk(
-          spawnSync(cmd, args, { cwd: repoDir, stdio: 'pipe', timeout: 10000 }),
-          `${cmd} ${args.join(' ')}`
-        );
-      run('git', ['config', 'user.email', 'test@test.com']);
-      run('git', ['config', 'user.name', 'Test']);
-      run('git', ['config', 'commit.gpgsign', 'false']);
-      fs.writeFileSync(path.join(repoDir, 'app.ts'), 'console.log("v1");\n');
-      fs.writeFileSync(path.join(repoDir, 'VERSION'), '0.1.0.0\n');
-      fs.writeFileSync(
-        path.join(repoDir, 'CHANGELOG.md'),
-        '# Changelog\n\n## [0.1.0.0] - 2026-01-01\n\n- Initial release\n'
-      );
-      // The cwd-relative pr-body plant (below) lives inside this working tree;
-      // ignore it so the fixture repo stays clean and the agent never tries to
-      // commit test scaffolding.
-      fs.writeFileSync(path.join(repoDir, '.gitignore'), 'ship/\n');
-      run('git', ['add', 'app.ts', 'VERSION', 'CHANGELOG.md', '.gitignore']);
-      run('git', ['commit', '-m', 'initial']);
-      run('git', ['push', '-u', 'origin', 'main']);
-      run('git', ['checkout', '-b', 'feature/docsync-test']);
-      fs.writeFileSync(path.join(repoDir, 'app.ts'), 'console.log("v2");\n');
-      fs.writeFileSync(path.join(repoDir, 'VERSION'), '0.1.0.1\n');
-      fs.writeFileSync(
-        path.join(repoDir, 'CHANGELOG.md'),
-        '# Changelog\n\n## [0.1.0.1] - 2026-01-02\n\n- Docsync test feature\n\n## [0.1.0.0] - 2026-01-01\n\n- Initial release\n'
-      );
-      run('git', ['add', 'app.ts', 'VERSION', 'CHANGELOG.md']);
-      run('git', ['commit', '-m', 'feat: docsync test feature']);
-
-      // Extract-don't-copy: slice the LIVE generated skeleton's Step 17→19
-      // tail. Fail loudly on marker drift — a tolerant slice silently builds
-      // a wrong fixture (mirrors extractSkillSections's throw-on-rename).
-      const skeleton = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md'), 'utf-8');
-      const start = skeleton.indexOf('## Step 17: Push');
-      const end = skeleton.indexOf('## Step 20: Persist ship metrics');
-      if (start === -1 || end === -1 || end <= start) {
-        throw new Error(
-          'ship/SKILL.md step markers moved — update the skill-e2e-ship-docsync fixture slice'
-        );
-      }
-      const tail = skeleton.slice(start, end);
-      fs.mkdirSync(path.join(workDir, 'ship', 'sections'), { recursive: true });
-      fs.writeFileSync(path.join(workDir, 'ship', 'SKILL-tail.md'), tail);
-
-      // Plant the real pr-body section at the STOP pointer's ~ path (HOME
-      // override) and at a relative path as insurance.
-      const prBody = fs.readFileSync(
-        path.join(ROOT, 'ship', 'sections', 'pr-body.md'), 'utf-8'
-      );
-      const plantedSkills = path.join(workDir, '.claude', 'skills', 'gstack');
-      fs.mkdirSync(path.join(plantedSkills, 'ship', 'sections'), { recursive: true });
-      fs.mkdirSync(path.join(plantedSkills, 'document-release'), { recursive: true });
-      fs.writeFileSync(path.join(plantedSkills, 'ship', 'sections', 'pr-body.md'), prBody);
-      fs.writeFileSync(path.join(workDir, 'ship', 'sections', 'pr-body.md'), prBody);
-      // Third plant: resolvable relative to the agent's cwd (repoDir), not just
-      // relative to SKILL-tail.md — saves a wasted turn if the agent tries a
-      // cwd-relative read before the ~ path.
-      fs.mkdirSync(path.join(repoDir, 'ship', 'sections'), { recursive: true });
-      fs.writeFileSync(path.join(repoDir, 'ship', 'sections', 'pr-body.md'), prBody);
-      fs.writeFileSync(
-        path.join(plantedSkills, 'document-release', 'SKILL.md'),
-        DOC_RELEASE_STUB
-      );
-
-      // Route Step 17's credential pre-push guard to its silent branch.
-      fs.mkdirSync(path.join(workDir, 'gstack-home'), { recursive: true });
-      fs.writeFileSync(
-        path.join(workDir, 'gstack-home', '.redact-prepush-prompted'), ''
-      );
-    });
-
-    afterAll(() => {
-      try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
-      try { fs.rmSync(remoteDir, { recursive: true, force: true }); } catch {}
-    });
-
-    testConcurrentIfSelected('ship-docsync', async () => {
-      const result = await runSkillTest({
-        prompt: `You are executing the /ship workflow; your working directory is the git repo. Steps 0-16 are complete: tests passed, review done, VERSION bumped to 0.1.0.1, CHANGELOG updated, changes committed on branch feature/docsync-test. The remaining workflow is in ${path.join(workDir, 'ship', 'SKILL-tail.md')} — Read it and continue the workflow from Step 17 to completion. Skill section files referenced by STOP pointers live under ${path.join(workDir, 'ship', 'sections')} (also planted at ship/sections/ relative to the repo) — resolve section reads there, not via \`~\`. Base branch: main. There is no GitHub/GitLab service in this environment: if gh or glab commands fail, print the would-be PR title and body and stop. gstack helper binaries (gstack-*) are unavailable in this environment — treat their failures as no-ops and continue. Do NOT ask questions.`,
-        workingDirectory: repoDir,
-        maxTurns: 30,
-        allowedTools: ['Bash', 'Read', 'Grep', 'Glob', 'Write', 'Agent', 'Task'],
-        timeout: CAPTURE_LONG_MS,
-        env: {
-          HOME: workDir,
-          GSTACK_HOME: path.join(workDir, 'gstack-home'),
-        },
-        testName: 'ship-docsync',
+async function runShipDocs(testName: string, scenario: DocsScenario) {
+  if (!process.env.EVALS_RUN_ID) throw Error('Native docs acceptance requires EVALS_RUN_ID');
+  const deadline = Date.now() + CAPTURE_LONG_MS;
+  const fixture = fixtureDocs(scenario);
+  try {
+    const skeleton = fs.readFileSync(path.join(fixture.skills, 'ship/SKILL.md'), 'utf8');
+    const prBody = fs.readFileSync(path.join(fixture.skills, 'ship/sections/pr-body.md'), 'utf8');
+    const phase = path.join(fixture.home, 'phase.md');
+    const storePointer = fs.readFileSync(path.join(process.env.DOCSYNC_GENERATED_ROOT || path.resolve(import.meta.dir, '..'), 'ship/sections/apple-release.md'), 'utf8')
+      .split('\n').find(line => line.startsWith('**Documentation preflight:**'));
+    if (!storePointer) throw new Error('store documentation preflight pointer moved');
+    fs.writeFileSync(phase, docsShipPhase(skeleton, prBody, scenario, storePointer));
+    const report = path.join(fixture.home, 'ship-report.md');
+    const receipt = path.join(fixture.home, 'publication.json');
+    const publish = path.join(fixture.home, 'fixture-publish.ts');
+    fs.writeFileSync(publish, `import {readFileSync,writeFileSync} from 'node:fs';\nconst report=readFileSync(${JSON.stringify(report)},'utf8');\nif(!/Documentation/i.test(report)) throw Error('missing audit report');\nwriteFileSync(${JSON.stringify(receipt)},JSON.stringify({report}),{mode:0o600});\n`);
+    const observer = await observeDocsWrites(fixture);
+    let result: SkillTestResult | undefined;
+    let observation: ReturnType<typeof observer.stop>;
+    try {
+      result = await runSkillTest(docsSessionOptions({
+        fixture,
+        phase,
+        report,
+        publish,
+        scenario,
+        testName,
         runId,
-      });
-
-      logCost('/ship doc-sync dispatch', result);
-
-      // Assert ONLY on result.toolCalls — the prompt and skill text echo into
-      // the transcript and would false-positive any transcript-wide match
-      // (trap documented in skill-e2e-autoplan-dual-voice.test.ts).
-      const calls = Array.isArray(result.toolCalls) ? result.toolCalls : [];
-      // Matcher is dispatch-SPECIFIC, not mention-specific: both markers come
-      // verbatim from the Step 18 subagent prompt dictated by pr-body.md. A
-      // subagent that merely quotes section text mentioning "document-release"
-      // (e.g. a PR-body drafter) must NOT count — that false-pass would mask
-      // the exact regression this test exists to catch. Verified against
-      // recorded burn-in transcripts: real dispatch inputs carry both markers.
-      // Section-paste exclusion: a subagent handed the WHOLE pr-body.md as
-      // context carries the markers too. The dictated Step 18 prompt never
-      // contains the section's scaffolding, so its presence disqualifies.
-      // Verified across all recorded runs: real dispatches match markers,
-      // zero contain scaffold strings.
-      const dispatchIdx = calls.findIndex((tc) => {
-        if (tc.tool !== 'Agent' && tc.tool !== 'Task') return false;
-        const input = JSON.stringify(tc.input ?? {});
-        return (
-          /document-release\/SKILL\.md|executing the \/document-release workflow/i.test(input) &&
-          !/## Step 19: Create PR\/MR|Parent processing:/.test(input)
-        );
-      });
-      const prCreateIdx = calls.findIndex(
-        (tc) =>
-          tc.tool === 'Bash' &&
-          /gh pr create|glab mr create/.test(String((tc.input as any)?.command ?? ''))
-      );
-      const readPrBody = calls.some(
-        (tc) =>
-          (tc.tool === 'Read' &&
-            /sections\/pr-body\.md/.test(String((tc.input as any)?.file_path ?? ''))) ||
-          (tc.tool === 'Bash' &&
-            /sections\/pr-body\.md/.test(String((tc.input as any)?.command ?? '')))
-      );
-
-      if (!readPrBody) {
-        // Diagnostic only — near-tautological under any prompt; the dispatch
-        // below is the invariant.
-        console.warn('ship-docsync: pr-body.md was never opened');
+        timeout: Math.max(1, deadline - Date.now() - 15_000),
+      }));
+    } finally {
+      observation = observer.stop();
+      preserveDocsEvidence(fixture, result ?? { output: 'capture did not return', toolCalls: [] }, runId, testName, { observation });
+    }
+    if (!result) throw Error('missing native parent result');
+    logCost(testName, result);
+    const calls = result.toolCalls;
+    const dispatch = docsDispatchIndex(calls);
+    const publishCall = calls.findIndex(call => call.tool === 'Bash' && String(call.input?.command).includes(`bun ${publish}`));
+    let passed = false;
+    try {
+      expect(dispatch).toBeGreaterThanOrEqual(0);
+      expect(calls[dispatch].input.run_in_background).toBe(false);
+      if (publishCall >= 0) expect(dispatch).toBeLessThan(publishCall);
+      expect(result.exitReason).toBe('success');
+      expect(docsWriteFailures(observation!, scenario === 'current' || scenario === 'store' ? [] : [DOC_PATH], {
+        result, fixture, scripts: [publish], readOnly: scenario === 'current' || scenario === 'store',
+      })).toEqual([]);
+      expect(docsToolFailures(result, fixture, [publish], scenario === 'current' || scenario === 'store')).toEqual([]);
+      const output = fs.readFileSync(report, 'utf8');
+      const after = repoSnapshot(fixture.repo);
+      const changed = changedFiles(fixture.before, after);
+      expect(after.head).toBe(fixture.before.head);
+      expect(after.index).toBe(fixture.before.index);
+      expect(after.contents['personal-note.txt']).toBe(fixture.before.contents['personal-note.txt']);
+      expect(fs.readFileSync(path.join(fixture.repo, DOC_PATH), 'utf8')).toContain('User-maintained note: KEEP THIS EXACTLY.');
+      if (scenario === 'store') {
+        expect(output).toMatch(/Documentation[\s\S]*blocked/i);
+        expect(fs.existsSync(receipt)).toBe(false);
+        expect(publishCall).toBe(-1);
+        expect(changed).toEqual([]);
+        expect(output).not.toMatch(/Documentation(?: is|:) current/i);
+      } else {
+        const raw = JSON.parse(calls[dispatch].output.trimEnd().split('\n').at(-1)!);
+        const contract = parseDocsCompletion(calls[dispatch].output, raw.audit_id);
+        expect(JSON.stringify(calls[dispatch].input)).toContain(raw.audit_id);
+        expect(calls[dispatch].output).toContain('SESSION_KIND: spawned');
+        expect(sawSpawnedMarker(result)).toBe(true);
+        vetDocsCompletion(contract, {
+          settled: result.exitReason === 'success', markerSeen: sawSpawnedMarker(result),
+          headUnchanged: after.head === fixture.before.head, indexUnchanged: after.index === fixture.before.index,
+          candidateUnchanged: changed.every(p => p === DOC_PATH), readOnly: false,
+          changedPaths: changed, allowedDocs: [DOC_PATH],
+        });
+        expect(contract.status).toBe(scenario === 'current' ? 'current' : 'updated');
+        expect(contract.files_reviewed).toContain(DOC_PATH);
+        expect(docsCompletedRead(result, path.join(fixture.repo, DOC_PATH), fixture, {
+          source: Buffer.from(fixture.before.contents[DOC_PATH], 'base64').toString('utf8'),
+          beforeFirstEdit: scenario !== 'current',
+        })).toBe(true);
+        expect(output).toContain(contract.documentation_section);
+        expect(fs.existsSync(receipt)).toBe(true);
+        expect(publishCall).toBeGreaterThan(dispatch);
+        expect(changed).toEqual(scenario === 'current' ? [] : [DOC_PATH]);
+        if (scenario === 'updated') expect(fs.readFileSync(path.join(fixture.repo, DOC_PATH), 'utf8')).toMatch(/Default format: JSON\./i);
       }
+      const actualMutation = calls.filter(call => call.tool === 'Bash').map(call => String(call.input?.command))
+        .filter(command => /\bgit\s+(?:add|commit|push|reset|checkout|stash|merge|pull|rebase)(?=[\s;&|<>)]|$)/.test(command));
+      expect(actualMutation).toEqual([]);
+      passed = true;
+    } finally {
+      recordE2E(collector, testName, 'Ship doc-sync lifecycle', result, { passed });
+    }
+  } finally {
+    fixture.clean();
+  }
+}
 
-      recordE2E(evalCollector, '/ship doc-sync dispatch', 'Ship doc-sync dispatch E2E', result, {
-        passed:
-          dispatchIdx >= 0 &&
-          (prCreateIdx < 0 || dispatchIdx < prCreateIdx) &&
-          ['success', 'error_max_turns', 'timeout'].includes(result.exitReason),
-      });
-
-      // THE regression assert: the /document-release subagent was dispatched.
-      expect(dispatchIdx).toBeGreaterThanOrEqual(0);
-      // v1.79: the dispatch must carry the explicit foreground flag — the
-      // whole #497/#2440 class is "prose said foreground, the call didn't".
-      // Phrase pins prove the text exists; this proves the model obeys it.
-      expect((calls[dispatchIdx].input as any)?.run_in_background).toBe(false);
-      // Sequencing: dispatch happens BEFORE PR creation (when a create was attempted).
-      if (prCreateIdx >= 0) expect(dispatchIdx).toBeLessThan(prCreateIdx);
-      // 'timeout' is acceptable ONLY because the dispatch assert above is
-      // independently hard — a run that times out AFTER a clean dispatch
-      // proves the invariant; one that times out before it already failed on
-      // dispatchIdx. Never soften dispatchIdx to compensate.
-      expect(['success', 'error_max_turns', 'timeout']).toContain(result.exitReason);
-
-      console.log(
-        `dispatchIdx=${dispatchIdx} prCreateIdx=${prCreateIdx} readPrBody=${readPrBody} exit=${result.exitReason}`
-      );
-    }, CAPTURE_LONG_MS);
+describeE2E('Ship doc-sync lifecycle E2E (gate)', () => {
+  describeIfSelected('Ship doc-sync lifecycle', ['ship-docsync-completion', 'ship-docsync-current', 'ship-docsync-failure', 'ship-docsync-store',
+      'ship-docsync-missing-marker', 'ship-docsync-missing-asset', 'ship-docsync-launch-failure', 'ship-docsync-timeout-unsettled',
+      'ship-docsync-late-result', 'ship-docsync-stale-before', 'ship-docsync-stale-after', 'ship-docsync-recovery'], () => {
+    testConcurrentIfSelected('ship-docsync-completion', () => runShipDocs('ship-docsync-completion', 'updated'), CAPTURE_LONG_MS);
+    testConcurrentIfSelected('ship-docsync-current', () => runShipDocs('ship-docsync-current', 'current'), CAPTURE_LONG_MS);
+    testConcurrentIfSelected('ship-docsync-failure', () => runShipDocsFault('ship-docsync-failure', 'legacy-completion', collector, CAPTURE_LONG_MS), CAPTURE_LONG_MS);
+    testConcurrentIfSelected('ship-docsync-store', () => runShipDocs('ship-docsync-store', 'store'), CAPTURE_LONG_MS);
+    testConcurrentIfSelected('ship-docsync-missing-marker', () => runShipDocsFault('ship-docsync-missing-marker', 'missing-marker', collector), CAPTURE_MS);
+    testConcurrentIfSelected('ship-docsync-missing-asset', () => runShipDocsFault('ship-docsync-missing-asset', 'missing-asset', collector), CAPTURE_MS);
+    testConcurrentIfSelected('ship-docsync-launch-failure', () => runShipDocsFault('ship-docsync-launch-failure', 'launch-failure', collector), CAPTURE_MS);
+    testConcurrentIfSelected('ship-docsync-timeout-unsettled', () => runShipDocsFault('ship-docsync-timeout-unsettled', 'timeout-unsettled', collector), CAPTURE_MS);
+    testConcurrentIfSelected('ship-docsync-late-result', () => runShipDocsFault('ship-docsync-late-result', 'late-result', collector), CAPTURE_MS);
+    testConcurrentIfSelected('ship-docsync-stale-before', () => runShipDocsFault('ship-docsync-stale-before', 'stale-before', collector), CAPTURE_MS);
+    testConcurrentIfSelected('ship-docsync-stale-after', () => runShipDocsFault('ship-docsync-stale-after', 'stale-after', collector), CAPTURE_MS);
+    testConcurrentIfSelected('ship-docsync-recovery', () => runShipDocsFault('ship-docsync-recovery', 'recovery', collector), CAPTURE_MS);
   });
 });
 
-// Module-level afterAll — finalize eval collector after all tests complete
-afterAll(async () => {
-  await finalizeEvalCollector(evalCollector);
-});
+afterAll(() => finalizeEvalCollector(collector));

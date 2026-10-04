@@ -1,17 +1,17 @@
 import { expect, test } from 'bun:test';
-import { resolvePaidShardBudget, retriesForFiles, planPaidShards, parseRunManifest, verifySliceResults, runPaidShard, buildRunManifest, paidShardWallUpperBoundMs, collectPaidTestFiles, selectPaidTestFiles, isOverlayTestFile, OVERLAY_MAX_ACTIVE_SHARDS, DEFAULT_SHARD_TIMEOUT_MS, DEFAULT_JOBS } from '../scripts/test-paid-shards';
-import { FINDING_RETRY_BUDGETS, ALL_TIERS, AUTOPLAN_CHAIN_BUDGET } from './helpers/eval-budgets';
+import { resolvePaidShardBudget, retriesForFiles, planPaidShards, parseRunManifest, verifySliceResults, runPaidShard, buildRunManifest, paidShardWallUpperBoundMs, collectPaidTestFiles, selectPaidTestFiles, isOverlayTestFile, DEFAULT_SHARD_TIMEOUT_MS, DEFAULT_JOBS, parseCliOptions, expandCaseShards, expandTrialShards, shardFile, sliceExecutionOrder, sliceSupervisedWallMs } from '../scripts/test-paid-shards';
+import { FINDING_RETRY_BUDGETS, ALL_TIERS, SHARD_RESERVE_MS } from './helpers/eval-budgets';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 for (const budget of FINDING_RETRY_BUDGETS) {
-  test(`${budget.file}: supervision preserves every existing attempt and retry`, () => {
+  test(`${budget.file}: supervision covers its one run of every case`, () => {
     expect(budget.testMs).toBe(1_500_000);
-    expect(budget.retries).toBe(1);
-    expect(retriesForFiles([budget.file])).toBe(budget.retries);
-    expect(budget.shardReserveMs).toBe(AUTOPLAN_CHAIN_BUDGET.shardReserveMs);
-    expect(budget.shardMs).toBe(budget.cases * budget.testMs * (budget.retries + 1) + budget.shardReserveMs);
+    // Paid evals never retry: a timed-out case is its verdict.
+    expect(retriesForFiles([budget.file])).toBe(0);
+    expect(budget.shardReserveMs).toBe(SHARD_RESERVE_MS);
+    expect(budget.shardMs).toBe(budget.cases * budget.testMs + budget.shardReserveMs);
     expect(resolvePaidShardBudget([budget.file])).toEqual({ timeoutMs: budget.shardMs, source: 'registered', policyId: budget.id });
     const source = fs.readFileSync(path.join(import.meta.dir, '..', budget.file), 'utf8');
     if (budget.file === 'test/skill-e2e-plan-ceo-split-overflow.test.ts') {
@@ -20,19 +20,12 @@ for (const budget of FINDING_RETRY_BUDGETS) {
       expect([...source.matchAll(/const deadlineAt = Date\.now\(\) \+ 1_500_000;/g)]).toHaveLength(budget.cases);
       expect([...source.matchAll(/timeoutMs:\s*deadlineAt - Date\.now\(\)/g)]).toHaveLength(budget.cases);
       expect(source).toContain("floor: FLOOR, kind: 'scope', deadlineAt");
-    } else if (budget.file === 'test/skill-e2e-plan-eng-finding-count.test.ts') {
-      // Its terminal assessment shares the original allowance with the actor.
-      expect([...source.matchAll(/const startedAt = Date\.now\(\);/g)]).toHaveLength(budget.cases);
-      expect([...source.matchAll(/const deadlineAt = startedAt \+ 1_500_000;/g)]).toHaveLength(budget.cases);
-      expect([...source.matchAll(/timeoutMs:\s*deadlineAt - Date\.now\(\)/g)]).toHaveLength(budget.cases);
-      expect(source).toContain('deadlineAt: Math.min(input.deadlineAt, deadlineAt)');
     } else {
       expect([...source.matchAll(/timeoutMs:\s*1_500_000\b/g)]).toHaveLength(budget.cases);
     }
     expect([...source.matchAll(/1_500_000\s*\/\* physical ceiling:/g)]).toHaveLength(budget.cases);
-    // Current periodic CI already supports this supervision wall.
-    const workflow = Bun.YAML.parse(fs.readFileSync(path.join(import.meta.dir, '../.github/workflows/evals-periodic.yml'), 'utf8')) as any;
-    expect(budget.shardMs).toBeLessThan(workflow.jobs['eval-slices']['timeout-minutes'] * 60_000);
+    // The planned periodic CI job cap supports this supervision wall.
+    expect(budget.shardMs).toBeLessThan(livePlan().plan!.ciTimeoutMinutes * 60_000);
   });
 
   test(`${budget.file}: own-shard allocation leaves ordinary and explicit limits intact`, () => {
@@ -86,15 +79,18 @@ for (const budget of FINDING_RETRY_BUDGETS) {
   });
 }
 
-test('ordinary tiers and Autoplan allocations remain unchanged', () => {
+test('ordinary tiers and registered allocations remain unchanged', () => {
   expect(ALL_TIERS).toEqual({ JUDGE_MS: 120000, CAPTURE_MS: 300000, CAPTURE_LONG_MS: 600000, PTY_MS: 900000, PTY_LONG_MS: 1200000 });
   expect(resolvePaidShardBudget(['test/other.test.ts'])).toEqual({ timeoutMs: 1800000, source: 'default', policyId: null });
-  expect(resolvePaidShardBudget([AUTOPLAN_CHAIN_BUDGET.file])).toEqual({ timeoutMs: AUTOPLAN_CHAIN_BUDGET.shardMs, source: 'registered', policyId: AUTOPLAN_CHAIN_BUDGET.id });
-  expect(new Set(FINDING_RETRY_BUDGETS.map(b => b.file)).size).toBe(6);
+  expect(resolvePaidShardBudget(['test/other.test.ts'], 12_000)).toEqual({ timeoutMs: 12_000, source: 'explicit', policyId: null });
+  for (const value of [NaN, Infinity, -1, 0, 1.5, 2_147_483_648]) {
+    expect(() => resolvePaidShardBudget(['test/other.test.ts'], value)).toThrow('timer-safe');
+  }
+  expect(new Set(FINDING_RETRY_BUDGETS.map(b => b.file)).size).toBe(2);
 });
 
 test('actual shard launcher honors the explicit saved planner limit without a provider', async () => {
-  const budget = FINDING_RETRY_BUDGETS.find(b => b.file.includes('plan-eng-finding-count'))!;
+  const budget = FINDING_RETRY_BUDGETS.find(b => b.file.includes('plan-eng-multi-finding-batching'))!;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'finding-retry-wall-'));
   try {
     const outcome = await runPaidShard([budget.file], 1, 1, { rootDir: dir, logDir: dir, jobs: 2,
@@ -107,40 +103,48 @@ test('actual shard launcher honors the explicit saved planner limit without a pr
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }, 10000);
 
-const periodicWorkflow = Bun.YAML.parse(fs.readFileSync(path.join(import.meta.dir, '../.github/workflows/evals-periodic.yml'), 'utf8')) as any;
-const periodicJob = periodicWorkflow.jobs['eval-slices'];
-const periodicPlanStep = periodicWorkflow.jobs['plan-slices'].steps.find((step: any) => step.run?.includes('--tier periodic --emit-plan'));
-const periodicSliceCount = Number(periodicPlanStep.run.match(/--slices\s+(\d+)/)?.[1]);
-const periodicRunStep = periodicJob.steps.find((step: any) => step.run?.includes('--plan /tmp/paid-plan/manifest.json'));
-const periodicWorkers = Number(periodicRunStep.env.EVALS_JOBS);
-const livePlan = (discovered?: string[]) => buildRunManifest({ tier: 'periodic', sliceCount: periodicSliceCount,
-  evalsAll: true, dedicatedAutoplanSlice: true, env: { EVALS_ALL: '1' }, discovered });
+function periodicLane() {
+  const workflow = Bun.YAML.parse(fs.readFileSync(path.join(import.meta.dir, '../.github/workflows/evals-periodic.yml'), 'utf8')) as any;
+  const job = workflow.jobs['eval-slices'];
+  const planStep = workflow.jobs['plan-slices'].steps.find((step: any) => step.run?.includes('--tier periodic --emit-plan'));
+  const planned = parseCliOptions(planStep.run.slice(planStep.run.indexOf('scripts/test-paid-shards.ts') + 'scripts/test-paid-shards.ts'.length).trim().split(/\s+/), {});
+  const runStep = job.steps.find((step: any) => step.run?.includes('--plan /tmp/paid-plan/manifest.json'));
+  return { job, planStep, planned, workers: Number(runStep.env.EVALS_JOBS) };
+}
+function livePlan(discovered?: string[]) {
+  const { planned } = periodicLane();
+  return buildRunManifest({ tier: 'periodic', sliceBudgetMs: planned.sliceBudgetMs!, jobs: planned.jobs,
+    evalsAll: true, env: { EVALS_ALL: '1' }, discovered });
+}
 
 test('live periodic census fits the declared CI wall including setup', () => {
+  const { job, planStep, planned, workers } = periodicLane();
   const m = livePlan();
-  expect(periodicPlanStep.run).toContain('--autoplan-slice');
-  expect(periodicJob.strategy.matrix.slice).toEqual(Array.from({ length: periodicSliceCount }, (_, index) => index + 1));
-  expect(periodicWorkers).toBe(2);
-  const walls = Array.from({ length: periodicSliceCount }, (_, index) => {
-    const files = m.entries.filter(e => e.status === 'planned' && e.slice === index + 1).map(e => e.file);
-    const workers = files.some(isOverlayTestFile) ? Math.min(periodicWorkers, OVERLAY_MAX_ACTIVE_SHARDS) : periodicWorkers;
-    return paidShardWallUpperBoundMs(files, workers);
-  });
-  expect(Math.max(...walls) + 20 * 60_000).toBeLessThanOrEqual(periodicJob['timeout-minutes'] * 60_000);
-  expect(m.entries.filter(e => e.status === 'planned')).toHaveLength(100);
-  const overlays = m.entries.filter(e => e.status === 'planned' && e.slice === periodicSliceCount - 1);
-  expect(overlays).toHaveLength(6);
+  expect(planStep.run).not.toContain('--autoplan-slice');
+  expect(job.strategy.matrix.slice).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_slices) }}');
+  expect(job['timeout-minutes']).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_timeout_minutes) }}');
+  expect(workers).toBe(2);
+  expect(planned.jobs).toBe(workers);
+  const walls = Array.from({ length: m.sliceCount }, (_, index) => sliceSupervisedWallMs(sliceExecutionOrder(
+    m.entries.filter(e => e.status === 'planned' && e.slice === index + 1)).map(e => e.file), workers));
+  expect(Math.max(...walls) + 20 * 60_000).toBeLessThanOrEqual(m.plan!.ciTimeoutMinutes * 60_000);
+  expect(m.plan!.ciTimeoutMinutes).toBeLessThanOrEqual(360);
+  expect(m.sliceCount).toBeLessThanOrEqual(job.strategy['max-parallel']);
+  const plannedFiles = new Set(m.entries.filter(e => e.status === 'planned').map(e => shardFile(e.file)));
+  expect(plannedFiles).toEqual(new Set(selectPaidTestFiles(collectPaidTestFiles(), 'periodic').selected));
+  const overlays = m.entries.filter(e => e.status === 'planned' && e.slice === m.sliceCount);
+  expect(overlays).toHaveLength(5);
   expect(overlays.every(e => isOverlayTestFile(e.file))).toBe(true);
-  expect(m.entries.filter(e => e.status === 'planned' && e.slice === periodicSliceCount).map(e => e.file)).toEqual([AUTOPLAN_CHAIN_BUDGET.file]);
 });
 
 test('registered allocation is deterministic and preserves every discovered file', () => {
   const files = collectPaidTestFiles();
-  expect(files).toHaveLength(119);
+  expect(files).toHaveLength(113);
+  expect(files).toContain('test/skill-e2e-ship-skip.test.ts');
   const m = livePlan(files);
   expect(livePlan([...files].reverse())).toEqual(m);
-  expect(m.entries.map(e => e.file).sort()).toEqual([...files].sort());
-  expect(new Set(m.entries.map(e => e.file)).size).toBe(files.length);
+  expect([...new Set(m.entries.map(e => shardFile(e.file)))].sort()).toEqual([...files].sort());
+  expect(new Set(m.entries.map(e => e.file)).size).toBe(m.entries.length);
 });
 
 test('ordinary-only manifests retain round-robin allocation', () => {
@@ -157,31 +161,43 @@ test('ordinary-only manifests retain round-robin allocation', () => {
 
 test('explicit allocation keeps its timer across load scheduling', () => {
   const m = buildRunManifest({ tier: 'periodic', sliceCount: 7, evalsAll: true,
-    dedicatedAutoplanSlice: true, timeoutMs: 2_000_000, env: { EVALS_ALL: '1' } });
+    timeoutMs: 2_000_000, env: { EVALS_ALL: '1' } });
   for (const entry of m.entries.filter(e => e.budget)) {
     expect(entry.budget).toEqual(resolvePaidShardBudget([entry.file], 2_000_000));
   }
 });
 
 test('single-slice manifest retains all registered files with one allocation', () => {
-  const m = buildRunManifest({ tier: 'periodic', sliceCount: 1, evalsAll: true, env: { EVALS_ALL: '1' } });
-  expect(m.entries.filter(e => e.status === 'planned').every(e => e.slice === 1)).toBe(true);
-  for (const budget of FINDING_RETRY_BUDGETS) expect(m.entries.find(e => e.file === budget.file)?.budget).toEqual(resolvePaidShardBudget([budget.file]));
+  // A registered file runs in exactly one scheduled lane: periodic, or the marathon lane for full flows.
+  const manifests = (['periodic', 'marathon'] as const).map(tier => buildRunManifest({ tier, sliceCount: 1, evalsAll: true, env: { EVALS_ALL: '1' } }));
+  for (const m of manifests) expect(m.entries.filter(e => e.status === 'planned').every(e => e.slice === 1)).toBe(true);
+  for (const budget of FINDING_RETRY_BUDGETS) {
+    const entries = manifests.flatMap(m => m.entries.filter(e => e.file === budget.file && e.status === 'planned'));
+    expect(entries, budget.file).toHaveLength(1);
+    expect(entries[0]!.budget).toEqual(resolvePaidShardBudget([budget.file]));
+  }
 });
 
 test('current detach supervision covers the live-census floor', () => {
-  const files = selectPaidTestFiles(collectPaidTestFiles(), 'periodic').selected;
-  const excess = files.reduce((n, file) => n + Math.max(0, resolvePaidShardBudget([file]).timeoutMs - DEFAULT_SHARD_TIMEOUT_MS), 0);
-  const floor = Math.ceil((Math.ceil(files.length / DEFAULT_JOBS) * DEFAULT_SHARD_TIMEOUT_MS + excess) / 1000 * 1.05);
+  const floorFor = (tier: 'gate' | 'periodic') => {
+    // Case-sharded files contribute one shard per case and isolated cases one
+    // shard per trial, exactly as the runner plans.
+    const files = expandTrialShards(expandCaseShards(selectPaidTestFiles(collectPaidTestFiles(), tier).selected, tier), tier).keys;
+    const excess = files.reduce((n, file) => n + Math.max(0, resolvePaidShardBudget([file]).timeoutMs - DEFAULT_SHARD_TIMEOUT_MS), 0);
+    return Math.ceil((Math.ceil(files.length / DEFAULT_JOBS) * DEFAULT_SHARD_TIMEOUT_MS + excess) / 1000 * 1.05);
+  };
   const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dir, '../package.json'), 'utf8'));
-  const configured = Number(pkg.scripts['eval:bg:periodic'].match(/--timeout\s+(\d+)/)[1]);
-  expect(floor).toBe(65541);
-  expect(configured).toBeGreaterThanOrEqual(floor);
-  expect(pkg.scripts['eval:bg:gate']).toContain('--timeout 36000');
+  const periodicTimeout = Number(pkg.scripts['eval:bg:periodic'].match(/--timeout\s+(\d+)/)[1]);
+  const gateTimeout = Number(pkg.scripts['eval:bg:gate'].match(/--timeout\s+(\d+)/)[1]);
+  expect(floorFor('gate')).toBe(22_355);
+  expect(gateTimeout).toBe(49_320);
+  expect(gateTimeout).toBeGreaterThanOrEqual(floorFor('gate'));
+  expect(floorFor('periodic')).toBe(37_632);
+  expect(periodicTimeout).toBeGreaterThanOrEqual(floorFor('periodic'));
 });
 
 for (const jobs of [1, 2, 3]) test(`FIFO bound covers partial durations with ${jobs} workers`, () => {
-  const long = FINDING_RETRY_BUDGETS.find(b => b.cases === 2)!.file;
+  const long = FINDING_RETRY_BUDGETS[0]!.file;
   for (const files of [[], ['test/a.test.ts'], [long, 'test/a.test.ts', 'test/b.test.ts'],
     ['test/a.test.ts', 'test/b.test.ts', long, 'test/c.test.ts', 'test/d.test.ts'],
     [long, FINDING_RETRY_BUDGETS[1]!.file, 'test/a.test.ts', 'test/b.test.ts']]) {

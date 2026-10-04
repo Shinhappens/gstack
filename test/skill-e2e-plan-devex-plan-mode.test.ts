@@ -13,6 +13,7 @@ import {
   planFileHasDecisionsSection,
   assertReportAtBottomIfPlanWritten,
 } from './helpers/claude-pty-runner';
+import { assertNoPlanFileDecisions } from './helpers/plan-mode-evidence';
 
 const describeE2E = describeE2ETier('gate');
 
@@ -34,12 +35,14 @@ describeE2E('plan-devex-review plan-mode smoke (gate)', () => {
     }
     expect(['asked', 'plan_ready']).toContain(obs.outcome);
     assertReportAtBottomIfPlanWritten(obs);
+    assertNoPlanFileDecisions(obs, planFileHasDecisionsSection);
   }, CAPTURE_LONG_MS);
 
   // v1.21+ regression: see skill-e2e-plan-ceo-plan-mode.test.ts for the
-  // contract. Pass envelope is ['asked', 'plan_ready']; failure signals
-  // are 'auto_decided' (AUTO_DECIDE without opt-in) plus the standard
-  // silent_write/exited/timeout.
+  // contract. With AskUserQuestion blocked the decision must still be asked
+  // (the prose fallback, observed as 'asked'); a plan-file ## Decisions
+  // section is not a substitute. Failure signals also include 'auto_decided'
+  // (AUTO_DECIDE without opt-in) plus the standard silent_write/exited/timeout.
   test('AskUserQuestion surfaces when --disallowedTools AskUserQuestion is set', async () => {
     const obs = await runPlanSkillObservation({
       skillName: 'plan-devex-review',
@@ -61,15 +64,13 @@ describeE2E('plan-devex-review plan-mode smoke (gate)', () => {
           `--- evidence (last 2KB visible) ---\n${obs.evidence}`,
       );
     }
-    if (obs.outcome === 'plan_ready') {
-      if (!obs.planFile || !planFileHasDecisionsSection(obs.planFile)) {
-        throw new Error(
-          `plan-devex-review AskUserQuestion-blocked regression: plan_ready without a "## Decisions" section in ${obs.planFile ?? '<no plan file detected>'} — Step 0 was silently skipped.\n` +
-            `--- evidence (last 2KB visible) ---\n${obs.evidence}`,
-        );
-      }
-    }
-    expect(['asked', 'plan_ready']).toContain(obs.outcome);
     assertReportAtBottomIfPlanWritten(obs);
+    assertNoPlanFileDecisions(obs, planFileHasDecisionsSection);
+    if (obs.outcome !== 'asked') {
+      throw new Error(
+        `plan-devex-review AskUserQuestion-blocked regression: outcome=${obs.outcome} — Step 0 reached ${obs.planFile ?? 'plan_ready'} without asking.\n` +
+          `--- evidence (last 2KB visible) ---\n${obs.evidence}`,
+      );
+    }
   }, CAPTURE_LONG_MS);
 });

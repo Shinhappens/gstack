@@ -16,7 +16,7 @@
  *     Mode / admin can't create symlinks, and the test skips gracefully.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -258,6 +258,27 @@ describe('mkdirSecure', () => {
     mkdirSecure(d);
     expect(() => fs.writeFileSync(path.join(d, 'browse.json.lock'), '1')).not.toThrow();
     expect(fs.readdirSync(d)).toContain('browse.json.lock');
+  });
+
+  // #2048: Bun on Windows threw EEXIST from a recursive mkdir of an existing
+  // .gstack, which made every browse command fatal. Simulated here so every
+  // platform proves the contract; a file at the path is still a conflict.
+  test('tolerates a runtime EEXIST for an existing directory, never for a file (#2048)', () => {
+    const d = path.join(tmpDir, 'state', '.gstack');
+    mkdirSecure(d);
+    const file = path.join(tmpDir, 'not-a-dir');
+    fs.writeFileSync(file, 'x');
+    const original = fs.mkdirSync;
+    const eexist = spyOn(fs, 'mkdirSync').mockImplementation(((target: fs.PathLike, options?: any) => {
+      if (fs.existsSync(target)) throw Object.assign(new Error(`EEXIST: file already exists, mkdir '${target}'`), { code: 'EEXIST' });
+      return original(target, options);
+    }) as typeof fs.mkdirSync);
+    try {
+      expect(() => mkdirSecure(d)).not.toThrow();
+      expect(() => mkdirSecure(file)).toThrow('EEXIST');
+    } finally {
+      eexist.mockRestore();
+    }
   });
 
   test('recursive behavior: creates intermediate directories', () => {

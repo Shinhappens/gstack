@@ -29,7 +29,7 @@ Conventions:
 - [/devex-review](devex-review/SKILL.md): Live developer experience audit.
 - [/diagram](diagram/SKILL.md): Turn an English description (or mermaid source) into a diagram triplet: the source, an editable .excalidraw file you can open on excalidraw.com, and rendered SVG + PNG.
 - [/document-generate](document-generate/SKILL.md): Generate missing documentation from scratch for a feature, module, or entire project.
-- [/document-release](document-release/SKILL.md): Post-ship documentation update.
+- [/document-release](document-release/SKILL.md): Release documentation audit.
 - [/freeze](freeze/SKILL.md): Restrict file edits to a specific directory for the session.
 - [/gstack](gstack/SKILL.md): Router for the gstack skill suite.
 - [/gstack-upgrade](gstack-upgrade/SKILL.md): Upgrade gstack to the latest version.
@@ -53,8 +53,8 @@ Conventions:
 - [/plan-devex-review](plan-devex-review/SKILL.md): Interactive developer experience plan review.
 - [/plan-eng-review](plan-eng-review/SKILL.md): Eng manager-mode plan review.
 - [/plan-tune](plan-tune/SKILL.md): Self-tuning question sensitivity + developer psychographic for gstack (v1: observational).
-- [/qa](qa/SKILL.md): Systematically QA test a web application and fix bugs found.
-- [/qa-only](qa-only/SKILL.md): Report-only QA testing.
+- [/qa](qa/SKILL.md): Fix browser/API/CLI/job/worker/webhook bugs.
+- [/qa-only](qa-only/SKILL.md): Report browser/API/CLI/job/worker/webhook bugs.
 - [/retro](retro/SKILL.md): Weekly engineering retrospective.
 - [/review](review/SKILL.md): Pre-landing PR review.
 - [/scrape](scrape/SKILL.md): Pull data from a web page through the Aside browser — your real, already signed-in sessions.
@@ -65,6 +65,7 @@ Conventions:
 - [/skillify](skillify/SKILL.md): Codify the most recent successful /scrape flow into a permanent browser-skill on disk.
 - [/spec](spec/SKILL.md): Turn vague intent into a precise, executable spec in five phases.
 - [/sync-gbrain](sync-gbrain/SKILL.md): Keep gbrain current with this repo's code and refresh agent search guidance in CLAUDE.md.
+- [/test-audit](test-audit/SKILL.md): Find low-value or duplicate tests and the test-only code they keep alive.
 - [/unfreeze](unfreeze/SKILL.md): Clear the freeze boundary set by /freeze, allowing edits to all directories again.
 
 ## Browse Commands
@@ -97,7 +98,7 @@ Run with `browse <command> [args]`. Full reference: `browse/SKILL.md`.
 - `click <sel>`: Click element
 - `cookie <name>=<value>`: Set cookie on current page domain
 - `cookie-import <json>`: Import cookies from JSON file
-- `cookie-import-browser [browser] [--domain d] [--profile p] [--all] [--clear-storage] [--verify-auth]`: Copy cookies from chrome, chromium, brave, edge, or macOS-only comet, arc, dia.
+- `cookie-import-browser [browser] [--domain d] [--profile p] [--all] [--clear-storage] [--verify-auth]`: Copy cookies from chrome, chromium, brave, edge, Windows-only opera, opera-gx, or macOS-only comet, arc, dia.
 - `dialog-accept [text]`: Auto-accept next alert/confirm/prompt.
 - `dialog-dismiss`: Auto-dismiss next dialog
 - `fill <sel> <val>`: Fill input
@@ -139,7 +140,7 @@ Run with `browse <command> [args]`. Full reference: `browse/SKILL.md`.
 - `text [selector|@ref]`: Cleaned visible page text, or cleaned text for a CSS selector/@ref when one is provided
 
 ### Server
-- `connect`: Launch headed Chromium with Chrome extension
+- `connect [--supervise]`: Launch headed Chromium with Chrome extension; --supervise keeps the CLI attached and respawns a crashed server
 - `disconnect`: Disconnect headed browser, return to headless mode
 - `focus [@ref]`: Bring headed browser window to foreground (macOS)
 - `handoff [message]`: Open visible Chrome at current page for user takeover

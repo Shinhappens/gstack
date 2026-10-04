@@ -134,7 +134,6 @@ import * as fs from 'node:fs'; import * as path from 'node:path'; import * as os
 import {launchClaudePty,resolveClaudeBinary} from ${JSON.stringify(helper('claude-pty-runner.ts'))};
 import {readPlanCountTranscript} from ${JSON.stringify(helper('plan-count-transcript.ts'))};
 import {readPendingQuestion} from ${JSON.stringify(helper('plan-count-pending-question.ts'))};
-import {autoplanSetupDecision} from ${JSON.stringify(helper('autoplan-setup-question.ts'))};
 if(resolveClaudeBinary()!==${JSON.stringify(fake)})throw Error('fake CLI binding failed');
 const root=${JSON.stringify(dir)},results=[];
 for(const enabled of [false,true]){
@@ -147,18 +146,13 @@ try{await session.waitFor('Enter to select',{timeoutMs:5000,pollMs:20});
 const transcript=()=>readPlanCountTranscript(session.hermeticConfigDir,cwd);
 const pending=()=>readPendingQuestion(owned,cwd,session.hermeticConfigDir,startedAt,transcript());
 if(transcript().calls.length)throw Error('unpublished packet manufactured JSONL coverage');
-const seen=new Set(),inputs=[],first=await session.currentScreen();
-if(autoplanSetupDecision(first,new Set()).kind!=='waiting')throw Error('partial panel unexpectedly authorized input');
+const inputs=[];
 if(enabled){
 if(pending()?.source!=='pre_tool_use'||pending()?.answered)throw Error('pending source was lost or counted as answer');
-for(let step=0;step<3;step++){
- const current=await session.currentScreen(),call=pending();
+for(const [step,input] of ['1','1','\\r'].entries()){
+ const call=pending();
  if(!call||transcript().calls.length)throw Error('pending identity lost or premature coverage');
- const action=autoplanSetupDecision(current,seen,call);
- if(action.kind!=='input')throw Error('full native packet not navigable: '+JSON.stringify({action,current,call}));
- for(const key of action.signatures)seen.add(key);
- if(autoplanSetupDecision(current,seen,call).kind!=='waiting')throw Error('redraw repeated input');
- inputs.push(action.input);session.send(action.input);
+ inputs.push(input);session.send(input);
  await session.waitFor(step===0?'☒ '+call.questions[0].header:step===1?'Ready to submit your answers?':'NATIVE_PACKET_COMPLETE',{timeoutMs:3000,pollMs:20});
 }
 if(pending())throw Error('completed replay reopened pending identity');

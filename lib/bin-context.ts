@@ -7,8 +7,9 @@
 
 import { spawnSync } from "child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
-import { homedir } from "os";
 import { basename, dirname, join } from "path";
+import { resolveStateRoot } from "./state-root";
+import { legacyRemoteSlug, remoteSlug } from "./remote-identity";
 
 /** Keep the slug inside the [a-zA-Z0-9._-] alphabet gstack-slug promises (`tr -cd`). */
 function sanitizeSlug(s: string): string {
@@ -125,7 +126,10 @@ export function outermostRemoteRepo(startDir: string): { root: string; url: stri
  *   1. Walk UP to the OUTERMOST project root (see outermostProjectRoot). Without
  *      the walk, a nested/vendored repo derived its slug from the INNERMOST
  *      `git remote get-url origin`, splitting the store the bash side keeps whole.
- *   2. Cached slug is sticky (#2212) — EXCEPT two provable bug shapes:
+ *   2. Cached slug is sticky (#2212) — EXCEPT two provable bug shapes. Entries
+ *      are versioned ("v2:<slug>"); an unversioned entry is recomputed once and
+ *      moves only when it equals the pre-#3003 last-two slug of a 3+-segment
+ *      remote:
  *      - old-bug shape (#1125): cached value equals basename(cwd) while the
  *        walk-up says cwd is NOT the project root; that cache came from the
  *        pre-walk-up resolver, so recompute and heal.
@@ -141,21 +145,50 @@ export function outermostRemoteRepo(startDir: string): { root: string; url: stri
  *        project root), so the heal never fires.
  *   3. Canonical remote-derived slug from the OUTERMOST remote-bearing repo
  *      (see outermostRemoteRepo — never PROJECT_ROOT, which may be a
- *      marker-only ancestor with no remote): [:/]<owner>/<repo>[.git] →
- *      owner-repo, byte-parity with browse/bin/remote-slug. Degenerate slugs
+ *      marker-only ancestor with no remote): remoteSlug() from
+ *      lib/remote-identity.ts — owner-repo for 2-segment and local remotes,
+ *      "<last-two>-<16 hex>" for 3+-segment hosted remotes (#3003) —
+ *      byte-parity with browse/bin/remote-slug. Degenerate slugs
  *      ("", ".", "..", anything with "/") are rejected — a hostile origin
  *      like `url = ..` must never escape ~/.gstack/projects/<slug>.
  *   4. Project root's basename; else basename(cwd) for plain non-project folders.
  */
+/** gstack-slug's per-path cache file: the cwd in MSYS form with "/" → "_". */
+export function slugCacheFile(stateRoot: string, cwd: string): string {
+  return join(stateRoot, "slug-cache", toMsysPath(cwd).replace(/\//g, "_"));
+}
+
+/** Cache entries written since #3003 carry this version prefix ("v2:<slug>"). */
+export const SLUG_CACHE_VERSION_PREFIX = "v2:";
+
+/**
+ * The slug a versioned cache entry records for `cwd`, or undefined when there is
+ * no entry, the entry predates the versioned format, or its value is unusable
+ * (empty, "." or ".." after sanitizing). Never spawns git: hot-path readers
+ * (the AskUserQuestion preference hook) rely on gstack-slug, which every skill
+ * preamble runs, having already written the entry.
+ */
+export function readVersionedSlugCache(stateRoot: string, cwd: string): string | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(slugCacheFile(stateRoot, cwd), "utf-8");
+  } catch {
+    return undefined;
+  }
+  if (!raw.startsWith(SLUG_CACHE_VERSION_PREFIX)) return undefined;
+  const slug = sanitizeSlug(raw.slice(SLUG_CACHE_VERSION_PREFIX.length).trim());
+  return slug && slug !== "." && slug !== ".." ? slug : undefined;
+}
+
 export function slugFromEnvironment(gstackHome?: string, cwd: string = process.cwd()): string {
-  const home = gstackHome || process.env.GSTACK_HOME || join(homedir(), ".gstack");
+  const home = gstackHome || resolveStateRoot();
   const cacheDir = join(home, "slug-cache");
-  const cacheFile = join(cacheDir, toMsysPath(cwd).replace(/\//g, "_"));
+  const cacheFile = slugCacheFile(home, cwd);
 
   // 0. explicit env override — per-invocation escape hatch, never persisted
   //    (caching it would rebind THIS cwd's slug for every later env-less run).
   const envSlug = sanitizeSlug((process.env.GSTACK_PROJECT_SLUG || "").trim());
-  if (envSlug) return envSlug;
+  if (envSlug && envSlug !== "." && envSlug !== "..") return envSlug;
 
   // 1. outermost project root along the cwd ancestor chain (may be "").
   const projectRoot = outermostProjectRoot(cwd);
@@ -171,7 +204,9 @@ export function slugFromEnvironment(gstackHome?: string, cwd: string = process.c
   //    (old-bug #1125 and degraded-ancestor 2026-08-17 — see the doc above).
   if (existsSync(cacheFile)) {
     try {
-      const cached = sanitizeSlug(readFileSync(cacheFile, "utf-8").trim());
+      const raw = readFileSync(cacheFile, "utf-8");
+      const versioned = raw.startsWith(SLUG_CACHE_VERSION_PREFIX);
+      const cached = sanitizeSlug((versioned ? raw.slice(SLUG_CACHE_VERSION_PREFIX.length) : raw).trim());
       if (cached) {
         const pwdBase = sanitizeSlug(basename(cwd));
         const rootBase = projectRoot ? sanitizeSlug(basename(projectRoot)) : "";
@@ -193,24 +228,33 @@ export function slugFromEnvironment(gstackHome?: string, cwd: string = process.c
             const r = resolveRemote();
             return r.url !== "" && r.root !== projectRoot;
           })();
-        if (!oldBugShape && !degradedAncestorShape) slug = cached;
+        if (!oldBugShape && !degradedAncestorShape) {
+          slug = cached;
+          // Unversioned (pre-#3003) entry: recompute once. Keep the sticky
+          // value unless it is exactly the old last-two slug of a 3+-segment
+          // remote (mirrors bin/gstack-slug).
+          if (!versioned) {
+            const { url } = resolveRemote();
+            if (url) {
+              const upgraded = remoteSlug(url);
+              const legacy = legacyRemoteSlug(url);
+              if (upgraded && upgraded !== legacy && cached === legacy) slug = upgraded;
+            }
+          }
+        }
       }
     } catch {
       slug = "";
     }
   }
-  // 3. canonical remote-derived slug from the outermost remote-bearing repo.
-  //    Parse mirrors bin/gstack-slug step 2 exactly (byte-parity with
-  //    browse/bin/remote-slug): `${REMOTE_URL%.git}` strips ONE trailing
-  //    ".git" (case-sensitive), then sed extracts the LAST two path segments
-  //    — and sed's no-match passthrough means the stripped URL itself is the
-  //    raw slug when no [:/]owner/repo tail exists.
+  // 3. canonical remote-derived slug from the outermost remote-bearing repo,
+  //    via the shared rule in lib/remote-identity.ts (twin of
+  //    bin/gstack-remote-identity.sh): legacy last-two parse for 2-segment and
+  //    local remotes, "<last-two>-<16 hex>" for 3+-segment hosted remotes.
   if (!slug) {
     const { url } = resolveRemote();
     if (url) {
-      const stripped = url.endsWith(".git") ? url.slice(0, -4) : url;
-      const m = stripped.match(/[:/]([^/]+)\/([^/]+)$/);
-      const candidate = sanitizeSlug(m ? `${m[1]}-${m[2]}` : stripped);
+      const candidate = remoteSlug(url);
       // Dot-only / degenerate guard (mirrors bin/gstack-slug): a hostile
       // origin like `url = ..` yields "." or ".." here, which would file
       // state OUTSIDE ~/.gstack/projects/. Reject and let the basename
@@ -234,10 +278,10 @@ export function slugFromEnvironment(gstackHome?: string, cwd: string = process.c
     } catch {
       // no cache yet — write below
     }
-    if (current !== slug) {
+    if (current !== `${SLUG_CACHE_VERSION_PREFIX}${slug}`) {
       mkdirSync(cacheDir, { recursive: true });
       const tmp = `${cacheFile}.tmp.${process.pid}`;
-      writeFileSync(tmp, slug, "utf-8");
+      writeFileSync(tmp, `${SLUG_CACHE_VERSION_PREFIX}${slug}`, "utf-8");
       renameSync(tmp, cacheFile);
     }
   } catch {

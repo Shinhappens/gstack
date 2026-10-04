@@ -28,6 +28,8 @@ import {
   CODEX_REVIEW_E2E_SECTIONS,
 } from './helpers/skill-fixture';
 import { E2E_TOUCHFILES, GLOBAL_TOUCHFILES, selectTests } from './helpers/touchfiles';
+import { readShippedSkillRouting } from './helpers/shipped-skill-routing';
+import { hasNarrationLeak } from './helpers/skill-body-narration';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 
@@ -151,6 +153,45 @@ describe('extractSkillBody (synthetic)', () => {
     expect(out).toContain('## Step 2 — Other');
     expect(out).not.toContain('preamble junk');
     expect(out).not.toContain('shared-preamble junk');
+    expect(out).not.toContain('footer junk');
+  });
+
+  test.each([
+    ['plain', '', '# Actual'],
+    ['one-space indent', '', ' # Actual'],
+    ['three-space indent', '', '   # Actual'],
+    ['tab separator', '', '#\tActual'],
+    ['empty title', '', '#'],
+    ['backtick fence', '```md\n# FALSE TITLE\n## FALSE SECTION\n```\n', '# Actual'],
+    ['tilde fence', '~~~md\n# FALSE TITLE\n~~~\n', '# Actual'],
+    ['short nested fence', '````md\n```\n# FALSE TITLE\n```\n````\n', '# Actual'],
+    ['mismatched fence', '~~~md\n```\n# FALSE TITLE\n~~~\n', '# Actual'],
+    ['nonclosing suffix', '```md\n```not-a-close\n# FALSE TITLE\n```\n', '# Actual'],
+    ['indented code', '    # FALSE TITLE\n', '# Actual'],
+    ['missing separator', '#FALSE TITLE\n', '# Actual'],
+    ['quoted title', '> # FALSE TITLE\n', '# Actual'],
+  ])('preserves a post-preamble H1 introduction: %s', (_name, decoy, title) => {
+    const file = path.join(tmpDir, 'title-boundary.md');
+    fs.writeFileSync(file, SYNTHETIC_SKILL.replace(
+      'footer junk, last shared-preamble section\n\n',
+      `footer junk, last shared-preamble section\n${decoy}${title}\nREAL INTRODUCTION\n\n`,
+    ));
+    const out = extractSkillBody(file);
+    expect(out).toBe(extractSkillBody(skillDir).replace(
+      '## Step 1 — Do the thing', `${title}\nREAL INTRODUCTION\n\n## Step 1 — Do the thing`,
+    ));
+    expect(out).not.toContain('FALSE TITLE');
+    expect(out).not.toContain('footer junk');
+    expect(extractSkillSections(file, ['Plan Status Footer']))
+      .toContain(`${decoy}${title}\nREAL INTRODUCTION`);
+  });
+
+  test('a post-preamble H1 and introduction are a complete body without another H2', () => {
+    const file = path.join(tmpDir, 'title-only-body.md');
+    fs.writeFileSync(file, SYNTHETIC_SKILL.slice(0, SYNTHETIC_SKILL.indexOf('## Step 1 — Do the thing'))
+      + '# Actual\nREAL INTRODUCTION\n');
+    const out = extractSkillBody(file);
+    expect(out).toContain('# Actual\nREAL INTRODUCTION');
     expect(out).not.toContain('footer junk');
   });
 
@@ -321,6 +362,18 @@ describe('real-skill pins: section lists used by E2E fixtures', () => {
 });
 
 describe('real-skill pins: body/head extraction used by E2E fixtures', () => {
+  test.each(['qa-only', 'skillify', 'context-save', 'context-restore'])(
+    'extractSkillBody(%s) preserves the complete real H1 introduction', (skill) => {
+      const file = path.join(ROOT, skill, 'SKILL.md');
+      const full = fs.readFileSync(file, 'utf8');
+      const title = full.indexOf(`\n# /${skill}`, full.indexOf('## Plan Status Footer'));
+      const nextSection = full.indexOf('\n## ', title);
+      expect(title).toBeGreaterThan(0);
+      expect(nextSection).toBeGreaterThan(title);
+      expect(extractSkillBody(file)).toContain(full.slice(title + 1, nextSection).trimEnd());
+    },
+  );
+
   // scrape/skillify/context-*: skill-e2e-skillify + skill-e2e-context-skills.
   // review/plan-eng-review/ship: skill-e2e-coverage-audit + skill-e2e-triage.
   const BODY_EXTRACTED_SKILLS = [
@@ -398,10 +451,12 @@ test('routing catalog contains installed project names without a request-to-skil
     writeFileSync: (file: string, content: string) => writes.set(file, content),
   };
   const compiled = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end) + '\ninstallSkills(fixtureRoot);');
-  new Function('ROOT', 'fs', 'path', 'extractSkillHead', 'fixtureRoot', compiled)(
-    ROOT, mockFs, path, (file: string) => installed.get(file), fixtureRoot,
+  new Function('ROOT', 'fs', 'path', 'extractSkillHead', 'readShippedSkillRouting', 'fixtureRoot', compiled)(
+    ROOT, mockFs, path, (file: string) => installed.get(file), readShippedSkillRouting, fixtureRoot,
   );
   const instructions = writes.get(path.join(fixtureRoot, 'CLAUDE.md'))!;
+  expect(instructions).toContain(readShippedSkillRouting().instruction);
+  expect(instructions).not.toContain('→ invoke');
   expect(instructions).toContain('installed gstack skills: gstack, qa, review.');
   expect(instructions).toContain("built-in skills are outside this project's workflow");
   expect(instructions).toContain('matching the request to the skill descriptions');
@@ -413,3 +468,42 @@ test('routing catalog contains installed project names without a request-to-skil
     .toBe(installed.get(path.join(ROOT, 'review/SKILL.md')));
   expect(writes.size).toBe(4);
 });
+
+test('routing fixtures read the ## Skill routing section gstack ships', () => {
+  const routing = readShippedSkillRouting();
+  expect(routing.instruction).toStartWith('## Skill routing\n\n');
+  expect(routing.instruction).toContain('Skill tool');
+  expect(routing.rules.some(rule => rule.includes('/context-save'))).toBe(true);
+  expect(routing.rules.some(rule => rule.includes('/context-restore'))).toBe(true);
+  expect(routing.section).not.toContain('If B:');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'shipped-routing-drift-'));
+  try {
+    fs.mkdirSync(path.join(root, 'bin'));
+    fs.writeFileSync(path.join(root, 'bin', 'gstack-skill-start'), '#!/bin/bash\necho no routing here\n');
+    expect(() => readShippedSkillRouting(root)).toThrow('routing-injection heredoc not found');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// Stored synthesized SKILL.md bodies for the skillify narration grader.
+{
+  const DIR = path.join(import.meta.dir, 'fixtures', 'skillify-narration');
+  const read = (name: string) => fs.readFileSync(path.join(DIR, name), 'utf8');
+  const KNOWN_BAD = fs.readdirSync(DIR).filter(name => name.startsWith('known-bad-')).sort();
+
+  describe('skillify narration grader', () => {
+    test('accepts a clean body that says "let me know" in a trigger', () => {
+      expect(hasNarrationLeak(read('known-good.md'))).toBe(false);
+    });
+    test('stored known-bad fixtures exist', () => {
+      expect(KNOWN_BAD.length).toBeGreaterThanOrEqual(4);
+    });
+    test.each(KNOWN_BAD)('still rejects %s', (name) => {
+      expect(hasNarrationLeak(read(name))).toBe(true);
+    });
+    test('the previous grader rejected every known-bad fixture and also the known-good one', () => {
+      const previous = (body: string) => /^I /m.test(body) || /Let me /i.test(body) || /^I'll /m.test(body);
+      for (const name of KNOWN_BAD) expect(previous(read(name))).toBe(true);
+      expect(previous(read('known-good.md'))).toBe(true);
+    });
+  });
+}

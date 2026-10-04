@@ -1,6 +1,7 @@
 /** Lossless, read-only question metadata from one isolated Claude fixture. */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 
 export interface NativePlanQuestion {
   header: string;
@@ -44,6 +45,8 @@ export interface PlanCountTranscript {
   /** Actual native plan-mode approval requests; pending is the UI gate, never an AUQ. */
   planReadyRequests?: Array<{ sessionId: string; toolUseId: string; timestamp: string; failed: boolean; source?: 'pre_tool_use' }>;
   error?: string;
+  /** Owned reads only: why the exact parent journal supplied no owned lines. */
+  reason?: OwnedTranscriptReason;
 }
 
 /** Hook-only verified causal order (physical order for independent ready records). The existing fixture projection remains unchanged. */
@@ -57,6 +60,8 @@ interface OwnedSnapshot {
   file: string;
   text: string;
   events: ClaudeParentPublicEvent[];
+  /** Record types (never content) from the journal head to the first turn, set on refusal. */
+  rootShape?: string[];
 }
 
 /** A rejected/refused call needs an actual later answer, not unrelated progress. */
@@ -142,55 +147,132 @@ function validQuestions(value: unknown): value is NativePlanQuestion[] {
       object(o) && typeof o.label === 'string' && o.label.trim()));
 }
 
+/**
+ * Windows spells one native path C:\, c:\, C:/ or Git Bash /c/ (hook env,
+ * journal and tool input disagree). Fold separators, the MSYS drive prefix and
+ * drive-letter case only. No resolve: `.`, `..` and doubled separators stay
+ * distinct, so a normalize check after the fold still rejects them. The path
+ * module is a parameter so win32 call sites are unit-testable on any host.
+ */
+export function nativePathSpelling(value: string, p: typeof path = path): string {
+  if (p.sep !== '\\') return value;
+  return value.replace(/^\/([A-Za-z])(?=\/|$)/, '$1:').replaceAll('/', '\\')
+    .replace(/^[a-z](?=:)/, drive => drive.toUpperCase());
+}
+/** Validation-then-compare: absolute, and its folded spelling is already normal. */
+export function ownedNativePath(value: unknown, p: typeof path = path): value is string {
+  if (typeof value !== 'string') return false;
+  const folded = nativePathSpelling(value, p);
+  return p.isAbsolute(folded) && p.normalize(folded) === folded;
+}
+export function sameNativePath(a: unknown, b: unknown, p: typeof path = path): boolean {
+  return typeof a === 'string' && typeof b === 'string' && nativePathSpelling(a, p) === nativePathSpelling(b, p);
+}
+function sameRealPath(a: unknown, b: unknown): boolean {
+  try { return typeof a === 'string' && typeof b === 'string' && sameNativePath(fs.realpathSync(a), fs.realpathSync(b)); }
+  catch { return false; }
+}
+
+/**
+ * Why an owned journal supplied no owned lines (docs/autoplan-guard-troubleshooting.md).
+ * Positive identity conflicts are hard; `changing`, `identity` and `malformed`
+ * retry; only `unrecognized_shape:*` may degrade to an advisory.
+ */
+export type OwnedTranscriptReason = 'competing_root' | 'foreign_cwd' | 'sidechain' | 'agent' | 'cycle' |
+  'changing' | 'identity' | 'malformed' | `unrecognized_shape:${string}`;
+type OwnedLines = { lines: string[]; root?: string } | { reason: OwnedTranscriptReason; shape: string[] };
+
+const nativeUuid = (value: unknown): value is string => typeof value === 'string' &&
+  /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
+/** Record type names only, never content: `attachment:hook_success`, `system:compact_boundary`. */
+const recordShape = (r: Record<string, any>): string => [r.type, r.subtype, object(r.attachment) ? r.attachment.type : undefined]
+  .filter(x => typeof x === 'string' && x).map(x => x.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40)).join(':') || 'untyped';
+/** Claude writes each SessionStart hook result as a message-less attachment chained above the first user turn. */
+const sessionStartRecord = (r: Record<string, any>): boolean => r.type === 'attachment' && r.message == null &&
+  object(r.attachment) && r.attachment.hookEvent === 'SessionStart' &&
+  typeof r.attachment.type === 'string' && /^hook_[a-z_]{1,48}$/.test(r.attachment.type);
+
 /** Native journal writes can flush children before parents. Owned snapshots
  * use causal order; ordinary readers only recover membership, keeping physical order. */
-function ownedCausalLines(lines: string[], cwd: string, filename: string): string[] {
-  const uuid = (value: unknown): value is string => typeof value === 'string' &&
-    /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
-  const scoped = lines.flatMap((line, index) => {
+function ownedCausalLines(lines: string[], cwd: string, filename: string): OwnedLines {
+  const parsed = lines.flatMap((line, index) => {
     if (!line.trim()) return [];
     const record = JSON.parse(line);
-    return object(record) && filename === `${record.sessionId}.jsonl` && record.agentId == null
-      ? [{ line, index, record }] : [];
+    return object(record) && filename === `${record.sessionId}.jsonl` ? [{ line, index, record }] : [];
   });
-  const first = scoped.find(x => object(x.record.message) && ['user', 'assistant'].includes(x.record.message.role));
-  if (!first) return [];
-  const nodes = scoped.filter(({ record: r }) => r.isSidechain === false &&
-    typeof r.cwd === 'string' && path.isAbsolute(r.cwd) && uuid(r.uuid) && validTimestamp(r.timestamp));
-  const byId = new Map<string, typeof nodes[number]>();
+  type Node = typeof parsed[number];
+  const first = parsed.find(x => x.record.agentId == null && object(x.record.message) &&
+    ['user', 'assistant'].includes(x.record.message.role));
+  if (!first) return { lines: [] };
+  const nodes = parsed.filter(({ record: r }) => r.agentId == null && r.isSidechain === false &&
+    typeof r.cwd === 'string' && path.isAbsolute(r.cwd) && nativeUuid(r.uuid) && validTimestamp(r.timestamp));
+  const byId = new Map<string, Node>();
   for (const node of nodes) {
-    if (byId.has(node.record.uuid)) throw Error('ambiguous owned native UUID');
+    if (byId.has(node.record.uuid)) return { reason: 'competing_root', shape: ['duplicate_uuid'] };
     byId.set(node.record.uuid, node);
   }
-  if (byId.get(first.record.uuid) !== first) return [];
-  const parent = (r: Record<string, any>): string | undefined => uuid(r.parentUuid) ? r.parentUuid :
+  const anyById = new Map<string, Record<string, any>>();
+  for (const { record } of parsed) if (nativeUuid(record.uuid) && !anyById.has(record.uuid)) anyById.set(record.uuid, record);
+  const excluded = (r: Record<string, any>): OwnedTranscriptReason => r.agentId != null ? 'agent' :
+    r.isSidechain !== false ? 'sidechain' : 'unrecognized_shape:record_metadata';
+  const parent = (r: Record<string, any>): string | undefined => nativeUuid(r.parentUuid) ? r.parentUuid :
     r.parentUuid === null && r.type === 'system' && r.subtype === 'compact_boundary' &&
-    r.message == null && uuid(r.logicalParentUuid) ? r.logicalParentUuid : undefined;
+    r.message == null && nativeUuid(r.logicalParentUuid) ? r.logicalParentUuid : undefined;
+  if (byId.get(first.record.uuid) !== first) return { reason: excluded(first.record), shape: [recordShape(first.record)] };
   // Anchor through the first observed conversation node, never an unrelated
-  // later root. An unflushed/malformed ancestor supplies no ownership.
-  let root = first;
-  const ancestry = new Set<string>();
-  while (true) {
-    if (ancestry.has(root.record.uuid)) throw Error('cyclic owned native ancestry');
-    ancestry.add(root.record.uuid);
-    const id = parent(root.record);
+  // later root. An unflushed ancestor supplies no ownership yet.
+  const chain: Node[] = [first], seen = new Set<Node>(chain);
+  const shape = () => chain.map(n => recordShape(n.record)).reverse().slice(0, 32);
+  let genesis = false;
+  for (let at = first; ;) {
+    const id = parent(at.record);
     if (!id) break;
     const next = byId.get(id);
-    if (!next) return [];
-    root = next;
+    if (!next) {
+      const other = anyById.get(id);
+      if (other) return { reason: excluded(other), shape: [recordShape(other), ...shape()] };
+      // A resumed fork begins with a boundary whose logical parent stayed in the
+      // source session. It is a root only as this file's first record; mid-file
+      // it may be an unflushed ancestor, so it supplies no ownership yet.
+      if (at.record.parentUuid !== null || at !== parsed.find(x => nativeUuid(x.record.uuid))) return { lines: [] };
+      genesis = true;
+      break;
+    }
+    if (seen.has(next)) return { reason: 'cycle', shape: shape() };
+    chain.push(next); seen.add(next);
+    at = next;
   }
-  if (root.record.parentUuid !== null || root.record.cwd !== cwd ||
-      !object(root.record.message) || root.record.message.role !== 'user') return [];
-  if (nodes.some(x => x !== root && x.record.parentUuid === null &&
-      object(x.record.message) && x.record.message.role === 'user')) throw Error('competing owned native roots');
-  // Stable topological traversal preserves physical order whenever two ready
-  // records have no parent dependency. No timestamp provides ordering credit.
-  const children = new Map<string, number[]>();
-  const indexed = new Map(nodes.map(x => [x.index, x]));
+  const top = chain.toReversed(), root = top[0]!;
+  const turn = top.findIndex(n => object(n.record.message));
+  const children = new Map<string, Node[]>();
   for (const node of nodes) {
     const id = parent(node.record);
-    if (id) { const list = children.get(id) ?? []; list.push(node.index); children.set(id, list); }
+    if (id) { const list = children.get(id) ?? []; list.push(node); children.set(id, list); }
   }
+  // Uniqueness over every root candidate: a null-parent user, a SessionStart
+  // chain head carrying a conversation, and the resumed-genesis boundary.
+  const carriesTurn = (head: Node): boolean => {
+    for (const pending = [head]; pending.length;) for (const child of children.get(pending.pop()!.record.uuid) ?? []) {
+      if (object(child.record.message)) return true;
+      if (sessionStartRecord(child.record)) pending.push(child);
+    }
+    return false;
+  };
+  const candidates = new Set<Node>([root, ...nodes.filter(({ record: r }) => r.parentUuid === null &&
+    (object(r.message) ? r.message.role === 'user' : sessionStartRecord(r))).filter(n =>
+    object(n.record.message) || carriesTurn(n))]);
+  if (candidates.size > 1) return { reason: 'competing_root', shape: shape() };
+  for (const node of genesis ? [root] : top.slice(0, turn + 1)) if (!sameNativePath(node.record.cwd, cwd))
+    return { reason: sameRealPath(node.record.cwd, cwd) ? 'unrecognized_shape:cwd_spelling' : 'foreign_cwd', shape: shape() };
+  if (!genesis) {
+    const preamble = top.slice(0, turn).find(n => !sessionStartRecord(n.record));
+    const odd = root.record.parentUuid !== null ? `root_parent:${recordShape(root.record)}`
+      : preamble ? `preamble:${recordShape(preamble.record)}`
+      : top[turn]!.record.message.role !== 'user' ? `first_turn:${recordShape(top[turn]!.record)}` : undefined;
+    if (odd) return { reason: `unrecognized_shape:${odd}`, shape: shape() };
+  }
+  // Stable topological traversal preserves physical order whenever two ready
+  // records have no parent dependency. No timestamp provides ordering credit.
   const ready: number[] = [];
   const offer = (value: number) => {
     let i = ready.length; ready.push(value);
@@ -208,14 +290,15 @@ function ownedCausalLines(lines: string[], cwd: string, filename: string): strin
     }
     return result;
   };
+  const indexed = new Map(nodes.map(x => [x.index, x]));
   const ordered: string[] = [];
   offer(root.index);
   while (ready.length) {
     const node = indexed.get(take())!;
     ordered.push(node.line);
-    for (const child of children.get(node.record.uuid) ?? []) offer(child);
+    for (const child of children.get(node.record.uuid) ?? []) offer(child.index);
   }
-  return ordered;
+  return { lines: ordered, root: root.record.uuid };
 }
 
 /**
@@ -260,23 +343,31 @@ export function readPlanCountTranscript(configDir: string, cwd: string,
         // fixture's first parent user message; legacy records keep exact-cwd scoping.
         let originSeen = false;
         const ancestry = new Set<string>();
-        let causalMembership: Set<string> | undefined;
-        const nativeUuid = (value: unknown): value is string =>
-          typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
+        let causal: OwnedLines | undefined, causalMembership: Set<string> | undefined, ownedLines: string[] | undefined;
         // Claude appends JSONL during rendering; an unfinished record is not
         // evidence of a call or an answer until its newline has been written.
         const completeLines = text.slice(0, text.lastIndexOf('\n') + 1).split('\n');
         const recoveredMember = (id: string) => {
           if (causalMembership === undefined) {
-            causalMembership = new Set<string>();
-            try {
-              causalMembership = new Set(ownedCausalLines(completeLines, cwd, entry.name)
-                .map(line => JSON.parse(line).uuid));
-            } catch { /* Invalid strict ancestry adds no recovery; legacy traversal continues. */ }
+            // Invalid strict ancestry adds no recovery; legacy traversal continues.
+            try { causal ??= ownedCausalLines(completeLines, cwd, entry.name); } catch { causal = { lines: [] }; }
+            causalMembership = new Set('lines' in causal ? causal.lines.map(line => JSON.parse(line).uuid) : []);
           }
           return causalMembership.has(id);
         };
-        for (const line of ownedSnapshot ? ownedCausalLines(completeLines, cwd, entry.name) : completeLines) {
+        if (ownedSnapshot) {
+          causal = ownedCausalLines(completeLines, cwd, entry.name);
+          if ('reason' in causal) {
+            ownedSnapshot.rootShape = causal.shape;
+            return { status: causal.reason === 'competing_root' || causal.reason === 'cycle' ? 'error' : 'missing',
+              calls: [], assistantMessages: [], reason: causal.reason };
+          }
+          // The verified root seeds ownership; message-less preamble and
+          // boundary roots supply no events of their own.
+          ownedLines = causal.lines;
+          if (causal.root) ancestry.add(causal.root);
+        }
+        for (const line of ownedLines ?? completeLines) {
           if (!line.trim()) continue;
           const record = JSON.parse(line);
           if (!object(record) || typeof record.sessionId !== 'string' ||
@@ -290,12 +381,16 @@ export function readPlanCountTranscript(configDir: string, cwd: string,
               // A delayed metadata parent must not cut an already-rooted native
               // session at its first cwd change. Recover membership lazily; do
               // not discover a later root or reorder public uses and results.
-              (!ownedSnapshot && record.cwd !== cwd && ancestry.size > 0 &&
+              (!ownedSnapshot && !sameNativePath(record.cwd, cwd) && ancestry.size > 0 &&
                 recoveredMember(record.uuid)));
           if (!originSeen && object(record.message) && ['user', 'assistant'].includes(record.message.role)) {
             originSeen = true;
-            if (parentMetadata && record.cwd === cwd && record.message.role === 'user' &&
-                record.parentUuid === null) ancestry.add(record.uuid);
+            // The first user prompt roots ownership itself, or through the
+            // verified causal root above it (SessionStart preamble, resumed
+            // boundary). Children can flush before parents, so physical order
+            // never decides that ancestry.
+            if (parentMetadata && sameNativePath(record.cwd, cwd) && record.message.role === 'user' &&
+                (record.parentUuid === null || recoveredMember(record.uuid))) ancestry.add(record.uuid);
           }
           if (continuation) ancestry.add(record.uuid);
           // Native compaction resets parentUuid but links its prior owned
@@ -307,7 +402,7 @@ export function readPlanCountTranscript(configDir: string, cwd: string,
             ancestry.has(record.logicalParentUuid) && !ancestry.has(record.uuid);
           if (compactContinuation) ancestry.add(record.uuid);
           if (ownedSnapshot && !ancestry.has(record.uuid)) continue;
-          if ((record.cwd !== cwd && !continuation) || record.isSidechain !== false || !object(record.message)) continue;
+          if ((!sameNativePath(record.cwd, cwd) && !continuation) || record.isSidechain !== false || !object(record.message)) continue;
           if (ownedSnapshot && record.message.role === 'user' && record.origin?.kind === 'human' &&
               record.isMeta !== true && nativeUuid(record.promptId) && typeof record.message.content === 'string') {
             const autoplan = /^<command-message>autoplan<\/command-message>\n<command-name>\/autoplan<\/command-name>(?:\n<command-args>[\s\S]*<\/command-args>)?$/.test(record.message.content);
@@ -407,37 +502,79 @@ export function readPlanCountTranscript(configDir: string, cwd: string,
   }
 }
 
+/** What a refused owned read can report without content: inputs to the hook's guidance and advisory. */
+export interface OwnedTranscriptDiagnostic {
+  /** Claude Code version recorded in the journal's own records, when present. */
+  claudeVersion?: string;
+  /** Record types from the journal head down to its first turn; never content. */
+  rootShape: string[];
+  /** Parent assistant tool_use ids present in complete records. */
+  toolUseIds: string[];
+  /** sha256 of the exact bytes read, so two reads can prove a stable snapshot. */
+  sha256: string;
+  /** The journal ends at a record boundary (no partially written record). */
+  complete: boolean;
+}
+
+class OwnedReadError extends Error {
+  constructor(readonly reason: OwnedTranscriptReason) { super(reason); }
+}
+
+function diagnose(bytes: Buffer, sessionId: string, rootShape: string[] = []): OwnedTranscriptDiagnostic {
+  const text = bytes.toString('utf8'), toolUseIds: string[] = [];
+  let claudeVersion: string | undefined;
+  for (const line of text.slice(0, text.lastIndexOf('\n') + 1).split('\n')) {
+    let record: unknown;
+    try { record = JSON.parse(line); } catch { continue; }
+    if (!object(record) || record.sessionId !== sessionId || record.agentId != null || record.isSidechain !== false) continue;
+    if (!claudeVersion && typeof record.version === 'string' && /^\d+\.\d+\.\d+[0-9A-Za-z.+-]{0,24}$/.test(record.version))
+      claudeVersion = record.version;
+    if (object(record.message) && record.message.role === 'assistant' && Array.isArray(record.message.content))
+      for (const block of record.message.content)
+        if (object(block) && block.type === 'tool_use' && typeof block.id === 'string') toolUseIds.push(block.id);
+  }
+  return { ...(claudeVersion ? { claudeVersion } : {}), rootShape, toolUseIds,
+    sha256: createHash('sha256').update(bytes).digest('hex'), complete: text.endsWith('\n') };
+}
+
 /** Read exactly the native hook's parent file; never scan another session. */
 export function readOwnedClaudePublicTranscript(file: string, cwd: string, sessionId: string): {
-  transcript: PlanCountTranscript; events: ClaudeParentPublicEvent[];
+  transcript: PlanCountTranscript; events: ClaudeParentPublicEvent[]; diagnostic?: OwnedTranscriptDiagnostic;
 } {
-  let fd: number | undefined;
+  let fd: number | undefined, bytes: Buffer | undefined;
   try {
-    if (!/^[A-Za-z0-9_-]{1,160}$/.test(sessionId) || !path.isAbsolute(cwd) ||
-        !path.isAbsolute(file) || path.normalize(file) !== file ||
-        path.basename(file) !== `${sessionId}.jsonl`) throw Error('invalid native parent identity');
+    if (!/^[A-Za-z0-9_-]{1,160}$/.test(sessionId) || !path.isAbsolute(cwd) || !ownedNativePath(file) ||
+        path.basename(nativePathSpelling(file)) !== `${sessionId}.jsonl`) throw new OwnedReadError('identity');
+    file = nativePathSpelling(file);
     const project = path.dirname(file), projects = path.dirname(project), config = path.dirname(projects);
     if (path.basename(projects) !== 'projects' ||
-        [config, projects, project].some(dir => !fs.lstatSync(dir).isDirectory() || fs.realpathSync(dir) !== dir))
-      throw Error('invalid native parent directory');
+        [config, projects, project].some(dir => !fs.lstatSync(dir).isDirectory() || !sameNativePath(fs.realpathSync(dir), dir)))
+      throw new OwnedReadError('identity');
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     const before = fs.fstatSync(fd, { bigint: true });
-    if (!before.isFile() || before.size > BigInt(MAX_BYTES)) throw Error('invalid native parent file');
-    const bytes = fs.readFileSync(fd);
+    if (!before.isFile() || before.size > BigInt(MAX_BYTES)) throw new OwnedReadError('identity');
+    bytes = fs.readFileSync(fd);
     const after = fs.fstatSync(fd, { bigint: true }), current = fs.lstatSync(file, { bigint: true });
-    if (!current.isFile() || before.dev !== current.dev || before.ino !== current.ino ||
-        before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
+    if (!current.isFile() || before.dev !== current.dev || before.ino !== current.ino) throw new OwnedReadError('identity');
+    // Racing Claude's own append is transient: the hook retries within its deadline.
+    if (before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
         before.size !== current.size || before.mtimeNs !== current.mtimeNs ||
-        before.size !== BigInt(bytes.length)) throw Error('native parent changed during read');
+        before.size !== BigInt(bytes.length)) throw new OwnedReadError('changing');
     const text = bytes.toString('utf8');
-    if (!Buffer.from(text).equals(bytes)) throw Error('invalid native parent encoding');
-    const events: ClaudeParentPublicEvent[] = [];
-    const transcript = readPlanCountTranscript(config, cwd, () => {}, file, { file, text, events });
-    if (events.some(event => event.sessionId !== sessionId)) throw Error('foreign native parent event');
-    return { transcript, events };
-  } catch {
-    return { transcript: { status: 'error', calls: [], assistantMessages: [],
-      error: 'Owned native public transcript is unavailable or changing' }, events: [] };
+    if (!Buffer.from(text).equals(bytes)) throw new OwnedReadError('malformed');
+    const snapshot: OwnedSnapshot = { file, text, events: [] };
+    const transcript = readPlanCountTranscript(config, cwd, () => {}, file, snapshot);
+    if (snapshot.events.some(event => event.sessionId !== sessionId)) throw new OwnedReadError('identity');
+    if (transcript.status === 'error') transcript.reason ??= 'malformed';
+    if (transcript.status === 'ready') return { transcript, events: snapshot.events };
+    return { transcript, events: [], diagnostic: diagnose(bytes, sessionId, snapshot.rootShape) };
+  } catch (error) {
+    // A journal Claude has not created yet is unflushed, not an identity failure.
+    const reason = error instanceof OwnedReadError ? error.reason :
+      (error as NodeJS.ErrnoException)?.code === 'ENOENT' ? undefined : 'identity';
+    return { transcript: { status: 'error', calls: [], assistantMessages: [], ...(reason ? { reason } : {}),
+      error: `Owned native public transcript is unavailable (${reason ?? 'not created yet'})` }, events: [],
+      ...(bytes ? { diagnostic: diagnose(bytes, sessionId) } : {}) };
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }

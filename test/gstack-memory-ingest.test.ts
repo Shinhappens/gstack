@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, statSync, chmodSync, readdirSync, symlinkSync, utimesSync, copyFileSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, statSync, chmodSync, readdirSync, symlinkSync, utimesSync, copyFileSync, realpathSync } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, join } from "path";
 import { spawnSync } from "child_process";
@@ -30,7 +30,7 @@ describe("requested secret scanning at the import boundary", () => {
   const realScanner = process.env.GSTACK_TEST_GITLEAKS;
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "gstack-scan-"));
+    home = realpathSync(mkdtempSync(join(tmpdir(), "gstack-scan-")));
     bin = join(home, "bin");
     mkdirSync(bin);
     mkdirSync(join(home, "tmp"));
@@ -112,7 +112,11 @@ const rel = relative(process.env.HOME, report);
 if (report !== '/dev/stdout' && (isAbsolute(rel) || rel.startsWith('..'))) process.exit(2);
 appendFileSync(join(process.env.HOME, 'scans'), JSON.stringify({ input, report, body: readFileSync(input, 'utf8'), inputMode: statSync(input).mode & 511, dirMode: statSync(dirname(report)).mode & 511, reportMode: statSync(report).mode & 511 }) + '\\n');
 if (mode === 'error') process.exit(2);
-if (mode === 'timeout') Bun.sleepSync(63000);
+if (mode === 'timeout') {
+  writeFileSync(join(process.env.HOME, 'scanner.pid'), String(process.pid));
+  Bun.sleepSync(2000);
+  writeFileSync(join(process.env.HOME, 'scanner-late'), 'late scanner work');
+}
 if (process.env.APPEND_DURING_SCAN) {
   const path = realpathSync(process.env.APPEND_DURING_SCAN);
   if (!path.startsWith(process.env.HOME + '/')) process.exit(2);
@@ -139,8 +143,8 @@ if (process.env.LIMIT_STAGE_WRITES === '1') {
 `, { mode: 0o700 });
   }
 
-  function run(args: string[] = [], timeout = 30000) {
-    const argv = [SCRIPT, "--include-unattributed", "--sources", "transcript", ...args];
+  function run(args: string[] = [], timeout = 30000, preload?: string) {
+    const argv = [...(preload ? ["--preload", preload] : []), SCRIPT, "--include-unattributed", "--sources", "transcript", ...args];
     const limited = env.LIMIT_STAGE_WRITES === "1";
     const r = spawnSync(limited ? "/bin/bash" : process.execPath,
       limited ? ["-c", 'trap "" XFSZ; exec "$@"', "f3-limit", process.execPath, ...argv] : argv, {
@@ -516,18 +520,84 @@ if (process.env.LIMIT_STAGE_WRITES === '1') {
     });
   }
 
-  it("ends a detect invocation at its 60-second deadline and retries after repair", () => {
+  it("enforces the production 60-second detect contract with a short real timeout and retries after repair", async () => {
     scanner("timeout");
     const path = source();
-    const r = run(["--scan-secrets"], 75000);
+    const original = readFileSync(path);
+    const preload = join(home, "scanner-timeout.cjs");
+    const observed = join(home, "scanner-timeout.jsonl");
+    writeFileSync(preload, String.raw`
+const cp = require('child_process');
+const { appendFileSync, realpathSync } = require('fs');
+const { sep } = require('path');
+const actual = cp.execFileSync;
+const ownedHome = realpathSync(${JSON.stringify(home)});
+const ownedTmp = realpathSync(${JSON.stringify(join(home, "tmp"))}) + sep;
+const ownedScanner = realpathSync(${JSON.stringify(join(bin, "gitleaks"))});
+cp.execFileSync = function(file, args, options) {
+  if (file !== 'gitleaks' || args?.[0] !== 'detect') return actual(file, args, options);
+  if (!ownedScanner.startsWith(ownedHome + sep)
+    || realpathSync(Bun.which(file, { PATH: options.env.PATH })) !== ownedScanner
+    || realpathSync(options.env.HOME) !== ownedHome
+    || args.length !== 10 || args[1] !== '--no-git' || args[2] !== '--source'
+    || args[4] !== '--report-format' || args[5] !== 'json' || args[6] !== '--report-path'
+    || args[8] !== '--exit-code' || args[9] !== '0'
+    || !realpathSync(args[3]).startsWith(ownedTmp) || !realpathSync(args[7]).startsWith(ownedTmp)
+    || options.stdio !== 'ignore' || options.timeout !== 60000 || options.killSignal !== 'SIGKILL') {
+    throw Error('Unexpected scanner or production detect contract');
+  }
+  appendFileSync(${JSON.stringify(observed)}, JSON.stringify({ phase: 'invoke', timeout: options.timeout,
+    effectiveTimeout: 500, killSignal: options.killSignal }) + '\n');
+  try { return actual(file, args, { ...options, timeout: 500 }); }
+  catch (error) {
+    appendFileSync(${JSON.stringify(observed)}, JSON.stringify({ phase: 'error', code: error.code,
+      signal: error.signal, status: error.status, pid: error.pid }) + '\n');
+    throw error;
+  }
+};
+require('module').syncBuiltinESMExports();
+`);
+    const passthrough = spawnSync(process.execPath, ["--preload", preload, "-e", String.raw`
+const { execFileSync } = require('child_process');
+process.stdout.write(execFileSync('gitleaks', ['version'], { timeout: 60000, killSignal: 'SIGKILL' }));
+process.stdout.write(execFileSync(process.execPath, ['-e', 'process.stdout.write("passthrough")'], { timeout: 60000, killSignal: 'SIGKILL' }));
+`], { env, cwd: home, encoding: "utf8", timeout: 5000 });
+    expect(passthrough.error).toBeUndefined();
+    expect(passthrough.status, passthrough.stderr).toBe(0);
+    expect(passthrough.stdout).toBe("8.30.1\npassthrough");
+    expect(existsSync(observed)).toBe(false);
+    const r = run(["--scan-secrets"], 5000, preload);
+    const pid = Number(readFileSync(join(home, "scanner.pid"), "utf8"));
+    expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+    expect(readFileSync(observed, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toEqual([
+      { phase: "invoke", timeout: 60000, effectiveTimeout: 500, killSignal: "SIGKILL" },
+      { phase: "error", code: "ETIMEDOUT", signal: "SIGKILL", status: null, pid },
+    ]);
+    const reapedBy = performance.now() + 500;
+    let reaped = false;
+    while (performance.now() < reapedBy) {
+      try { process.kill(pid, 0); }
+      catch (error) {
+        expect((error as NodeJS.ErrnoException).code).toBe("ESRCH");
+        reaped = true;
+        break;
+      }
+      await Bun.sleep(10);
+    }
+    expect(reaped).toBe(true);
+    expect(existsSync(join(home, "scanner-late"))).toBe(false);
     expect(r.stderr).toContain("secret-scan error");
     expect(imported()).toEqual([]);
     expect(sessions()[path]).toBeUndefined();
+    expect(readFileSync(path)).toEqual(original);
     expect(readdirSync(join(home, "tmp"))).toEqual([]);
     scanner("clean");
     expect(run(["--scan-secrets"]).status).toBe(0);
+    expect(imported()).toHaveLength(1);
     expect(sessions()[path]).toBeDefined();
-  }, 80000);
+    expect(readdirSync(join(home, "tmp"))).toEqual([]);
+    expect(existsSync(join(home, "scanner-late"))).toBe(false);
+  });
 
   it("does not stamp --no-write pages that could not pass the requested scan", () => {
     scanner("error");
@@ -721,7 +791,22 @@ function isolateGitRemote(repo: string, url: string): void {
   expect(git("remote", "get-url", "origin")).toBe(url);
 }
 
+/**
+ * These cases exercise transcript ingest after the user consented, so the
+ * isolated state root gets `transcript_ingest_mode: recent` unless the case
+ * set the key itself. The no-consent paths live in
+ * gstack-gbrain-sync-transcript-mode.test.ts.
+ */
+function seedTranscriptConsent(gstackHome: string | undefined): void {
+  if (!gstackHome) return;
+  mkdirSync(gstackHome, { recursive: true });
+  const config = join(gstackHome, "config.yaml");
+  const current = existsSync(config) ? readFileSync(config, "utf-8") : "";
+  if (!/^transcript_ingest_mode:/m.test(current)) writeFileSync(config, `${current}transcript_ingest_mode: recent\n`);
+}
+
 function runScript(args: string[], env: Record<string, string> = {}): { stdout: string; stderr: string; exitCode: number } {
+  seedTranscriptConsent(env.GSTACK_HOME);
   const result = spawnSync("bun", [SCRIPT, ...args], {
     encoding: "utf-8",
     timeout: 30000,

@@ -173,6 +173,7 @@ describe('link_claude_skill_dirs prefers rendered SKILL.md (behavior)', () => {
         'SKILL_PREFIX=0',
         '_WINDOWS_COPY_NOTE_PRINTED=1',
         `GSTACK_HOME="${home}"`,
+        `GSTACK_STATE_ROOT="${home}"`,
         extractFn(SETUP_SRC, '_link_or_copy'),
         extractFn(SETUP_SRC, '_print_windows_copy_note_once'),
         extractFn(SETUP_SRC, '_link_skill_runtime_assets'),

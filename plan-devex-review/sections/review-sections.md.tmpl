@@ -41,7 +41,7 @@ stay together; independent policies each need their own decision.
 Before starting review passes, check for prior DX reviews on this project:
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
 ~/.claude/skills/gstack/bin/gstack-review-read 2>/dev/null | grep plan-devex-review || echo "NO_PRIOR_DX_REVIEWS"
 ```
 
@@ -247,7 +247,7 @@ required proof of the accepted contract does not reopen that contract.
 
 {{CODEX_PLAN_REVIEW}}
 
-## CRITICAL RULE — How to ask questions
+## How to ask questions
 
 Follow the AskUserQuestion format from the Preamble above. Additional rules for
 DX reviews:
@@ -429,11 +429,11 @@ Use AskUserQuestion with applicable options:
              | DX EXPANSION     | DX POLISH          | DX TRIAGE
 Scope        | Push UP (opt-in) | Maintain           | Critical only
 Posture      | Enthusiastic     | Rigorous           | Surgical
-Competitive  | Full benchmark   | Full benchmark     | Skip
-Magical      | Full design      | Verify exists      | Skip
+Competitive  | Full benchmark   | Full benchmark     | Target only
+Magical      | Full design      | Verify exists      | Verify exists
 Journey      | All stages +     | All stages         | Install + Hello
              | best-in-class    |                    | World only
-Passes       | All 8, expanded  | All 8, standard    | Pass 1 + 3 only
+Passes       | All 8, expanded  | All 8, standard    | All 8, blockers only
 Outside voice| Recommended      | Recommended        | Skip
 ```
 

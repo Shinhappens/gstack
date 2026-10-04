@@ -11,6 +11,9 @@ import { pickPlanReviewQuestion } from './helpers/plan-review-cases';
 import type { NativeQuestion } from './helpers/plan-skill-questions';
 import captured from './fixtures/design-board-questions.json';
 import outsideVoices from './fixtures/design-outside-voices-question.json';
+import { usePrivateStateRoot } from './helpers/private-state-root';
+
+usePrivateStateRoot();
 
 let cwd: string;
 let stateFile: string;

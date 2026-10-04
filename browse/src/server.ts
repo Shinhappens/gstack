@@ -17,34 +17,27 @@ import { BrowserManager, markDaemonProcess } from './browser-manager';
 import { handleReadCommand, hasOutArg } from './read-commands';
 import { handleWriteCommand } from './write-commands';
 import { handleMetaCommand } from './meta-commands';
-import { handleCookiePickerRoute, hasActivePicker } from './cookie-picker-routes';
+import { hasActivePicker } from './cookie-picker-routes';
 import { COMMAND_DESCRIPTIONS, PAGE_CONTENT_COMMANDS, DOM_CONTENT_COMMANDS, wrapUntrustedContent, canonicalizeCommand, buildUnknownCommandError, ALL_COMMANDS } from './commands';
 import {
   wrapUntrustedPageContent, datamarkContent,
   runContentFilters, type ContentFilterResult,
   markHiddenElements, getCleanTextWithStripping, cleanupHiddenMarkers,
 } from './content-security';
-import { isSidecarAvailable, scanWithSidecar } from './security-sidecar-client';
 import { writeSecureFile, mkdirSecure, appendSecureFile } from './file-permissions';
 import { handleSnapshot, SNAPSHOT_FLAGS } from './snapshot';
 import {
   initRegistry, validateToken as validateScopedToken, checkScope, checkDomain,
-  checkRate, createToken, createSetupKey, exchangeSetupKey, revokeToken,
-  listTokens, recordCommand,
-  isRootToken, checkConnectRateLimit, type TokenInfo, type ScopeCategory,
-  DEFAULT_PAIR_SCOPES, InvalidScopeError, ReservedClientIdError, assertValidClientId,
-  assertValidTokenOptions, revokeSetupKeys, getClientSession, grantReducesAccess,
+  checkRate, recordCommand, isRootToken, type TokenInfo,
 } from './token-registry';
-import { validateTempPath } from './path-security';
 import { resolveConfig, ensureStateDir, readVersionHash, resolveChromiumProfile, cleanSingletonLocks, isPairAgentEnabled } from './config';
 import {
   isSessionPersistEnabled, persistSessionState, restoreSessionState,
   sessionPersistIntervalMs, SESSION_STATE_FILE,
 } from './session-persist';
-import { emitActivity, subscribe, getActivityAfter, getActivityHistory, getSubscriberCount } from './activity';
-import { createSseEndpoint } from './sse-helpers';
+import { emitActivity } from './activity';
 import { initAuditLog, writeAuditEntry } from './audit';
-import { inspectElement, modifyStyle, resetModifications, getModificationHistory, detachSession, type InspectorResult } from './cdp-inspector';
+import { detachSession } from './cdp-inspector';
 // Bun.spawn used instead of child_process.spawn (compiled bun binaries
 // fail posix_spawn on all executables including /bin/bash)
 import { safeUnlink, safeUnlinkQuiet, safeKill } from './error-handling';
@@ -53,23 +46,18 @@ import {
 } from './port-allocator';
 import { acquireAgentStateLock, readAgentRecord, clearAgentRecord, isOurAgent, isAgentRecordLive, isAgentRecordGone, stopAgentByRecord, spawnTerminalAgent } from './terminal-agent-control';
 import { isProcessAlive } from './error-handling';
-import { sanitizeBody, stripLoneSurrogateEscapes, stripLoneSurrogates, sanitizeReplacer } from './sanitize';
+import { sanitizeBody, stripLoneSurrogates } from './sanitize';
 import { startSocksBridge, testUpstream, type BridgeHandle } from './socks-bridge';
 import { parseProxyConfig, toUpstreamConfig, ProxyConfigError } from './proxy-config';
 import { writeReceipt } from '../../lib/egress-receipt';
 import { redactProxyUrl } from './proxy-redact';
 import { type XvfbHandle } from './xvfb';
 import { logTunnelDenial } from './tunnel-denial-log';
-import {
-  mintSseSessionToken, validateSseSessionToken, extractSseCookie,
-  buildSseSetCookie, SSE_COOKIE_NAME,
-} from './sse-session-cookie';
-import {
-  mintPtySessionToken, buildPtySetCookie, revokePtySessionToken,
-} from './pty-session-cookie';
-import {
-  mintLease, validateLease, refreshLease, revokeLease,
-} from './pty-session-lease';
+import { validateSseSessionToken, extractSseCookie } from './sse-session-cookie';
+import { ROUTES } from './routes';
+import { dispatchRoute, type RouteContext, type Surface } from './routes/table';
+import { TUNNEL_COMMANDS, canDispatchOverTunnel } from './routes/commands';
+import { getInspectorSubscriberCount, clearInspectorSubscribers } from './routes/inspector';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
@@ -167,8 +155,7 @@ let tunnelUrl: string | null = null;
 let tunnelListener: any = null;           // ngrok listener handle
 let tunnelServer: ReturnType<typeof Bun.serve> | null = null; // tunnel HTTP listener
 
-/** Which HTTP listener accepted this request. */
-export type Surface = 'local' | 'tunnel';
+export type { Surface };
 
 /**
  * Factory contract for embedders (gbrowser phoenix overlay).
@@ -199,7 +186,7 @@ export interface ServerConfig {
   // were documented but never read (the idle timer, activity state, and
   // shutdown target are module-global, so per-factory wiring would lie for
   // any embedder running >1 handler). Real support belongs to the deferred
-  // server.ts singleton/route-table refactor. Until then: BROWSE_IDLE_TIMEOUT
+  // server.ts singleton refactor. Until then: BROWSE_IDLE_TIMEOUT
   // and CHROMIUM_PROFILE env are the honest knobs.
   /** Caller-owned. shutdown() does NOT call xvfb.stop(); caller is responsible. */
   xvfb?: XvfbHandle | null;
@@ -299,7 +286,9 @@ export function resolveConfigFromEnv(): Omit<ServerConfig, 'browserManager' | 's
  * token via Authorization: Bearer.
  *
  * Updating this set is a deliberate security decision. Every addition widens
- * the tunnel attack surface.
+ * the tunnel attack surface. It must equal the paths of the route-table
+ * entries that declare the 'tunnel' surface (browse/test/server-route-table.test.ts),
+ * so widening the tunnel means editing this literal and the entry.
  */
 const TUNNEL_PATHS = new Set<string>([
   '/connect',
@@ -318,42 +307,25 @@ const TUNNEL_PATHS = new Set<string>([
 export const GSTACK_EXTENSION_ID = 'dgbkdbjebeiblbajiilljmhjdpmiglep';
 
 /**
- * Commands reachable via POST /command over the tunnel surface. A paired
- * remote agent can drive the browser (goto, click, text, etc.) but cannot
- * configure the daemon, bootstrap new sessions, import cookies, or reach
- * extension-inspector state. This allowlist maps to the eng-review decision
- * logged in the CEO plan for sec-wave v1.6.0.0.
+ * The extension-origin auth check (POST /extension-token): Origin is exactly
+ * the pinned extension and Host is loopback. Defense-in-depth alongside the
+ * 127.0.0.1 bind: a DNS-rebinding page can't present a localhost Host header.
+ * Host arrives as '127.0.0.1:34567', so parse out the hostname — never compare
+ * the raw header (which carries the port) against a literal.
  */
-export const TUNNEL_COMMANDS = new Set<string>([
-  // Original 17
-  'goto', 'click', 'text', 'screenshot',
-  'html', 'links', 'forms', 'accessibility',
-  'attrs', 'media', 'data',
-  'scroll', 'press', 'type', 'select', 'wait', 'eval',
-  // Tab + navigation primitives operator docs and CLI hints already promised
-  'newtab', 'tabs', 'back', 'forward', 'reload',
-  // Read/inspect/write operators paired agents need to be useful
-  'snapshot', 'fill', 'url', 'closetab',
-]);
-
-/**
- * Pure gate: returns true iff the command is reachable over the tunnel surface.
- * Extracted from the inline /command handler so the gate logic is unit-testable
- * without standing up an HTTP listener. Behavior is identical to the inline
- * check; the function canonicalizes the command (so aliases hit the same set)
- * and returns false for null/undefined input.
- *
- * `args` is consulted so an `--out` invocation (e.g. `eval --out <file>`) is
- * NEVER tunnel-dispatchable: `--out` turns an otherwise-readable command into a
- * local-disk WRITE, and the tunnel surface never grants disk-write capability to
- * remote paired agents. Omitting `args` preserves the old command-only behavior.
- */
-export function canDispatchOverTunnel(command: string | undefined | null, args?: string[]): boolean {
-  if (typeof command !== 'string' || command.length === 0) return false;
-  if (Array.isArray(args) && hasOutArg(args)) return false;
-  const cmd = canonicalizeCommand(command);
-  return TUNNEL_COMMANDS.has(cmd);
+function isPinnedExtensionRequest(req: Request): boolean {
+  let hostname: string | null = null;
+  try {
+    hostname = new URL(`http://${req.headers.get('host') ?? ''}`).hostname;
+  } catch (err) {
+    if (!(err instanceof TypeError)) throw err;  // TypeError = malformed Host
+  }
+  const originOk = req.headers.get('origin') === `chrome-extension://${GSTACK_EXTENSION_ID}`;
+  const hostOk = hostname === '127.0.0.1' || hostname === 'localhost';
+  return originOk && hostOk;
 }
+
+export { TUNNEL_COMMANDS, canDispatchOverTunnel };
 
 /**
  * Read ngrok authtoken from env var, ~/.gstack/ngrok.env, or ngrok's native
@@ -639,6 +611,7 @@ function generateHelpText(): string {
 
 // ─── Buffer (from buffers.ts) ────────────────────────────────────
 import { consoleBuffer, networkBuffer, dialogBuffer, addConsoleEntry, addNetworkEntry, addDialogEntry, type LogEntry, type NetworkEntry, type DialogEntry } from './buffers';
+
 export { consoleBuffer, networkBuffer, dialogBuffer, addConsoleEntry, addNetworkEntry, addDialogEntry, type LogEntry, type NetworkEntry, type DialogEntry };
 
 const CONSOLE_LOG_PATH = config.consoleLog;
@@ -752,6 +725,7 @@ const idleCheckInterval = setInterval(idleCheckTick, 60_000);
 // dual-instance fix` describe block for usage.
 export const __testInternals__ = {
   serverInstanceId: SERVER_INSTANCE_ID,
+  tunnelPaths: TUNNEL_PATHS as ReadonlySet<string>,
   idleCheckTick,
   // Watchdog seams (watchdog.test.ts): drive the 15s poll against an
   // arbitrary (dead) PID, trigger the handoff-promotion suppression exactly
@@ -896,6 +870,7 @@ function suppressHeadedParentShutdown(stateConfig: ServerConfig['config'] = conf
 
 // ─── Command Sets (from commands.ts — single source of truth) ───
 import { READ_COMMANDS, WRITE_COMMANDS, META_COMMANDS } from './commands';
+
 export { READ_COMMANDS, WRITE_COMMANDS, META_COMMANDS };
 
 /**
@@ -911,28 +886,7 @@ function isWriteInvocation(command: string, args: string[]): boolean {
   return WRITE_COMMANDS.has(command) || hasOutArg(args);
 }
 
-// ─── Inspector State (in-memory) ──────────────────────────────
-let inspectorData: InspectorResult | null = null;
-let inspectorTimestamp: number = 0;
-
-// Inspector SSE subscribers
-type InspectorSubscriber = (event: any) => void;
-const inspectorSubscribers = new Set<InspectorSubscriber>();
-
-/** Diagnostic accessor used by the $B memory snapshot. */
-export function getInspectorSubscriberCount(): number {
-  return inspectorSubscribers.size;
-}
-
-function emitInspectorEvent(event: any): void {
-  for (const notify of inspectorSubscribers) {
-    queueMicrotask(() => {
-      try { notify(event); } catch (err: any) {
-        console.error('[browse] Inspector event subscriber threw:', err.message);
-      }
-    });
-  }
-}
+export { getInspectorSubscriberCount };
 
 // ─── Server ────────────────────────────────────────────────────
 const browserManager = new BrowserManager();
@@ -1408,7 +1362,7 @@ export function buildCommandResponse(cr: CommandResult): Response {
 }
 
 /** HTTP wrapper — converts CommandResult to Response. Used by the /command
- * route dispatcher (line ~2158). The wrapper layer exists so
+ * route (routes/commands.ts, via RouteContext). The wrapper layer exists so
  * `buildCommandResponse` is independently unit-testable (v1.38.1.0).
  */
 async function handleCommand(body: any, tokenInfo?: TokenInfo | null): Promise<Response> {
@@ -1740,7 +1694,7 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
     try { detachSession(); } catch (err: any) {
       console.warn('[browse] Failed to detach CDP session:', err.message);
     }
-    inspectorSubscribers.clear();
+    clearInspectorSubscribers();
     if (cfgBrowserManager.isWatching()) cfgBrowserManager.stopWatch();
     clearInterval(flushInterval);
     clearInterval(idleCheckInterval);
@@ -1838,13 +1792,37 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
     await activeShutdown?.(code ?? 2);
   };
 
-  // Substitute cfgBrowserManager for module-level browserManager in the
-  // dispatcher body so all browser-state reads/writes go through the cfg
-  // instance. Other module-level references (handleCommand, getTokenInfo,
-  // isRootRequest, etc.) take the token as a parameter and are passed
-  // `authToken` (the cfg-derived value) explicitly.
-  const browserManager = cfgBrowserManager;
-
+  // Everything a route handler may use. Handlers get the cfg-provided
+  // BrowserManager and auth checks as functions; the raw token reaches only
+  // the two bootstrap routes that hand it on (see RouteContext).
+  const routeCtx: RouteContext = {
+    browserManager: cfgBrowserManager,
+    startTime,
+    browsePort,
+    validateAuth,
+    isRootRequest,
+    getTokenInfo,
+    hasSseCookie: (req) => validateSseSessionToken(extractSseCookie(req)),
+    isPinnedExtensionRequest,
+    isRootTokenValue: (token) => token !== null && token === authToken,
+    bootstrapRootToken: authToken,
+    resetIdleTimer,
+    terminal: { readPort: readTerminalPort, grantToken: grantPtyToken, restartSession: restartPtySession },
+    tunnel: {
+      state: () => ({ active: tunnelActive, url: tunnelUrl, hasListener: tunnelServer !== null }),
+      close: closeTunnel,
+      resolveAuthtoken: resolveNgrokAuthtoken,
+      start: (authtoken) => startTunnel({
+        fetchHandler: makeFetchHandler('tunnel'),
+        authtoken,
+        consent: 'pair_agent=on (isPairAgentEnabled gate at /tunnel/start)',
+      }),
+    },
+    commands: {
+      handle: handleCommand,
+      handleInternal: (body, tokenInfo, opts) => handleCommandInternal(body, tokenInfo, opts),
+    },
+  };
 
   const makeFetchHandler = (surface: Surface) => async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
@@ -1885,1225 +1863,7 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
       if (overlayResp) return overlayResp;
     }
 
-    // GET /connect — alive probe.  Unauth on both surfaces.  Used by /pair
-    // and /tunnel/start to detect dead ngrok tunnels via the tunnel URL,
-    // since /health is not tunnel-reachable under the dual-listener design.
-    //
-    // Shares the same rate limit as POST /connect — otherwise a tunnel
-    // caller can probe unlimited GETs and lock out nothing, which makes
-    // the endpoint a free daemon-enumeration surface.
-    if (url.pathname === '/connect' && req.method === 'GET') {
-      if (!checkConnectRateLimit()) {
-        return new Response(JSON.stringify({ error: 'Rate limited' }), {
-          status: 429, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-      return new Response(JSON.stringify({ alive: true }), {
-        status: 200, headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
-      // Cookie picker routes — HTML page unauthenticated, data/action routes require auth
-      if (url.pathname.startsWith('/cookie-picker')) {
-        return handleCookiePickerRoute(url, req, browserManager, authToken);
-      }
-
-      // Welcome page — served when GStack Browser launches in headed mode
-      if (url.pathname === '/welcome') {
-        const welcomePath = (() => {
-          // Gate GSTACK_SLUG on a strict regex BEFORE interpolating it into
-          // the filesystem path. Without this, a slug like "../../etc/passwd"
-          // would resolve to ~/.gstack/projects/../../etc/passwd/... — path
-          // traversal.  Not exploitable today (attacker needs local env-var
-          // access), but the gate is one regex and buys us defense-in-depth.
-          const rawSlug = process.env.GSTACK_SLUG || 'unknown';
-          const slug = /^[a-z0-9_-]+$/.test(rawSlug) ? rawSlug : 'unknown';
-          const homeDir = process.env.HOME || process.env.USERPROFILE || '/tmp';
-          const projectWelcome = `${homeDir}/.gstack/projects/${slug}/designs/welcome-page-20260331/finalized.html`;
-          if (fs.existsSync(projectWelcome)) return projectWelcome;
-          // Fallback: built-in welcome page from gstack install.  Reject
-          // SKILL_ROOT values containing '..' for the same defense-in-depth
-          // reason as the GSTACK_SLUG regex above.  Not exploitable today
-          // (env set at install time), but the gate is one check.
-          const rawSkillRoot = process.env.GSTACK_SKILL_ROOT || `${homeDir}/.claude/skills/gstack`;
-          if (rawSkillRoot.includes('..')) return null;
-          const builtinWelcome = `${rawSkillRoot}/browse/src/welcome.html`;
-          if (fs.existsSync(builtinWelcome)) return builtinWelcome;
-          return null;
-        })();
-        if (welcomePath) {
-          try {
-            const html = require('fs').readFileSync(welcomePath, 'utf-8');
-            return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-          } catch (err: any) {
-            console.error('[browse] Failed to read welcome page:', welcomePath, err.message);
-          }
-        }
-        // No welcome page found — serve a simple fallback (avoid ERR_UNSAFE_REDIRECT on Windows)
-        return new Response(
-          `<!DOCTYPE html><html><head><title>GStack Browser</title>
-          <style>body{background:#111;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}
-          .msg{text-align:center;opacity:.7;}.gold{color:#f5a623;font-size:2em;margin-bottom:12px;}</style></head>
-          <body><div class="msg"><div class="gold">◈</div><p>GStack Browser ready.</p><p style="font-size:.85em">Waiting for commands from Claude Code.</p></div></body></html>`,
-          { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-        );
-      }
-
-      // ─── POST /extension-token — pinned-origin token bootstrap ──────
-      //
-      // The ONLY endpoint that hands out AUTH_TOKEN. GET /health used to
-      // carry the token (headed mode + any chrome-extension:// Origin),
-      // which meant ANY extension — or any localhost caller in headed
-      // mode — could read the root token. Now the token is released only
-      // to the one extension identity we ship: the Origin header must be
-      // exactly `chrome-extension://<GSTACK_EXTENSION_ID>`, where the ID
-      // is pinned by the "key" field in extension/manifest.json (derive
-      // it with `bun browse/scripts/extension-id.ts`). Chrome sets Origin
-      // on cross-origin POSTs from extension contexts and web pages
-      // cannot forge a chrome-extension:// Origin.
-      //
-      // Local listener only: NEVER added to TUNNEL_PATHS, so the tunnel
-      // surface 404s it by default-deny.
-      if (url.pathname === '/extension-token' && req.method === 'POST') {
-        // Defense-in-depth alongside the 127.0.0.1 bind: a DNS-rebinding
-        // page can't present a localhost Host header. Host arrives as
-        // '127.0.0.1:34567', so parse out the hostname — never compare
-        // the raw header (which carries the port) against a literal.
-        let hostname: string | null = null;
-        try {
-          hostname = new URL(`http://${req.headers.get('host') ?? ''}`).hostname;
-        } catch (err) {
-          if (!(err instanceof TypeError)) throw err;  // TypeError = malformed Host
-        }
-        const originOk =
-          req.headers.get('origin') === `chrome-extension://${GSTACK_EXTENSION_ID}`;
-        const hostOk = hostname === '127.0.0.1' || hostname === 'localhost';
-        if (!originOk || !hostOk) {
-          // No detail in the body — don't teach a probing caller which
-          // check failed.
-          return new Response(JSON.stringify({ error: 'Forbidden' }), {
-            status: 403, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        return new Response(JSON.stringify({ token: authToken }), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // Health check — no auth required, does NOT reset idle timer.
-      // NEVER carries a token in any mode: token bootstrap is
-      // POST /extension-token (pinned extension Origin) and shell auth
-      // is POST /pty-session. Liveness/status only.
-      if (url.pathname === '/health') {
-        const healthy = await browserManager.isHealthy();
-        return new Response(JSON.stringify({
-          status: healthy ? 'healthy' : 'unhealthy',
-          mode: browserManager.getConnectionMode(),
-          uptime: Math.floor((Date.now() - startTime) / 1000),
-          tabs: browserManager.getTabCount(),
-          // No `security` field (#2557): the only writer of the status it
-          // reported (sidebar-agent.ts's session-state file) went away with
-          // the chat path, so it read from a file nothing wrote — reporting
-          // a permanent 'inactive', or a stale false-green 'protected'
-          // wherever an old state file survived on disk. The live defenses
-          // (content-security L1-L3, the L4 sidecar on /pty-inject-scan)
-          // report through their own call sites, not through /health.
-          // Terminal-agent discovery. ONLY a port number — never a token.
-          // Tokens flow via the /pty-session HttpOnly cookie path. See
-          // `pty-session-cookie.ts` for the rationale (codex outside-voice
-          // finding #2: don't reuse this endpoint for shell auth).
-          terminalPort: readTerminalPort(),
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // ─── /pty-session — mint sessionId + lease + attachToken ─────────
-      //
-      // v1.44+ four-tuple shape:
-      //   { terminalPort, sessionId, attachToken, leaseExpiresAt }
-      //
-      //  - sessionId    : stable, non-secret. Safe to log. Identifies "this
-      //                   terminal" across re-attaches.
-      //  - attachToken  : short-lived (30 min wall, single attach in practice
-      //                   since the agent revokes on WS close). Bearer for
-      //                   the /ws upgrade.
-      //  - leaseExpiresAt: client-visible deadline for the lease. Re-attach
-      //                   only works inside this window.
-      //
-      // The lease + attachToken are minted together so a successful
-      // /pty-session is one round trip. Re-attach mints a fresh attachToken
-      // for the SAME sessionId via /pty-session/reattach.
-      //
-      // NEVER added to TUNNEL_PATHS — the tunnel surface 404s any
-      // /pty-session attempt by default-deny.
-      if (url.pathname === '/pty-session' && req.method === 'POST') {
-        if (!validateAuth(req)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const port = readTerminalPort();
-        if (!port) {
-          return new Response(JSON.stringify({
-            error: 'terminal-agent not ready',
-          }), { status: 503, headers: { 'Content-Type': 'application/json' } });
-        }
-        const lease = mintLease();
-        const minted = mintPtySessionToken();
-        const granted = await grantPtyToken(minted.token, lease.sessionId);
-        if (!granted) {
-          revokePtySessionToken(minted.token);
-          revokeLease(lease.sessionId);
-          return new Response(JSON.stringify({
-            error: 'failed to grant terminal session',
-          }), { status: 503, headers: { 'Content-Type': 'application/json' } });
-        }
-        return new Response(JSON.stringify({
-          terminalPort: port,
-          sessionId: lease.sessionId,
-          attachToken: minted.token,
-          leaseExpiresAt: lease.expiresAt,
-          // Legacy alias — extensions still on the v1.43 wire shape keep
-          // working. Drop after one minor release once dogfood confirms.
-          ptySessionToken: minted.token,
-          expiresAt: minted.expiresAt,
-        }), {
-          status: 200,
-          headers: {
-            'Content-Type': 'application/json',
-            'Set-Cookie': buildPtySetCookie(minted.token),
-          },
-        });
-      }
-
-      // ─── /pty-session/reattach — mint fresh attachToken for existing sessionId
-      //
-      // Used by Commit 3's re-attach loop on the client. Validates the
-      // lease (rejects unknown/expired sessionId with 410 Gone), mints a
-      // fresh short-lived attachToken bound to the same sessionId, and
-      // pushes it to the agent. The client opens a new WS with the new
-      // token; the agent matches the sessionId binding and re-attaches
-      // to the existing PtySession (kept alive for the 60s detach
-      // window — Commit 3 wires that side).
-      if (url.pathname === '/pty-session/reattach' && req.method === 'POST') {
-        if (!validateAuth(req)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const port = readTerminalPort();
-        if (!port) {
-          return new Response(JSON.stringify({ error: 'terminal-agent not ready' }), {
-            status: 503, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        let body: any;
-        try { body = await req.json(); } catch { body = null; }
-        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : null;
-        const v = sessionId ? validateLease(sessionId) : { ok: false };
-        if (!v.ok) {
-          // 410 Gone — session window has closed (lease expired or never
-          // existed). Client must fall back to /pty-session for a brand-new
-          // session.
-          return new Response(JSON.stringify({ error: 'lease expired or unknown' }), {
-            status: 410, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const minted = mintPtySessionToken();
-        const granted = await grantPtyToken(minted.token, sessionId!);
-        if (!granted) {
-          revokePtySessionToken(minted.token);
-          return new Response(JSON.stringify({ error: 'failed to grant attach token' }), {
-            status: 503, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        return new Response(JSON.stringify({
-          terminalPort: port,
-          sessionId,
-          attachToken: minted.token,
-          leaseExpiresAt: v.ok ? v.expiresAt : 0,
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      // ─── /pty-restart — one-transaction kill + fresh mint ────────────
-      //
-      // The Restart button. Synchronously disposes the caller's existing
-      // PtySession on the agent, revokes the old lease, mints a fresh
-      // sessionId + lease + attachToken, and returns the new 4-tuple in
-      // one response. Zero race window between kill and mint (codex T2
-      // + D8 of the eng review).
-      if (url.pathname === '/pty-restart' && req.method === 'POST') {
-        if (!validateAuth(req)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const port = readTerminalPort();
-        if (!port) {
-          return new Response(JSON.stringify({ error: 'terminal-agent not ready' }), {
-            status: 503, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        let body: any;
-        try { body = await req.json(); } catch { body = null; }
-        const oldSessionId = typeof body?.sessionId === 'string' ? body.sessionId : null;
-        // Best-effort dispose. Missing/unknown sessionId is non-fatal —
-        // the client may be doing a "restart from scratch" with no prior
-        // session (e.g. ENDED state). The fresh mint always proceeds.
-        if (oldSessionId) {
-          await restartPtySession(oldSessionId);
-          revokeLease(oldSessionId);
-        }
-        const lease = mintLease();
-        const minted = mintPtySessionToken();
-        const granted = await grantPtyToken(minted.token, lease.sessionId);
-        if (!granted) {
-          revokePtySessionToken(minted.token);
-          revokeLease(lease.sessionId);
-          return new Response(JSON.stringify({ error: 'failed to grant terminal session' }), {
-            status: 503, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        return new Response(JSON.stringify({
-          terminalPort: port,
-          sessionId: lease.sessionId,
-          attachToken: minted.token,
-          leaseExpiresAt: lease.expiresAt,
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      // ─── /pty-dispose — explicit teardown (pagehide / browser quit) ──
-      //
-      // sendBeacon-compatible: accepts the auth token in the BODY so the
-      // extension's pagehide handler can fire it without setting headers
-      // (sendBeacon doesn't support custom headers). Codex T3 fix —
-      // without this, every browser quit + sidebar close leaves a zombie
-      // PTY alive for the 60s detach window (Commit 3).
-      if (url.pathname === '/pty-dispose' && req.method === 'POST') {
-        let body: any;
-        try { body = await req.json(); } catch { body = null; }
-        const authTokenFromBody = typeof body?.authToken === 'string' ? body.authToken : null;
-        // Accept either header bearer OR body authToken. Both must match
-        // the root auth token; otherwise reject.
-        const headerToken = extractToken(req);
-        const authedByHeader = headerToken !== null && headerToken === authToken;
-        const authedByBody = authTokenFromBody !== null && authTokenFromBody === authToken;
-        if (!authedByHeader && !authedByBody) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : null;
-        if (sessionId) {
-          await restartPtySession(sessionId);
-          revokeLease(sessionId);
-        }
-        return new Response(JSON.stringify({ ok: true }), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // ─── /internal/lease-refresh — loopback from terminal-agent on keepalive
-      //
-      // T6 PTY-only idle reset (codex outside-voice fix): the headless
-      // daemon's idle timer must reset only on active PTY usage, not on
-      // every passive SSE consumer. Terminal-agent calls this endpoint
-      // (lazily, only when its cached lease is within 5 min of expiry)
-      // on its 25s keepalive cycle. Refreshing the lease here also bumps
-      // lastActivity so the daemon stays alive while a sidebar terminal
-      // is actively in use.
-      //
-      // INTERNAL endpoint — bound to the root authToken so an external
-      // caller can't refresh another user's lease. Body: {sessionId}.
-      if (url.pathname === '/internal/lease-refresh' && req.method === 'POST') {
-        if (!validateAuth(req)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        let body: any;
-        try { body = await req.json(); } catch { body = null; }
-        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : null;
-        const r = sessionId ? refreshLease(sessionId) : { ok: false };
-        if (!r.ok) {
-          return new Response(JSON.stringify({ error: 'lease expired or unknown' }), {
-            status: 410, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        // T6: PTY activity resets the daemon idle timer.
-        resetIdleTimer();
-        return new Response(JSON.stringify({ ok: true, expiresAt: r.expiresAt }), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // ─── /pty-inject-scan — pre-inject prompt-injection scan for the
-      // extension's gstackInjectToTerminal callers. The extension routes
-      // every page-derived text through this endpoint BEFORE writing to
-      // the PTY (#1370). Local-only by intent: not added to the tunnel
-      // allowlist; root-token auth required. Sidecar absence degrades to
-      // L4 unavailable (extension shows WARN + user confirm per D7).
-      if (url.pathname === '/pty-inject-scan' && req.method === 'POST') {
-        if (!validateAuth(req)) {
-          return new Response(
-            JSON.stringify({ error: 'Unauthorized' }, sanitizeReplacer),
-            { status: 401, headers: { 'Content-Type': 'application/json' } },
-          );
-        }
-        // 64KB request cap. Defense against accidentally posting an
-        // entire page DOM into the PTY path.
-        const contentLength = Number(req.headers.get('content-length') || '0');
-        if (contentLength > 64 * 1024) {
-          return new Response(
-            JSON.stringify({ error: 'payload-too-large', limit: 65536 }, sanitizeReplacer),
-            { status: 413, headers: { 'Content-Type': 'application/json' } },
-          );
-        }
-        let body: { text?: unknown; origin?: unknown } = {};
-        try {
-          body = (await req.json()) as { text?: unknown; origin?: unknown };
-        } catch {
-          return new Response(
-            JSON.stringify({ error: 'malformed-json' }, sanitizeReplacer),
-            { status: 400, headers: { 'Content-Type': 'application/json' } },
-          );
-        }
-        const text = typeof body.text === 'string' ? body.text : '';
-        const origin = typeof body.origin === 'string' ? body.origin : 'unknown';
-        if (text.length === 0) {
-          return new Response(
-            JSON.stringify({ error: 'missing-text' }, sanitizeReplacer),
-            { status: 400, headers: { 'Content-Type': 'application/json' } },
-          );
-        }
-
-        // L1-L3 honest accounting (codex review correction):
-        //   - URL blocklist forced to BLOCK in PTY context (override
-        //     BROWSE_CONTENT_FILTER default — page-derived text in the
-        //     REPL is a higher-risk surface than ordinary tool output).
-        //   - L4 ML classifier via the sidecar when available.
-        //   - L1-L3 envelope/datamarking is INFORMATIONAL only; the
-        //     verdict is driven by the URL blocklist + L4.
-        // See CLAUDE.md "Sidebar security stack" + plan §"L1-L3 honest
-        // accounting".
-        let verdict: 'PASS' | 'WARN' | 'BLOCK' = 'PASS';
-        const reasons: string[] = [];
-
-        // Quick URL-blocklist check (re-uses the security module's
-        // pure-string helpers — no @huggingface/transformers dep).
-        // Pattern: text containing a known bad-actor domain → BLOCK.
-        if (/(\bbit\.ly|\btinyurl\.com|\bdiscord\.gg)/i.test(text)) {
-          verdict = 'BLOCK';
-          reasons.push('url-blocklist');
-        }
-
-        // L4 sidecar scan if available.
-        const sidecarAvail = isSidecarAvailable();
-        let l4: { available: boolean; verdict?: unknown; error?: string } = {
-          available: sidecarAvail.available,
-        };
-        if (sidecarAvail.available && verdict !== 'BLOCK') {
-          try {
-            const { verdict: layerVerdict } = await scanWithSidecar(text, {
-              timeoutMs: 5000,
-            });
-            l4 = { available: true, verdict: layerVerdict };
-            // LayerSignal shape: { verdict: 'safe'|'suspicious'|'unsafe', ... }
-            const lv = (layerVerdict as { verdict?: string })?.verdict;
-            if (lv === 'unsafe') {
-              verdict = 'BLOCK';
-              reasons.push('l4-unsafe');
-            } else if (lv === 'suspicious') {
-              verdict = 'WARN';
-              reasons.push('l4-suspicious');
-            }
-          } catch (err) {
-            l4 = {
-              available: false,
-              error: err instanceof Error ? err.message : String(err),
-            };
-            // L4 failure during scan: degrade to WARN per D7.
-            if (verdict === 'PASS') {
-              verdict = 'WARN';
-              reasons.push('l4-unavailable');
-            }
-          }
-        } else if (!sidecarAvail.available && verdict === 'PASS') {
-          verdict = 'WARN';
-          reasons.push(`l4-unavailable:${sidecarAvail.reason ?? 'unknown'}`);
-        }
-
-        // BLOCK decisions are surfaced in the response shape; the
-        // existing writeDecision audit log is tab-scoped (per-page) and
-        // doesn't fit the PTY surface. The extension logs the BLOCK
-        // event into its own activity feed on receipt, which keeps the
-        // audit signal observable without bolting a new attempts.jsonl
-        // onto the server.
-
-        return new Response(
-          JSON.stringify(
-            { verdict, reasons, l4, datamark: '<untrusted-page-content>' },
-            sanitizeReplacer,
-          ),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        );
-      }
-
-      // ─── /connect — setup key exchange for /pair-agent ceremony ────
-      if (url.pathname === '/connect' && req.method === 'POST') {
-        if (!checkConnectRateLimit()) {
-          return new Response(JSON.stringify({
-            error: 'Too many connection attempts. Wait 1 minute.',
-          }), { status: 429, headers: { 'Content-Type': 'application/json' } });
-        }
-        try {
-          const connectBody = await req.json() as { setup_key?: string };
-          if (!connectBody.setup_key) {
-            return new Response(JSON.stringify({ error: 'Missing setup_key' }), {
-              status: 400, headers: { 'Content-Type': 'application/json' },
-            });
-          }
-          const session = exchangeSetupKey(connectBody.setup_key);
-          if (!session) {
-            return new Response(JSON.stringify({
-              error: 'Invalid, expired, or already-used setup key',
-            }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-          }
-          console.log(`[browse] Remote agent connected: ${session.clientId} (scopes: ${session.scopes.join(',')})`);
-          return new Response(JSON.stringify({
-            token: session.token,
-            expires: session.expiresAt,
-            scopes: session.scopes,
-            agent: session.clientId,
-          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        } catch {
-          return new Response(JSON.stringify({ error: 'Invalid request body' }), {
-            status: 400, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-      }
-
-      // ─── /token — mint scoped tokens (root-only) ──────────────────
-      if (url.pathname === '/token' && req.method === 'POST') {
-        if (!isRootRequest(req)) {
-          return new Response(JSON.stringify({
-            error: 'Only the root token can mint sub-tokens',
-          }), { status: 403, headers: { 'Content-Type': 'application/json' } });
-        }
-        try {
-          const tokenBody = await req.json() as any;
-          if (!tokenBody.clientId) {
-            return new Response(JSON.stringify({ error: 'Missing clientId' }), {
-              status: 400, headers: { 'Content-Type': 'application/json' },
-            });
-          }
-          const session = createToken({
-            clientId: tokenBody.clientId,
-            scopes: tokenBody.scopes,
-            domains: tokenBody.domains,
-            tabPolicy: tokenBody.tabPolicy,
-            rateLimit: tokenBody.rateLimit,
-            expiresSeconds: tokenBody.expiresSeconds,
-          });
-          return new Response(JSON.stringify({
-            token: session.token,
-            expires: session.expiresAt,
-            scopes: session.scopes,
-            agent: session.clientId,
-          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        } catch (err) {
-          // Name the caller's typo (bad scope, negative rateLimit, reserved
-          // clientId) instead of hiding it behind the generic body error.
-          if (err instanceof InvalidScopeError || err instanceof ReservedClientIdError) {
-            return new Response(JSON.stringify({ error: err.message }), {
-              status: 400, headers: { 'Content-Type': 'application/json' },
-            });
-          }
-          return new Response(JSON.stringify({ error: 'Invalid request body' }), {
-            status: 400, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-      }
-
-      // ─── /token/:clientId — revoke a scoped token (root-only) ─────
-      if (url.pathname.startsWith('/token/') && req.method === 'DELETE') {
-        if (!isRootRequest(req)) {
-          return new Response(JSON.stringify({ error: 'Root token required' }), {
-            status: 403, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        // decodeURIComponent so CLI-encoded names (spaces, UTF-8) round-trip.
-        let clientId: string;
-        try {
-          clientId = decodeURIComponent(url.pathname.slice('/token/'.length));
-        } catch {
-          return new Response(JSON.stringify({ error: 'Malformed client ID encoding' }), {
-            status: 400, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const revoked = revokeToken(clientId);
-        // Release tabs UNCONDITIONALLY: ownership outlives the token (it clears
-        // only on tab close), so a client whose token already expired can still
-        // own tabs. Gating release on a revoke hit would orphan that ownership
-        // and let a same-name re-pair inherit an authenticated tab.
-        const tabsReleased = browserManager.releaseClientTabs(clientId).length;
-        if (!revoked && tabsReleased === 0) {
-          return new Response(JSON.stringify({ error: `Agent "${clientId}" not found` }), {
-            status: 404, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        console.log(`[browse] Revoked ${revoked} token(s), released ${tabsReleased} tab(s) for: ${clientId}`);
-        return new Response(JSON.stringify({ revoked: clientId, tokens_deleted: revoked, tabs_released: tabsReleased }), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // ─── /agents — list connected agents (root-only) ──────────────
-      if (url.pathname === '/agents' && req.method === 'GET') {
-        if (!isRootRequest(req)) {
-          return new Response(JSON.stringify({ error: 'Root token required' }), {
-            status: 403, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        // includeSetup: pending (unexchanged) setup keys are live grants the
-        // operator must be able to see — without them, revoking a paired-but-
-        // never-connected agent "works" while the list shows nothing.
-        const agents = listTokens({ includeSetup: true }).map(t => ({
-          clientId: t.clientId,
-          scopes: t.scopes,
-          domains: t.domains,
-          expiresAt: t.expiresAt,
-          commandCount: t.commandCount,
-          createdAt: t.createdAt,
-          pending: t.type === 'setup',
-        }));
-        return new Response(JSON.stringify({ agents }), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // ─── /pair — create setup key for pair-agent ceremony (root-only) ───
-      if (url.pathname === '/pair' && req.method === 'POST') {
-        if (!isRootRequest(req)) {
-          return new Response(JSON.stringify({ error: 'Root token required' }), {
-            status: 403, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        try {
-          const pairBody = await req.json() as any;
-          // Reject a reserved/invalid clientId up front (createSetupKey enforces
-          // it too, but this makes the 400 unambiguous and skips the teardown).
-          if (pairBody.clientId !== undefined) assertValidClientId(pairBody.clientId);
-          // Default: DEFAULT_PAIR_SCOPES (full page access). The trust boundary
-          // is the pairing ceremony itself, not the scope. --control adds
-          // browser-wide destructive commands (stop, restart, disconnect).
-          // --restrict limits scope — but can never grant control: that scope
-          // stays behind the explicit control flag.
-          if (!pairBody.control && !pairBody.admin
-              && Array.isArray(pairBody.scopes) && pairBody.scopes.includes('control')) {
-            return new Response(JSON.stringify({
-              error: 'The control scope requires the control flag (--control); it cannot be granted via a scopes list.',
-            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-          }
-          const scopes = pairBody.control || pairBody.admin
-            ? [...DEFAULT_PAIR_SCOPES, 'control' as const]
-            : ((pairBody.scopes || [...DEFAULT_PAIR_SCOPES]) as ScopeCategory[]);
-          // D1: a re-pair supersedes prior grants. ALWAYS drop stale setup keys
-          // so a superseded broad key can never be exchanged — this closes the
-          // shadow-key hole where a narrowing re-pair before the agent connects
-          // would otherwise leave the old broad key live. Revoke the live
-          // SESSION only when the new grant actually reduces access, so a
-          // broaden/refresh never strands a working agent mid-task. Compare
-          // against the resolved grant (not raw pairBody) so dropping 'control'
-          // or a default re-pair is classified correctly. Revoke runs BEFORE
-          // createSetupKey — revokeToken deletes all of a clientId's tokens, so
-          // minting first would nuke the fresh key.
-          const grant = {
-            scopes: [...scopes] as ScopeCategory[],
-            domains: pairBody.domains as string[] | undefined,
-            rateLimit: pairBody.rateLimit ?? 10,
-            tabPolicy: 'own-only' as const,
-          };
-          // Validate BEFORE any revoke (createSetupKey validates too, but that
-          // runs after the teardown below). A bad scope or negative rateLimit
-          // must 400 without knocking a live session offline — otherwise a
-          // reducing re-pair with a typo (--restrict red) destroys the session
-          // and mints no replacement.
-          assertValidTokenOptions(grant.scopes, grant.rateLimit);
-          const priorSession = pairBody.clientId ? getClientSession(pairBody.clientId) : null;
-          let superseded: { tokens_deleted: number; tabs_released: number } | undefined;
-          if (priorSession && grantReducesAccess(priorSession, grant)) {
-            const tokensDeleted = revokeToken(pairBody.clientId);
-            const tabsReleased = browserManager.releaseClientTabs(pairBody.clientId).length;
-            superseded = { tokens_deleted: tokensDeleted, tabs_released: tabsReleased };
-            console.log(`[browse] Superseded ${tokensDeleted} token(s), released ${tabsReleased} tab(s) for reducing re-pair: ${pairBody.clientId}`);
-          } else if (pairBody.clientId) {
-            revokeSetupKeys(pairBody.clientId);
-            // No live session, but tab ownership outlives token expiry: free any
-            // tabs orphaned by an expired session so this re-pair can't inherit
-            // an earlier incarnation's authenticated pages (mirrors DELETE
-            // /token's unconditional release). A live-session broaden keeps its
-            // tabs — the working agent still owns them.
-            if (!priorSession) browserManager.releaseClientTabs(pairBody.clientId);
-          }
-          const setupKey = createSetupKey({
-            clientId: pairBody.clientId,
-            scopes: [...scopes],
-            domains: pairBody.domains,
-            rateLimit: pairBody.rateLimit,
-          });
-          // Verify tunnel is actually alive before reporting it (ngrok may have died externally).
-          // Probe via GET /connect — under dual-listener /health is NOT on the tunnel allowlist,
-          // so the old probe would return 404 and always mark the tunnel as dead.
-          let verifiedTunnelUrl: string | null = null;
-          if (tunnelActive && tunnelUrl) {
-            try {
-              const probe = await fetch(`${tunnelUrl}/connect`, {
-                method: 'GET',
-                headers: { 'ngrok-skip-browser-warning': 'true' },
-                signal: AbortSignal.timeout(5000),
-              });
-              if (probe.ok) {
-                verifiedTunnelUrl = tunnelUrl;
-              } else {
-                console.warn(`[browse] Tunnel probe failed (HTTP ${probe.status}), marking tunnel as dead`);
-                await closeTunnel();
-              }
-            } catch {
-              console.warn('[browse] Tunnel probe timed out or unreachable, marking tunnel as dead');
-              await closeTunnel();
-            }
-          }
-          return new Response(JSON.stringify({
-            setup_key: setupKey.token,
-            expires_at: setupKey.expiresAt,
-            scopes: setupKey.scopes,
-            tunnel_url: verifiedTunnelUrl,
-            server_url: `http://127.0.0.1:${browsePort}`,
-            ...(superseded ? { superseded } : {}),
-          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        } catch (err) {
-          // Name the caller's typo (bad scope, negative rateLimit, reserved
-          // clientId) instead of hiding it behind the generic body error.
-          if (err instanceof InvalidScopeError || err instanceof ReservedClientIdError) {
-            return new Response(JSON.stringify({ error: err.message }), {
-              status: 400, headers: { 'Content-Type': 'application/json' },
-            });
-          }
-          return new Response(JSON.stringify({ error: 'Invalid request body' }), {
-            status: 400, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-      }
-
-      // ─── /tunnel/start — start ngrok tunnel on demand (root-only) ──
-      //
-      // Dual-listener model: binds a SECOND Bun.serve listener on an
-      // ephemeral 127.0.0.1 port dedicated to tunnel traffic, then points
-      // ngrok.forward() at THAT port.  The existing local listener (which
-      // serves /extension-token, /cookie-picker, /inspector/*, welcome, etc.)
-      // is never exposed to ngrok.
-      //
-      // Hard fail if the tunnel listener bind fails — NEVER fall back to
-      // the local port, which would silently defeat the whole security
-      // property.
-      if (url.pathname === '/tunnel/start' && req.method === 'POST') {
-        if (!isRootRequest(req)) {
-          return new Response(JSON.stringify({ error: 'Root token required' }), {
-            status: 403, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        if (!isPairAgentEnabled()) {
-          // Consent-on-first-use: the /pair-agent skill asks once and sets the
-          // key; a direct API caller gets the same hint instead of a tunnel.
-          return new Response(JSON.stringify({
-            error: 'pair-agent is off (tunnel exposes this browser beyond the machine)',
-            hint: 'enable once with: gstack-config set pair_agent on — or run /pair-agent, which asks for consent and sets it',
-          }), { status: 403, headers: { 'Content-Type': 'application/json' } });
-        }
-        if (tunnelActive && tunnelUrl && tunnelServer) {
-          // Verify tunnel is still alive before returning cached URL.
-          // Probe GET /connect (the only unauth-reachable path on the tunnel
-          // surface); /health is NOT tunnel-reachable under dual-listener.
-          try {
-            const probe = await fetch(`${tunnelUrl}/connect`, {
-              method: 'GET',
-              headers: { 'ngrok-skip-browser-warning': 'true' },
-              signal: AbortSignal.timeout(5000),
-            });
-            if (probe.ok) {
-              return new Response(JSON.stringify({ url: tunnelUrl, already_active: true }), {
-                status: 200, headers: { 'Content-Type': 'application/json' },
-              });
-            }
-          } catch {}
-          // Tunnel is dead — tear down cleanly before restarting
-          console.warn('[browse] Cached tunnel is dead, restarting...');
-          await closeTunnel();
-        }
-
-        // 1) Resolve ngrok authtoken from env / .gstack / native config
-        const authtoken = resolveNgrokAuthtoken();
-        if (!authtoken) {
-          return new Response(JSON.stringify({
-            error: 'No ngrok authtoken found',
-            hint: 'Run: ngrok config add-authtoken YOUR_TOKEN',
-          }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-        }
-
-        // 2) Bind the tunnel listener + open ngrok via the shared helper
-        //    (see startTunnel — hard-fails the bind, cleans up both ngrok
-        //    and the Bun listener on any post-bind failure).
-        const started = await startTunnel({
-          fetchHandler: makeFetchHandler('tunnel'),
-          authtoken,
-          consent: 'pair_agent=on (isPairAgentEnabled gate at /tunnel/start)',
-        });
-        if (!started.ok) {
-          return new Response(JSON.stringify({
-            error: started.stage === 'bind'
-              ? `Failed to bind tunnel listener: ${started.error.message}`
-              : `Failed to open ngrok tunnel: ${started.error.message}`,
-          }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-        }
-        return new Response(JSON.stringify({ url: started.url }), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // ─── SSE session cookie mint (auth required) ──────────────────
-      //
-      // Issues a short-lived view-only token in an HttpOnly SameSite=Strict
-      // cookie so EventSource calls can authenticate without putting the
-      // root token in a URL. The returned cookie is valid ONLY on the SSE
-      // endpoints (/activity/stream, /inspector/events); it is not a
-      // scoped token and cannot be used against /command.
-      //
-      // The extension calls this once at bootstrap with the root Bearer
-      // header, then opens EventSource with `withCredentials: true` which
-      // sends the cookie back automatically.
-      if (url.pathname === '/sse-session' && req.method === 'POST') {
-        if (!validateAuth(req)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const minted = mintSseSessionToken();
-        return new Response(JSON.stringify({
-          expiresAt: minted.expiresAt,
-          cookie: SSE_COOKIE_NAME,
-        }), {
-          status: 200,
-          headers: {
-            'Content-Type': 'application/json',
-            'Set-Cookie': buildSseSetCookie(minted.token),
-          },
-        });
-      }
-
-      // Refs endpoint — auth required, does NOT reset idle timer
-      if (url.pathname === '/refs') {
-        if (!validateAuth(req)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const refs = browserManager.getRefMap();
-        return new Response(JSON.stringify({
-          refs,
-          url: browserManager.getCurrentUrl(),
-          mode: browserManager.getConnectionMode(),
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // Activity stream — SSE, auth required, does NOT reset idle timer
-      if (url.pathname === '/activity/stream') {
-        // Auth: Bearer header OR view-only SSE session cookie (EventSource
-        // can't send Authorization headers, so the extension fetches a cookie
-        // via POST /sse-session first, then opens EventSource with
-        // withCredentials: true). The ?token= query param is NO LONGER
-        // accepted — URLs leak to logs/referer/history. See N1 in the
-        // v1.6.0.0 security wave plan.
-        const cookieToken = extractSseCookie(req);
-        if (!validateAuth(req) && !validateSseSessionToken(cookieToken)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const afterId = parseInt(url.searchParams.get('after') || '0', 10);
-        // Cleanup contract (abort + enqueue-fail + heartbeat-fail, all
-        // idempotent) lives in createSseEndpoint; sanitizeReplacer is
-        // applied to every JSON.stringify inside the helper, so
-        // page-content-derived fields (URLs, command args, errors)
-        // stay surrogate-safe per CLAUDE.md egress invariant.
-        return createSseEndpoint(req, {
-          initialReplay: (send) => {
-            const { entries, gap, gapFrom, availableFrom } = getActivityAfter(afterId);
-            if (gap) send('gap', { gapFrom, availableFrom });
-            for (const entry of entries) send('activity', entry);
-          },
-          subscribe,
-          liveEventName: 'activity',
-        });
-      }
-
-      // Activity history — REST, auth required, does NOT reset idle timer
-      if (url.pathname === '/activity/history') {
-        if (!validateAuth(req)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const limit = parseInt(url.searchParams.get('limit') || '50', 10);
-        const { entries, totalAdded } = getActivityHistory(limit);
-        return new Response(JSON.stringify({ entries, totalAdded, subscribers: getSubscriberCount() }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-
-      // ─── Batch endpoint — N commands, 1 HTTP round-trip ─────────────
-      // Accepts both root AND scoped tokens (same as /command).
-      // Executes commands sequentially through the full security pipeline.
-      // Designed for remote agents where tunnel latency dominates.
-      if (url.pathname === '/batch' && req.method === 'POST') {
-        const tokenInfo = getTokenInfo(req);
-        if (!tokenInfo) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        resetIdleTimer();
-        const body = await req.json();
-        const { commands } = body;
-
-        if (!Array.isArray(commands) || commands.length === 0) {
-          return new Response(JSON.stringify({ error: '"commands" must be a non-empty array' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        if (commands.length > 50) {
-          return new Response(JSON.stringify({ error: 'Max 50 commands per batch' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-
-        const startTime = Date.now();
-        emitActivity({
-          type: 'command_start',
-          command: 'batch',
-          args: [`${commands.length} commands`],
-          url: browserManager.getCurrentUrl(),
-          tabs: browserManager.getTabCount(),
-          mode: browserManager.getConnectionMode(),
-          clientId: tokenInfo?.clientId,
-        });
-
-        const results: Array<{ index: number; status: number; result: string; command: string; tabId?: number }> = [];
-        for (let i = 0; i < commands.length; i++) {
-          const cmd = commands[i];
-          if (!cmd || typeof cmd.command !== 'string') {
-            results.push({ index: i, status: 400, result: JSON.stringify({ error: 'Missing "command" field' }), command: '' });
-            continue;
-          }
-          // Reject nested batches
-          if (cmd.command === 'batch') {
-            results.push({ index: i, status: 400, result: JSON.stringify({ error: 'Nested batch commands are not allowed' }), command: 'batch' });
-            continue;
-          }
-          const cr = await handleCommandInternal(
-            { command: cmd.command, args: cmd.args, tabId: cmd.tabId },
-            tokenInfo,
-            { skipRateCheck: true, skipActivity: true },
-          );
-          // Sanitize lone surrogates per-result (#1440 — /batch bypasses the
-          // handleCommand chokepoint, so it needs its own sanitization).
-          const safeResult = typeof cr.result === 'string' ? sanitizeBody(cr.result, !!cr.json) : cr.result;
-          results.push({
-            index: i,
-            status: cr.status,
-            result: safeResult,
-            command: cmd.command,
-            tabId: cmd.tabId,
-          });
-        }
-
-        const duration = Date.now() - startTime;
-        emitActivity({
-          type: 'command_end',
-          command: 'batch',
-          args: [`${commands.length} commands`],
-          url: browserManager.getCurrentUrl(),
-          duration,
-          status: 'ok',
-          result: `${results.filter(r => r.status === 200).length}/${commands.length} succeeded`,
-          tabs: browserManager.getTabCount(),
-          mode: browserManager.getConnectionMode(),
-          clientId: tokenInfo?.clientId,
-        });
-
-        // Sanitize the JSON envelope a second time (defense in depth) — catches
-        // any \uXXXX escape sequences for lone surrogates that survived the
-        // per-result pass.
-        const batchBody = stripLoneSurrogateEscapes(JSON.stringify({
-          results,
-          duration,
-          total: commands.length,
-          succeeded: results.filter(r => r.status === 200).length,
-          failed: results.filter(r => r.status !== 200).length,
-        }));
-        return new Response(batchBody, {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // ─── File serving endpoint (for remote agents to retrieve downloaded files) ────
-      if (url.pathname === '/file' && req.method === 'GET') {
-        const tokenInfo = getTokenInfo(req);
-        if (!tokenInfo) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const filePath = url.searchParams.get('path');
-        if (!filePath) {
-          return new Response(JSON.stringify({ error: 'Missing "path" query parameter' }), {
-            status: 400, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        try {
-          validateTempPath(filePath);
-        } catch (err: any) {
-          return new Response(JSON.stringify({ error: err.message }), {
-            status: 403, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        if (!fs.existsSync(filePath)) {
-          return new Response(JSON.stringify({ error: 'File not found' }), {
-            status: 404, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const stat = fs.statSync(filePath);
-        if (stat.size > 200 * 1024 * 1024) {
-          return new Response(JSON.stringify({ error: 'File too large (max 200MB)' }), {
-            status: 413, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const ext = path.extname(filePath).toLowerCase();
-        const MIME_MAP: Record<string, string> = {
-          '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-          '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-          '.avif': 'image/avif',
-          '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
-          '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
-          '.pdf': 'application/pdf', '.json': 'application/json',
-          '.html': 'text/html', '.txt': 'text/plain', '.mhtml': 'message/rfc822',
-        };
-        const contentType = MIME_MAP[ext] || 'application/octet-stream';
-        resetIdleTimer();
-        return new Response(Bun.file(filePath), {
-          headers: {
-            'Content-Type': contentType,
-            'Content-Length': String(stat.size),
-            'Content-Disposition': `inline; filename="${path.basename(filePath)}"`,
-            'Cache-Control': 'no-cache',
-          },
-        });
-      }
-
-      // ─── Command endpoint (accepts both root AND scoped tokens) ────
-      // Must be checked BEFORE the blanket root-only auth gate below,
-      // because scoped tokens from /connect are valid for /command.
-      if (url.pathname === '/command' && req.method === 'POST') {
-        const tokenInfo = getTokenInfo(req);
-        if (!tokenInfo) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        resetIdleTimer();
-        const body = await req.json() as any;
-        // Tunnel surface: only commands in TUNNEL_COMMANDS are allowed.
-        // Paired remote agents drive the browser but cannot configure the
-        // daemon, launch new browsers, import cookies, or rotate tokens.
-        if (surface === 'tunnel') {
-          if (!canDispatchOverTunnel(body?.command, body?.args)) {
-            logTunnelDenial(req, url, `disallowed_command:${body?.command}`);
-            return new Response(JSON.stringify({
-              error: `Command '${body?.command}' is not allowed over the tunnel surface`,
-              hint: `Tunnel commands: ${[...TUNNEL_COMMANDS].sort().join(', ')}. Note: --out (disk write) is never allowed over the tunnel.`,
-            }), { status: 403, headers: { 'Content-Type': 'application/json' } });
-          }
-        }
-        return handleCommand(body, tokenInfo);
-      }
-
-      // ─── Auth-required endpoints (root token only) ─────────────────
-
-      if (!validateAuth(req)) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // ─── Inspector endpoints ──────────────────────────────────────
-
-      // POST /inspector/pick — receive element pick from extension, run CDP inspection
-      if (url.pathname === '/inspector/pick' && req.method === 'POST') {
-        const body = await req.json();
-        const { selector, activeTabUrl } = body;
-        if (!selector) {
-          return new Response(JSON.stringify({ error: 'Missing selector' }), {
-            status: 400, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        try {
-          const page = browserManager.getPage();
-          const result = await inspectElement(page, selector);
-          inspectorData = result;
-          inspectorTimestamp = Date.now();
-          // Also store on browserManager for CLI access
-          (browserManager as any)._inspectorData = result;
-          (browserManager as any)._inspectorTimestamp = inspectorTimestamp;
-          emitInspectorEvent({ type: 'pick', selector, timestamp: inspectorTimestamp });
-          return new Response(JSON.stringify(result), {
-            status: 200, headers: { 'Content-Type': 'application/json' },
-          });
-        } catch (err: any) {
-          return new Response(JSON.stringify({ error: err.message }), {
-            status: 500, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-      }
-
-      // GET /inspector — return latest inspector data
-      if (url.pathname === '/inspector' && req.method === 'GET') {
-        if (!inspectorData) {
-          return new Response(JSON.stringify({ data: null }), {
-            status: 200, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const stale = inspectorTimestamp > 0 && (Date.now() - inspectorTimestamp > 60000);
-        return new Response(JSON.stringify({ data: inspectorData, timestamp: inspectorTimestamp, stale }), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // POST /inspector/apply — apply a CSS modification
-      if (url.pathname === '/inspector/apply' && req.method === 'POST') {
-        const body = await req.json();
-        const { selector, property, value } = body;
-        if (!selector || !property || value === undefined) {
-          return new Response(JSON.stringify({ error: 'Missing selector, property, or value' }), {
-            status: 400, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        try {
-          const page = browserManager.getPage();
-          const mod = await modifyStyle(page, selector, property, value);
-          emitInspectorEvent({ type: 'apply', modification: mod, timestamp: Date.now() });
-          return new Response(JSON.stringify(mod), {
-            status: 200, headers: { 'Content-Type': 'application/json' },
-          });
-        } catch (err: any) {
-          return new Response(JSON.stringify({ error: err.message }), {
-            status: 500, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-      }
-
-      // POST /inspector/reset — clear all modifications
-      if (url.pathname === '/inspector/reset' && req.method === 'POST') {
-        try {
-          const page = browserManager.getPage();
-          await resetModifications(page);
-          emitInspectorEvent({ type: 'reset', timestamp: Date.now() });
-          return new Response(JSON.stringify({ ok: true }), {
-            status: 200, headers: { 'Content-Type': 'application/json' },
-          });
-        } catch (err: any) {
-          return new Response(JSON.stringify({ error: err.message }), {
-            status: 500, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-      }
-
-      // GET /inspector/history — return modification list
-      if (url.pathname === '/inspector/history' && req.method === 'GET') {
-        return new Response(JSON.stringify({ history: getModificationHistory() }), {
-          status: 200, headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // GET /memory — diagnostic snapshot (auth required, does NOT reset idle).
-      // Same auth model as /activity/stream and /inspector/events: Bearer header
-      // OR view-only SSE-session cookie. Does NOT extend /health (which is
-      // unauthenticated liveness-only — token bootstrap moved to the pinned
-      // POST /extension-token); a separate endpoint with the standard SSE auth
-      // keeps /health free of anything worth stealing.
-      if (url.pathname === '/memory' && req.method === 'GET') {
-        const cookieToken = extractSseCookie(req);
-        if (!validateAuth(req) && !validateSseSessionToken(cookieToken)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const { buildMemorySnapshotJson } = await import('./memory-command');
-        const snapshot = await buildMemorySnapshotJson(cfgBrowserManager);
-        // sanitizeReplacer is required at every SSE/JSON egress that ships
-        // page-content-derived strings — tab.url and tab.title come from
-        // page content, so lone-surrogate bytes from broken emoji or
-        // mid-emoji splits could otherwise reach the sidebar / Claude API.
-        return new Response(JSON.stringify(snapshot, sanitizeReplacer), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      // GET /inspector/events — SSE for inspector state changes (auth required)
-      if (url.pathname === '/inspector/events' && req.method === 'GET') {
-        // Same auth model as /activity/stream: Bearer OR view-only cookie.
-        // ?token= query param dropped (see N1 in the v1.6.0.0 security plan).
-        const cookieToken = extractSseCookie(req);
-        if (!validateAuth(req) && !validateSseSessionToken(cookieToken)) {
-          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-            status: 401, headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        // Cleanup contract (abort + enqueue-fail + heartbeat-fail,
-        // idempotent) lives in createSseEndpoint; sanitizeReplacer is
-        // applied to every JSON.stringify inside the helper. The
-        // inspector subscriber set stays here because it's also written
-        // to by emitInspectorEvent above.
-        return createSseEndpoint(req, {
-          initialReplay: inspectorData
-            ? (send) => send('state', { data: inspectorData, timestamp: inspectorTimestamp })
-            : undefined,
-          subscribe: (notify) => {
-            inspectorSubscribers.add(notify);
-            return () => inspectorSubscribers.delete(notify);
-          },
-          liveEventName: 'inspector',
-        });
-      }
-
-      return new Response('Not found', { status: 404 });
+    return dispatchRoute(ROUTES, req, url, surface, routeCtx);
   };
 
   return {

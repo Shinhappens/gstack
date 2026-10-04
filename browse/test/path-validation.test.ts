@@ -1,6 +1,6 @@
 import { beforeAll, describe, it, expect } from 'bun:test';
 import { chromium } from 'playwright';
-import { validateOutputPath } from '../src/meta-commands';
+import { validateOutputPath } from '../src/path-security';
 import { validateReadPath, SENSITIVE_COOKIE_NAME, SENSITIVE_COOKIE_VALUE } from '../src/read-commands';
 import { BLOCKED_METADATA_HOSTS } from '../src/url-validation';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync, realpathSync } from 'fs';

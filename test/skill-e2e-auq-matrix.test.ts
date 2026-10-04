@@ -4,9 +4,10 @@
  *
  * Layer 0 (auq-format-always-loaded.test.ts) deterministically guarantees each
  * listed skill SHIPS the format spec in its always-loaded skeleton. This test
- * proves each skill's model OBEYS it: that the first real AUQ it fires is a
- * compliant decision brief (all 7 format elements) with a substantive
- * recommendation (>= 4). One parametrized case per skill so a single weak skill
+ * proves each skill's model OBEYS it: that the first real AUQ it fires carries
+ * the fields software reads (a Recommendation: line and exactly one
+ * (recommended) option) with a substantive recommendation (>= 4). The other
+ * format elements are logged. One parametrized case per skill so a single weak skill
  * is an isolated failure, not a blocker for the rest.
  *
  * Capture records the actual public AskUserQuestion payload and verifies its
@@ -27,6 +28,7 @@
  * Run a subset in the foreground with AUQ_MATRIX_ONLY="plan-eng-review,spec".
  */
 import { test } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import { CAPTURE_MS } from './helpers/eval-budgets';
 import { describeE2ETier } from './helpers/e2e-gate';
 import * as fs from 'node:fs';
@@ -34,6 +36,7 @@ import {
   setupSkillDir,
   captureFirstAuq,
   scoreAuqFormat,
+  auqMachineFormatProblems,
   skillFromWorktree,
   gradeAuqRecommendation,
 } from './helpers/auq-sdk-capture';
@@ -96,7 +99,7 @@ const MATRIX: MatrixSkill[] = [
     // controlled Opus re-run passed cleanly (7/7 format, substance 5, 160s).
     // The spec workflow's long pre-question phase needs the stronger model
     // to reach its first AskUserQuestion inside the turn budget.
-    model: 'claude-opus-4-7',
+    model: resolveEvalModel('capture'),
   },
   {
     skill: 'design-consultation',
@@ -155,7 +158,8 @@ describeE2E('AUQ behavioral matrix (periodic)', () => {
           throw new Error(`${m.skill}: agent produced NO AUQ capture (never reached a question in budget).`);
         }
         const problems: string[] = [];
-        if (fmt.missing.length > 0) problems.push(`missing format element(s): ${fmt.missing.join(', ')}`);
+        // Presentation elements (ELI10, Pros / cons, ✅/❌, Net:) are logged above, not failed.
+        problems.push(...auqMachineFormatProblems(text));
         if (substance < 4) problems.push(`recommendation substance ${substance} < 4 (boilerplate/weak)`);
         if (problems.length > 0) {
           throw new Error(

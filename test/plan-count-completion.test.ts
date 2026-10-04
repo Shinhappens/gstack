@@ -4,11 +4,28 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { hasNativePlanCompletion, hasNativePlanTerminal, isPlanReadyVisible, classifyPlanCountFrame, isNumberedOptionListVisible, isPermissionDialogVisible, isProseAUQVisible, assertReviewReportAtBottom } from './helpers/claude-pty-runner';
+import { hasNativePlanCompletion, hasNativePlanTerminal, isPlanReadyVisible, classifyPlanCountFrame, isNumberedOptionListVisible, isPermissionDialogVisible, isProseAUQVisible } from './helpers/claude-pty-runner';
 import type { PlanCountTranscript } from './helpers/plan-count-transcript';
 import capturedL from './fixtures/devex-review-l-calls.json';
 import designStatusCapture from './fixtures/design-count-native-issue-fields.json';
 import designEnvelope from './fixtures/design-completion-envelope-90f.json';
+import { nativePlanCallFingerprint, isNativeCompletionSummary } from './helpers/claude-pty-runner';
+import type { NativePlanQuestionCall } from './helpers/plan-count-transcript';
+import captured_ceo_completion_handoff_m from './fixtures/ceo-completion-handoff-m-call.json';
+import nextStepCapture_ceo_completion_handoff_m from './fixtures/ceo-handoff-n-calls.json';
+import captured_ceo_completion_handoff_o from './fixtures/ceo-completion-handoff-o-call.json';
+import capturedQ_ceo_completion_handoff_o from './fixtures/ceo-completion-handoff-q-call.json';
+import fs_ceo_handoff_y from 'node:fs';
+import os_ceo_handoff_y from 'node:os';
+import path_ceo_handoff_y from 'node:path';
+import fixture_ceo_handoff_y from './fixtures/ceo-handoff-y-call.json';
+import captured_dx_manual_handoff_ao from './fixtures/dx-manual-handoff-ao.json';
+import fixture_plan_count_dx_handoff_o from './fixtures/devex-handoff-o-call.json';
+import actual_eng_next_handoff_ah from './fixtures/eng-next-handoff-ah.json';
+import { isCurrentPlanApprovalScreen } from './helpers/plan-count-pending-exit';
+import { createHash } from 'node:crypto';
+import capture_eng_task_pause_navigation_f359 from './fixtures/eng-task-pause-navigation-f359.json';
+import fixture_design_count_native_8525 from './fixtures/design-count-native-8525.json';
 
 describe('captured Design completion envelope', () => {
   function completedEnvelope() {
@@ -31,23 +48,10 @@ describe('captured Design completion envelope', () => {
   });
   test('the actual runner branch recognizes the idle native envelope without answering an exit gate',()=>{
     const f=completedEnvelope();try {
-      const source=fs.readFileSync(path.join(import.meta.dir,'helpers/claude-pty-runner.ts'),'utf8');
-      const expression=/const nativeSummary = ([\s\S]+?);\n      const terminalFrame/.exec(source)?.[1];expect(expression).toBeTruthy();
-      const evaluate=new Function('opts','nativeCompletion','renderedFrame','visible','transcript','startedAt','administrative',
-        'isNumberedOptionListVisible','isPermissionDialogVisible','isProseAUQVisible','hasNativePlanTerminal',`return (${expression});`);
       const screen=designEnvelope.screen.replaceAll(designEnvelope.originalPlanPath,f.file);
-      const check=()=>evaluate({expectedPlanPath:f.file},hasNativePlanCompletion(f.transcript,f.file,designEnvelope.startedAt),classifyPlanCountFrame(screen),screen,f.transcript,
-        designEnvelope.startedAt,new Set(),isNumberedOptionListVisible,isPermissionDialogVisible,isProseAUQVisible,hasNativePlanTerminal);
+      const check=()=>isNativeCompletionSummary({expectedPlanPath:f.file,nativeCompletion:hasNativePlanCompletion(f.transcript,f.file,designEnvelope.startedAt),
+        renderedFrame:classifyPlanCountFrame(screen),visible:screen,transcript:f.transcript,startedAt:designEnvelope.startedAt,administrative:new Set()});
       expect(check()).toBe(true);
-      const paid=fs.readFileSync(path.join(import.meta.dir,'skill-e2e-plan-design-finding-count.test.ts'),'utf8');
-      const start=paid.indexOf("        if (!['plan_ready', 'completion_summary', 'ceiling_reached'].includes(obs.outcome))");
-      const end=paid.indexOf('\n      } finally {',start);expect(start).toBeGreaterThan(0);expect(end).toBeGreaterThan(start);
-      const validate=new Function('fs','planPath','obs','FLOOR','CEILING','assertReviewReportAtBottom',new Bun.Transpiler({loader:'ts'}).transformSync(paid.slice(start,end)));
-      const obs={outcome:'completion_summary',reviewCount:5,step0Count:3,elapsedMs:0,fingerprints:[],evidence:screen};
-      expect(()=>validate(fs,f.file,obs,4,7,assertReviewReportAtBottom)).not.toThrow();
-      expect(()=>validate(fs,f.file,{...obs,outcome:'timed_out'},4,7,assertReviewReportAtBottom)).toThrow('finding-count FAILED');
-      expect(()=>validate(fs,f.file,{...obs,reviewCount:3},4,7,assertReviewReportAtBottom)).toThrow('BAND FAIL');
-      expect(()=>validate(fs,f.file,{...obs,reviewCount:8},4,7,assertReviewReportAtBottom)).toThrow('BAND FAIL');
       f.transcript.calls[0]!.answered=false;expect(check()).toBe(false);
     }finally{f.cleanup();}
   });
@@ -1019,4 +1023,506 @@ describe('untagged completed DX handoff', () => {
       expect(hasNativePlanTerminal(nativeHandoff(f),f.file,f.startedAt,'plan_ready')).toBe(false);
     } finally {f.cleanup();}
   });
+});
+
+describe('ceo-completion-handoff-m', () => {
+const captured = captured_ceo_completion_handoff_m;
+const nextStepCapture = nextStepCapture_ceo_completion_handoff_m;
+const calls = () => structuredClone(captured.calls) as NativePlanQuestionCall[];
+const handoff = () => calls().at(-1)!;
+const fingerprint = (call: NativePlanQuestionCall) => nativePlanCallFingerprint(call, 0, false);
+describe('CEO completion described by a native navigation choice', () => {
+});
+
+describe('native next-review navigation with a resolved CEO recap', () => {
+  const retryCalls = () => structuredClone(captured.distinctRetry.calls) as NativePlanQuestionCall[];
+  const retryHandoff = () => retryCalls().at(-1)!;
+});
+
+describe('CEO completed next-step identity in native option order', () => {
+  const input = () => structuredClone(nextStepCapture.calls) as NativePlanQuestionCall[];
+  const actual = () => input().at(-1)!;
+  test('the actual report precedes handoff but the captured absent Exit remains incomplete', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ceo-native-next-step-'));
+    const report = path.join(dir, 'plan.md');
+    try {
+      fs.writeFileSync(report, nextStepCapture.report.content);
+      const written = Date.parse(nextStepCapture.report.successfulUpdateAt) / 1000;
+      fs.utimesSync(report, written, written);
+      const calls = input();
+      expect(Date.parse(calls.at(-2)!.answeredAt!)).toBeLessThan(written * 1000);
+      expect(Date.parse(calls.at(-1)!.answeredAt!)).toBeGreaterThan(written * 1000);
+      const transcript = { status: 'ready' as const, calls, assistantMessages: [],
+        planReadyRequests: structuredClone(nextStepCapture.planReadyRequests) };
+      const admin = new Set([fingerprint(calls.at(-1)!).signature]);
+      expect(hasNativePlanTerminal(transcript, report, Date.parse('2026-09-09T01:06:22Z'), 'plan_ready', admin)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+});
+
+describe('ceo-completion-handoff-o', () => {
+const captured = captured_ceo_completion_handoff_o;
+const capturedQ = capturedQ_ceo_completion_handoff_o;
+const calls = () => structuredClone(captured.calls) as NativePlanQuestionCall[];
+const handoff = () => calls().at(-1)!;
+describe('closed CEO navigation with the native review-prefixed identity', () => {
+});
+
+describe('CEO completion recap after native project metadata', () => {
+  const qCalls = () => structuredClone(capturedQ.calls) as NativePlanQuestionCall[];
+  const qHandoff = () => qCalls().at(-1)!;
+  test('actual full report and Exit chronology retain last substantive-answer freshness', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ceo-metadata-navigation-'));
+    const report = path.join(dir, 'plan.md');
+    try {
+      fs.writeFileSync(report, capturedQ.reportContent);
+      const reportAt = Date.parse(capturedQ.reportAt) / 1000;
+      fs.utimesSync(report, reportAt, reportAt);
+      const transcript = { status: 'ready' as const, calls: qCalls(), assistantMessages: [], planReadyRequests: structuredClone(capturedQ.planReadyRequests) };
+      const administrative = new Set([`${qHandoff().sessionId}:${qHandoff().toolUseId}`]);
+      const start = Date.parse('2026-09-09T03:25:54Z');
+      expect(hasNativePlanTerminal(transcript, report, start, 'plan_ready')).toBe(false);
+      expect(hasNativePlanTerminal(transcript, report, start, 'plan_ready', administrative)).toBe(true);
+      transcript.planReadyRequests[0]!.failed = true;
+      expect(hasNativePlanTerminal(transcript, report, start, 'plan_ready', administrative)).toBe(false);
+      transcript.planReadyRequests = structuredClone(capturedQ.planReadyRequests);
+      fs.utimesSync(report, start / 1000, start / 1000);
+      expect(hasNativePlanTerminal(transcript, report, start, 'plan_ready', administrative)).toBe(false);
+      fs.writeFileSync(report, 'Incomplete plan');
+      fs.utimesSync(report, reportAt, reportAt);
+      expect(hasNativePlanTerminal(transcript, report, start, 'plan_ready', administrative)).toBe(false);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+});
+
+describe('ceo-handoff-y', () => {
+const fs = fs_ceo_handoff_y;
+const os = os_ceo_handoff_y;
+const path = path_ceo_handoff_y;
+const fixture = fixture_ceo_handoff_y;
+const fp=(c:NativePlanQuestionCall)=>nativePlanCallFingerprint(c,0,false);
+describe('Y bare next-Eng navigation is administrative, not completion evidence',()=>{
+ test('independent fresh report and native Exit still gate completion; menu alone cannot pass',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'gstack-handoff-y-free-'));const report=path.join(dir,'report.md');
+  try{fs.writeFileSync(report,fixture.report);const calls=structuredClone(fixture.calls) as NativePlanQuestionCall[];const transcript={status:'ready' as const,calls,assistantMessages:[],planReadyRequests:structuredClone(fixture.planReadyRequests)};const handoff=calls.at(-1)!;const admin=new Set([fp(handoff).signature]);const issueAt=Date.parse(calls.at(-2)!.answeredAt!),handoffAt=Date.parse(handoff.answeredAt!);const started=Date.parse(calls[0]!.answeredAt!)-1000;
+   // Controlled metadata only: original Y report mtime was not captured.
+   const between=(issueAt+handoffAt)/2;fs.utimesSync(report,between/1000,between/1000);
+   expect(hasNativePlanTerminal(transcript,report,started,'plan_ready')).toBe(false);expect(hasNativePlanTerminal(transcript,report,started,'plan_ready',admin)).toBe(true);
+   fs.utimesSync(report,(issueAt-1)/1000,(issueAt-1)/1000);expect(hasNativePlanTerminal(transcript,report,started,'plan_ready',admin)).toBe(false);
+   fs.utimesSync(report,between/1000,between/1000);expect(hasNativePlanTerminal({...transcript,planReadyRequests:[]},report,started,'plan_ready',admin)).toBe(false);
+   expect(hasNativePlanTerminal({...transcript,calls:[handoff]},report,started,'plan_ready',admin)).toBe(false);
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+ });
+});
+});
+
+describe('dx-manual-handoff-ao', () => {
+const fs = fs_ceo_handoff_y;
+const os = os_ceo_handoff_y;
+const path = path_ceo_handoff_y;
+const captured = captured_dx_manual_handoff_ao;
+type Edit=(calls:NativePlanQuestionCall[], transcript:PlanCountTranscript, report:string)=>void;
+function replay(edit?:Edit){
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'dx-manual-handoff-ao-'));
+ try {
+  const report=path.join(dir,'report.md');fs.writeFileSync(report,captured.reportContent);
+  const written=captured.provenance.reportMtimeMs/1000;fs.utimesSync(report,written,written);
+  const transcript={status:'ready',calls:structuredClone(captured.calls),assistantMessages:[],planReadyRequests:structuredClone(captured.planReadyRequests)} as PlanCountTranscript;
+  edit?.(transcript.calls,transcript,report);
+  return hasNativePlanTerminal(transcript,report,captured.provenance.startedAt,'plan_ready');
+ } finally {fs.rmSync(dir,{recursive:true,force:true});}
+}
+function change(call:NativePlanQuestionCall,from:string,to:string){
+ const q=call.questions[0]!;expect(q.question).toContain(from);
+ const selected=call.answers![q.question];q.question=q.question.replace(from,to);call.answers={[q.question]:selected!};
+}
+describe('AO completed manual DX handoff preserves report freshness',()=>{
+ test('exact owned report precedes navigation only, with the current Exit gate recognized',()=>{
+  expect(captured.calls).toHaveLength(2);expect(captured.events).toHaveLength(4);
+  expect(Date.parse(captured.calls[0]!.answeredAt!)).toBeLessThan(captured.provenance.reportMtimeMs);
+  expect(Date.parse(captured.calls[1]!.answeredAt!)).toBeGreaterThan(captured.provenance.reportMtimeMs);
+  expect(classifyPlanCountFrame(captured.screen)).toBe('plan_ready');
+  expect(replay()).toBe(true);
+ });
+ test('equivalent completed recap and manual roles retain current authority',()=>{
+  for(const [from,to] of [
+   [' (5/10 -> 8.5/10)',''],
+   ['5/10 -> 8.5/10','6/10 → 9/10'],
+   ['What should happen next?',"What's next?"],
+   ['The DX review found','The DX review identified'],
+   ['All are written into the plan as tasks T1 to T9.','All DX decisions and tasks are recorded in the plan.'],
+  ])expect(replay(calls=>change(calls[1]!,from!,to!)),to).toBe(true);
+  expect(replay(calls=>calls[1]!.questions[0]!.options.reverse())).toBe(true);
+  expect(replay(calls=>{const c=calls[1]!;change(c,'Net: hand off now as you asked, or chain the eng review here.','Net: hand off now as you asked, or chain the eng review here.\n> Historical example: add a new task before leaving.');})).toBe(true);
+  expect(replay(calls=>{const o=calls[1]!.questions[0]!.options[0]!;o.description=o.description!.replace('Plan exits now with all DX decisions and tasks recorded; nothing else is started.','Exit the plan now with all DX tasks and decisions recorded. No further review is started.');})).toBe(true);
+ });
+ test('source, conditional or withdrawn completion facts cannot make a stale report current',()=>{
+  const edits:Array<[string,string]>=[
+   ['D13 — DX review','Source: D13 — DX review'],
+   ['DX review complete','DX review is not complete'],
+   ['DX review complete','DX review complete only after another decision'],
+   ['ELI10: The DX review found','ELI10: Earlier review assessment: The DX review found'],
+   ['ELI10: The DX review found','ELI10: If approved, the DX review found'],
+   ['All are written into the plan as tasks T1 to T9.','Example: All are written into the plan as tasks T1 to T9.'],
+   ['All are written into the plan as tasks T1 to T9.','Previously, all are written into the plan as tasks T1 to T9.'],
+   ['All are written into the plan as tasks T1 to T9.','"All are written into the plan as tasks T1 to T9."'],
+   ['All are written into the plan as tasks T1 to T9.','All will be written into the plan as tasks T1 to T9.'],
+   ['Project/branch/task:','Source:\nProject/branch/task:'],
+   ['Project/branch/task: ','Project/branch/task: If approved, '],
+   ['Project/branch/task: ','Project/branch/task: Source excerpt, not a current assessment: '],
+  ];
+  for(const [from,to] of edits)expect(replay(calls=>change(calls[1]!,from,to)),to).toBe(false);
+  for(const suffix of [' This review is not complete.',' These tasks are not recorded.',' This review is "withdrawn".',' One DX decision remains unresolved.',' We must fix another issue.',' Add another migration task.',' Should we approve another change?',' <gstack-qid:foreign>']) {
+   expect(replay(calls=>{const c=calls[1]!;change(c,c.questions[0]!.question,c.questions[0]!.question+suffix);}),suffix).toBe(false);
+  }
+ });
+ test('selected manual action must close with recorded decisions and no new work',()=>{
+  for(const prefix of ['Source: ','Earlier review assessment: ','If approved, ','> '])expect(replay(calls=>{const o=calls[1]!.questions[0]!.options[0]!;o.description=prefix+o.description;}),prefix).toBe(false);
+  for(const suffix of [' Also update the plan before exit.',' Run /plan-eng-review now.',' This plan is not complete.',' The tasks are "withdrawn".',' This manual handoff is cancelled.'])expect(replay(calls=>{calls[1]!.questions[0]!.options[0]!.description+=suffix;}),suffix).toBe(false);
+  for(const from of ['all DX decisions and tasks recorded','nothing else is started'])expect(replay(calls=>{const o=calls[1]!.questions[0]!.options[0]!;o.description=o.description!.replace(from,'more work remains');}),from).toBe(false);
+  for(const index of [1,2])expect(replay(calls=>{const c=calls[1]!,q=c.questions[0]!;c.answers={[q.question]:q.options[index]!.label};})).toBe(false);
+ });
+ test('completed owned native answer identity remains mandatory',()=>{
+  const mutations:Array<(c:NativePlanQuestionCall)=>void>=[
+   c=>{c.answered=false;},c=>{c.failed=true;},c=>{c.sessionId='foreign';},c=>{c.toolUseId='';},
+   c=>{c.answeredAt='invalid';},c=>{c.answeredAt=new Date(Date.now()+60_000).toISOString();},
+   c=>{c.unansweredQuestionIndices=[0];},c=>{delete c.unansweredQuestionIndices;},
+   c=>{c.questions[0]!.multiSelect=true;},c=>{c.questions[0]!.header='Issue decision';},
+   c=>{c.questions.push(structuredClone(c.questions[0]!));},
+   c=>{c.answers={wrong:c.questions[0]!.options[0]!.label};},
+   c=>{c.answers![c.questions[0]!.question]='Not an offered answer';},
+   c=>{c.answers!.extra='foreign';},
+   c=>{c.questions[0]!.options[1]!.label=c.questions[0]!.options[0]!.label;},
+  ];
+  for(const edit of mutations)expect(replay(calls=>edit(calls[1]!)),edit.toString()).toBe(false);
+ });
+ test('other modifying answers and complete report/current Exit gates remain unchanged',()=>{
+  expect(replay(calls=>{calls[0]!.answeredAt=new Date(captured.provenance.reportMtimeMs+1).toISOString();})).toBe(false);
+  expect(replay((_calls,_t,report)=>{const time=Date.parse(captured.calls[0]!.answeredAt!)/1000-1;fs.utimesSync(report,time,time);})).toBe(false);
+  expect(replay((_calls,_t,report)=>fs.writeFileSync(report,'# Completion summary\nDone.'))).toBe(false);
+  expect(replay((_calls,_t,report)=>fs.unlinkSync(report))).toBe(false);
+  for(const mutate of [
+   (t:PlanCountTranscript)=>{t.planReadyRequests=[];},
+   (t:PlanCountTranscript)=>{t.planReadyRequests![0]!.failed=true;},
+   (t:PlanCountTranscript)=>{t.planReadyRequests![0]!.sessionId='foreign';},
+   (t:PlanCountTranscript)=>{t.planReadyRequests![0]!.timestamp=captured.calls[1]!.answeredAt!;},
+   (t:PlanCountTranscript)=>{t.status='missing';},
+  ])expect(replay((_calls,t)=>mutate(t))).toBe(false);
+ });
+});
+});
+
+describe('plan-count-dx-handoff-o', () => {
+const fixture = fixture_plan_count_dx_handoff_o;
+function replay(mutate?: (call: NativePlanQuestionCall, transcript: PlanCountTranscript) => void): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dx-native-handoff-'));
+  const report = path.join(dir, 'review.md');
+  const transcript = structuredClone(fixture.transcript) as PlanCountTranscript;
+  const call = transcript.calls.at(-1)!;
+  mutate?.(call, transcript);
+  fs.writeFileSync(report, fixture.report);
+  const writtenAt = Date.parse(fixture.reportWrite.resultAt);
+  fs.utimesSync(report, writtenAt / 1000, writtenAt / 1000);
+  try {
+    return hasNativePlanTerminal(transcript, report,
+      Date.parse(fixture.startedAt), 'plan_ready');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('actual completed DX navigation preserves the prior full report and all thirteen native calls', () => {
+  expect(fixture.transcript.calls).toHaveLength(13);
+  expect(fixture.transcript.calls.every(call => call.answered && !call.failed)).toBe(true);
+  expect(fixture.reportWrite.failed).toBe(false);
+  expect(replay()).toBe(true);
+});
+
+test('closed navigation cannot hide a real new issue, unfinished review, or conditional closure', () => {
+  const variants = [
+    (q: any) => { q.header = 'New finding'; },
+    (q: any) => { q.question = q.question.replace('D11 — What next?', 'D11 — Should we fix the missing authorization check?'); },
+    (q: any) => { q.question = q.question.replace('The DX review is done.', 'The DX review is not done.'); },
+    (q: any) => { q.question = q.question.replace('The DX review is done.', 'The DX review is done only after tests pass.'); },
+    (q: any) => { q.question += '\nOne documentation gap remains unresolved.'; },
+    (q: any) => { q.question += '\nPlease fix the missing authorization check first.'; },
+    (q: any) => { q.question += '\nShould we add the missing test?'; },
+    (q: any) => { q.question += '\nOnce the tests pass, the DX review will be complete.'; },
+    (q: any) => { q.question += '\nAll decisions resolved after tests pass.'; },
+    (q: any) => { q.question += '\nDX review complete after tests pass.'; },
+    (q: any) => { q.question += '\nWe could fix the missing authorization check before Eng.'; },
+    (q: any) => { q.question = q.question.replace('ELI10: The DX review is done.', '```text\nThe DX review is done.\n```'); },
+    (q: any) => { q.question = q.question.replace('ELI10: The DX review is done.', '```text\nThe DX review is done.'); },
+    (q: any) => { q.question = q.question.replace('ELI10: The DX review is done.', '> The DX review is done.'); },
+    (q: any) => { q.options[2].description = 'Proceed to fix the missing contrast test before Eng.'; },
+    (q: any) => { q.options[2].description = 'One issue remains unresolved; handle it manually.'; },
+    (q: any) => { q.options[2].label = 'C) Add the missing test'; },
+    (q: any) => { q.options.push({ label: 'D) Add a migration guide', description: 'A new required deliverable.' }); },
+    (q: any) => { q.question = q.question.replace('plan-devex-review-next-steps', 'plan-devex-review-new-issue'); },
+    (q: any) => { q.question += '\n<gstack-qid:broken'; },
+    (q: any) => { q.multiSelect = true; },
+  ];
+  for (const mutate of variants) {
+    expect(replay(call => {
+      const question = call.questions[0]!;
+      mutate(question);
+      // Keep a real offered answer after text mutations so the semantic guard,
+      // rather than a stale answer key, is what must reject the altered call.
+      call.answers = { [question.question]: question.options[0]!.label };
+    }), String(mutate)).toBe(false);
+  }
+});
+
+test('native failure, offered answer, report freshness and real Exit remain required', () => {
+  expect(replay(call => { call.answered = false; })).toBe(false);
+  expect(replay(call => { call.failed = true; })).toBe(false);
+  expect(replay(call => { call.unansweredQuestionIndices = [0]; })).toBe(false);
+  expect(replay(call => { call.answers = { [call.questions[0]!.question]: 'Add a new test first' }; })).toBe(false);
+  expect(replay((_call, transcript) => { transcript.planReadyRequests = []; })).toBe(false);
+  expect(replay((_call, transcript) => { transcript.planReadyRequests![0]!.failed = true; })).toBe(false);
+  expect(replay((_call, transcript) => { transcript.planReadyRequests![0]!.sessionId = 'foreign'; })).toBe(false);
+  expect(replay((_call, transcript) => {
+    transcript.calls[11]!.answeredAt = new Date(Date.parse(fixture.reportWrite.resultAt) + 1000).toISOString();
+  })).toBe(false);
+});
+
+test('pure navigation preserves actual option order and ordinary next-review sequencing', () => {
+  expect(replay(call => { call.questions[0]!.options.reverse(); })).toBe(true);
+  expect(replay(call => {
+    const q = call.questions[0]!;
+    q.options[0]!.description += ' After Eng review is complete, proceed to implementation.';
+  })).toBe(true);
+});
+});
+
+describe('eng-next-handoff-ah', () => {
+const fs = fs_ceo_handoff_y;
+const os = os_ceo_handoff_y;
+const path = path_ceo_handoff_y;
+const actual = actual_eng_next_handoff_ah;
+test('exact final exit/report replay retains all freshness, identity and answer gates', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-eng-next-ah-'));
+  const file = path.join(dir, 'reviewed.md');
+  const now = Date.now;
+  try {
+    fs.writeFileSync(file, actual.plan);
+    fs.utimesSync(file, actual.source.stat.mtimeMs / 1000, actual.source.stat.mtimeMs / 1000);
+    Date.now = () => Date.parse(actual.captureAt);
+    const t = structuredClone(actual.transcript) as PlanCountTranscript;
+    const id = actual.fingerprint.signature;
+    const admin = new Set([id]);
+    const check = (v = t, a = admin) => hasNativePlanTerminal(v, file, actual.startedAt, 'plan_ready', a);
+    expect(isCurrentPlanApprovalScreen(actual.screen)).toBe(true);
+    expect(check()).toBe(true);
+    expect(check(t, new Set())).toBe(false);
+    expect(check(t, new Set(['foreign:call']))).toBe(false);
+    for (const mutate of [
+      (v: PlanCountTranscript) => { v.planReadyRequests = []; },
+      (v: PlanCountTranscript) => { v.planReadyRequests!.at(-1)!.failed = true; },
+      (v: PlanCountTranscript) => { v.planReadyRequests!.at(-1)!.sessionId = 'foreign'; },
+      (v: PlanCountTranscript) => { v.planReadyRequests!.at(-1)!.timestamp = '2026-09-10T03:29:40.000Z'; },
+      (v: PlanCountTranscript) => { v.planReadyRequests!.at(-1)!.timestamp = new Date(Date.now() + 1).toISOString(); },
+      (v: PlanCountTranscript) => { v.calls.at(-1)!.answered = false; },
+      (v: PlanCountTranscript) => { v.calls.at(-2)!.answeredAt = '2026-09-10T03:29:00.000Z'; },
+    ]) { const v = structuredClone(t); mutate(v); expect(check(v)).toBe(false); }
+    fs.writeFileSync(file, actual.plan.replace('NO UNRESOLVED DECISIONS', 'Report still pending'));
+    fs.utimesSync(file, actual.source.stat.mtimeMs / 1000, actual.source.stat.mtimeMs / 1000);
+    expect(check()).toBe(false);
+  } finally { Date.now = now; fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+const b176 = actual.sourceBoundB176;
+const recorded = () => structuredClone(b176.transcript) as PlanCountTranscript;
+test('actual pending ExitPlanMode needs the classified recap plus the unchanged fresh report and native gates',()=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'eng-b176-terminal-')),file=path.join(dir,'report.md'),now=Date.now;
+ try{
+  Date.now=()=>Date.parse(b176.capturedAt);fs.writeFileSync(file,b176.plan);fs.utimesSync(file,b176.sourceReport.mtimeMs/1000,b176.sourceReport.mtimeMs/1000);
+  const t=recorded(),signature=b176.fingerprint.signature;
+  const admin=new Set([signature]);
+  const check=(transcript=t,administrative=admin)=>hasNativePlanTerminal(transcript,file,b176.startedAt,'plan_ready',administrative);
+  expect(isCurrentPlanApprovalScreen(b176.screen)).toBe(true);
+  expect(check()).toBe(true);expect(check(t,new Set())).toBe(false);expect(check(t,new Set(['foreign:call']))).toBe(false);
+  for(const mutate of [
+   (v:PlanCountTranscript)=>{v.planReadyRequests=[];},
+   (v:PlanCountTranscript)=>{v.planReadyRequests![0]!.failed=true;},
+   (v:PlanCountTranscript)=>{v.planReadyRequests![0]!.sessionId='foreign';},
+   (v:PlanCountTranscript)=>{v.planReadyRequests![0]!.timestamp=new Date(Date.now()+1).toISOString();},
+   (v:PlanCountTranscript)=>{v.planReadyRequests![0]!.timestamp=v.calls.at(-1)!.answeredAt!;},
+   (v:PlanCountTranscript)=>{v.calls.at(-1)!.answered=false;},
+   (v:PlanCountTranscript)=>{v.calls.at(-2)!.answeredAt=new Date(b176.sourceReport.mtimeMs+1).toISOString();},
+  ]){const v=recorded();mutate(v);expect(check(v)).toBe(false);}
+  fs.utimesSync(file,(b176.startedAt-1)/1000,(b176.startedAt-1)/1000);expect(check()).toBe(false);
+  fs.writeFileSync(file,b176.plan.replace('NO UNRESOLVED DECISIONS','PENDING'));fs.utimesSync(file,b176.sourceReport.mtimeMs/1000,b176.sourceReport.mtimeMs/1000);expect(check()).toBe(false);
+ }finally{Date.now=now;fs.rmSync(dir,{recursive:true,force:true});}
+});
+});
+
+describe('eng-task-pause-navigation-f359', () => {
+const fs = fs_ceo_handoff_y;
+const os = os_ceo_handoff_y;
+const path = path_ceo_handoff_y;
+const capture = capture_eng_task_pause_navigation_f359;
+const actual=()=>({call:structuredClone(capture.transcript.calls.at(-1)!) as NativePlanQuestionCall,prior:structuredClone(capture.transcript.calls.slice(0,-1)) as NativePlanQuestionCall[],plan:capture.plan});
+test('handoff alone never supplies a native terminal or refreshes modifying answers',()=>{
+ const x=actual(),fp=nativePlanCallFingerprint(x.call,0,false),admin=new Set([fp.signature]);
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'gstack-eng-task-pause-')),file=path.join(dir,'reviewed.md'),now=Date.now;
+ try {
+  fs.writeFileSync(file,x.plan);fs.utimesSync(file,capture.reportSource.mtimeMs/1000,capture.reportSource.mtimeMs/1000);
+  Date.now=()=>Date.parse('2026-09-16T07:04:00.000Z');
+  const t=structuredClone(capture.transcript) as PlanCountTranscript;
+  const check=(v=t,a=admin)=>hasNativePlanTerminal(v,file,Date.parse('2026-09-16T06:40:00.000Z'),'plan_ready',a);
+  expect(check()).toBe(false); // Actual capture precedes the native exit.
+  // The later retained native exit is real; this is a gate replay, not a
+  // replacement verdict for the original paid timeout/failure.
+  expect(createHash('sha256').update(JSON.stringify(t.calls)).digest('hex')).toBe(capture.terminalCapture.callsSha256);
+  t.planReadyRequests=structuredClone(capture.terminalCapture.planReadyRequests);
+  t.assistantMessages=structuredClone(capture.terminalCapture.assistantMessages);
+  expect(check()).toBe(true);expect(check(t,new Set())).toBe(false);expect(check(t,new Set(['foreign:call']))).toBe(false);
+  for(const mutate of [
+   (v:PlanCountTranscript)=>{v.planReadyRequests![0]!.failed=true;},
+   (v:PlanCountTranscript)=>{v.planReadyRequests![0]!.sessionId='foreign';},
+   (v:PlanCountTranscript)=>{v.planReadyRequests![0]!.timestamp=x.call.answeredAt!;},
+   (v:PlanCountTranscript)=>{v.planReadyRequests=[];},
+   (v:PlanCountTranscript)=>{v.calls[5]!.answeredAt=x.call.answeredAt;},
+   (v:PlanCountTranscript)=>{v.calls[5]!.answered=false;v.calls[5]!.unansweredQuestionIndices=[0];},
+  ]){const v=structuredClone(t);mutate(v);expect(check(v)).toBe(false);}
+ }finally{Date.now=now;fs.rmSync(dir,{recursive:true,force:true});}
+});
+});
+
+describe('design-count-native-8525', () => {
+const fixture = fixture_design_count_native_8525;
+function completion() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'design-8525-replay-'));
+  const file = path.join(dir, path.basename(fixture.provenance.planPath));
+  const transcript = structuredClone(fixture.transcript) as PlanCountTranscript;
+  const edit = fixture.provenance.operations.filter(o => o.tool === 'Edit').at(-1)!;
+  const mtime = Date.parse(edit.acknowledgedAt) / 1000;
+  const write = (content = fixture.report) => { fs.writeFileSync(file, content); fs.utimesSync(file, mtime, mtime); };
+  write();
+  // The replay starts before the first retained native assistant message.
+  const startedAt = Math.min(...transcript.assistantMessages.map(m => Date.parse(m.timestamp))) - 1_000;
+  const final = transcript.assistantMessages.at(-1)!;
+  const check = () => hasNativePlanTerminal(transcript, file, startedAt, 'completion_summary');
+  return { dir, file, transcript, final, write, check, cleanup: () => fs.rmSync(dir, {recursive:true, force:true}) };
+}
+
+test('exact native final text and reconstructed read-back-verified report supply completion', () => {
+  const f = completion(); try { expect(f.check()).toBe(true); } finally { f.cleanup(); }
+});
+test('current typed status accepts presentation, field order and current report prose independently', () => {
+  const f=completion();try {
+    for (const heading of ['## Completion','### Completion summary','## Review complete','## Design review complete','**Review completion:**']) {
+      for (const status of ['STATUS: DONE','**STATUS:** DONE — review saved and verified.','**STATUS: DONE**']) {
+        for (const fields of [
+          [status,`What changed: \`${path.basename(f.file)}\` now carries the current review report.`],
+          [`Report: ${f.file} contains the reviewed plan and verification.`,status],
+          [status,`- Plan saved to \`${f.file}\`.`],
+        ]) {f.final.text=heading+'\n\n'+fields.join('\n\n');expect(f.check(),f.final.text).toBe(true);}
+      }
+    }
+  } finally {f.cleanup();}
+});
+for (const [name, change] of Object.entries({
+  'blocked':(s:string)=>s.replace('DONE —','BLOCKED —'),
+  'concerns':(s:string)=>s.replace('DONE —','DONE_WITH_CONCERNS —'),
+  'pending':(s:string)=>s.replace('DONE —','NEEDS_CONTEXT —'),
+  'conditional status':(s:string)=>s.replace('DONE —','DONE if approved —'),
+  'conditional reason':(s:string)=>s.replace('completed with evidence','will be completed with evidence'),
+  'quoted status':(s:string)=>s.replace('**STATUS:**','> **STATUS:**'),
+  'literal status':(s:string)=>s.replace(/\*\*STATUS:\*\* (.+)/,'`STATUS: $1`'),
+  'fenced status':(s:string)=>s.replace(/\*\*STATUS:\*\* (.+)/,'```text\nSTATUS: $1\n```'),
+  'duplicate status':(s:string)=>s+'\nSTATUS: DONE',
+  'conflicting status':(s:string)=>s+'\nSTATUS: BLOCKED',
+  'historical context':(s:string)=>'Previous result:\n\n'+s,
+  'copied section':(s:string)=>'Source example:\n\n'+s,
+  'quoted section':(s:string)=>'> '+s.replaceAll('\n','\n> '),
+  'duplicate section':(s:string)=>s+'\n## Review complete\nSTATUS: DONE',
+  'unavailable report':(s:string)=>s.replace('now carries','is unavailable; would contain'),
+  'proposed write':(s:string)=>s.replace('now carries','will contain'),
+  'historical report':(s:string)=>s.replace('now carries','previously contained'),
+  'wrong path':(s:string)=>s.replaceAll('gstack-test-plan-design.md','wrong-plan.md'),
+  'ambiguous path':(s:string)=>s.replace('now carries','and `another-plan.md` now carry'),
+  'different absolute directory':(s:string)=>s.replaceAll('gstack-test-plan-design.md','/elsewhere/gstack-test-plan-design.md'),
+  'relative traversal':(s:string)=>s.replaceAll('gstack-test-plan-design.md','../gstack-test-plan-design.md'),
+  'quoted artifact line':(s:string)=>s.replace('**What changed:**','> **What changed:**'),
+  'literal artifact prose':(s:string)=>s.replace(/\*\*What changed:\*\* (.+)/,'**What changed:** "$1"'),
+  'missing artifact field':(s:string)=>s.replace(/^\*\*What changed:\*\*.+\n/m,''),
+  'withdrawn report':(s:string)=>s+'\nThe report is withdrawn.',
+  'remaining decision':(s:string)=>s+'\nOne design decision is unresolved.',
+})) test(`typed delivery rejects ${name}`, () => {const f=completion();try {f.final.text=change(f.final.text);expect(f.check()).toBe(false);}finally{f.cleanup();}});
+test('typed delivery retains source session, answer chronology, fresh file and complete Design report checks', () => {
+  const f=completion();try {
+    const original=structuredClone(f.transcript);
+    for (const change of [
+      (t:PlanCountTranscript)=>{t.calls[1]!.answered=false;},
+      (t:PlanCountTranscript)=>{t.calls[1]!.failed=true;},
+      (t:PlanCountTranscript)=>{t.calls[1]!.sessionId='foreign';},
+      (t:PlanCountTranscript)=>{t.calls[1]!.answeredAt=t.assistantMessages.at(-1)!.timestamp;},
+      (t:PlanCountTranscript)=>{t.assistantMessages.at(-1)!.timestamp='2999-01-01T00:00:00Z';},
+    ]) {Object.assign(f.transcript,structuredClone(original));change(f.transcript);expect(f.check()).toBe(false);}
+    Object.assign(f.transcript,structuredClone(original));
+    for (const body of ['# Draft',fixture.report+'\n## Implementation changes\n',fixture.report.replace('| 1 | clean |','| 1 | pending |'),fixture.report.replace('DESIGN CLEARED','NOT CLEARED'),fixture.report.replace('NO UNRESOLVED DECISIONS','**UNRESOLVED DECISIONS:**\n- Still open')]) {f.write(body);expect(f.check()).toBe(false);}
+    f.write();fs.utimesSync(f.file,1,1);expect(f.check()).toBe(false);
+    fs.rmSync(f.file);expect(f.check()).toBe(false);
+    const alternate=path.join(f.dir,'alternate.md');fs.writeFileSync(alternate,fixture.report);fs.symlinkSync(alternate,f.file);expect(f.check()).toBe(false);
+  }finally{f.cleanup();}
+});
+const cf74 = fixture.cf74Retry;
+
+function cf74Completion() {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'design-cf74-completion-'));
+  const file=path.join(dir,path.basename(cf74.provenance.planPath));
+  const transcript=structuredClone(cf74.transcript) as PlanCountTranscript;
+  const final=transcript.assistantMessages.at(-1)!;
+  final.text=final.text.replaceAll(cf74.provenance.planPath,file);
+  const startedAt=Math.min(...transcript.calls.map(c=>Date.parse(c.answeredAt!)))-1000;
+  const write=(body=cf74.report)=>{fs.writeFileSync(file,body);fs.utimesSync(file,cf74.provenance.reportMtimeMs/1000,cf74.provenance.reportMtimeMs/1000);};
+  write();
+  return {dir,file,transcript,final,startedAt,write,check:()=>hasNativePlanTerminal(transcript,file,startedAt,'completion_summary'),cleanup:()=>fs.rmSync(dir,{recursive:true,force:true})};
+}
+
+test('cf74 actual completed native report envelope binds the fresh owned Design report',()=>{
+  const f=cf74Completion();try{expect(f.check()).toBe(true);}finally{f.cleanup();}
+});
+for(const heading of ['## Completion report','### Completion summary','## Completion'])for(const field of ['Plan written:','Plan saved:','Plan written to'])
+  test(`cf74 complete typed delivery: ${heading}/${field}`,()=>{
+    const f=cf74Completion();try{f.final.text=f.final.text.replace('## Completion report',heading).replace('Plan written:',field);expect(f.check()).toBe(true);}finally{f.cleanup();}
+  });
+for(const [name,change]of Object.entries({
+  'pending status':(s:string)=>s.replace('STATUS: DONE','STATUS: PENDING'),
+  'conditional status':(s:string)=>s.replace('STATUS: DONE','STATUS: DONE if approved'),
+  'quoted status':(s:string)=>s.replace('**STATUS: DONE**','`STATUS: DONE`'),
+  'duplicate status':(s:string)=>s+'\nSTATUS: DONE',
+  'quoted whole report':(s:string)=>'> '+s.replaceAll('\n','\n> '),
+  'historical report':(s:string)=>s.replace('## Completion report','Historical source:\n\n## Completion report'),
+  'duplicate report':(s:string)=>s+'\n## Completion report\nSTATUS: DONE',
+  'future write':(s:string)=>s.replace('Plan written:','Plan will be written:'),
+  'conditional write':(s:string)=>s.replace('Plan written:', 'Plan written if approved:'),
+  'quoted written field':(s:string)=>s.replace('- **Plan written:**','> **Plan written:**'),
+  'ambiguous path':(s:string)=>s.replace(' — accepted behavior',' and another-report.md — accepted behavior'),
+  'foreign path':(s:string)=>s.replaceAll('gstack-test-plan-design.md','foreign-report.md'),
+  'withdrawn report':(s:string)=>s+'\nThe review report is withdrawn.',
+  'unresolved decision':(s:string)=>s+'\nOne design decision is unresolved.',
+  'quoted current unresolved status':(s:string)=>s+'\nOne design decision is "unresolved".',
+}))test(`cf74 typed completion rejects ${name}`,()=>{const f=cf74Completion();try{f.final.text=change(f.final.text);expect(f.check()).toBe(false);}finally{f.cleanup();}});
+test('cf74 typed envelope cannot bypass fresh own Design report and native chronology',()=>{
+  const f=cf74Completion();try{
+    const base=structuredClone(f.transcript);
+    for(const change of [
+      (t:PlanCountTranscript)=>{t.calls[0]!.answered=false;},(t:PlanCountTranscript)=>{t.calls[0]!.failed=true;},
+      (t:PlanCountTranscript)=>{t.calls[0]!.answers={};},(t:PlanCountTranscript)=>{t.calls[0]!.unansweredQuestionIndices=[0];},
+      (t:PlanCountTranscript)=>{t.calls[0]!.sessionId='foreign';},(t:PlanCountTranscript)=>{t.calls[0]!.answeredAt=t.assistantMessages.at(-1)!.timestamp;},
+    ]){Object.assign(f.transcript,structuredClone(base));change(f.transcript);expect(f.check()).toBe(false);}
+    Object.assign(f.transcript,structuredClone(base));
+    for(const report of [cf74.report.replace('| 1 | clean |','| 1 | pending |'),cf74.report.replace('DESIGN CLEARED','DESIGN NOT CLEARED'),cf74.report.replace('NO UNRESOLVED DECISIONS','**UNRESOLVED DECISIONS:**\n- One pending'),cf74.report+'\n## Another section\n', '# Draft']){f.write(report);expect(f.check()).toBe(false);}
+    f.write();fs.utimesSync(f.file,1,1);expect(f.check()).toBe(false);
+    fs.rmSync(f.file);expect(f.check()).toBe(false);
+    const target=path.join(f.dir,'other.md');fs.writeFileSync(target,cf74.report);fs.symlinkSync(target,f.file);expect(f.check()).toBe(false);
+  }finally{f.cleanup();}
+});
 });

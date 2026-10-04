@@ -72,6 +72,15 @@ import { execGbrainText, spawnGbrainAsync } from "../lib/gbrain-exec";
 import { writeReceipt } from "../lib/egress-receipt";
 import { checkOwnedStagingDir, STAGING_MARKER } from "../lib/staging-guard";
 import { hasRepoPolicyStore, repoPolicyTierBatch } from "../lib/gbrain-repo-policy-client";
+import { resolveStateRoot, mergedStateRoots, type StateRootEnv } from "../lib/state-root";
+import {
+  cutoffExclusion,
+  purgeStagedTranscripts,
+  readTranscriptConsent,
+  repoExclusion,
+  type TranscriptConsent,
+  type TranscriptPolicy,
+} from "../lib/transcript-consent";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -154,6 +163,8 @@ interface ProbeReport {
    */
   skipped_policy_deny: number;
   skipped_policy_readonly: number;
+  /** Sessions a scoped consent (new@ cutoff, transcript_repos) kept out. */
+  scope: TranscriptScopeCounts;
   estimate_minutes: number;
 }
 
@@ -173,6 +184,8 @@ interface BulkResult {
   failed: number;
   duration_ms: number;
   partial_pages: number;
+  /** Sessions a scoped consent kept out, and transcript pages selected. */
+  scope?: TranscriptScopeCounts;
   /**
    * D6: when set, indicates a process-level failure (gbrain CLI missing
    * or `gbrain import` crashed). Per-file errors (FILE_TOO_LARGE etc.)
@@ -186,7 +199,7 @@ interface BulkResult {
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const HOME = homedir();
-const GSTACK_HOME = process.env.GSTACK_HOME || join(HOME, ".gstack");
+const GSTACK_HOME = resolveStateRoot();
 const STATE_PATH = join(GSTACK_HOME, ".transcript-ingest-state.json");
 const DEFAULT_INCREMENTAL_BUDGET_MS = 50;
 
@@ -200,6 +213,41 @@ const ALL_TYPES: MemoryType[] = [
   "retro",
   "builder-profile-entry",
 ];
+
+// ── Transcript consent ─────────────────────────────────────────────────────
+
+export type { TranscriptConsent } from "../lib/transcript-consent";
+
+let cachedConsent: TranscriptPolicy | null = null;
+
+/**
+ * Read transcript consent once per process across every merged state root
+ * (lib/transcript-consent.ts). `recent`, `all` and `new@<time>` are consent;
+ * an absent key, `off`, a legacy value (A-E, incremental) and anything
+ * unrecognized are not. A cutoff or allowlist applies even under an explicit
+ * `--sources transcript`. Pass `env` to bypass the per-process cache.
+ */
+function readIngestConsent(env?: StateRootEnv): TranscriptPolicy {
+  if (!env && cachedConsent) return cachedConsent;
+  const policy = readTranscriptConsent(mergedStateRoots(env ?? process.env));
+  if (!env) cachedConsent = policy;
+  return policy;
+}
+
+/** The consent fields without the contributing roots. */
+export function normalizeTranscriptConsent(env?: StateRootEnv): TranscriptConsent {
+  const { roots: _roots, ...consent } = readIngestConsent(env);
+  return consent;
+}
+
+/** Sessions a scoped consent kept out of this run, by reason. */
+export interface TranscriptScopeCounts {
+  pre_cutoff: number;
+  missing_start: number;
+  not_allowlisted: number;
+  /** Transcript pages this run selected for staging. */
+  sessions_selected: number;
+}
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
@@ -217,6 +265,11 @@ Options:
   --include-unattributed  Ingest sessions with no resolvable git remote.
   --all-history        Walk transcripts older than 90 days too.
   --sources <list>     Comma-separated subset: ${ALL_TYPES.join(",")}
+                       Default: every type, minus transcript unless
+                       transcript_ingest_mode is recent (90 days), all (all
+                       history) or new@<UTC> (sessions started after it).
+                       A list naming transcript overrides it; a new@ cutoff
+                       and transcript_repos still apply.
   --limit <N>          Stop after N pages written (smoke testing).
   --no-write           Skip gbrain put calls (still updates state file).
                        Used by tests + dry runs without actual ingest.
@@ -236,6 +289,7 @@ function parseArgs(): CliArgs {
   let allHistory = false;
   let limit: number | null = null;
   let sources: Set<MemoryType> = new Set(ALL_TYPES);
+  let sourcesExplicit = false;
   let noWrite = process.env.GSTACK_MEMORY_INGEST_NO_WRITE === "1";
   let scanSecrets = process.env.GSTACK_MEMORY_INGEST_SCAN_SECRETS === "1";
 
@@ -265,6 +319,7 @@ function parseArgs(): CliArgs {
           console.error(`--sources must include at least one of: ${ALL_TYPES.join(",")}`);
           process.exit(1);
         }
+        sourcesExplicit = true;
         break;
       }
       case "--help":
@@ -277,6 +332,16 @@ function parseArgs(): CliArgs {
         process.exit(1);
     }
   }
+
+  const consent = readIngestConsent();
+  if (!sourcesExplicit && !consent.affirmative) {
+    sources.delete("transcript");
+    if (!quiet) {
+      const why = consent.reason === "repos-unreadable" ? "; its +repos marker needs a transcript_repos allowlist" : "";
+      console.error(`gstack-memory-ingest: transcripts skipped (transcript_ingest_mode=${consent.value ?? "not set"}${why}); set it to recent, all or new@<UTC time>, or pass --sources transcript.`);
+    }
+  }
+  if (consent.affirmative && consent.window !== "recent") allHistory = true;
 
   return { mode, quiet, benchmark, includeUnattributed, allHistory, sources, limit, noWrite, scanSecrets };
 }
@@ -371,15 +436,43 @@ interface WalkContext {
   args: CliArgs;
   state: IngestState;
   windowStartMs: number; // ignore files older than this unless --all-history
+  consent: TranscriptConsent;
+  scope: TranscriptScopeCounts;
 }
 
-function makeWalkContext(args: CliArgs, state: IngestState): WalkContext {
+export function emptyScopeCounts(): TranscriptScopeCounts {
+  return { pre_cutoff: 0, missing_start: 0, not_allowlisted: 0, sessions_selected: 0 };
+}
+
+function makeWalkContext(args: CliArgs, state: IngestState, scope: TranscriptScopeCounts = emptyScopeCounts()): WalkContext {
   const ninetyDaysAgoMs = Date.now() - 90 * 24 * 60 * 60 * 1000;
   return {
     args,
     state,
     windowStartMs: args.allHistory ? 0 : ninetyDaysAgoMs,
+    consent: readIngestConsent(),
+    scope,
   };
+}
+
+/**
+ * The `new@` cutoff, applied in both parsers' walks on each session's first
+ * record timestamp (read from the file prefix, never mtime): a session that
+ * started before the cutoff and was appended later stays out, and a session
+ * with no start timestamp is excluded (fail-closed).
+ */
+function sessionPassesCutoff(ctx: WalkContext, path: string): boolean {
+  const why = cutoffExclusion(ctx.consent, ctx.consent.cutoff === undefined ? null : transcriptPrefix(path).startedAt);
+  if (why === "pre-cutoff") ctx.scope.pre_cutoff++;
+  else if (why === "missing-start") ctx.scope.missing_start++;
+  return why === null;
+}
+
+/** The transcript_repos allowlist, applied after the attribution gate. */
+function sessionRepoAllowed(ctx: WalkContext, remote: string | undefined): boolean {
+  if (repoExclusion(ctx.consent, remote) === null) return true;
+  ctx.scope.not_allowlisted++;
+  return false;
 }
 
 function* walkClaudeCodeProjects(ctx: WalkContext): Generator<{ path: string; type: MemoryType }> {
@@ -408,6 +501,7 @@ function* walkClaudeCodeProjects(ctx: WalkContext): Generator<{ path: string; ty
       } catch {
         continue;
       }
+      if (!sessionPassesCutoff(ctx, fullPath)) continue;
       yield { path: fullPath, type: "transcript" };
     }
   }
@@ -441,6 +535,7 @@ function* walkCodexSessions(ctx: WalkContext): Generator<{ path: string; type: M
     }
   }
   for (const path of recurse(root, 0)) {
+    if (!sessionPassesCutoff(ctx, path)) continue;
     yield { path, type: "transcript" };
   }
 }
@@ -747,6 +842,12 @@ function dateOnly(ts: string | undefined): string {
   }
 }
 
+/** A timestamp as ISO-8601 UTC, or "" when absent or unparseable. */
+function isoOrEmpty(ts: string | undefined): string {
+  const ms = ts ? Date.parse(ts) : NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+}
+
 export function buildTranscriptPage(path: string, session: ParsedSession): PageRecord {
   const remote = resolveGitRemote(session.cwd);
   const slug_repo = repoSlug(remote);
@@ -772,6 +873,7 @@ export function buildTranscriptPage(path: string, session: ParsedSession): PageR
     `cwd: ${session.cwd || ""}`,
     `git_remote: ${remote || "_unattributed"}`,
     `start_time: ${session.start_time || ""}`,
+    `session_started_at: ${isoOrEmpty(session.start_time)}`,
     `end_time: ${session.end_time || ""}`,
     `message_count: ${session.message_count}`,
     `tool_calls: ${session.tool_calls}`,
@@ -1128,7 +1230,7 @@ export function readNewFailures(
 
 /**
  * The ONE attribution gate (#2394): a transcript is attributable iff its cwd
- * resolves to a git remote. Both probeMode (via transcriptCwdFromPrefix +
+ * resolves to a git remote. Both probeMode (via transcriptPrefix +
  * resolveGitRemote — the same memoized resolver) and preparePages route
  * through THIS logic, so the two stages' post-attribution counts are
  * structurally identical — the parity the probe report promises.
@@ -1164,10 +1266,15 @@ const TRANSCRIPT_PROBE_MAX_BYTES = 256 * 1024;
  *   - Claude Code cwd comes from the first record that carries one;
  *   - unparseable lines are skipped (the truncated-tail case included).
  *
+ * The session start (the `new@` cutoff input) follows the same rules: Codex
+ * takes the first record's timestamp (or payload.timestamp), Claude Code the
+ * first record that carries a timestamp. A start beyond the prefix reads as
+ * missing, which a cutoff treats as excluded.
+ *
  * Non-transcript types (artifacts) always pass — the attribution filter in
  * preparePages only applies to transcripts (#2394).
  */
-function transcriptCwdFromPrefix(path: string): string {
+export function transcriptPrefix(path: string): { cwd: string; startedAt: string } {
   // Chunked read until the prefix contains at least one COMPLETE record
   // (newline), up to the hard cap — a first record larger than one chunk
   // (giant pasted prompt) must not truncate mid-JSON and mis-classify a
@@ -1192,12 +1299,12 @@ function transcriptCwdFromPrefix(path: string): string {
       closeSync(fd);
     }
   } catch {
-    return "";
+    return { cwd: "", startedAt: "" };
   }
   const lines = raw.split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length === 0) return "";
 
   let cwd = "";
+  let startedAt = "";
   let sawFirstParseable = false;
   for (const line of lines) {
     let rec: any;
@@ -1211,18 +1318,18 @@ function transcriptCwdFromPrefix(path: string): string {
       // Format detection mirrors parseTranscriptJsonl's `first` record check.
       const isCodex = rec?.type === "session_meta" || rec?.payload?.id != null;
       if (isCodex) {
-        // Codex: cwd comes from the session_meta FIRST record only.
+        // Codex: cwd and start come from the session_meta FIRST record only.
         cwd = rec.payload?.cwd || rec.cwd || "";
+        startedAt = rec.timestamp || rec.payload?.timestamp || "";
         break;
       }
     }
-    // Claude Code: first record with a cwd wins (the first record included).
-    if (rec?.cwd) {
-      cwd = rec.cwd;
-      break;
-    }
+    // Claude Code: the first record with a cwd and the first with a timestamp.
+    if (!cwd && rec?.cwd) cwd = rec.cwd;
+    if (!startedAt && rec?.timestamp) startedAt = rec.timestamp;
+    if (cwd && startedAt) break;
   }
-  return cwd;
+  return { cwd, startedAt: typeof startedAt === "string" ? startedAt : "" };
 }
 
 async function probeMode(args: CliArgs): Promise<ProbeReport> {
@@ -1260,12 +1367,13 @@ async function probeMode(args: CliArgs): Promise<ProbeReport> {
     // skip transcripts with no resolvable git remote unless --include-unattributed.
     let remote = "";
     if (type === "transcript") {
-      const cwd = transcriptCwdFromPrefix(path);
+      const { cwd } = transcriptPrefix(path);
       remote = cwd ? resolveGitRemote(cwd) : "";
       if (!args.includeUnattributed && remote === "") {
         skippedUnattributed++;
         continue;
       }
+      if (!sessionRepoAllowed(ctx, remote || "_unattributed")) continue;
     }
     candidates.push({ path, type, remote });
   }
@@ -1326,6 +1434,7 @@ async function probeMode(args: CliArgs): Promise<ProbeReport> {
     skipped_unattributed: skippedUnattributed,
     skipped_policy_deny: skippedPolicyDeny,
     skipped_policy_readonly: skippedPolicyReadonly,
+    scope: ctx.scope,
     estimate_minutes: estimateMinutes,
   };
 }
@@ -1490,6 +1599,7 @@ function preparePages(
           continue;
         }
         page = buildTranscriptPage(path, session);
+        if (!sessionRepoAllowed(ctx, page.git_remote)) continue;
       } else {
         page = buildArtifactPage(path, type, raw);
       }
@@ -1609,6 +1719,7 @@ function preparePages(
   // whole batch every run (#2724: 887 staged → 0 ingested). Disambiguate
   // before staging, consulting state so assignments hold across runs.
   disambiguateSlugs(finalPrepared, state);
+  ctx.scope.sessions_selected = finalPrepared.filter((p) => p.type === "transcript").length;
 
   // Derived from the FINAL set: partial counts must describe pages that are
   // actually eligible and within the limit, not the whole scanned corpus.
@@ -1961,9 +2072,20 @@ function runGbrainImportOnce(
 }
 
 async function ingestPass(args: CliArgs): Promise<BulkResult> {
+  // Tightening a scoped consent removes unpublished staged pages outside it and
+  // their fingerprints, BEFORE the state loads, so a later widening re-stages.
+  if (!args.noWrite) {
+    const purged = purgeStagedTranscripts(GSTACK_HOME, readIngestConsent());
+    if (purged > 0) console.error(`[memory-ingest] removed ${purged} staged transcript pages outside the new scope`);
+  }
+  const scope = emptyScopeCounts();
+  return { ...(await ingestPassScoped(args, scope)), scope };
+}
+
+async function ingestPassScoped(args: CliArgs, scope: TranscriptScopeCounts): Promise<BulkResult> {
   const t0 = Date.now();
   const state = loadState();
-  const ctx = makeWalkContext(args, state);
+  const ctx = makeWalkContext(args, state, scope);
   const remoteHttpMode = isRemoteHttpMcpMode();
   const resumeDir = process.env.GSTACK_INGEST_RESUME_DIR;
   const resuming = !args.noWrite && !remoteHttpMode
@@ -2597,6 +2719,7 @@ function printProbeReport(r: ProbeReport, json: boolean): void {
   if (r.skipped_policy_readonly > 0) {
     console.log(`Skipped (policy read-only): ${r.skipped_policy_readonly}  (remote tier is read-only; transcript ingest writes pages)`);
   }
+  for (const line of scopeLines(r.scope)) console.log(line);
   console.log("By type:");
   for (const [t, v] of Object.entries(r.by_type)) {
     if (v.count > 0) {
@@ -2604,6 +2727,26 @@ function printProbeReport(r: ProbeReport, json: boolean): void {
     }
   }
   console.log(`\nEstimate: ~${r.estimate_minutes} min for full --bulk pass.`);
+}
+
+/** Exclusion counts by reason; nothing when consent has no cutoff or allowlist. */
+function scopeLines(scope: TranscriptScopeCounts | undefined, indent = ""): string[] {
+  if (!scope) return [];
+  const lines: string[] = [];
+  if (scope.pre_cutoff > 0) lines.push(`${indent}Excluded (pre-cutoff):     ${scope.pre_cutoff}  (session started before the new@ cutoff)`);
+  if (scope.missing_start > 0) lines.push(`${indent}Excluded (missing start):  ${scope.missing_start}  (no start timestamp; excluded under new@)`);
+  if (scope.not_allowlisted > 0) lines.push(`${indent}Excluded (not allowlisted): ${scope.not_allowlisted}  (repo not in transcript_repos)`);
+  return lines;
+}
+
+/**
+ * Under a new@ cutoff, a run that selects no session says so, so "nothing
+ * happened" reads as expected rather than broken.
+ */
+function zeroSessionsNotice(r: BulkResult, args: CliArgs): string | null {
+  const consent = readIngestConsent();
+  if (!consent.cutoff || !args.sources.has("transcript") || !r.scope || r.scope.sessions_selected > 0) return null;
+  return `[memory-ingest] 0 transcript sessions ingested under new@${consent.cutoff}: ${r.scope.pre_cutoff} started before the cutoff; new sessions will appear on the next sync`;
 }
 
 function printBulkResult(r: BulkResult, args: CliArgs): void {
@@ -2619,6 +2762,7 @@ function printBulkResult(r: BulkResult, args: CliArgs): void {
   if (r.skipped_policy_deny > 0) {
     console.log(`  skipped (policy deny):      ${r.skipped_policy_deny}  (change with: gstack-gbrain-repo-policy set <remote> read-write)`);
   }
+  for (const line of scopeLines(r.scope, "  ")) console.log(line);
   console.log(`  failed:                ${r.failed}`);
   console.log(`  duration:              ${(r.duration_ms / 1000).toFixed(1)}s`);
   if (args.benchmark) {
@@ -2652,6 +2796,8 @@ async function main(): Promise<void> {
     if (result.written > 0 || result.failed > 0) {
       console.error(`[memory-ingest] ${result.written} written, ${result.failed} failed in ${dt}ms`);
     }
+    const zero = zeroSessionsNotice(result, args);
+    if (zero) console.error(zero);
     // D6: system_error → process-level failure; orchestrator sees ERR.
     // Per-file errors do NOT exit non-zero.
     if (result.system_error) process.exit(1);
@@ -2660,6 +2806,8 @@ async function main(): Promise<void> {
 
   const result = await ingestPass(args);
   printBulkResult(result, args);
+  const zero = zeroSessionsNotice(result, args);
+  if (zero) console.error(zero);
   if (result.system_error) process.exit(1);
 }
 

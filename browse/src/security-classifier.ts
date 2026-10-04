@@ -24,9 +24,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { mkdirSecure } from './file-permissions';
 import { type LayerSignal } from './security';
+import { resolveStateRoot } from '../../lib/state-root';
 
 // ─── Model location + packaging ──────────────────────────────
 
@@ -45,7 +45,7 @@ import { type LayerSignal } from './security';
  *   vocab.txt
  *   onnx/model.onnx  (~112MB)
  */
-const MODELS_DIR = path.join(os.homedir(), '.gstack', 'models');
+const MODELS_DIR = path.join(resolveStateRoot(), 'models');
 const TESTSAVANT_DIR = path.join(MODELS_DIR, 'testsavant-small');
 const TESTSAVANT_HF_URL = 'https://huggingface.co/testsavantai/prompt-injection-defender-small-v0-onnx/resolve/main';
 const TESTSAVANT_FILES = [

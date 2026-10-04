@@ -14,6 +14,9 @@ import { __testInternals__, fetchHandler, idleCheckTick } from "../src/daemon";
 
 const { markMeaningfulActivity } = __testInternals__;
 import { makeBoardHtml, makeTmpDir, req, resetDaemon } from "./daemon-tests-fixtures";
+import { usePrivateStateRoot } from "../../test/helpers/private-state-root";
+
+const stateRoot = usePrivateStateRoot();
 
 let tmpDir: string;
 
@@ -365,19 +368,25 @@ describe("daemon /shutdown", () => {
     // arms setTimeout(process.exit, 50). bun test runs ALL files in one
     // process, so letting that exit fire would kill the whole suite ~100ms
     // later (exit 0, no summary — see test/no-suicide-exit.test.ts). Stub
-    // process.exit, wait past both timers so they fire harmlessly while
-    // stubbed, then restore. (resetForTest does NOT defuse the timers: the
-    // exit callback is unconditional.)
+    // process.exit and restore it only after the exit callback has reached
+    // the stub; a fixed sleep lets a late timer reach the real exit under
+    // load. (resetForTest does NOT defuse the timers: the exit callback is
+    // unconditional.)
     const origExit = process.exit;
-    (process as any).exit = (() => undefined) as any;
+    let exitCode: number | undefined;
+    const exited = new Promise<void>((resolve) => {
+      (process as any).exit = ((code?: number) => {
+        exitCode = code;
+        resolve();
+      }) as any;
+    });
     try {
       const r = await fetchHandler(req("POST", "/shutdown"));
       expect(r.status).toBe(200);
       const body = (await r.json()) as any;
       expect(body.shuttingDown).toBe(true);
-      // Let both 50ms timers (gracefulShutdown, then its process.exit) fire
-      // against the stub before restoring the real process.exit.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await exited;
+      expect(exitCode).toBe(0);
     } finally {
       (process as any).exit = origExit;
     }
@@ -527,6 +536,30 @@ describe("daemon malformed body handling", () => {
     expect(r.status).toBe(400);
     const body = (await r.json()) as any;
     expect(body.error).toContain("HTML file not found");
+  });
+});
+
+// ─── Daemon log ──────────────────────────────────────────────────
+
+describe("daemon log", () => {
+  test("an unopenable log disables file logging instead of raising an uncaught error", async () => {
+    // A directory where the log file belongs makes the asynchronous open fail
+    // with EISDIR, the same path as a state root removed before the open lands.
+    fs.mkdirSync(path.join(stateRoot.dir, "design-daemon.log"));
+    await publishTestBoard();
+    const log = __testInternals__.daemonLog();
+    expect(log).toBeTruthy();
+    while (__testInternals__.daemonLog() === log) await new Promise((r) => setTimeout(r, 1));
+    expect(log!.destroyed).toBe(true);
+    expect(__testInternals__.daemonLog()).toBeNull();
+
+    const dirB = makeTmpDir("log-b");
+    try {
+      await publishTestBoard({ dir: dirB });
+      expect(__testInternals__.boards.size).toBe(2);
+    } finally {
+      try { fs.rmSync(dirB, { recursive: true, force: true }); } catch {}
+    }
   });
 });
 

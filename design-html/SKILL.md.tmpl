@@ -58,16 +58,16 @@ around obstacles.
 Detect context with the CEO-plan check and the design-artifact checks below:
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 setopt +o nomatch 2>/dev/null || true
 _CEO=$(ls -t "$GSTACK_STATE_ROOT/projects/$SLUG/ceo-plans/"*.md 2>/dev/null | head -1)
 [ -n "$_CEO" ] && echo "CEO_PLAN: $_CEO" || echo "NO_CEO_PLAN"
 ```
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 setopt +o nomatch 2>/dev/null || true
 _APPROVED=$(ls -t "$GSTACK_STATE_ROOT/projects/$SLUG/designs/"*/approved.json 2>/dev/null | head -1)
 [ -n "$_APPROVED" ] && echo "APPROVED: $_APPROVED" || echo "NO_APPROVED"
@@ -82,8 +82,17 @@ Now route based on what was found. Check these cases in order:
 
 ### Case A: approved.json exists (design-shotgun ran)
 
-If `APPROVED` was found, read it. Extract: approved variant PNG path, user feedback,
-screen name. Also read the CEO plan if one exists (it adds strategic context).
+If `APPROVED` was found, read it for user feedback and screen name, and resolve the
+approved PNG (never guess it from a letter or the newest variant):
+
+```bash
+{{BIN_DIR}}/gstack-design-approved "<APPROVED path>"
+```
+
+It prints the approved image's absolute path. If it prints "approved image ... is
+missing; reselect from the board" instead, tell the user exactly that, offer
+/design-shotgun to reselect, and do not substitute another image. Also read the CEO
+plan if one exists (it adds strategic context).
 
 Read `DESIGN.md` if it exists in the repo root. These tokens take priority for
 system-level values (fonts, brand colors, spacing scale).
@@ -151,7 +160,7 @@ After routing, output a brief context summary:
 ```bash
 $D prompt --image <approved-variant.png> --output json
 ```
-This returns colors, typography, layout structure, and component inventory via GPT-4o vision.
+This returns colors, typography, layout structure, and component inventory via an OpenAI vision model (gpt-5.5 by default, `GSTACK_DESIGN_MODEL` overrides).
 
 2. If `$D` is not available, read the approved PNG inline using the Read tool.
    Describe the visual layout, colors, typography, and component structure yourself.
@@ -231,8 +240,9 @@ _ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 [ -n "$_PRETEXT_VENDOR" ] && echo "VENDOR: $_PRETEXT_VENDOR" || echo "VENDOR_MISSING"
 ```
 
-- If `VENDOR` found: read the file and inline it in a `<script>` tag. The HTML file
-  is fully self-contained with zero network dependencies.
+- If `VENDOR` found: inline the file in a `<script type="module">` and put the page's
+  Pretext code after it in that same script; the bundle ends in `export {...}` and sets
+  no global. The HTML file is fully self-contained with zero network dependencies.
 - If `VENDOR_MISSING`: use CDN import as fallback:
   `<script type="module">import { prepare, layout, prepareWithSegments, walkLineRanges, layoutNextLine, layoutWithLines } from 'https://esm.sh/@chenglou/pretext'</script>`
   Add a comment: `<!-- FALLBACK: vendor/pretext.js missing, using CDN -->`
@@ -306,17 +316,20 @@ echo "SERVER: http://localhost:$_PORT/finalized.html"
 echo "PID: $_SERVER_PID"
 ```
 
+Remember the printed `SERVER:` URL and `PID:` value; each bash block is a fresh
+shell, so later blocks restate them literally.
+
 If python3 is not available, fall back to:
 ```bash
 open <path-to-finalized.html>
 ```
 
-Tell the user: "Live preview running at http://localhost:$_PORT/finalized.html.
+Tell the user: "Live preview running at <SERVER URL>.
 After each edit, just refresh the browser (Cmd+R) to see changes."
 
 When the refinement loop ends (Step 4 exits), kill the server:
 ```bash
-kill $_SERVER_PID 2>/dev/null || true
+kill <PID> 2>/dev/null || true
 ```
 
 ---
@@ -377,7 +390,7 @@ LOOP:
   5. Apply feedback using targeted Edit tool changes on the HTML file
      (do NOT regenerate the entire file — surgical edits only)
 
-  6. Brief summary of what changed (2-3 lines max)
+  6. Briefly say what changed
 
   7. If verification screenshots are available, re-take them to confirm the fix
 

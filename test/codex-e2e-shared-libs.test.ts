@@ -8,7 +8,7 @@ import { e2eTierEnabled } from './helpers/e2e-gate';
 import { EvalCollector } from './helpers/eval-store';
 import { detectBaseBranch, E2E_TOUCHFILES, getChangedFiles, GLOBAL_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import {
-  createSharedLibsFixture, installHostileGitConfig, installSourceShims, readRequests,
+  createSharedLibsFixture, installHostileGitConfig, installSourceShims, isGuardedGitRequest, readRequests,
   seedOpportunitySources, sharedReadOnlyViolations, SHARED_LIBS_ROOT, snapshotFixture,
 } from './helpers/shared-libs-eval-fixture';
 
@@ -54,6 +54,7 @@ describeCodex('Shared-code audit on live Codex (periodic)', () => {
       result = await runCodexSkill({
         skillDir: path.join(SHARED_LIBS_ROOT, '.agents/skills/gstack-deslop-shared-libs'),
         skillName: 'deslop-shared-libs',
+        runtimeRoot: SHARED_LIBS_ROOT,
         // Extract the actual generated Codex workflow, retaining all standalone rules
         // and its common rubric without importing an unrelated parent preamble.
         sections: [
@@ -111,9 +112,7 @@ describeCodex('Shared-code audit on live Codex (periodic)', () => {
         for (const forbidden of ['status', 'fetch', 'ls-remote', 'pull', 'push', 'clone', 'add', 'write-tree', 'hash-object', 'checkout', 'reset']) {
           expect(request.args).not.toContain(forbidden);
         }
-        expect(request.args).toContain('--no-lazy-fetch');
-        expect(request.args).toContain('core.fsmonitor=false');
-        expect(request.args).toContain('log.showSignature=false');
+        expect(isGuardedGitRequest(request), JSON.stringify(request)).toBe(true);
       }
       const apiReads = requests.filter(row => (row.tool === 'gh' && row.args[0] === 'api') || row.tool === 'curl');
       expect(apiReads.length).toBeGreaterThan(0);

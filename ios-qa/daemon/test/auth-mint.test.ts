@@ -8,6 +8,9 @@ import { join } from 'path';
 import { mintForCaller } from '../src/auth-mint';
 import { SessionTokenStore } from '../src/session-tokens';
 import { grantIdentity } from '../src/allowlist';
+import { usePrivateStateRoot } from '../../../test/helpers/private-state-root';
+
+usePrivateStateRoot();
 
 let tmpDir: string;
 let listPath: string;

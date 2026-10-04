@@ -100,7 +100,7 @@ describe('terse build — per-resolver behavior', () => {
     test('default: emits full section', () => {
       const out = generateContextHealth(makeCtx('default'));
       expect(out).toContain('## Context Health');
-      expect(out).toContain('PROGRESS');
+      expect(out.replace(/^## Context Health.*$/m, '').trim().length).toBeGreaterThan(80);
     });
 
     test('terse: returns empty string', () => {

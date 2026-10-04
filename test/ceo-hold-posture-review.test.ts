@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import captured from './fixtures/ceo-hold-proof-fb10.json';
 import { buildCeoHoldPostureReview, evaluateCeoHoldPostureReview, type CeoHoldPostureReviewInput } from './helpers/ceo-hold-posture-review';
-import { hasNativePostAnswerCeoPosture } from './helpers/ceo-mode-option';
+import { hasNativePostAnswerCeoPosture, holdDeferKeepIndex } from './helpers/ceo-mode-option';
 import type { PlanReviewDecisionInput, PlanReviewDecisionJudgment } from './helpers/plan-review-decisions';
 import type { NativePublicToolEvent } from './helpers/plan-count-transcript';
 import { nativePlanCallFingerprint } from './helpers/claude-pty-runner';
@@ -243,7 +243,7 @@ async function registered(scenario:'accept'|'uncertain'|'missing source'|'missin
     navigateToModeAskUserQuestion:async()=>({modeIndex:3,visibleAtMode:'captured mode',question:{nativeCall:mode(f)}}),
     planCountQuestionInput:(_v:string,q:any)=>q.nativeCall.toolUseId===modeId?'3':'1',selectPtyNumberedOption:async()=>{throw Error('unexpected legacy key');},
     hasNativePostAnswerCeoPosture:scenario==='lexical pass'||scenario==='expansion'?()=>true:hasNativePostAnswerCeoPosture,
-    ceoModeSubmissionInput:()=>null,ceoExpansionPacingReady:()=>false,ceoExpansionPacingChoice:()=>null,
+    ceoModeSubmissionInput:()=>null,ceoModePacketTabAnswer:()=>null,ceoExpansionPacingReady:()=>false,ceoExpansionPacingChoice:()=>null,holdDeferKeepIndex,
     nextCeoPostureContinuation:(_a:any,_b:any,_c:any,_d:any,_e:any,continued:boolean)=>continued?null:'question',
     capturePlanCountQuestion:()=>({nativeCall:pending}),isPlanReadyVisible:()=>false,isNumberedOptionListVisible:()=>false,
     buildCeoHoldPostureReview,evaluateCeoHoldPostureReview:async(review:PlanReviewDecisionInput)=>{
@@ -276,3 +276,11 @@ for(const sourcePath of ['C:\\owned\\PLAN.md','\\\\server\\share\\PLAN.md'])test
       expect(r.deadlines).toEqual([r.deadline]);expect(r.error).toBeUndefined();expect(r.snapshots.at(-1)).toBe('posture_confirmed');
     }else{expect(r.error).toBeInstanceOf(Error);expect(r.snapshots.at(-1)).toBe('failed');}
   });
+
+test('a decision whose grounding line names no plan file stays bound by the owned source Read (census 36597762183 HOLD D2)',()=>{
+  const f=input();revise(f,q=>{q.question=q.question.replace(/Project\/branch\/task:[^\n]*/,'Project/branch/task: gstack-plan-count on main, HOLD SCOPE review of saved project views.');});
+  expect(buildCeoHoldPostureReview(f)!.plan).toBe(f.source.content);
+  const unread=input();revise(unread,q=>{q.question=q.question.replace(/Project\/branch\/task:[^\n]*/,'Project/branch/task: gstack-plan-count on main, HOLD SCOPE review of saved project views.');});
+  unread.publicTools=unread.publicTools.filter(e=>e.toolUseId!==sourceId);
+  expect(()=>buildCeoHoldPostureReview(unread)).toThrow('complete original source Read/ACK');
+});

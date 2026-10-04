@@ -129,16 +129,16 @@ describe('gstack-detach', () => {
     const logB = path.join(dir, 'b.log');
     try {
       // First holds the lock for ~3s; second must wait then acquire.
-      spawnSync(DETACH, ['--log', logA, '--lock', lock, '--', 'sleep', '3'], { encoding: 'utf-8', timeout: 10000 });
+      spawnSync(DETACH, ['--log', logA, '--lock', lock, '--', 'sleep', '3'], { encoding: 'utf-8', timeout: 10000, env: { ...process.env, HOME: dir } });
       waitFor(() => logHas(logA, "ACQUIRED"), 4000);
-      spawnSync(DETACH, ['--log', logB, '--lock', lock, '--', 'echo', 'second-ran'], { encoding: 'utf-8', timeout: 10000 });
+      spawnSync(DETACH, ['--log', logB, '--lock', lock, '--', 'echo', 'second-ran'], { encoding: 'utf-8', timeout: 10000, env: { ...process.env, HOME: dir } });
       // Second should report WAITING (first still holds it) then ACQUIRE after release.
       expect(waitFor(() => logHas(logB, 'WAITING for lock'), 4000)).toBe(true);
       expect(waitFor(() => logHas(logB, '### gstack-detach EXIT=0 ###'), 12000)).toBe(true);
       expect(logHas(logB, 'second-ran')).toBe(true);
+      expect(fs.existsSync(path.join(dir, '.gstack', 'locks', `${lock}.lock`))).toBe(true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
-      fs.rmSync(path.join(os.homedir(), '.gstack', 'locks', `${lock}.lock`), { force: true });
     }
   }, 20000);
 

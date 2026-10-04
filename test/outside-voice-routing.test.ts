@@ -140,7 +140,7 @@ for (const host of ['claude', 'codex'] as const) {
       const text = readFileSync(join(dir, 'SKILL.md'), 'utf8');
       expect(text).toContain('Step 0: Detect platform and base branch');
       expect(text).toContain('Step 3: Get the diff');
-      expect(text).toContain('Step 5.7: Adversarial review (always-on)');
+      expect(text).toContain('Step 4.8: Adversarial review (always-on)');
       expect(text).toContain(host === 'codex' ? 'gstack-claude-code' : 'codex exec');
       expect(text).not.toContain('## Preamble (run first)');
       expect(text.match(/^name:/gm)).toHaveLength(1);

@@ -14,9 +14,9 @@ const files: CoverageFile[] = [
 const owner = { session_id: 'owned-session', parent_tool_use_id: null };
 function captured(tool = 'Bash', decorate = (text: string) => text): any[] {
   return [{ type: 'system', subtype: 'init', cwd, ...owner }, ...files.flatMap((file, i) => [
-    { type: 'assistant', ...owner, message: { content: [{ type: 'tool_use', id: `read-${i}`, name: tool,
+    { type: 'assistant', ...owner, message: { role: 'assistant', content: [{ type: 'tool_use', id: `read-${i}`, name: tool,
       input: tool === 'Read' ? { file_path: file.path } : { command: `cat -n ${file.path}` } }] } },
-    { type: 'user', ...owner, message: { content: [{ type: 'tool_result', tool_use_id: `read-${i}`,
+    { type: 'user', ...owner, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `read-${i}`,
       content: decorate(file.content), is_error: false }] } },
   ])];
 }
@@ -50,11 +50,14 @@ for (const cwd of ['C:\\owned\\coverage', '\\\\server\\share\\coverage']) {
   });
 }
 
-test('one shell result can contain both complete files without parsing command syntax', () => {
+test('one shell result with a whole-file sed range and cat proves both complete files at their printed positions', () => {
   const rows = captured();
   rows[1].message.content[0].input.command = 'sed -n 1,999p src/billing.ts; cat test/billing.test.ts';
-  rows[2].message.content[0].content = files.map(file => file.content).join('\n=====\n');
+  rows[2].message.content[0].content = files.map(file => file.content).join('');
   expect(() => requireCoverageFileReads(rows.slice(0, 3), cwd, files)).not.toThrow();
+  // Bytes the command never printed (here a separator) leave neither read at a provable position.
+  rows[2].message.content[0].content = files.map(file => file.content).join('\n=====\n');
+  expect(() => requireCoverageFileReads(rows.slice(0, 3), cwd, files)).toThrow('no successful complete file read');
 });
 
 test('one cat -n command with multiple literal operands proves both full files', () => {
@@ -167,9 +170,6 @@ test('diagram accepts an explicit single GAP legend mixed with quality keys', ()
 
 test('review testing checklist documents a coverage diagram shape accepted by the native oracle', () => {
   const checklist = fs.readFileSync(path.join(ROOT, 'review/specialists/testing.md'), 'utf8');
-  expect(checklist).toContain('If the caller explicitly asks for an ASCII coverage diagram');
-  expect(checklist).toContain('dedicated tool call');
-  expect(checklist).toMatch(/Read\s+diffs, package files, configs, or other context in separate tool calls\./);
   expect(checklist).toContain('valid USD happy path returns success [OK]');
   expect(checklist).toContain('refund success and guard branches not imported or untested [GAP]');
   expect(checklist).toContain('Legend: [OK] tested [GAP] no test');

@@ -43,6 +43,7 @@ beforeEach(() => {
   mkdirSync(bin, { recursive: true });
   writeFixture(join(bin, 'gstack-config'), `#!/bin/sh\nexec bash "${join(ROOT, 'bin/gstack-config')}" "$@"\n`);
   writeFixture(join(bin, 'gstack-redact'), `#!/bin/sh\nexec "${process.execPath}" "${join(ROOT, 'bin/gstack-redact')}" "$@"\n`);
+  writeFixture(join(bin, 'gstack-paths'), `#!/bin/sh\nexec bash "${join(ROOT, 'bin/gstack-paths')}" "$@"\n`);
   expect(shell('~/.claude/skills/gstack/bin/gstack-config set redact_prepush_hook true').status).toBe(0);
 });
 

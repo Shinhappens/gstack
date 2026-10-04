@@ -19,13 +19,16 @@ const SLOW_TIMEOUT = 60_000;
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { removeUnreachableGbrain, useUnreachableGbrain } from './helpers/unreachable-gbrain';
 import { GSTACK_SCHEMA_PACK_VERSION } from '../scripts/brain-cache-spec';
 
 let TMP_HOME: string;
+let GBRAIN_STUB: string | undefined;
 const ORIGINAL_HOME = process.env.GSTACK_HOME;
 
 beforeEach(() => {
   TMP_HOME = mkdtempSync(join(tmpdir(), 'gstack-schema-test-'));
+  GBRAIN_STUB = useUnreachableGbrain();
   process.env.GSTACK_HOME = TMP_HOME;
   delete require.cache[require.resolve('../bin/gstack-brain-cache')];
 });
@@ -34,6 +37,7 @@ afterEach(() => {
   if (ORIGINAL_HOME) process.env.GSTACK_HOME = ORIGINAL_HOME;
   else delete process.env.GSTACK_HOME;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+  removeUnreachableGbrain(GBRAIN_STUB);
 });
 
 async function importCache(): Promise<typeof import('../bin/gstack-brain-cache')> {

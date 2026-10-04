@@ -16,7 +16,7 @@ function fixture() {
   for (const file of [COOKIE_MANUAL_REVIEW_FILE, 'setup-browser-cookies/SKILL.md', 'BROWSER.md']) {
     const target = join(root, file); mkdirSync(resolve(target, '..'), { recursive: true });
     const source = readFileSync(join(ROOT, file), 'utf8');
-    writeFileSync(target, file === 'setup-browser-cookies/SKILL.md' ? approvedCookieWorkflowSource(source) : source);
+    writeFileSync(target, file === COOKIE_MANUAL_REVIEW_FILE ? source : approvedCookieWorkflowSource(source));
   }
   const entry = manualReviewFixture(root);
   const approval = entry.manual_review!.approval;

@@ -51,12 +51,12 @@ gbrain:
       render_as: "## Prior investigations in this repo"
     - id: project-learnings
       kind: filesystem
-      glob: "~/.gstack/projects/{repo_slug}/learnings.jsonl"
+      glob: "{gstack_state_root}/projects/{repo_slug}/learnings.jsonl"
       tail: 10
       render_as: "## Recent learnings (patterns + pitfalls)"
     - id: recent-eureka
       kind: filesystem
-      glob: "~/.gstack/analytics/eureka.jsonl"
+      glob: "{gstack_state_root}/analytics/eureka.jsonl"
       tail: 5
       render_as: "## Recent eureka moments (cross-project)"
 ---
@@ -118,9 +118,8 @@ If any learnings come back, name which one applies to your investigation in one 
 After forming your root cause hypothesis, lock edits to the affected module to prevent scope creep.
 
 ```bash
-# $HOME-anchored like the careful/freeze frontmatter hooks (#1871): frontmatter
-# hooks and early skill bash run before any runtime var like CLAUDE_SKILL_DIR
-# exists, so a ${CLAUDE_SKILL_DIR}-relative path silently never resolves (#2469).
+# $HOME-anchored like the careful/freeze frontmatter hooks: early skill bash runs
+# before CLAUDE_SKILL_DIR exists, so a relative path would never resolve.
 _FREEZE_SCRIPT="$HOME/.claude/skills/gstack/freeze/bin/check-freeze.sh"
 [ -x "$_FREEZE_SCRIPT" ] && echo "FREEZE_AVAILABLE" || echo "FREEZE_UNAVAILABLE"
 ```

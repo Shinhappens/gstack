@@ -7,7 +7,6 @@ import { execFileSync } from 'node:child_process';
 import { nextCeoModeNavigation } from './helpers/ceo-mode-option';
 import { planCountQuestionInput } from './helpers/claude-pty-runner';
 import type { NativePlanQuestionCall } from './helpers/plan-count-transcript';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import priorCalls from './fixtures/ceo-mode-prerequisite-o-calls.json';
 import directProceedCall from './fixtures/ceo-mode-prerequisite-q-call.json';
 import fullAd from './fixtures/ceo-mode-full-ad.json';
@@ -87,9 +86,6 @@ describe('CEO mode prerequisite navigation', () => {
     expect(nextCeoModeNavigation(screen,'HOLD SCOPE',seen,call)).toEqual({kind:'wait'});
     const modes='☐ Review mode\nWhich mode?\n❯ 1. SELECTIVE EXPANSION\n  2. HOLD SCOPE\n  3. SCOPE EXPANSION\n  4. SCOPE REDUCTION';
     for(const [mode,index] of [['HOLD SCOPE',2],['SCOPE EXPANSION',3]] as const){const a=nextCeoModeNavigation(modes,mode,new Set());expect(a.kind).toBe('mode');if(a.kind==='mode')expect(a.index).toBe(index);}
-  });
-  test('fixture and free regression select only the mode-routing eval', () => {
-    for(const file of ['test/ceo-mode-prerequisite.test.ts','test/fixtures/ceo-mode-prerequisite-o-calls.json','test/fixtures/ceo-mode-prerequisite-q-call.json'])expect(selectTests([file],E2E_TOUCHFILES).selected).toEqual(['plan-ceo-mode-routing']);
   });
 });
 for(const fixtureIndex of [1,2,3,4])test.skipIf(process.platform==='win32')(`fake native PTY skips prerequisite ${fixtureIndex} and confirms target posture`,async()=>{

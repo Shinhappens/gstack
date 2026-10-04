@@ -41,18 +41,17 @@ gbrain:
       render_as: "## Prior office-hours sessions in this repo"
     - id: builder-profile
       kind: filesystem
-      glob: "~/.gstack/builder-profile.jsonl"
-      tail: 1
+      glob: "{gstack_state_root}/developer-profile.json"
       render_as: "## Your builder profile snapshot"
     - id: design-doc-history
       kind: filesystem
-      glob: "~/.gstack/projects/{repo_slug}/*-design-*.md"
+      glob: "{gstack_state_root}/projects/{repo_slug}/*-design-*.md"
       sort: mtime_desc
       limit: 3
       render_as: "## Recent design docs for this project"
     - id: prior-eureka
       kind: filesystem
-      glob: "~/.gstack/analytics/eureka.jsonl"
+      glob: "{gstack_state_root}/analytics/eureka.jsonl"
       tail: 5
       render_as: "## Recent eureka moments"
 ---
@@ -86,14 +85,15 @@ Understand the project and the area the user wants to change.
 3. Use Grep/Glob to map the codebase areas most relevant to the user's request.
 4. **List existing design docs for this project:**
    ```bash
+   GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
    setopt +o nomatch 2>/dev/null || true  # zsh compat
-   ls -t ~/.gstack/projects/$SLUG/*-design-*.md 2>/dev/null
+   ls -t "$GSTACK_STATE_ROOT"/projects/$SLUG/*-design-*.md 2>/dev/null
    ```
    If design docs exist, list them: "Prior designs for this project: [titles + dates]"
 
 {{LEARNINGS_SEARCH}}
 
-5. **Ask: what's your goal with this?** This is a real question, not a formality. The answer determines everything about how the session runs.
+5. **Ask: what's your goal with this?** This is a real question, not a formality. The answer determines everything about how the session runs. Unless the user already chose a mode, ask it even when the request suggests one, recommending that mode. Read the chosen mode's section before its first question.
 
    Via AskUserQuestion, ask:
 
@@ -135,6 +135,7 @@ Use this mode when the user is building a startup or doing intrapreneurship.
 ## Phase 2B: Builder Mode — Design Partner
 
 Use this mode when the user is building for fun, learning, hacking on open source, at a hackathon, or doing research.
+The section below applies to every builder-mode reply, including a direct request for ideas or unlocks that skips the generative questions.
 
 {{SECTION:phase-2b-builder-brainstorm}}
 
@@ -148,8 +149,9 @@ After the user states the problem (first question in Phase 2A or 2B), search exi
 
 Extract 3-5 significant keywords from the user's problem statement and grep across design docs:
 ```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 setopt +o nomatch 2>/dev/null || true  # zsh compat
-grep -li "<keyword1>\|<keyword2>\|<keyword3>" ~/.gstack/projects/$SLUG/*-design-*.md 2>/dev/null
+grep -li "<keyword1>\|<keyword2>\|<keyword3>" "$GSTACK_STATE_ROOT"/projects/$SLUG/*-design-*.md 2>/dev/null
 ```
 
 If matches found, read the matching design docs and surface them:
@@ -234,9 +236,9 @@ Use AskUserQuestion to confirm. If the user disagrees with a premise, revise und
 
 ---
 
-## Phase 4: Alternatives Generation (MANDATORY)
+## Phase 4: Alternatives Generation
 
-Produce 2-3 distinct implementation approaches. This is NOT optional.
+Produce 2-3 distinct implementation approaches.
 
 For each approach:
 ```
@@ -297,7 +299,7 @@ Count the signals. You'll use this count in Phase 6 to determine which tier of c
 After counting signals, append a session entry to the builder profile. This is the single
 source of truth for all closing state (tier, resource dedup, journey tracking). The
 `gstack-developer-profile --log-session` binary handles its own directory creation
-and writes via atomic mktemp+mv to `~/.gstack/developer-profile.json`.
+and writes via atomic mktemp+mv to `$GSTACK_STATE_ROOT/developer-profile.json`.
 
 Append one JSON line with these fields (substitute actual values from this session):
 - `date`: current ISO 8601 timestamp
@@ -316,7 +318,7 @@ Append one JSON line with these fields (substitute actual values from this sessi
 
 The session entry is appended to `developer-profile.json`'s `sessions[]` array. A second
 session entry with `mode: "resources"` is appended via `--log-session` after resource
-selection in Phase 6 Beat 3.5.
+selection in Phase 6 (Founder Resources).
 
 ---
 

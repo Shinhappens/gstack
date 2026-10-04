@@ -204,7 +204,7 @@ The contract is the seam; the bespoke glue collapses onto it. Mapping:
 |-----------------|--------------------|
 | `bin/gstack-gbrain-sync.ts` (`sync`/`reindex-code`/`sources`) | `provider.registerSource` / `provider.refresh` |
 | `lib/gstack-decision-semantic.ts` `semanticRecall` | `provider.search` (scoped) → same degrade-to-null |
-| `bin/gstack-brain-context-load.ts` (`query`/`list_pages`) | `provider.search` / `provider.status` |
+| `bin/gstack-brain-context-load.ts` (`query`/`list`) | `provider.search` / `provider.status` |
 | `bin/gstack-memory-ingest.ts` (`import`, put) | `provider.add` (optional cap; GBrain-only) |
 | `lib/gbrain-sources.ts` (`ensureSourceRegistered`, `probeSource`) | GBrain adapter internals |
 | `lib/gbrain-local-status.ts` | GBrain adapter availability probe (kept, reused) |

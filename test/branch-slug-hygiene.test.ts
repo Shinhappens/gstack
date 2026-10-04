@@ -113,10 +113,13 @@ describe('branch slug hygiene (#2550, #1851)', () => {
       paths: HOST_PATHS.claude,
       preambleTier: 2,
     };
-    const out = generateContextRecovery(ctx);
+    // The probe moved into bin/gstack-context-recovery (#2763); the render is
+    // one literal command, so the branch-form discipline is pinned there.
+    expect(generateContextRecovery(ctx)).toContain('```bash\n~/.claude/skills/gstack/bin/gstack-context-recovery\n```');
+    const out = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-context-recovery'), 'utf-8');
     expect(out).toContain('${BRANCH:-unknown}-reviews.jsonl');
     expect(out).not.toContain('${_BRANCH}-reviews.jsonl');
-    // The gstack-slug eval that defines $BRANCH must render BEFORE the probe.
+    // The gstack-slug eval that defines $BRANCH must run BEFORE the probe.
     const evalIdx = out.indexOf('gstack-slug');
     const probeIdx = out.indexOf('${BRANCH:-unknown}-reviews.jsonl');
     expect(evalIdx).toBeGreaterThan(-1);

@@ -1,6 +1,12 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import {
+  buildHeadedServerEnv,
+  runHeadedSupervisor,
+  SUPERVISOR_GUARD_WINDOW_MS,
+  type HeadedSupervisorDeps,
+} from '../src/cli';
 
 // v1.44 outer supervisor — static-grep invariants.
 //
@@ -11,9 +17,11 @@ import * as path from 'path';
 // unexpected exit, with the same crash-loop guard shape as the v1.44
 // terminal-agent watchdog.
 //
-// Live respawn tests belong in the e2e tier (real Bun.spawn cycles take
-// 3-8s each). These tripwires defend the load-bearing invariants:
-// opt-in by default, signal handlers wired, crash-loop guard, env knobs.
+// The static tripwires below defend the wiring in main(): opt-in by default,
+// signal handlers, env knobs. The behavioral block drives the extracted
+// runHeadedSupervisor loop with injected clock, sleep, and process probes —
+// the respawn path shipped broken (a block-scoped env) because only source
+// text was checked.
 
 const CLI_TS = path.resolve(import.meta.path, '..', '..', 'src', 'cli.ts');
 
@@ -69,6 +77,111 @@ describe('CLI outer supervisor (v1.44+)', () => {
     // broken even though the server is back up.
     const block = sliceBetween(src, 'Supervisor mode:', '// ─── Headed Disconnect');
     expect(block).toContain('spawnTerminalAgent({');
+  });
+});
+
+// A scripted world for runHeadedSupervisor: `alive` decides the PID probe per
+// tick, sleep advances the injected clock, and every side effect is recorded.
+function harness(opts: {
+  alive: (tick: number) => boolean;
+  startServer?: (call: number) => Promise<{ pid: number; port: number }>;
+  spawnTerminalAgent?: () => void;
+  tickMs?: number;
+  exitAfterSleeps?: number;
+}) {
+  let clock = 1_000_000, sleeps = 0, tick = 0, exiting = false, starts = 0;
+  const calls = { startEnv: [] as Record<string, string>[], agents: [] as number[], log: [] as string[], warn: [] as string[], error: [] as string[] };
+  const deps: HeadedSupervisorDeps = {
+    env: buildHeadedServerEnv({ proxyUrl: 'socks5://127.0.0.1:9050', configHash: 'abc123' }),
+    tickMs: opts.tickMs ?? 30_000,
+    backoffMs: [1000, 2000, 4000, 8000, 30000],
+    daemonLog: '/state/browse-daemon.log',
+    readState: () => ({ pid: 4242 }),
+    isProcessAlive: () => opts.alive(tick++),
+    startServer: async (env) => {
+      calls.startEnv.push(env);
+      const call = starts++;
+      return opts.startServer ? opts.startServer(call) : { pid: 5000 + call, port: 34567 };
+    },
+    spawnTerminalAgent: (server) => { calls.agents.push(server.pid); opts.spawnTerminalAgent?.(); },
+    sleep: async (ms) => {
+      clock += ms; sleeps++;
+      if (opts.exitAfterSleeps !== undefined && sleeps >= opts.exitAfterSleeps) exiting = true;
+    },
+    now: () => clock,
+    isExiting: () => exiting,
+    log: (line) => calls.log.push(line),
+    warn: (line) => calls.warn.push(line),
+    error: (line) => calls.error.push(line),
+  };
+  return { deps, calls, stop: () => { exiting = true; } };
+}
+
+describe('runHeadedSupervisor (behavior)', () => {
+  test('a dead server is respawned with exactly the initial connect env, and its terminal agent too', async () => {
+    const h = harness({ alive: (t) => t !== 0, exitAfterSleeps: 4 });
+    expect(await runHeadedSupervisor(h.deps)).toBe('stopped');
+    expect(h.calls.startEnv).toHaveLength(1);
+    expect(h.calls.startEnv[0]).toEqual({
+      BROWSE_HEADED: '1', BROWSE_PORT: '34567', BROWSE_PARENT_PID: '0',
+      BROWSE_PROXY_URL: 'socks5://127.0.0.1:9050', BROWSE_CONFIG_HASH: 'abc123',
+    });
+    expect(h.calls.startEnv[0]).toBe(h.deps.env);
+    expect(h.calls.agents).toEqual([5000]);
+    expect(h.calls.error).toEqual([]);
+    expect(h.calls.log.join('\n')).toContain('server respawned (PID 5000, port 34567)');
+  });
+
+  test('a failed respawn is logged with the daemon log path and counted toward the guard', async () => {
+    const h = harness({ alive: () => false, startServer: async () => { throw new Error('port 34567 busy'); } });
+    expect(await runHeadedSupervisor(h.deps)).toBe('gave_up');
+    const failures = h.calls.error.filter(line => line.includes('server respawn failed'));
+    expect(failures).toHaveLength(5);
+    expect(failures[0]).toBe('[browse] Supervisor: server respawn failed: port 34567 busy. Daemon log: /state/browse-daemon.log');
+  });
+
+  test('five crashes inside the window give up with the cause and the relaunch command', async () => {
+    const h = harness({ alive: () => false });
+    expect(await runHeadedSupervisor(h.deps)).toBe('gave_up');
+    expect(h.calls.startEnv).toHaveLength(5);
+    expect(h.calls.error.at(-1)).toBe(
+      '[browse] Supervisor: 5 server crashes in 300s, giving up. Crash reasons: /state/browse-daemon.log. Relaunch: $B connect --supervise',
+    );
+  });
+
+  test('crashes spread wider than the rolling window never trip the guard', async () => {
+    // One crash per tick with a tick longer than the window: every earlier
+    // respawn is pruned before the guard is checked.
+    const h = harness({ alive: (t) => t >= 12, tickMs: SUPERVISOR_GUARD_WINDOW_MS + 1, exitAfterSleeps: 30 });
+    expect(await runHeadedSupervisor(h.deps)).toBe('stopped');
+    expect(h.calls.startEnv).toHaveLength(12);
+    expect(h.calls.error).toEqual([]);
+  });
+
+  test('a terminal-agent failure after a successful respawn warns and keeps supervising', async () => {
+    const h = harness({ alive: (t) => t !== 0, spawnTerminalAgent: () => { throw new Error('no pty'); }, exitAfterSleeps: 4 });
+    expect(await runHeadedSupervisor(h.deps)).toBe('stopped');
+    expect(h.calls.warn.some(line => line === '[browse] Supervisor: terminal-agent respawn failed: no pty')).toBe(true);
+    expect(h.calls.error).toEqual([]);
+  });
+
+  test('an exit requested during backoff stops without starting a server', async () => {
+    // Sleep 1 is the tick, sleep 2 the backoff; exiting flips during backoff.
+    const h = harness({ alive: () => false, exitAfterSleeps: 2 });
+    expect(await runHeadedSupervisor(h.deps)).toBe('stopped');
+    expect(h.calls.startEnv).toEqual([]);
+  });
+
+  test('a live server is left alone', async () => {
+    const h = harness({ alive: () => true, exitAfterSleeps: 5 });
+    expect(await runHeadedSupervisor(h.deps)).toBe('stopped');
+    expect(h.calls.startEnv).toEqual([]);
+  });
+});
+
+describe('buildHeadedServerEnv', () => {
+  test('omits proxy and config hash when this invocation has none', () => {
+    expect(buildHeadedServerEnv({ proxyUrl: null, configHash: '' })).toEqual({ BROWSE_HEADED: '1', BROWSE_PORT: '34567', BROWSE_PARENT_PID: '0' });
   });
 });
 

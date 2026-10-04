@@ -108,9 +108,11 @@ describe("generateVariant Retry-After handling", () => {
     expect(result.success).toBe(true);
     expect(calls.length).toBe(2);
     const gap = calls[1].ts - calls[0].ts;
-    // Falls through to existing 2s exponential leading delay
+    // Falls through to existing 2s exponential leading delay. The ceiling
+    // only has to reject the next backoff step (4s) or a double wait; timers
+    // on a loaded scheduler fire over a second late.
     expect(gap).toBeGreaterThanOrEqual(1800);
-    expect(gap).toBeLessThan(3000);
+    expect(gap).toBeLessThan(3900);
   });
 
   test("no Retry-After header: falls through to exponential", async () => {
@@ -125,7 +127,7 @@ describe("generateVariant Retry-After handling", () => {
     expect(calls.length).toBe(2);
     const gap = calls[1].ts - calls[0].ts;
     expect(gap).toBeGreaterThanOrEqual(1800);
-    expect(gap).toBeLessThan(3000);
+    expect(gap).toBeLessThan(3900);
   });
 
   test("Retry-After: 0 retries immediately, skips leading exponential", async () => {

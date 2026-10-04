@@ -64,6 +64,19 @@ describe('e2e-gate: env matrix (read at call time)', () => {
     expect(describeE2ETier('periodic')).toBe(describe.skip);
   });
 
+  test('marathon runs only in its own lane; gate and periodic lanes skip it', () => {
+    process.env.EVALS = '1';
+    for (const lane of ['gate', 'periodic']) {
+      process.env.EVALS_TIER = lane;
+      expect(e2eTierEnabled('marathon')).toBe(false);
+      expect(describeE2ETier('marathon')).toBe(describe.skip);
+    }
+    process.env.EVALS_TIER = 'marathon';
+    expect(describeE2ETier('marathon')).toBe(describe);
+    expect(describeE2ETier('gate')).toBe(describe.skip);
+    expect(describeE2ETier('periodic')).toBe(describe.skip);
+  });
+
   test('EVALS=1 + EVALS_TIER unset → skip both tiers (the tierless test:evals / eval:bg:all trap)', () => {
     process.env.EVALS = '1';
     expect(e2eTierEnabled('gate')).toBe(false);

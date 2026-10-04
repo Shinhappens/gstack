@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { spawnSync } from 'child_process';
+import { slugCacheFile } from '../lib/bin-context';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const HOOK = path.join(ROOT, 'hosts', 'claude', 'hooks', 'question-preference-hook');
@@ -161,6 +162,11 @@ describe('memory injection', () => {
       },
     ]);
     // Set a never-ask preference and check both deny AND memory are surfaced.
+    // The hook resolves the project bucket from gstack-slug's versioned
+    // slug-cache entry (#2901), which the skill preamble writes first.
+    const cacheFile = slugCacheFile(stateRoot, fixtureCwd);
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, `v2:${cwdSlug}`);
     fs.mkdirSync(path.join(stateRoot, 'projects', cwdSlug), { recursive: true });
     fs.writeFileSync(
       path.join(stateRoot, 'projects', cwdSlug, 'question-preferences.json'),

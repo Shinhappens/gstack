@@ -3,8 +3,71 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { generatePlanCompletionAuditReview, generatePlanCompletionAuditShip, generatePlanCompletionGateShip, generatePlanVerificationExec } from '../scripts/resolvers/plan-gates';
+import { HOST_PATHS } from '../scripts/resolvers/types';
 
 const SHIP_DIR = path.join(__dirname, '..', 'ship');
+
+describe('authored ship-only plan verification handoff', () => {
+  const ctx = { skillName: 'ship', tmplPath: 'ship/SKILL.md.tmpl', host: 'claude' as const, paths: HOST_PATHS.claude };
+  test('local execution-only checks remain required in Step 8.1/9 outside implementation counts', () => {
+    const audit = generatePlanCompletionAuditShip(ctx);
+    const extraction = audit.slice(audit.indexOf('### Actionable Item Extraction'), audit.indexOf('### Verification Mode')).replace(/\s+/g, ' ');
+    expect(extraction).toMatch(/execution-only verification/i);
+    expect(extraction).toContain('Step 8.1/9');
+    expect(extraction).toMatch(/outside implementation counts/i);
+    expect(extraction).toMatch(/never DONE from static inspection/);
+    expect(extraction).toMatch(/do not waive those checks/i);
+    expect(fs.readFileSync(path.join(SHIP_DIR, 'sections/plan-completion.md.tmpl'), 'utf8')).toContain('exactly these seven fields');
+    const gate = generatePlanCompletionGateShip(ctx);
+    expect(gate).toContain('Any NOT DONE items');
+    expect(gate).toMatch(/per-item confirmation/i);
+  });
+  test('review-mode extraction retains its existing categories and has no ship-only routing', () => {
+    const audit = generatePlanCompletionAuditReview({ ...ctx, skillName: 'review' });
+    expect(audit).toContain('**Test requirements:**');
+    expect(audit).not.toMatch(/execution-only verification/i);
+    expect(audit).not.toContain('Step 8.1/9');
+    expect(audit).toContain('EXTERNAL-STATE');
+  });
+  test('preparation hands every explicit check to the report-only execution owner before Fix-First', () => {
+    const text = generatePlanVerificationExec(ctx).replace(/\s+/g, ' ');
+    expect(text).toContain('Collect now; execute in Step 9');
+    expect(text).toMatch(/do not invoke an entire QA skill or start probes here/i);
+    for (const heading of ['Verification', 'Test plan', 'Testing', 'How to test', 'Manual testing']) {
+      expect(text).toContain(`\`${heading}\``);
+    }
+    expect(text).toContain('Step 8.2');
+    expect(text).toContain('Handoff to Step 9.2.1');
+    expect(text).toMatch(/before Fix-First/);
+    expect(text).toMatch(/never silently waive/i);
+    expect(text).toMatch(/noninteractive runs return blocked/i);
+    expect(text).toContain('VERIFY_RESULT=pass only if all selected items pass, skipped only if none exist, otherwise fail');
+    expect(text).toContain('`## Verification Results`');
+    expect(text.indexOf('Collect now')).toBeLessThan(text.indexOf('Handoff to Step 9.2.1'));
+    expect(text.indexOf('Handoff to Step 9.2.1')).toBeLessThan(text.indexOf('After execution'));
+  });
+  test('the authored parent validates all seven fields and settles failed children before fallback', () => {
+    const audit = fs.readFileSync(path.join(SHIP_DIR, 'sections/plan-completion.md.tmpl'), 'utf8');
+    const parent = audit.slice(audit.indexOf('**Parent processing:**')).replace(/\s+/g, ' ');
+    expect(parent).toMatch(/valid LAST-line JSON, use the audit-failure fallback/i);
+    expect(parent).toContain('exactly the seven declared fields');
+    expect(parent).toContain('classification sum equals `total_items`');
+    expect(parent).toContain('a string `summary`');
+    expect(parent).toMatch(/missing, extra or invalid fields fail/i);
+    expect(parent).toMatch(/no-plan\/no-actionable reports retain zero counts/i);
+    expect(parent).toContain('~10 minutes');
+    expect(parent).toMatch(/stop any live child and confirm it stopped before an inline audit/i);
+    expect(parent).toMatch(/never race a late result/i);
+    expect(parent).toMatch(/if that also fails, AskUserQuestion/i);
+    expect(parent).toContain('Stop and fix the audit (recommended/default)');
+    const contract = audit.split('\n').find(line => line.startsWith('{"total_items":N,'))!;
+    expect(Object.keys(JSON.parse(contract.replace(/:N([,}])/g, ':0$1'))).sort())
+      .toEqual(['total_items', 'done', 'changed', 'partial', 'not_done', 'unverifiable', 'summary'].sort());
+    expect(generatePlanCompletionGateShip(ctx)).toContain('Only PARTIAL items (no NOT DONE, no UNVERIFIABLE)');
+    expect(generatePlanCompletionGateShip(ctx)).toMatch(/not blocking/i);
+  });
+});
 
 // Carved (v2 plan T9): the Plan Completion gate moved into sections/plan-completion.md.
 // Read the skeleton + sections union so these invariants follow the content.
@@ -19,13 +82,13 @@ function readShipUnion(): string {
   return t;
 }
 
-describe('ship/SKILL.md — Plan Completion gate invariants (VAS-449 remediation)', () => {
+describe('ship/SKILL.md — Plan Completion gate invariants', () => {
   const skill = readShipUnion();
 
   test('Path concreteness rule: filesystem-pathed items must be test -f checked', () => {
     expect(skill).toContain('**Path concreteness rule.**');
     expect(skill).toMatch(/concrete filesystem path/);
-    expect(skill).toMatch(/MUST be classified DONE or NOT DONE based on `\[ -f/);
+    expect(skill).toMatch(/classified DONE or NOT DONE based on `\[ -f/);
   });
 
   test('Validator detection: project package.json validate-* scripts are auto-run', () => {
@@ -35,25 +98,36 @@ describe('ship/SKILL.md — Plan Completion gate invariants (VAS-449 remediation
   });
 
   test('Per-item UNVERIFIABLE confirmation: blanket-confirm is forbidden', () => {
-    expect(skill).toContain('**Per-item confirmation is mandatory.**');
-    expect(skill).toMatch(/Do NOT use a single AskUserQuestion to blanket-confirm/);
-    expect(skill).toMatch(/VAS-449/);
+    expect(skill).toMatch(/per-item confirmation/i);
+    expect(skill).toMatch(/do not use a single AskUserQuestion to blanket-confirm/i);
   });
 
   test('Subagent failure: fail-closed, not silent fail-open', () => {
     expect(skill).not.toMatch(/Never block \/ship on subagent failure\.\s*$/m);
-    expect(skill).toMatch(/Silent fail-open is the failure shape that VAS-449 surfaced/);
+    // The audit-failure fallback still forbids a silent fail-open (meaning, not the old incident ID).
+    const fallback = skill.slice(skill.indexOf('**Audit-failure fallback:**'), skill.indexOf('**Audit-failure fallback:**') + 800);
+    expect(fallback).toMatch(/fail[- ]open/i);
     expect(skill).toMatch(/Stop and fix the audit/);
   });
 
   test('parent rejects audit errors and malformed counts instead of treating them as no plan', () => {
     const audit = fs.readFileSync(path.join(SHIP_DIR, 'sections/plan-completion.md'), 'utf8');
-    const parent = audit.slice(audit.indexOf('**Parent processing:**'), audit.indexOf('**If the subagent fails'));
-    expect(parent).toContain('non-null `error`');
-    expect(parent).toContain('nonnegative integer');
-    expect(parent).toContain('count sum');
-    expect(parent).toContain('audit-failure fallback');
-    expect(parent).toContain('Valid no-plan/no-actionable-item reports retain zero counts');
+    expect(audit.indexOf('**Parent processing:**')).toBeGreaterThan(-1);
+    expect(audit.indexOf('**Parent processing:**')).toBeLessThan(audit.indexOf('**Audit-failure fallback:**'));
+    const parent = audit.slice(audit.indexOf('**Parent processing:**'), audit.indexOf('**Audit-failure fallback:**')).replace(/\s+/g, ' ');
+    expect(parent).toContain('seven declared fields');
+    expect(parent).toMatch(/audit-failure fallback/i);
+  });
+
+  test('successful plan audits use the declared seven-field contract without an error field', () => {
+    const audit = fs.readFileSync(path.join(SHIP_DIR, 'sections/plan-completion.md'), 'utf8');
+    const line = audit.split('\n').find(line => line.startsWith('{"total_items":N,'));
+    expect(line).toBeDefined();
+    const contract = JSON.parse(line!.replace(/:N([,}])/g, ':0$1'));
+    expect(Object.keys(contract).sort()).toEqual(['total_items', 'done', 'changed', 'partial', 'not_done', 'unverifiable', 'summary'].sort());
+    expect(contract).not.toHaveProperty('error');
+    expect(audit).toContain('exactly these seven fields on the LAST LINE');
+    expect(audit).not.toContain('A non-null `error`');
   });
 
   test('CONTENT-SHAPE dispatch invokes validator before falling back to UNVERIFIABLE', () => {
@@ -69,7 +143,7 @@ describe('ship/SKILL.md — Plan Completion gate invariants (VAS-449 remediation
     expect(todos).toMatch(/Step 8[^\n]+P1[^\n]+plan/);
     expect(todos).toMatch(/Step 5[^\n]+P0[^\n]+deduplicate/);
     expect(todos.indexOf('Add approved deferrals')).toBeLessThan(todos.indexOf('Detect completed TODOs'));
-    expect(todos).toMatch(/unpersisted[^\n]+Step 19/);
+    expect(todos.replace(/\s+/g, ' ')).toMatch(/retain unsaved follow-ups in Step 19's PR summary/i);
   });
 
   test('CHANGELOG uses the normal workflow without checkpoint context or squash prerequisites', () => {
@@ -81,15 +155,16 @@ describe('ship/SKILL.md — Plan Completion gate invariants (VAS-449 remediation
   test('live evidence recovery distinguishes bookkeeping failure from stale inputs', () => {
     const entry = fs.readFileSync(path.join(SHIP_DIR, 'SKILL.md'), 'utf8');
     const gate = entry.slice(entry.indexOf('## Step 16:'), entry.indexOf('## Step 17:'));
-    expect(gate).toContain('Content, command or age mismatch, or no passing live evidence');
-    expect(gate).toContain('Ledger read/write failure only');
-    expect(gate).toContain('unchanged final content');
-    expect(gate).toMatch(/exact command and permitted age, cite its exit,\s+timestamp and log/);
-    expect(gate).toMatch(/never\s+ledger FRESH/);
-    expect(gate).toMatch(/Do not rerun green suites solely because the ledger cannot save\s+or read its record/);
-    expect(gate).toContain('required live RUN must pass');
-    expect(gate).toMatch(/TODO edits and generated tests are content\s+changes, not ledger-only bookkeeping/);
-    expect(gate).toContain('If unchanged content cannot be confirmed, STOP');
+    const text = gate.replace(/\s+/g, ' ');
+    expect(text).toContain('STALE/MISSING');
+    expect(text).toContain('| Only receipt storage/readback failed |');
+    expect(text).toContain('**ledger unavailable**, never FRESH');
+    const storage = text.slice(text.indexOf('| Only receipt storage/readback failed |')).split('|')[2];
+    expect(storage).not.toContain('gstack-evidence run');
+    expect(storage).toMatch(/without that proof, use STALE\/MISSING/i);
+    expect(text).toMatch(/\*\*New, changed or unwaived test failure:\*\* stop publication\. Run Steps 5–15/i);
+    expect(text).toMatch(/reuse waivers only for the same verified pre-existing failures/i);
+    expect(text).toMatch(/make evidence STALE/);
   });
 
   test('ship contract precedes base detection and fresh remote facts precede distribution decisions', () => {
@@ -97,18 +172,17 @@ describe('ship/SKILL.md — Plan Completion gate invariants (VAS-449 remediation
     expect(entry.indexOf('# Ship:')).toBeLessThan(entry.indexOf('## Step 0:'));
     const preflight = entry.slice(entry.indexOf('## Step 1:'), entry.indexOf('## Step 2:'));
     expect(preflight).toContain('git fetch origin <base>');
-    expect(preflight).toMatch(/fetch fails[^\n]+STOP/);
+    expect(preflight).toMatch(/fetch fails[^\n]+\bstop\b/i);
     expect(entry).not.toContain('auto-generate and commit, or flag');
-    expect(entry).toContain('commit with Step 15');
+    expect(entry).toContain('Step 15 commits those tests');
   });
 
   test('bisectable commits proceed directly to verification without rewriting existing history', () => {
     const entry = fs.readFileSync(path.join(SHIP_DIR, 'SKILL.md'), 'utf8');
     const commit = entry.slice(entry.indexOf('## Step 15:'), entry.indexOf('## Step 16:'));
-    expect(commit).toContain('Create small, logical commits for `git bisect`');
-    expect(commit).toContain('If all changes are already committed, continue to Step 16');
-    expect(commit).toContain('never create an empty commit');
-    expect(commit).toContain('Each commit must work independently');
+    expect(commit).toMatch(/bisectable commits/i);
+    expect(commit).toContain('continue to Step 16');
+    expect(commit).toMatch(/never create an empty commit/i);
     expect(commit).not.toMatch(/checkpoint|WIP|squash|git rebase|git reset/);
     expect(entry).not.toMatch(/Step 15\.[012]/);
   });
@@ -116,11 +190,15 @@ describe('ship/SKILL.md — Plan Completion gate invariants (VAS-449 remediation
   test('a rejected push stops publication and routes changed content back through verification', () => {
     const entry = fs.readFileSync(path.join(SHIP_DIR, 'SKILL.md'), 'utf8');
     const push = entry.slice(entry.indexOf('## Step 17:'), entry.indexOf('## Step 20:'));
-    expect(push).toMatch(/push fails[^\n]+STOP/);
-    expect(push).toContain('Step 5');
-    expect(push).toContain('Step 16');
+    const recovery = push.replace(/\s+/g, ' ');
+    expect(push).toMatch(/push fails[^\n]+\bstop\b/i);
+    expect(recovery).toContain('**Non-fast-forward push:**');
+    expect(recovery).toContain('Run Steps 5–16 before returning to Step 17');
+    expect(recovery).toMatch(/never rewrite history/i);
+    expect(recovery).toContain('**Authentication, hook or network failure:**');
+    expect(recovery).toMatch(/repeat Step 16 even if content is unchanged/i);
     expect(push).toMatch(/never force.push/i);
-    expect(push).toContain('Only a successful push');
+    expect(push).toMatch(/only a successful push/i);
   });
 });
 
@@ -130,7 +208,7 @@ test('push idempotency requires the live remote SHA and fails closed on transpor
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
     GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' };
   const git = (...args: string[]) => {
-    const r = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: 5000 });
+    const r = spawnSync('git', args, { cwd, env, encoding: 'utf8', timeout: 30_000 });
     if (r.status !== 0) throw new Error(r.stderr || String(r.error));
   };
   try {
@@ -142,7 +220,11 @@ test('push idempotency requires the live remote SHA and fails closed on transpor
     const source = fs.readFileSync(path.join(SHIP_DIR, 'SKILL.md.tmpl'), 'utf8');
     const block = source.slice(source.indexOf('**Idempotency check:** Check if the branch'))
       .match(/```bash\n([\s\S]*?)\n```/)![1].replaceAll('<branch-name>', 'feature');
-    const inspect = () => spawnSync('bash', ['-c', block], { cwd, env, encoding: 'utf8', timeout: 5000 });
+    const inspect = () => {
+      const r = spawnSync('bash', ['-c', block], { cwd, env, encoding: 'utf8', timeout: 30_000 });
+      if (r.error) throw new Error(`idempotency check did not run: ${r.error.message}; stderr: ${r.stderr}`);
+      return r;
+    };
     expect(inspect().stdout).toContain('PUSH_NEEDED');
     git('push', '-u', 'origin', 'feature');
     expect(inspect().stdout).toContain('ALREADY_PUSHED');
@@ -155,4 +237,4 @@ test('push idempotency requires the live remote SHA and fails closed on transpor
     expect(unavailable.stdout).not.toContain('ALREADY_PUSHED');
     expect(unavailable.stdout).toContain('BLOCKED');
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
-});
+}, 120_000);

@@ -55,7 +55,7 @@ Run whichever commands are relevant based on the detected platform. Build the re
 ║  ├─ Staging workflow:   {file or "not found"}              ║
 ║  └─ Preview deploys:    {detected or "not detected"}       ║
 ║  WHAT WILL HAPPEN                                          ║
-║  1. Wait for required CI if pending                       ║
+║  1. Wait for all CI on this head (gstack-ci-gate)         ║
 ║  2. Readiness checks and explicit merge approval          ║
 ║  3. Merge PR via {merge method}                            ║
 ║  4. {Wait for deploy workflow / Wait 60s / Skip}           ║
@@ -134,11 +134,12 @@ and still refresh deployment facts before each merge approval."
 
 Save the deploy config fingerprint so we can detect future changes:
 ```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 {{SLUG_EVAL}}
-mkdir -p ~/.gstack/projects/$SLUG
+mkdir -p "$GSTACK_STATE_ROOT"/projects/$SLUG
 CURRENT_HASH=$(sed -n '/## Deploy Configuration/,/^## /p' CLAUDE.md 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
 WORKFLOW_HASH=$(find .github/workflows -maxdepth 1 \( -name '*deploy*' -o -name '*cd*' \) 2>/dev/null | xargs cat 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
-echo "${CURRENT_HASH}-${WORKFLOW_HASH}" > ~/.gstack/projects/$SLUG/land-deploy-confirmed
+echo "${CURRENT_HASH}-${WORKFLOW_HASH}" > "$GSTACK_STATE_ROOT"/projects/$SLUG/land-deploy-confirmed
 ```
 Continue to Step 2.
 

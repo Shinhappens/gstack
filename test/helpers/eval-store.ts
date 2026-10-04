@@ -76,6 +76,18 @@ export interface EvalTestEntry {
    *  its body again and re-records under the same name. Set by addTest. */
   attempt?: number;
 
+  // Trial identity (eval reliability policy). Stamped by addTest from the
+  // TRIAL_ENV variables the paid runner sets on an isolated trial shard.
+  /** Registry id (E2E_TIERS / LLM_JUDGE_TOUCHFILES key) this record belongs to. */
+  case_id?: string;
+  kind?: EvalCaseKind;
+  /** 1-based trial index within the case's panel. */
+  trial?: number;
+  panel?: PanelShape;
+  /** Why a failed record failed; 'contract' comes only from expectContract. */
+  failure_class?: TrialFailureClass;
+  policy_version?: number;
+
   // E2E
   transcript?: any[];
   prompt?: string;
@@ -129,6 +141,329 @@ export function evalEntryOutcome(entry: unknown): 'passed' | 'failed' | 'manual-
   const result = entry as EvalTestEntry;
   if (result.execution !== undefined && result.execution !== 'executed' && result.execution !== 'reused') return 'failed';
   return result.passed === true ? 'passed' : 'failed';
+}
+
+// --- Trials and panel verdicts ---
+//
+// Paid evals never retry. Each case's kind (E2E_KINDS) fixes its trials before
+// the run; a panel verdict is computed once, by panelVerdict(), from exactly
+// panel.n trial records of one run attempt. The report, collector-outcomes,
+// the PR comment and pass-rates all read that one function.
+
+export type EvalCaseKind = 'rule' | 'behavior' | 'judge';
+/** assertion: an ordinary failed expectation. contract: expectContract() fired
+ *  (fails the panel at any count). timeout: the case budget ran out.
+ *  infra: API/CLI/runner failure before the model could be graded. */
+export type TrialFailureClass = 'assertion' | 'contract' | 'timeout' | 'infra';
+export type TrialOutcome = 'passed' | 'failed' | 'skipped';
+export interface PanelShape { n: number; k: number }
+
+/** Environment the paid runner sets on an isolated trial shard. */
+export const TRIAL_ENV = {
+  caseId: 'GSTACK_EVAL_CASE_ID',
+  kind: 'GSTACK_EVAL_KIND',
+  trial: 'GSTACK_EVAL_TRIAL',
+  panelN: 'GSTACK_EVAL_PANEL_N',
+  panelK: 'GSTACK_EVAL_PANEL_K',
+  policyVersion: 'GSTACK_EVAL_POLICY_VERSION',
+} as const;
+
+/** Sidecar every expectContract() failure appends to (in GSTACK_EVAL_DIR), so a
+ *  contract veto survives a test that throws before recording its entry. */
+export const CONTRACT_VIOLATIONS_FILE = 'contract-violations.jsonl';
+
+export interface TrialContext {
+  case_id: string;
+  kind: EvalCaseKind;
+  trial: number;
+  panel: PanelShape;
+  policy_version: number;
+}
+
+const EVAL_KINDS: readonly EvalCaseKind[] = ['rule', 'behavior', 'judge'];
+const FAILURE_CLASSES: readonly TrialFailureClass[] = ['assertion', 'contract', 'timeout', 'infra'];
+
+function positiveInt(raw: string | undefined): number | null {
+  if (raw === undefined || !/^[1-9][0-9]*$/.test(raw)) return null;
+  return Number(raw);
+}
+
+/** Trial context of this process, or null outside an isolated trial shard.
+ *  A partial or malformed context throws: a mislabeled trial is fail-open. */
+export function trialContextFromEnv(env: NodeJS.ProcessEnv = process.env): TrialContext | null {
+  const caseId = env[TRIAL_ENV.caseId];
+  if (!caseId) return null;
+  const kind = env[TRIAL_ENV.kind] as EvalCaseKind | undefined;
+  const trial = positiveInt(env[TRIAL_ENV.trial]);
+  const n = positiveInt(env[TRIAL_ENV.panelN]);
+  const k = positiveInt(env[TRIAL_ENV.panelK]);
+  const policy = positiveInt(env[TRIAL_ENV.policyVersion]);
+  if (!kind || !EVAL_KINDS.includes(kind) || trial === null || n === null || k === null || policy === null || k > n || trial > n) {
+    throw new Error(`Malformed trial context for ${caseId}: ${Object.values(TRIAL_ENV).map((name) => `${name}=${env[name] ?? ''}`).join(' ')}`);
+  }
+  return { case_id: caseId, kind, trial, panel: { n, k }, policy_version: policy };
+}
+
+/** Failure class of a failed record: an explicit class wins, then the exit reason. */
+export function failureClassOf(entry: Pick<EvalTestEntry, 'failure_class' | 'exit_reason'>): TrialFailureClass {
+  if (entry.failure_class && FAILURE_CLASSES.includes(entry.failure_class)) return entry.failure_class;
+  return entry.exit_reason === 'timeout' ? 'timeout' : 'assertion';
+}
+
+export class ContractViolation extends Error {
+  constructor(message: string) {
+    super(`CONTRACT: ${message}`);
+    this.name = 'ContractViolation';
+  }
+}
+
+/**
+ * Assert a contract: an outcome the product must meet on every run. On failure
+ * it records failure_class 'contract' before throwing, both on the collector
+ * entry named `record.name` (now or when the test records it) and in the
+ * GSTACK_EVAL_DIR sidecar, so panelVerdict() fails the panel even at 2 of 3.
+ */
+export function expectContract(
+  condition: unknown,
+  message: string,
+  record?: { collector: EvalCollector | null; name: string },
+): asserts condition {
+  if (condition) return;
+  record?.collector?.markContractViolation(record.name, message);
+  const evalDir = process.env.GSTACK_EVAL_DIR;
+  if (evalDir) {
+    const context = trialContextFromEnv();
+    fs.mkdirSync(evalDir, { recursive: true });
+    fs.appendFileSync(path.join(evalDir, CONTRACT_VIOLATIONS_FILE), JSON.stringify({
+      case_id: context?.case_id ?? record?.name ?? null,
+      name: record?.name ?? null,
+      trial: context?.trial ?? null,
+      message,
+      at: new Date().toISOString(),
+    }) + '\n');
+  }
+  throw new ContractViolation(message);
+}
+
+export interface PanelTrial {
+  trial: number;
+  outcome: TrialOutcome;
+  /** Required meaning for a failed trial; absent reads as 'assertion'. */
+  failure_class?: TrialFailureClass;
+  /** CI run attempt (github.run_attempt); absent means 1. */
+  attempt?: number;
+  exit_reason?: string;
+  error?: string;
+  execution?: 'executed' | 'reused';
+}
+
+export interface PanelVerdictInput {
+  case: string;
+  kind: EvalCaseKind;
+  panel: PanelShape;
+  trials: readonly PanelTrial[];
+  quarantined?: boolean;
+}
+
+export type PanelStatus = 'PASS' | 'FAIL' | 'INCOMPLETE' | 'SKIPPED';
+
+export interface PanelVerdict {
+  case: string;
+  kind: EvalCaseKind;
+  panel: PanelShape;
+  attempt: number;
+  quarantined: boolean;
+  status: PanelStatus;
+  passed: number;
+  failed: number;
+  /** A failed trial carried failure_class 'contract'. */
+  contract: boolean;
+  /** PASS with at least one failed trial: shown as `PASS k/n`, never clean. */
+  split: boolean;
+  /** Whether this verdict makes the lane red. */
+  failsLane: boolean;
+  /** Whether it counts as passing coverage (never for quarantined or skipped). */
+  coverage: boolean;
+  /** Machine classification of a lane-failing verdict: INCOMPLETE (missing or
+   *  malformed trial records), INFRA (every failed trial is infra-class), or
+   *  VERDICT (a real red). Null when the verdict does not fail the lane. */
+  redClass: 'INCOMPLETE' | 'INFRA' | 'VERDICT' | null;
+  /** One glyph per trial index: ✓ pass, ✗ fail, – skipped, · missing. */
+  marks: string;
+  reason: string;
+  trials: PanelTrial[];
+}
+
+/**
+ * The single verdict function. `rule`/`judge` cases run panel {1,1}; `behavior`
+ * cases run EVAL_POLICY.panel; a quarantined case runs a full panel whose k
+ * keeps its kind's meaning (k = n for rule). Verdict: INCOMPLETE unless
+ * exactly one record per trial index 1..n; SKIPPED when every trial skipped;
+ * FAIL on any contract trial; otherwise PASS iff passed >= k. A quarantined
+ * FAIL fails the lane only on a hard break (0 of n) or a contract violation.
+ */
+export function panelVerdict(input: PanelVerdictInput): PanelVerdict {
+  const { n, k } = input.panel;
+  if (!Number.isInteger(n) || !Number.isInteger(k) || n < 1 || k < 1 || k > n) {
+    throw new Error(`${input.case}: invalid panel {n:${n}, k:${k}}`);
+  }
+  if (!EVAL_KINDS.includes(input.kind)) throw new Error(`${input.case}: unknown kind ${String(input.kind)}`);
+  const attempts = new Set(input.trials.map((t) => t.attempt ?? 1));
+  if (attempts.size > 1) {
+    throw new Error(`${input.case}: trials from run attempts ${[...attempts].join(', ')}; compute one verdict per attempt`);
+  }
+  const attempt = [...attempts][0] ?? 1;
+  const quarantined = input.quarantined === true;
+  const trials = [...input.trials].sort((a, b) => a.trial - b.trial);
+  const byIndex = new Map<number, PanelTrial>();
+  const problems: string[] = [];
+  for (const t of trials) {
+    if (!Number.isInteger(t.trial) || t.trial < 1 || t.trial > n) problems.push(`unexpected trial t${t.trial}`);
+    else if (byIndex.has(t.trial)) problems.push(`duplicate trial t${t.trial}`);
+    else if (t.outcome !== 'passed' && t.outcome !== 'failed' && t.outcome !== 'skipped') problems.push(`t${t.trial} has outcome ${String(t.outcome)}`);
+    else byIndex.set(t.trial, t);
+  }
+  for (let i = 1; i <= n; i++) if (!trials.some((t) => t.trial === i)) problems.push(`missing trial t${i}`);
+  const marks = Array.from({ length: n }, (_, i) => {
+    const t = byIndex.get(i + 1);
+    return !t ? '·' : t.outcome === 'passed' ? '✓' : t.outcome === 'failed' ? '✗' : '–';
+  }).join('');
+  const passed = [...byIndex.values()].filter((t) => t.outcome === 'passed').length;
+  const failedTrials = [...byIndex.values()].filter((t) => t.outcome === 'failed');
+  const skipped = [...byIndex.values()].filter((t) => t.outcome === 'skipped').length;
+  const contract = failedTrials.some((t) => failureClassOf(t) === 'contract');
+  const base = { case: input.case, kind: input.kind, panel: { n, k }, attempt, quarantined, passed, failed: failedTrials.length, contract, marks, trials };
+
+  if (problems.length === 0 && skipped === n) {
+    return { ...base, status: 'SKIPPED', split: false, failsLane: false, coverage: false, redClass: null, reason: 'every trial skipped (no verdict credit)' };
+  }
+  if (problems.length === 0 && skipped > 0) problems.push(`${skipped} of ${n} trials skipped`);
+  if (problems.length > 0) {
+    return { ...base, status: 'INCOMPLETE', split: false, failsLane: true, coverage: false, redClass: 'INCOMPLETE', reason: problems.join('; ') };
+  }
+  if (!contract && passed >= k) {
+    const split = failedTrials.length > 0;
+    return {
+      ...base, status: 'PASS', split, failsLane: false, coverage: !quarantined, redClass: null,
+      reason: split ? `PASS ${passed}/${n}` : `${passed}/${n} passed`,
+    };
+  }
+  const hardBreak = passed === 0;
+  const failsLane = !quarantined || contract || hardBreak;
+  const allInfra = !contract && failedTrials.length > 0 && failedTrials.every((t) => failureClassOf(t) === 'infra');
+  const why = contract ? 'contract violation' : `${passed}/${n} passed, needs ${k}`;
+  return {
+    ...base, status: 'FAIL', split: false, failsLane, coverage: false,
+    redClass: failsLane ? (allInfra ? 'INFRA' : 'VERDICT') : null,
+    reason: !quarantined ? why
+      : contract ? `${why}; quarantine never excuses a contract`
+        : hardBreak ? `${why}; quarantined hard break`
+          : `${why}; quarantined, does not fail the lane`,
+  };
+}
+
+// --- trial-outcomes JSONL (one line per trial; pass-rate history input) ---
+
+export const TRIAL_OUTCOME_SCHEMA = 'gstack-trial-outcome/v1';
+export const TRIAL_OUTCOMES_FILE = 'trial-outcomes.jsonl';
+/** Cap on a stored `error` line (sanitized first line of the failure). */
+export const TRIAL_ERROR_MAX = 300;
+
+export interface TrialOutcomeRecord {
+  schema: typeof TRIAL_OUTCOME_SCHEMA;
+  /** Registry id. */
+  case: string;
+  file: string;
+  tier: string;
+  kind: EvalCaseKind;
+  trial: number;
+  panel: PanelShape;
+  /** CI run attempt (github.run_attempt); 1 locally and for pre-policy backfill. */
+  attempt: number;
+  outcome: TrialOutcome;
+  /** Present exactly when outcome is 'failed'. */
+  failure_class?: TrialFailureClass;
+  exit_reason?: string;
+  error?: string;
+  duration_ms: number;
+  cost_usd: number;
+  model?: string;
+  cli_version?: string;
+  /** Reuse input key of the trial's shard, when known. */
+  input_identity?: string;
+  /** EVAL_POLICY.version; 0 marks pre-policy backfill. */
+  policy_version: number;
+  quarantined: boolean;
+  execution: 'executed' | 'reused';
+  /** shard: isolated trial shard status. junit: a rule file shard's per-test
+   *  JUnit outcome. backfill: imported pre-policy artifact record. */
+  source: 'shard' | 'junit' | 'backfill';
+  run_id?: string;
+  sha?: string;
+  lane?: string;
+  recorded_at?: string;
+  /** History series key: a hash of the case's own touchfiles (GLOBAL_TOUCHFILES excluded), stamped by the report job. */
+  series_identity?: string;
+}
+
+/** First line of free text, stripped of @-mentions and control characters, capped. */
+export function sanitizeTrialError(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const first = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
+  if (!first) return undefined;
+  // eslint-disable-next-line no-control-regex
+  const clean = first.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/`/g, "'").replace(/@(?=[A-Za-z0-9_-])/g, '@\u200b');
+  return clean.length > TRIAL_ERROR_MAX ? `${clean.slice(0, TRIAL_ERROR_MAX - 1)}…` : clean;
+}
+
+function trialRecordProblems(r: any): string[] {
+  const problems: string[] = [];
+  if (!r || typeof r !== 'object' || Array.isArray(r)) return ['not an object'];
+  if (r.schema !== TRIAL_OUTCOME_SCHEMA) problems.push(`schema ${String(r.schema)}`);
+  for (const key of ['case', 'file', 'tier'] as const) if (typeof r[key] !== 'string' || r[key].length === 0) problems.push(`${key} missing`);
+  if (!EVAL_KINDS.includes(r.kind)) problems.push(`kind ${String(r.kind)}`);
+  const n = r.panel?.n, k = r.panel?.k;
+  if (!Number.isInteger(n) || !Number.isInteger(k) || n < 1 || k < 1 || k > n) problems.push('panel invalid');
+  if (!Number.isInteger(r.trial) || r.trial < 1 || (Number.isInteger(n) && r.trial > n)) problems.push('trial invalid');
+  if (!Number.isInteger(r.attempt) || r.attempt < 1) problems.push('attempt invalid');
+  if (!['passed', 'failed', 'skipped'].includes(r.outcome)) problems.push(`outcome ${String(r.outcome)}`);
+  if (r.outcome === 'failed' && !FAILURE_CLASSES.includes(r.failure_class)) problems.push('failed without failure_class');
+  if (r.outcome !== 'failed' && r.failure_class !== undefined) problems.push('failure_class on a non-failed trial');
+  if (typeof r.duration_ms !== 'number' || !Number.isFinite(r.duration_ms) || r.duration_ms < 0) problems.push('duration_ms invalid');
+  if (typeof r.cost_usd !== 'number' || !Number.isFinite(r.cost_usd) || r.cost_usd < 0) problems.push('cost_usd invalid');
+  if (!Number.isInteger(r.policy_version) || r.policy_version < 0) problems.push('policy_version invalid');
+  if (typeof r.quarantined !== 'boolean') problems.push('quarantined invalid');
+  if (r.execution !== 'executed' && r.execution !== 'reused') problems.push('execution invalid');
+  if (!['shard', 'junit', 'backfill'].includes(r.source)) problems.push('source invalid');
+  if (r.error !== undefined && (typeof r.error !== 'string' || r.error.length > TRIAL_ERROR_MAX)) problems.push('error invalid');
+  if (r.series_identity !== undefined && (typeof r.series_identity !== 'string' || !/^[\w.-]{1,64}$/.test(r.series_identity))) problems.push('series_identity invalid');
+  return problems;
+}
+
+/** Serialize records as JSONL; throws on any invalid record (writers fail closed). */
+export function formatTrialOutcomes(records: readonly TrialOutcomeRecord[]): string {
+  return records.map((r) => {
+    const problems = trialRecordProblems(r);
+    if (problems.length > 0) throw new Error(`invalid trial record ${r?.case}~t${r?.trial}: ${problems.join(', ')}`);
+    return JSON.stringify(r);
+  }).join('\n') + (records.length > 0 ? '\n' : '');
+}
+
+/** Parse downloaded JSONL as data only: invalid lines are reported, never guessed. */
+export function parseTrialOutcomes(text: string, opts: { maxBytes?: number } = {}): { records: TrialOutcomeRecord[]; errors: string[] } {
+  const maxBytes = opts.maxBytes ?? 16 * 1024 * 1024;
+  if (Buffer.byteLength(text) > maxBytes) return { records: [], errors: [`trial outcomes exceed ${maxBytes} bytes`] };
+  const records: TrialOutcomeRecord[] = [];
+  const errors: string[] = [];
+  text.split('\n').forEach((line, i) => {
+    if (line.trim() === '') return;
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { errors.push(`line ${i + 1}: not JSON`); return; }
+    const problems = trialRecordProblems(parsed);
+    if (problems.length > 0) errors.push(`line ${i + 1}: ${problems.join(', ')}`);
+    else records.push(parsed as TrialOutcomeRecord);
+  });
+  return { records, errors };
 }
 
 export interface EvalResult {
@@ -887,6 +1222,7 @@ export class EvalCollector {
   private shard: string | null;
   private fileNamespace?: string;
   private createdAt = Date.now();
+  private pendingContract = new Map<string, string>();
 
   constructor(tier: 'e2e' | 'llm-judge', evalDir?: string, fileNamespace?: string) {
     if (fileNamespace !== undefined && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(fileNamespace)) {
@@ -903,7 +1239,29 @@ export class EvalCollector {
     // names are unique by convention). Stamp the 1-based attempt so a
     // pass-on-attempt-2 stays visible forever — the stream hides it.
     const prior = this.tests.filter((t) => t.name === entry.name).length;
-    this.tests.push({ ...entry, attempt: prior + 1 });
+    const context = trialContextFromEnv();
+    const record: EvalTestEntry = { ...(context ?? {}), ...entry, attempt: prior + 1 };
+    const contract = this.pendingContract.get(entry.name);
+    if (contract !== undefined) {
+      this.pendingContract.delete(entry.name);
+      Object.assign(record, { passed: false, failure_class: 'contract', error: record.error ?? contract });
+    }
+    this.tests.push(record);
+    this.savePartial();
+  }
+
+  /** expectContract() hook: mark `name`'s latest record (or its next one) as a
+   *  contract failure. An unmatched mark becomes its own failed record at
+   *  finalize, so the veto is never lost. */
+  markContractViolation(name: string, message: string): void {
+    const existing = this.tests.filter((t) => t.name === name).at(-1);
+    if (!existing) {
+      this.pendingContract.set(name, message);
+      return;
+    }
+    existing.passed = false;
+    existing.failure_class = 'contract';
+    existing.error = existing.error ?? message;
     this.savePartial();
   }
 
@@ -959,6 +1317,14 @@ export class EvalCollector {
   async finalize(): Promise<string> {
     if (this.finalized) return '';
     this.finalized = true;
+    for (const [name, message] of this.pendingContract) {
+      this.tests.push({
+        ...(trialContextFromEnv() ?? {}),
+        name, suite: 'contract', tier: this.tier, passed: false, duration_ms: 0, cost_usd: 0,
+        failure_class: 'contract', error: message, attempt: 1,
+      });
+    }
+    this.pendingContract.clear();
 
     const git = getGitInfo();
     const version = getVersion();

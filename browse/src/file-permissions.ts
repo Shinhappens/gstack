@@ -289,7 +289,8 @@ export function appendSecureFile(
   data: string | NodeJS.ArrayBufferView,
 ): void {
   const existed = fs.existsSync(filePath);
-  fs.appendFileSync(filePath, data, { mode: 0o600 });
+  const payload = typeof data === 'string' ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  fs.appendFileSync(filePath, payload, { mode: 0o600 });
   if (!existed) restrictFilePermissions(filePath);
 }
 
@@ -322,6 +323,14 @@ export function repairBrokenDacl(dirPath: string): void {
   }
 }
 
+function isExistingDirectory(dirPath: string): boolean {
+  try {
+    return fs.statSync(dirPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * `mkdir -p` with owner-only directory permissions, cross-platform.
  * Replaces `fs.mkdirSync(path, { recursive: true, mode: 0o700 })` + Windows ACL.
@@ -334,7 +343,14 @@ export function repairBrokenDacl(dirPath: string): void {
  * still listable by this process and repairs a broken DACL (#1605) if not.
  */
 export function mkdirSecure(dirPath: string): void {
-  fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  try {
+    fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  } catch (err: any) {
+    // Bun on Windows has thrown EEXIST from a recursive mkdir of an existing
+    // directory (#2048, #2635); recursive mkdir is idempotent, so only a
+    // non-directory at the path is a real conflict.
+    if (err?.code !== 'EEXIST' || !isExistingDirectory(dirPath)) throw err;
+  }
   restrictDirectoryPermissions(dirPath);
   if (process.platform === 'win32' && !canListDir(dirPath)) {
     repairBrokenDacl(dirPath);

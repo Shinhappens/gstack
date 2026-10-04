@@ -17,11 +17,13 @@ This doc serves two audiences:
 | Any host + gbrain not detected | Blocks suppressed at gen-time. Zero token overhead. Calibration takes still render (separate resolver, host-agnostic). |
 | GBrain or Hermes host | Blocks always render regardless of detection — these hosts ship gbrain integration as a first-class concern. |
 
-`.gbrain-source` pins **reads** only — writes go to the default engine
-configured in `~/.gbrain/config.json`. Documented at
-`bin/gstack-gbrain-sync.ts` for code-lookup resolvers; gstack treats the
-same contract as load-bearing for artifact `put` semantics. If a user
-reports writes landing in the wrong source, look here first.
+`.gbrain-source` selects the source for **reads and writes** made from that
+directory, including `gbrain put`. It does not select a storage engine: the
+engine is configured separately in `~/.gbrain/config.json`. GBrain resolves
+an explicit `--source` first, then `GBRAIN_SOURCE`, then the nearest trusted
+`.gbrain-source`, followed by registered path and default-source rules. If a
+page lands in an unexpected source, check the effective source selection
+before treating a successful `put` as proof it reached the intended corpus.
 
 Trust policy (`personal` vs `shared`, per endpoint hash) gates auto-push
 and writeback. Set via `gstack-config set
@@ -41,7 +43,7 @@ Before starting, search the brain for relevant context:
    `[slug] Title (score: 0.85) - first line of content...`.
 3. **If few results** (under 3): broaden to the single most specific
    keyword and search again. If still few, proceed without brain context.
-4. **Read top 3 results**: `gbrain get_page "<slug>"` for each. Stop
+4. **Read top 3 results**: `gbrain get "<slug>"` for each. Stop
    after 3 — diminishing returns past that.
 5. **Use the context** to inform your analysis. Cite specific slugs in
    your output when a brain page changed your thinking.
@@ -66,6 +68,18 @@ tags: [<tag>, <feature-slug>]
 EOF
 )"
 ```
+
+Read the page back from the **same working directory and account** before
+reporting it as saved:
+
+```bash
+gbrain get "<slug-prefix>/<feature-slug>"
+```
+
+Confirm that the returned page contains the intended title and substantive
+output. If the read fails or returns another page, report the save as
+unverified and retain the output for retry; do not claim a durable result.
+The same rule applies to entity stubs.
 
 **Slug guidance**: `<feature-slug>` should be kebab-case, lowercase, and
 unique within the prefix. Prefer concrete project/feature names over
@@ -137,7 +151,8 @@ rendered page. Add backlinks only when the relationship is concrete
 ### Completion summary
 
 In your final skill output, note brain utilization in one line:
-"Brain: read 3 pages, saved 1 page, enriched 2 entity stubs, 0 throttles."
+"Brain: read 3 pages, saved and read back 1 page, enriched 2 entity stubs,
+0 throttles." Count a page as saved only after its readback succeeds.
 This helps the user see brain coverage growing over time.
 
 ## Persistence verification (automated)

@@ -1,6 +1,6 @@
 /** Private evaluator inputs. Never copy this module or its JSON output into producer snapshots. */
 import { createHash } from 'node:crypto';
-import { CORPUS_VERSION, type EvalFamily, type EvalStack } from '../fixtures/cso-eval/materialize';
+import { CORPUS_VERSION, type EvalFamily } from '../fixtures/cso-eval/materialize';
 
 export interface OracleRequest { method: 'GET' | 'POST'; path: string; body?: string; headers?: Record<string, string> }
 export interface OracleResponse { status: number; body: string; headers?: Record<string, string> }
@@ -99,10 +99,4 @@ export function judgeRepair(family: EvalFamily, evidence: PrivateEvidence): { re
     && oracle.heldOut.every(assertion => patched.heldOut.some(observation => sameRequest(assertion.request, observation.request) && assertion.fixed(observation.response)))
     && patched.existingTestsPassed && evidence.immutableVerifier && evidence.independentRootCauseReview && evidence.featurePreserved && !evidence.boundaryMocks;
   return { reproduced, correctRepair, evidenceHash: createHash('sha256').update(JSON.stringify({ version: oracle.version, family, evidence })).digest('hex') };
-}
-export function runtimeStart(stack: EvalStack): { executable: string; args: string[]; port: 8000; environment: Record<string, string> } {
-  return stack === 'node' ? { executable: '/usr/local/bin/node', args: ['app.mjs'], port: 8000, environment: {} }
-    : stack === 'bun' ? { executable: '/usr/local/bin/bun', args: ['--no-install', 'app.ts'], port: 8000, environment: {} }
-    : stack === 'python' ? { executable: '/usr/local/bin/python', args: ['-I', 'app.py'], port: 8000, environment: {} }
-    : { executable: '/usr/local/bin/ruby', args: ['bin/rails', 'server', '-e', 'test', '-b', '127.0.0.1', '-p', '8000'], port: 8000, environment: { RAILS_ENV: 'test', RACK_ENV: 'test' } };
 }

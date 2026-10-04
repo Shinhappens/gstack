@@ -10,6 +10,7 @@
  */
 
 import { expect, beforeAll, afterAll } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
 import {
@@ -70,7 +71,7 @@ describeIfSelected('Office Hours Forcing Energy E2E', ['office-hours-forcing-ene
       judgeMetadata,
       name: '/office-hours-forcing-energy',
       suite: 'Office Hours Forcing Energy E2E',
-      model: 'claude-sonnet-4-6',
+      model: resolveEvalModel('capture'),
       run: (signal) => runSkillTest({
         signal,
         prompt: `Read office-hours/SKILL.md for the workflow.
@@ -85,7 +86,7 @@ Write Q3 output — the forcing question you would ask this founder — to ${wor
         timeout: CAPTURE_MS,
         testName: 'office-hours-forcing-energy',
         runId,
-        model: 'claude-sonnet-4-6',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/office-hours (FORCING)', result);
@@ -151,7 +152,7 @@ describeIfSelected('Office Hours Builder Wildness E2E', ['office-hours-builder-w
       judgeMetadata,
       name: '/office-hours-builder-wildness',
       suite: 'Office Hours Builder Wildness E2E',
-      model: 'claude-sonnet-4-6',
+      model: resolveEvalModel('capture'),
       run: (signal) => runSkillTest({
         signal,
         prompt: `Read office-hours/SKILL.md for the workflow.
@@ -166,7 +167,7 @@ Write your response — the three adjacent unlocks — to ${workDir}/unlocks.md.
         timeout: CAPTURE_MS,
         testName: 'office-hours-builder-wildness',
         runId,
-        model: 'claude-sonnet-4-6',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/office-hours (BUILDER)', result);

@@ -115,6 +115,50 @@ describe('terminal-agent: /internal/grant', () => {
   });
 });
 
+describe('terminal-agent: /internal/grant and /internal/revoke bearer auth', () => {
+  function post(route: 'grant' | 'revoke', token: string, authorization?: string): Promise<Response> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (authorization !== undefined) headers.Authorization = authorization;
+    return fetch(`http://127.0.0.1:${agentPort}/internal/${route}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ token }),
+    });
+  }
+
+  function wsStatus(token: string): Promise<number> {
+    return fetch(`http://127.0.0.1:${agentPort}/ws`, {
+      headers: { 'Origin': 'chrome-extension://abc123', 'Cookie': `gstack_pty=${token}` },
+    }).then((r) => r.status);
+  }
+
+  for (const route of ['grant', 'revoke'] as const) {
+    test(`${route}: no token → 403, wrong token → 403, valid internal token → 200`, async () => {
+      const target = `auth-matrix-${route}-token-long-enough`;
+      expect((await post(route, target)).status).toBe(403);
+      expect((await post(route, target, 'Bearer wrong-token')).status).toBe(403);
+      expect((await post(route, target, `Bearer ${internalToken}`)).status).toBe(200);
+    });
+  }
+
+  test('an unauthenticated revoke leaves the grant usable; an authenticated revoke removes it', async () => {
+    const token = 'revoke-auth-token-at-least-seventeen';
+    expect((await grantToken(token)).status).toBe(200);
+    expect(await wsStatus(token)).not.toBe(401);
+    expect((await post('revoke', token)).status).toBe(403);
+    expect((await post('revoke', token, 'Bearer wrong-token')).status).toBe(403);
+    expect(await wsStatus(token)).not.toBe(401);
+    expect((await post('revoke', token, `Bearer ${internalToken}`)).status).toBe(200);
+    expect(await wsStatus(token)).toBe(401);
+  });
+
+  test('an unauthenticated grant does not register the token', async () => {
+    const token = 'forged-grant-token-at-least-seventeen';
+    expect((await post('grant', token, 'Bearer wrong-token')).status).toBe(403);
+    expect(await wsStatus(token)).toBe(401);
+  });
+});
+
 describe('terminal-agent: /ws gates', () => {
   test('rejects upgrade attempts without an extension Origin', async () => {
     const resp = await fetch(`http://127.0.0.1:${agentPort}/ws`);

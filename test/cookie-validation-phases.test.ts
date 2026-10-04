@@ -30,8 +30,10 @@ test('the actual CI cookie repair planner executes only eight dependent cases wi
   expect(manifest.evalsAll).toBe(false);
   expect(manifest.selection).toEqual({ e2e: ['browse-basic', 'browse-snapshot', 'qa-quick', 'qa-only-no-fix', 'design-review-detector-shim-dom', 'diagram-triplet', 'canary-workflow', 'benchmark-workflow'], judges: [] });
   expect(manifest.entries.filter(entry => entry.status === 'planned').map(entry => entry.file).sort()).toEqual([
-    'test/skill-e2e-bws.test.ts', 'test/skill-e2e-deploy.test.ts', 'test/skill-e2e-design.test.ts', 'test/skill-e2e-diagram.test.ts', 'test/skill-e2e-qa-workflow.test.ts',
+    'test/skill-e2e-bws.test.ts', 'test/skill-e2e-deploy.test.ts', 'test/skill-e2e-design.test.ts#design-review-detector-shim-dom', 'test/skill-e2e-diagram.test.ts', 'test/skill-e2e-qa-workflow.test.ts',
   ]);
+  // The case-sharded design file runs only its one selected cookie case.
+  expect(manifest.entries.filter(entry => entry.file.startsWith('test/skill-e2e-design.test.ts#') && entry.status === 'skipped-by-diff').length).toBeGreaterThan(0);
 });
 
 test('the existing quality and behavior phases retain their complete separate shard census', () => {
@@ -41,8 +43,19 @@ test('the existing quality and behavior phases retain their complete separate sh
   const behaviorFiles = behavior.entries.filter(entry => entry.status === 'planned').map(entry => entry.file);
   expect(quality.evalsAll).toBe(true);
   expect(behavior.evalsAll).toBe(true);
-  expect(qualityFiles).toHaveLength(2);
-  expect(behaviorFiles).toHaveLength(56);
+  expect(qualityFiles).toHaveLength(1);
+  // 50 files, five of them the gate safety-rule evals (first-task-scaffold
+  // registers no gate case, so the gate lane skips it); the seven case-sharded
+  // files contribute one shard per gate case.
+  expect(new Set(behaviorFiles.map(file => file.split('#')[0])).size).toBe(50);
+  expect(behaviorFiles).toHaveLength(77);
+  expect(behaviorFiles).toEqual(expect.arrayContaining([
+    ...['review-exploratory-small-cli', 'ship-exploratory-small-cli', 'ship-exploratory-unavailable',
+      'ship-exploratory-plan-checks', 'ship-exploratory-late-input'].map(id => `test/skill-e2e-qa-callers.test.ts#${id}`),
+    'test/skill-e2e-qa-functional-fix.test.ts',
+    'test/skill-e2e-qa-functional.test.ts',
+    'test/skill-e2e-ship-skip.test.ts',
+  ]));
   expect(qualityFiles.every(file => file.startsWith('test/skill-llm-eval'))).toBe(true);
   expect(behaviorFiles.every(file => !qualityFiles.includes(file))).toBe(true);
 });
@@ -60,7 +73,11 @@ test('Windows retains complete shard logs on successful and failed runs', () => 
   const windows = Bun.YAML.parse(readFileSync(path.join(root, '.github/workflows/windows-free-tests.yml'), 'utf8')) as any;
   const upload = windows.jobs['windows-free-tests'].steps.find((step: any) => step.with?.name === 'windows-free-test-shard-logs');
   expect(upload.if).toBe('always()');
-  expect(upload.with.path).toBe('${{ runner.temp }}/gstack-free-test-*.log');
+  expect(upload.with.path.trim().split('\n')).toEqual([
+    '.context/free-test-logs/gstack-free-test-*.log',
+    '${{ runner.temp }}/gstack-free-test-*.log',
+  ]);
+  expect(upload.with['include-hidden-files']).toBe(true);
 });
 
 test('focused Windows diagnostics include the repaired lock and close cases without default-profile qualification', () => {

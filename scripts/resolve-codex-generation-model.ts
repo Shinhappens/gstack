@@ -103,6 +103,84 @@ export function resolveCodexGenerationModel(opts: {
   return { model, source: configPath, warnings };
 }
 
+export type CodexInvocationKind = 'exec' | 'review';
+
+export interface CodexRuntimeModelSelection {
+  kind: CodexInvocationKind;
+  /** Raw Codex model id, passed unchanged to the probe and to dispatch. */
+  model: string;
+  source: string;
+}
+
+/** Characters a model id may carry before it is interpolated into `-c "model=\"…\""`. */
+export const CODEX_RUNTIME_MODEL_PATTERN = /^[A-Za-z0-9._:/-]{1,100}$/;
+
+const REPAIR = 'Choose a model your Codex account can use: name it for this request, set GSTACK_CODEX_MODEL=<model>, or set model in the Codex config.toml.';
+
+/**
+ * Runtime model for gstack-owned Codex calls (#2914). Unlike the generation
+ * resolver above, this returns the user's raw model id (no prompt-overlay
+ * mapping), so ids without a dedicated overlay still work. Precedence: explicit
+ * request, GSTACK_CODEX_MODEL, Codex config.toml (`review_model` first for native
+ * review, then the legacy active profile's model, then `model`), then gstack's
+ * default. Any invalid user choice throws a repair message instead of falling
+ * back to the default.
+ */
+export function resolveCodexRuntimeModel(opts: {
+  kind: CodexInvocationKind;
+  explicit?: string;
+  env?: Record<string, string | undefined>;
+  codexHome?: string;
+  home?: string;
+}): CodexRuntimeModelSelection {
+  const env = opts.env ?? process.env;
+  const chosen = (source: string, raw: string): CodexRuntimeModelSelection => {
+    const model = raw.trim();
+    if (!CODEX_RUNTIME_MODEL_PATTERN.test(model)) {
+      throw new Error(`Invalid Codex model '${sanitize(raw)}' from ${sanitize(source)}: use 1-100 characters from A-Z a-z 0-9 . _ : / -. ${REPAIR}`);
+    }
+    return { kind: opts.kind, model, source: stripControl(source) };
+  };
+  if (opts.explicit) return chosen('explicit request', opts.explicit);
+  if (env.GSTACK_CODEX_MODEL) return chosen('GSTACK_CODEX_MODEL', env.GSTACK_CODEX_MODEL);
+
+  const home = opts.home ?? env.HOME ?? os.homedir();
+  const codexHome = opts.codexHome ?? env.CODEX_HOME ?? path.join(home, '.codex');
+  if (!path.isAbsolute(codexHome)) {
+    throw new Error(`CODEX_HOME '${sanitize(codexHome)}' is not an absolute path, so its config.toml model cannot be read. ${REPAIR}`);
+  }
+  const configPath = path.join(codexHome, 'config.toml');
+  let raw: string;
+  try {
+    raw = fs.readFileSync(configPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { kind: opts.kind, model: CODEX_DEFAULT_MODEL, source: `gstack default (no ${stripControl(configPath)})` };
+    }
+    throw new Error(`Could not read ${sanitize(configPath)}. ${REPAIR}`);
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = Bun.TOML.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Could not parse ${sanitize(configPath)}. ${REPAIR}`);
+  }
+  const profileName = typeof parsed.profile === 'string' ? parsed.profile : undefined;
+  const profiles = parsed.profiles as Record<string, Record<string, unknown> | undefined> | undefined;
+  const profile = profileName && typeof profiles === 'object' ? profiles?.[profileName] : undefined;
+  const candidates: Array<[string, unknown]> = [
+    ...(opts.kind === 'review' ? [[`${configPath} review_model`, parsed.review_model] as [string, unknown]] : []),
+    [`${configPath} [profiles.${profileName}].model`, profile?.model],
+    [`${configPath} model`, parsed.model],
+  ];
+  for (const [source, value] of candidates) {
+    if (value === undefined) continue;
+    if (typeof value !== 'string') throw new Error(`${sanitize(source)} is not a string. ${REPAIR}`);
+    return chosen(source, value);
+  }
+  return { kind: opts.kind, model: CODEX_DEFAULT_MODEL, source: `gstack default (no model in ${stripControl(configPath)})` };
+}
+
 function readArg(name: string): string | undefined {
   const exact = process.argv.indexOf(name);
   if (exact >= 0) return process.argv[exact + 1];
@@ -113,6 +191,13 @@ function readArg(name: string): string | undefined {
 
 if (import.meta.main) {
   try {
+    const runtime = readArg('--runtime');
+    if (runtime !== undefined) {
+      if (runtime !== 'exec' && runtime !== 'review') throw new Error('Usage: --runtime exec|review [--explicit <model>]');
+      const selection = resolveCodexRuntimeModel({ kind: runtime, explicit: readArg('--explicit') });
+      process.stdout.write(`${selection.model}\t${selection.source}\n`);
+      process.exit(0);
+    }
     const result = resolveCodexGenerationModel({
       explicit: readArg('--explicit'),
       codexHome: readArg('--codex-home'),

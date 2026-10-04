@@ -2,16 +2,9 @@ import {expect,test} from 'bun:test';
 import {planFloorDXPane,planFloorDXReplyInput,matchesNativePlanQuestion,type PlanFloorDXReply} from './helpers/claude-pty-runner';
 import captured from './fixtures/plan-floor-dx-custom-491.json';
 import editorHints from './fixtures/plan-floor-dx-editor-hint.json';
-import {E2E_TOUCHFILES,selectTests} from './helpers/touchfiles';
 const call=captured.call;
 const state=(stage:PlanFloorDXReply['stage']='focus'):PlanFloorDXReply=>({call:structuredClone(call),
   pane:planFloorDXPane(captured.questionViewport,call)!,reply:captured.reply,stage});
-
-test('editor-hint capture changes select the live DX finding-floor probe',()=>{
- expect(selectTests(['test/fixtures/plan-floor-dx-editor-hint.json'],E2E_TOUCHFILES,[]).selected)
-   .toContain('plan-devex-finding-floor');
-});
-
 test('generic matcher authenticates the crop while DX custom replies still require the complete pane',()=>{
   expect(matchesNativePlanQuestion(captured.originalViewport,call)).toBe(true);
   expect(planFloorDXPane(captured.originalViewport,call)).toBeNull();

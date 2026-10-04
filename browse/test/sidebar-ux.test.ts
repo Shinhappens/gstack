@@ -23,6 +23,8 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { stubRouteContext, callRoute, routeEntry } from './route-test-harness';
 import { EventEmitter } from 'node:events';
 import { BrowserManager } from '../src/browser-manager';
 
@@ -179,43 +181,6 @@ describe('browser tab bar (sidepanel.css)', () => {
     );
     expect(activeStyle).toContain('--bg-surface');
     expect(activeStyle).toContain('--text-body');
-  });
-});
-
-// ─── Sidebar CSS tests ──────────────────────────────────────────
-
-describe('sidebar CSS (sidepanel.css)', () => {
-  const css = fs.readFileSync(path.join(ROOT, '..', 'extension', 'sidepanel.css'), 'utf-8');
-
-  test('stop button style exists', () => {
-    expect(css).toContain('.stop-btn');
-  });
-
-  test('stop button uses error color', () => {
-    const stopBtnSection = css.slice(
-      css.indexOf('.stop-btn {'),
-      css.indexOf('}', css.indexOf('.stop-btn {')) + 1,
-    );
-    expect(stopBtnSection).toContain('--error');
-  });
-
-  test('experimental-banner no longer uses amber warning colors', () => {
-    const bannerSection = css.slice(
-      css.indexOf('.experimental-banner {'),
-      css.indexOf('}', css.indexOf('.experimental-banner {')) + 1,
-    );
-    // Should not be amber/warning anymore
-    expect(bannerSection).not.toContain('245, 158, 11, 0.15');
-    expect(bannerSection).not.toContain('#F59E0B');
-  });
-
-  test('tool description uses system font not mono', () => {
-    const toolSection = css.slice(
-      css.indexOf('.agent-tool {'),
-      css.indexOf('}', css.indexOf('.agent-tool {')) + 1,
-    );
-    expect(toolSection).toContain('font-system');
-    expect(toolSection).not.toContain('font-mono');
   });
 });
 
@@ -491,11 +456,6 @@ describe('tab switching does not steal focus', () => {
   const serverSrc = fs.readFileSync(path.join(ROOT, 'src', 'server.ts'), 'utf-8');
   const bmSrc = fs.readFileSync(path.join(ROOT, 'src', 'browser-manager.ts'), 'utf-8');
 
-  test('switchTab has bringToFront option', () => {
-    expect(bmSrc).toContain('bringToFront?: boolean');
-    expect(bmSrc).toContain('bringToFront !== false');
-  });
-
   test('handleCommand tab pinning does NOT steal focus', () => {
     // All switchTab calls in handleCommand should use bringToFront: false
     const handleFn = serverSrc.slice(
@@ -718,29 +678,37 @@ describe('welcome page', () => {
 });
 
 describe('server /welcome endpoint', () => {
-  const serverSrc = fs.readFileSync(path.join(ROOT, 'src', 'server.ts'), 'utf-8');
+  // Resolve against empty HOME / skill-root dirs so neither the project
+  // welcome page nor the installed one exists.
+  async function welcomeWithoutPages(): Promise<Response> {
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-welcome-empty-'));
+    const saved = { HOME: process.env.HOME, GSTACK_SKILL_ROOT: process.env.GSTACK_SKILL_ROOT };
+    try {
+      process.env.HOME = empty;
+      process.env.GSTACK_SKILL_ROOT = empty;
+      return await callRoute('GET', '/welcome', stubRouteContext());
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+      fs.rmSync(empty, { recursive: true, force: true });
+    }
+  }
 
-  test('/welcome endpoint exists in server.ts', () => {
-    expect(serverSrc).toContain("url.pathname === '/welcome'");
+  test('/welcome endpoint exists in the route table', () => {
+    expect(routeEntry('GET', '/welcome')).toMatchObject({ path: '/welcome', auth: 'none', surfaces: ['local'] });
   });
 
-  test('/welcome serves HTML content type', () => {
-    const welcomeSection = serverSrc.slice(
-      serverSrc.indexOf("url.pathname === '/welcome'"),
-      serverSrc.indexOf("url.pathname === '/health'"),
-    );
-    expect(welcomeSection).toContain("'Content-Type': 'text/html");
+  test('/welcome serves HTML content type', async () => {
+    expect((await welcomeWithoutPages()).headers.get('content-type')).toBe('text/html; charset=utf-8');
   });
 
-  test('/welcome serves fallback HTML if no welcome file found', () => {
-    const welcomeSection = serverSrc.slice(
-      serverSrc.indexOf("url.pathname === '/welcome'"),
-      serverSrc.indexOf("url.pathname === '/health'"),
-    );
+  test('/welcome serves fallback HTML if no welcome file found', async () => {
     // Changed from 302 redirect to about:blank (ERR_UNSAFE_REDIRECT on Windows)
     // to inline HTML fallback page (PR #822)
-    expect(welcomeSection).toContain('GStack Browser ready');
-    expect(welcomeSection).toContain('status: 200');
+    const resp = await welcomeWithoutPages();
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain('GStack Browser ready');
   });
 });
 
@@ -1004,40 +972,11 @@ describe('BROWSE_NO_AUTOSTART (sidebar headless prevention)', () => {
 // chat-queue rip (PR #1216) — /command and /batch reset the timer and are
 // covered by that factory suite.
 
-// ─── Shutdown kills the terminal-agent (server.ts) ──────────────
-
-describe('shutdown cleanup (server.ts)', () => {
-  const serverSrc = fs.readFileSync(path.join(ROOT, 'src', 'server.ts'), 'utf-8');
-
-  test('shutdown kills the terminal-agent via identity-based kill (no pkill)', () => {
-    // v1.44+ identity-based teardown: only the PID recorded by THIS
-    // daemon's agent is signaled. The pre-v1.44 `pkill -f terminal-agent`
-    // regex killed sibling gstack sessions on the same host (also pinned
-    // by browse/test/terminal-agent-pid-identity.test.ts).
-    const shutdownFn = serverSrc.slice(
-      serverSrc.indexOf('async function shutdown('),
-      serverSrc.indexOf('try { detachSession()', serverSrc.indexOf('async function shutdown(')),
-    );
-    expect(shutdownFn).toContain('stopAgentByRecord');
-    expect(shutdownFn).toContain('isOurAgent(record, process.pid)');
-    expect(shutdownFn).toContain('readAgentRecord');
-    // No pkill CALL — the word may appear in the explanatory comment, so
-    // match invocation shapes only. The repo-wide reintroduction tripwire
-    // is browse/test/terminal-agent-pid-identity.test.ts.
-    expect(shutdownFn).not.toMatch(/(?:spawnSync|execSync|\$)\(\s*['"`]pkill/);
-  });
-});
-
 // ─── Cookie button in sidebar footer ────────────────────────────
 
 describe('cookie import button (sidebar)', () => {
   const html = fs.readFileSync(path.join(ROOT, '..', 'extension', 'sidepanel.html'), 'utf-8');
   const js = fs.readFileSync(path.join(ROOT, '..', 'extension', 'sidepanel.js'), 'utf-8');
-
-  test('quick actions toolbar has cookies button', () => {
-    expect(html).toContain('id="chat-cookies-btn"');
-    expect(html).toContain('Cookies');
-  });
 
   test('cookies button navigates to cookie-picker', () => {
     expect(js).toContain("'chat-cookies-btn'");

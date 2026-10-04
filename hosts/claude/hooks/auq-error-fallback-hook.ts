@@ -30,9 +30,9 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { runBin } from './spawn-bin';
 import { SPAWNED_ESCAPE_SENTENCE } from './spawned-directive';
+import { logHookError as sharedLogHookError } from './hook-log';
 
 interface HookStdin {
   tool_name?: string;
@@ -40,25 +40,8 @@ interface HookStdin {
   cwd?: string;
 }
 
-function stateRoot(): string {
-  return (
-    process.env.GSTACK_STATE_ROOT ||
-    process.env.GSTACK_HOME ||
-    path.join(os.homedir(), '.gstack')
-  );
-}
-
 function logHookError(msg: string): void {
-  try {
-    const sr = stateRoot();
-    fs.mkdirSync(sr, { recursive: true });
-    fs.appendFileSync(
-      path.join(sr, 'hook-errors.log'),
-      `${new Date().toISOString()} auq-error-fallback-hook: ${msg}\n`,
-    );
-  } catch {
-    // last-resort swallow
-  }
+  sharedLogHookError('auq-error-fallback-hook', msg);
 }
 
 function readStdin(): Promise<string> {
@@ -132,7 +115,7 @@ export function sessionKind(cwd?: string): 'spawned' | 'headless' | 'interactive
       timeout: 3000,
       cwd: cwd && fs.existsSync(cwd) ? cwd : undefined,
     });
-    const out = (res.stdout || '').trim();
+    const out = String(res.stdout || '').trim();
     if (out === 'spawned' || out === 'headless' || out === 'interactive') return out;
   } catch (e) {
     logHookError(`sessionKind failed: ${(e as Error).message}`);

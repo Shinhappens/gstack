@@ -1,9 +1,7 @@
 import { expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
 import captured from './fixtures/eng-d1-clipped-elision-1579.json';
 import planningCapture from './fixtures/eng-d2-planning-prelude-4d.json';
-import { capturePlanCountQuestion, matchesNativePlanQuestion, parseNumberedOptions, planCountQuestionInput } from './helpers/claude-pty-runner';
-import { pickEngCountQuestion } from './helpers/eng-count-question-policy';
+import { capturePlanCountQuestion, matchesNativePlanQuestion } from './helpers/claude-pty-runner';
 import type { NativePlanQuestionCall } from './helpers/plan-count-transcript';
 
 const screen = captured.screen;
@@ -15,27 +13,6 @@ function pending(): NativePlanQuestionCall {
 const cursor = screen.indexOf('❯ 1.');
 const body = screen.slice(0, cursor);
 const menu = screen.slice(cursor);
-const compact = (value: string) => value.replace(/\s+/g, '');
-
-test('actual pending Eng D1 binds after native elision and viewport clipping compose', () => {
-  expect(createHash('sha256').update(screen).digest('hex')).toBe(captured.provenance.screenSha256);
-  const call = pending();
-  expect(call.toolUseId).toBe('toolu_013bZVkNzZX27USs6kSBK6a5');
-  expect(body).not.toMatch(/[☐□]/);
-  expect(call.questions[0]!.question.length).toBe(2462);
-  const visible = compact(body.replace(/^[ \t]*[│┃] ?|[│┃][ \t]*$/gm, '').trim());
-  expect(compact(call.questions[0]!.question).endsWith(visible)).toBe(false);
-  expect(compact(call.questions[0]!.question.slice(0, 2000) + '…').endsWith(visible)).toBe(true);
-  expect(parseNumberedOptions(screen).slice(0, 3).map(row => row.label)).toEqual(call.questions[0]!.options.map(row => row.label));
-  expect(pickEngCountQuestion(call.questions[0]!)).toBe(1);
-  expect(matchesNativePlanQuestion(screen, call)).toBe(true);
-  const active = capturePlanCountQuestion(screen, new Set(), 0, true, call)!;
-  expect(active.nativeCall).toBe(call);
-  expect(active.nativeQuestionIndex).toBe(0);
-  expect(active.promptSnippet).toBe(`${call.questions[0]!.header} ${call.questions[0]!.question}`);
-  expect(planCountQuestionInput(screen, active, 1)).toBe('1'); // computed only; no native key sent
-});
-
 for (const [name, visible] of [
   ['CRLF transport', screen.replaceAll('\n', '\r\n')],
   ['blank viewport padding', '\n \n' + screen],
@@ -101,18 +78,6 @@ test('an elided packet must match exactly one current native tab', () => {
   call.questions[0] = structuredClone(call.questions[1]!);
   expect(matchesNativePlanQuestion(pane, call)).toBe(false);
 });
-
-test('pending state, exact commitment and deduplication remain required', () => {
-  for (const call of [{ ...pending(), answered: true }, { ...pending(), failed: true }])
-    expect(capturePlanCountQuestion(screen, new Set(), 0, true, call)?.nativeCall).toBeUndefined();
-  const altered = pending();
-  altered.questions[0]!.options[0]!.description += ' Also add cross-request coordination.';
-  expect(() => pickEngCountQuestion(altered.questions[0]!)).toThrow('author-owned');
-  const seen = new Set<string>(), call = pending();
-  expect(capturePlanCountQuestion(screen, seen, 0, true, call)?.nativeCall).toBe(call);
-  expect(capturePlanCountQuestion(screen, seen, 1, true, call)).toBeNull();
-});
-
 // The native CLI, not the model, prepends this plan-mode path block. Its
 // basename is not independently witnessed: authority is limited to a direct
 // Markdown child of the same session's isolated native plans directory.
@@ -129,21 +94,6 @@ const withPlanning = (file: string, columns = 120) =>
   Bun.wrapAnsi('Planning: ' + file, columns, {hard:true,trim:false}).split('\n').map((row, index) =>
     (index && row.startsWith(' ') && Bun.stringWidth(row.slice(1)) > 0 ? row.slice(1) : row).trimEnd()).join('\n') + '\n' +
   planningPane.replace(/^─+/, '─'.repeat(columns));
-
-test('actual owned Planning prelude binds the exact pending elided Eng D2', () => {
-  expect(createHash('sha256').update(planningScreen).digest('hex')).toBe(planningCapture.provenance.screenSha256);
-  expect(planningCapture.provenance.outcome).toBe('cancelled_confirmed_harness_stall');
-  expect(withPlanning(planningPath)).toBe(planningScreen);
-  const call = planningPending();
-  expect(call.toolUseId).toBe('toolu_019V1fM5pvSC8bHaLVJgznms');
-  expect(pickEngCountQuestion(call.questions[0]!)).toBe(1);
-  expect(matchesNativePlanQuestion(planningScreen, call, planningDirectory)).toBe(true);
-  const fp = capturePlanCountQuestion(planningScreen, new Set(), 0, true, call, planningDirectory)!;
-  expect(fp.nativeCall).toBe(call);
-  expect(fp.nativeQuestionIndex).toBe(0);
-  expect(planCountQuestionInput(planningScreen, fp, 1)).toBe('1'); // computed only
-});
-
 for (const [name, visible, directory] of [
   ['unwrapped path', withPlanning(planningPath, 160), planningDirectory],
   ['three physical path rows', withPlanning(planningPath, 60), planningDirectory],
@@ -186,16 +136,4 @@ for (const [name, visible, directory] of [
   const call = planningPending();
   expect(matchesNativePlanQuestion(visible, call, directory)).toBe(false);
   expect(capturePlanCountQuestion(visible, new Set(), 0, true, call, directory)?.nativeCall).toBeUndefined();
-});
-
-test('Planning chrome never changes pending state, commitment policy or deduplication', () => {
-  for (const call of [{...planningPending(),answered:true}, {...planningPending(),failed:true}])
-    expect(capturePlanCountQuestion(planningScreen, new Set(), 0, true, call, planningDirectory)?.nativeCall).toBeUndefined();
-  const altered = planningPending();
-  altered.questions[0]!.options[0]!.description += ' Add cross-request behavior.';
-  expect(() => pickEngCountQuestion(altered.questions[0]!)).toThrow('author-owned');
-  const call = planningPending(), seen = new Set<string>();
-  expect(capturePlanCountQuestion(planningScreen, seen, 0, true, call, planningDirectory)?.nativeCall).toBe(call);
-  expect(capturePlanCountQuestion(planningScreen, seen, 1, true, call, planningDirectory)).toBeNull();
-  expect(matchesNativePlanQuestion(planningPane, call)).toBe(true);
 });

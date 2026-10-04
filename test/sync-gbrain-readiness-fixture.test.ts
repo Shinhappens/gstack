@@ -27,6 +27,13 @@ test('unknown actor negative replay rejects a contradictory GREEN verdict', () =
   expect(readinessVerdictProblems('unknown', 'Capability WARN: read unverified; gbrain status: YELLOW')).toEqual([]);
 });
 
+test('a negation earlier in the claim sentence is not a search/write readiness claim', () => {
+  const base = 'Capability ...... WARN source-scoped read unverified\ngbrain status: YELLOW\n';
+  expect(readinessVerdictProblems('unknown', `${base}With an unknown result, nothing about read, search, or write capability is confirmed either way.`)).toEqual([]);
+  expect(readinessVerdictProblems('unknown', `${base}Nothing was probed. With an unknown result, write capability is confirmed.`)).toContain('read-only check claims semantic search or write readiness');
+  expect(readinessVerdictProblems('unknown', `${base}Search is not probed; write capability is confirmed.`)).toContain('read-only check claims semantic search or write readiness');
+});
+
 test('ready actor negative replay rejects search/write claims from a read probe', () => {
   const verified = 'Capability ...... OK   source-scoped page read verified; semantic search and writes were not tested.\ngbrain status: YELLOW';
   expect(readinessVerdictProblems('ready', 'Capability ...... OK   source-scoped page read verified; semantic search and write readiness verified.\ngbrain status: YELLOW')).not.toEqual([]);

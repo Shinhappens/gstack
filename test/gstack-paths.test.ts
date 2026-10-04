@@ -172,6 +172,46 @@ describe('gstack-paths', () => {
   });
 });
 
+// Skill bash blocks read one value with --get (#2763): worktree-isolated
+// Claude Code sessions refuse eval/source but run NAME=$(literal --get NAME).
+describe('gstack-paths --get', () => {
+  function assignRoundTrip(env: Record<string, string | undefined>, name: string): { status: number | null; value: string; stderr: string } {
+    const result = spawnSync('bash', ['-c', `V=$(bash "$1" --get ${name}); : "\${V:?gstack-paths failed}"; printf '%s' "$V"`, 'sh', BIN], {
+      env: { PATH: process.env.PATH, USERPROFILE: '', ...env } as Record<string, string>,
+      encoding: 'utf-8',
+      timeout: 30_000,
+    });
+    return { status: result.status, value: result.stdout, stderr: result.stderr };
+  }
+  const evalValue = (env: Record<string, string | undefined>, name: string) => spawnSync('bash', ['-c', `eval "$(bash "$1")"; printf '%s' "\${${name}}"`, 'sh', BIN], {
+    env: { PATH: process.env.PATH, USERPROFILE: '', ...env } as Record<string, string>, encoding: 'utf-8', timeout: 30_000,
+  }).stdout;
+
+  test('each name matches the eval output, byte for byte', () => {
+    const env = { GSTACK_HOME: '/tmp/state root', TMPDIR: '/tmp/two words/', HOME: "/tmp/o'brien" };
+    for (const name of ['GSTACK_STATE_ROOT', 'PLAN_ROOT', 'TMP_ROOT']) {
+      const got = assignRoundTrip(env, name);
+      expect(got.status).toBe(0);
+      expect(got.value).toBe(evalValue(env, name));
+    }
+    expect(assignRoundTrip(env, 'GSTACK_STATE_ROOT').value).toBe('/tmp/state root');
+    expect(assignRoundTrip(env, 'TMP_ROOT').value).toBe('/tmp/two words');
+  });
+
+  test('a backslash path needs no quoting round-trip', () => {
+    if (process.platform === 'win32') return; // MSYS rewrites backslashes in env values (see #2374 tests)
+    expect(assignRoundTrip({ TMPDIR: '/tmp/back\\slash/dir', HOME: '/h' }, 'TMP_ROOT').value).toBe('/tmp/back\\slash/dir');
+  });
+
+  test('an unknown name is a usage error with empty stdout, so the caller guard fires', () => {
+    const got = assignRoundTrip({ HOME: '/h' }, 'NOPE');
+    expect(got.status).not.toBe(0);
+    expect(got.value).toBe('');
+    expect(got.stderr).toContain('usage: gstack-paths --get');
+    expect(got.stderr).toContain('gstack-paths failed');
+  });
+});
+
 describe('CEO plan persistence uses the selected state root', () => {
   for (const source of ['SKILL.md.tmpl', 'SKILL.md']) {
     for (const route of ['explicit', 'plugin', 'home'] as const) {
@@ -270,4 +310,120 @@ describe('CEO plan persistence uses the selected state root', () => {
       });
     }
   }
+});
+
+describe('gstack-paths state-root contract (W1)', () => {
+  const DOC = 'https://github.com/garrytan/gstack/blob/main/docs/state-root.md';
+  function runRaw(args: string[], env: Record<string, string>, bin = BIN) {
+    return spawnSync('bash', [bin, ...args], {
+      env: { PATH: process.env.PATH, USERPROFILE: '', TMPDIR: os.tmpdir(), ...env } as Record<string, string>,
+      encoding: 'utf-8',
+      timeout: 30_000,
+    });
+  }
+
+  test('GSTACK_STATE_ROOT and GSTACK_STATE_DIR join the chain in declared precedence', () => {
+    expect(run({ HOME: '/tmp/home', GSTACK_STATE_ROOT: '/tmp/a', GSTACK_HOME: '/tmp/b' }).GSTACK_STATE_ROOT).toBe('/tmp/a');
+    expect(run({ HOME: '/tmp/home', GSTACK_STATE_DIR: '/tmp/c' }).GSTACK_STATE_ROOT).toBe('/tmp/c');
+    expect(run({ HOME: '/tmp/home', GSTACK_HOME: '/tmp/b', GSTACK_STATE_DIR: '/tmp/c' }).GSTACK_STATE_ROOT).toBe('/tmp/b');
+    expect(run({ HOME: '/tmp/home', GSTACK_STATE_DIR: '/tmp/c', CLAUDE_PLUGIN_DATA: '/tmp/p', CLAUDE_PLUGIN_ROOT: '/x/gstack' }).GSTACK_STATE_ROOT).toBe('/tmp/c');
+  });
+
+  test('reading its own output back as input returns the same root', () => {
+    const env = { HOME: '/tmp/home', GSTACK_HOME: '/tmp/b', GSTACK_STATE_DIR: '/tmp/c' };
+    const first = run(env).GSTACK_STATE_ROOT;
+    expect(run({ ...env, GSTACK_STATE_ROOT: first }).GSTACK_STATE_ROOT).toBe(first);
+  });
+
+  test('stderr is empty on success, even with disagreeing root variables', () => {
+    const r = runRaw([], { HOME: '/tmp/home', GSTACK_STATE_ROOT: '/tmp/a', GSTACK_HOME: '/tmp/b', GSTACK_STATE_DIR: '/tmp/c' });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+  });
+
+  test('--explain golden: default environment', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-explain-'));
+    try {
+      const r = runRaw(['--explain'], { HOME: home, GSTACK_TEST_LEGACY_ROOT: '' });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+      expect(r.stdout).toBe([
+        `state root: ${home}/.gstack (selected by default)`,
+        'chain (first non-empty wins):',
+        '  GSTACK_STATE_ROOT    unset',
+        '  GSTACK_HOME          unset',
+        '  GSTACK_STATE_DIR     unset',
+        '  CLAUDE_PLUGIN_DATA   unset',
+        `  default              ${home}/.gstack  selected`,
+        'merged privacy keys (most restrictive value across roots wins):',
+        '  telemetry:        not set (default applies)',
+        '  memorable_recall: not set (default applies)',
+        '  codex_reviews:    not set (default applies)',
+        '  update_check:     not set (default applies)',
+        `docs: ${DOC}`,
+        '',
+      ].join('\n'));
+      expect(fs.readdirSync(home)).toEqual([]);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('--explain golden: disagreeing environment with state in $HOME/.gstack', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-explain-'));
+    const home = path.join(tmp, 'home');
+    const a = path.join(tmp, 'a');
+    try {
+      fs.mkdirSync(path.join(home, '.gstack'), { recursive: true });
+      fs.writeFileSync(path.join(home, '.gstack', 'config.yaml'), 'telemetry: off\ncodex_reviews: disabled\n');
+      fs.mkdirSync(a);
+      fs.writeFileSync(path.join(a, 'config.yaml'), 'telemetry: community\nupdate_check: true\n');
+      const r = runRaw(['--explain'], {
+        HOME: home, GSTACK_TEST_LEGACY_ROOT: '', GSTACK_STATE_ROOT: a, GSTACK_HOME: '/tmp/b',
+        CLAUDE_PLUGIN_DATA: '/tmp/p', CLAUDE_PLUGIN_ROOT: '/plugins/codex',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+      expect(r.stdout).toBe([
+        `state root: ${a} (selected by GSTACK_STATE_ROOT)`,
+        'chain (first non-empty wins):',
+        `  GSTACK_STATE_ROOT    ${a}  selected`,
+        '  GSTACK_HOME          /tmp/b  ignored',
+        '  GSTACK_STATE_DIR     unset',
+        '  CLAUDE_PLUGIN_DATA   /tmp/p  ignored',
+        `  default              ${home}/.gstack  ignored`,
+        `default root ${home}/.gstack also holds gstack state: yes`,
+        'merged privacy keys (most restrictive value across roots wins):',
+        `  telemetry:        off (from ${home}/.gstack/config.yaml)`,
+        '  memorable_recall: not set (default applies)',
+        `  codex_reviews:    disabled (from ${home}/.gstack/config.yaml)`,
+        `  update_check:     true (from ${a}/config.yaml)`,
+        `docs: ${DOC}`,
+        '',
+      ].join('\n'));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('a missing bin/gstack-state-root.sh fails stop: nonzero, empty stdout, message, no writes', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-paths-broken-'));
+    try {
+      const bin = path.join(tmp, 'bin');
+      fs.mkdirSync(bin);
+      fs.copyFileSync(BIN, path.join(bin, 'gstack-paths'));
+      const tmpRoot = path.join(tmp, 'tmproot');
+      const r = runRaw([], { HOME: path.join(tmp, 'home'), TMPDIR: tmpRoot }, path.join(bin, 'gstack-paths'));
+      expect(r.status).not.toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.stderr).toContain('gstack-paths: cannot resolve the gstack state root');
+      expect(r.stderr).toContain(path.join(bin, 'gstack-state-root.sh'));
+      expect(r.stderr).toContain('./setup');
+      expect(r.stderr).toContain('/gstack-upgrade');
+      expect(r.stderr).toContain(DOC);
+      expect(fs.readdirSync(tmp).sort()).toEqual(['bin']);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });

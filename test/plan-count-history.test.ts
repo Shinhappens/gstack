@@ -31,10 +31,11 @@ process.stdin.on('data',()=>{
   native('assistant',[{type:'text',text}],new Date(Date.now()+5).toISOString());
   process.stdout.write('●'+text.replace(/ /g,'')+'\nCrunched ·done\n❯ ');
 });process.stdin.resume();
+process.stdout.write('PTY_READY:history\x1b[2J\x1b[H');
 `);
   fs.chmodSync(fake,0o755);
   fs.writeFileSync(worker,`import fs from 'node:fs';\nimport {runPlanSkillCounting} from ${JSON.stringify(runner)};\n`+
-    `const result=await runPlanSkillCounting({skillName:'plan-devex-review',slashCommand:'/plan-devex-review',followUpPrompt:'# History fixture',expectedPlanPath:${JSON.stringify(report)},isLastStep0AUQ:()=>false,isReviewAUQ:(fp,prior)=>{fs.appendFileSync(${JSON.stringify(seen)},JSON.stringify({current:fp.nativeCall.toolUseId,prior:prior?.map(c=>c.toolUseId)??null})+'\\n');return true;},reviewCountCeiling:8,timeoutMs:33000,env:{PROBE_PLAN:${JSON.stringify(report)}}});\n`+
+    `const result=await runPlanSkillCounting({skillName:'plan-devex-review',slashCommand:'/plan-devex-review',followUpPrompt:'# History fixture',startupReadyMarker:'PTY_READY:history',expectedPlanPath:${JSON.stringify(report)},isLastStep0AUQ:()=>false,isReviewAUQ:(fp,prior)=>{fs.appendFileSync(${JSON.stringify(seen)},JSON.stringify({current:fp.nativeCall.toolUseId,prior:prior?.map(c=>c.toolUseId)??null})+'\\n');return true;},reviewCountCeiling:8,timeoutMs:33000,env:{PROBE_PLAN:${JSON.stringify(report)}}});\n`+
     `fs.writeFileSync(${JSON.stringify(resultFile)},JSON.stringify(result));\n`);
   const child=Bun.spawn([process.execPath,worker],{env:{...process.env,EVALS_HERMETIC:'1',EVALS_RUN_ID:'',BROWSE_TERMINAL_BINARY:fake},stdout:'pipe',stderr:'pipe'});
   const timer=setTimeout(()=>child.kill('SIGKILL'),35000);

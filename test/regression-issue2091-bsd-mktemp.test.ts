@@ -98,7 +98,7 @@ describe('#2091/#2370 bug 1: every mktemp template is BSD-safe (X placeholder at
     expect(withMktemp.length).toBeGreaterThanOrEqual(5);
     expect(withMktemp).toContain(path.join(ROOT, 'codex', 'sections', 'review-mode.md.tmpl'));
     expect(withMktemp).toContain(path.join(ROOT, 'codex', 'sections', 'consult-mode.md.tmpl'));
-    expect(withMktemp).toContain(path.join(ROOT, 'scripts', 'resolvers', 'review.ts'));
+    expect(withMktemp).toContain(path.join(ROOT, 'scripts', 'resolvers', 'outside-voice-steps.ts'));
   });
 
   test('no .tmpl, SKILL.md, or resolver carries a suffix after the X-run', () => {

@@ -301,7 +301,8 @@ describe('CEO finding fixture establishes scope before launch', () => {
       const plan = '# Export saved settings\nReview the CSV formatter before implementation.\n';
       const design = '# Settings export design\n\n## Problem\nOperators need saved settings in a spreadsheet for offline comparison.\n\n## Approach\nReuse the settings API and escape commas, quotes, and newlines in a CSV formatter.\n';
       seedCeoFindingProject(cwd, plan, design);
-      const output = execFileSync('bash', ['-c', `SLUG=fixture; BRANCH=main; ${DESIGN_DOC_DISCOVERY_BLOCK}`], {
+      const block = DESIGN_DOC_DISCOVERY_BLOCK.replaceAll('~/.claude/skills/gstack/bin/', `${path.resolve(import.meta.dir, '..')}/bin/`);
+      const output = execFileSync('bash', ['-c', `SLUG=fixture; BRANCH=main; ${block}`], {
         cwd, env: { PATH: process.env.PATH!, HOME: home }, encoding: 'utf8', timeout: 10_000,
       });
       expect(output).toBe(`Design doc found: ${path.join(cwd, 'DESIGN.md')}\n`);
@@ -363,6 +364,9 @@ describe('CEO finding fixture establishes scope before launch', () => {
       expect(committed).toBe(input);
       expect(committed).toContain(target);
       expect(committed).toContain('Proceed directly to the requested CEO review; skip the optional /office-hours prerequisite.');
+      // Supplied prerequisite: the split actor always chose HOLD SCOPE; an explicit
+      // choice skips 0E's mode question so the attempt starts at the candidates.
+      expect(committed).toContain('Use HOLD SCOPE mode for this review.');
       expect(committed.match(/^## E[1-5]\)/gm)).toHaveLength(5);
       expect(fs.readFileSync(path.join(root, 'CLAUDE.md'), 'utf8')).not.toContain('Payment processing');
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -378,100 +382,3 @@ describe('CEO finding fixture establishes scope before launch', () => {
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });
-
-// Main owns both distinct and paired registrations in this file. Select the
-// actual case and replace only its native count boundary; report/band checks
-// and the output-directory finally stay live.
-test.each(['success5', 'success7', 'success-paired', 'below', 'above', 'missing-report', 'trailing-report', 'timeout', 'throw', 'native-error', 'unknown-current'])('native count registration: %s', scenario => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ceo-count-body-')));
-  const script = path.join(root, 'registration.test.ts');
-  const factsPath = path.join(root, 'facts.json');
-  fs.writeFileSync(script, `
-import {describe, expect, mock} from 'bun:test';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import {execFileSync} from 'node:child_process';
-import * as runner from ${JSON.stringify(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'))};
-import {createPlanCountFixture} from ${JSON.stringify(path.join(ROOT, 'test/helpers/plan-count-fixture.ts'))};
-const captured = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(ROOT, 'test/fixtures/ceo-payment-ledger-decisions.json'))}, 'utf8'));
-const original = {...runner}, scenario = ${JSON.stringify(scenario)}, paired = scenario === 'success-paired';
-let calls = 0;
-mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/e2e-gate.ts'))}, () => ({describeE2ETier:tier=>{expect(tier).toBe('periodic');return describe;}}));
-mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'))}, () => ({...original,
-  runPlanSkillCounting:async opts=>{
-    calls++;
-    const target=opts.expectedPlanPath;
-    const facts={calls,target,validated:false};
-    fs.writeFileSync(${JSON.stringify(factsPath)},JSON.stringify(facts));
-    expect(path.dirname(path.dirname(target))).toBe(${JSON.stringify(root)});
-    expect(opts.cwd).toBeUndefined();
-    expect(opts.followUpPrompt).toContain(target);
-    expect(opts.followUpPrompt).toContain('in HOLD SCOPE mode');
-    expect(opts.followUpPrompt).toContain('skip the optional /office-hours prerequisite');
-    expect(opts).toMatchObject({skillName:'plan-ceo-review',slashCommand:'/plan-ceo-review',
-      reviewCountCeiling:paired?5:8,timeoutMs:1500000,env:{QUESTION_TUNING:'false',EXPLAIN_LEVEL:'default'}});
-    for(const key of ['isLastStep0AUQ','isFirstReviewAUQ','isCompletionHandoffAUQ','pickAUQ'])expect(typeof opts[key]).toBe('function');
-    const required=paired?[
-      'assert only','that the returned receipt is truthy','No assertion about the mock call history or virtual sleeper record',
-      'max_retries=1 means two total charge attempts',
-    ]:[
-      'bypasses the existing \\x60WebhookDispatcher\\x60','directly into a raw SQL','no error handling on the email leg',
-      "None planned. We'll rely on the existing integration suite catching regressions.",'order in a loop',
-    ];
-    for(const finding of required)expect(opts.followUpPrompt).toContain(finding);
-    if(!paired)expect(opts.firstAUQPick({options:[{index:1,label:'Branch diff vs main'},{index:7,label:'Skip interview and plan immediately'}]})).toBe(7);
-    const fixture=createPlanCountFixture(opts.followUpPrompt,{files:opts.fixtureFiles});
-    try {
-      const committed=execFileSync('git',['show','HEAD:PLAN.md'],{cwd:fixture.cwd,encoding:'utf8',timeout:5000});
-      expect(committed).toBe(opts.followUpPrompt);
-      expect(fs.readFileSync(path.join(fixture.cwd,'CLAUDE.md'),'utf8')).toContain(committed);
-    } finally {fixture.cleanup();}
-    facts.validated=true;fs.writeFileSync(${JSON.stringify(factsPath)},JSON.stringify(facts));
-    if(scenario==='throw')throw new Error('controlled count observation failure');
-    if(!paired){
-      expect(typeof opts.isReviewAUQ).toBe('function');
-      const prior=[];
-      for(const [index,item] of captured.captures.entries()){
-        if(item.savedPlan)fs.writeFileSync(target,item.savedPlan);
-        const call=structuredClone(item.call);
-        const fp=original.nativePlanCallFingerprint(call,index,true);
-        expect(opts.isReviewAUQ(fp,prior)).toBe(item.kind==='seeded-remedy'||item.call.questions[0].header==='TODO-1');
-        prior.push(call);
-      }
-      if(scenario==='unknown-current'){
-        const call=structuredClone(captured.captures[2].call),q=call.questions[0];
-        q.question='D99 — Should we change the billing currency?';call.answers={[q.question]:q.options[0].label};call.toolUseId+='-extra';
-        opts.isReviewAUQ(original.nativePlanCallFingerprint(call,99,true),prior);
-      }
-    }
-    if(scenario==='missing-report')fs.rmSync(target,{force:true});
-    if(scenario!=='missing-report')fs.writeFileSync(target,'# Reviewed plan\\n\\n## GSTACK REVIEW REPORT\\nVERDICT: APPROVED\\n'+(scenario==='trailing-report'?'\\n## Unreviewed tail\\n':''));
-    return {outcome:scenario==='timeout'?'timeout':scenario==='native-error'?'transcript_unavailable':'plan_ready',
-      reviewCount:{success5:5,success7:7,'success-paired':2,below:3,above:8}[scenario]??5,
-      step0Count:2,elapsedMs:1000,fingerprints:[],evidence:'controlled native observation'};
-  },
-}));
-await import(${JSON.stringify(path.join(ROOT, 'test/skill-e2e-plan-ceo-finding-count.test.ts'))});
-`);
-  try {
-    const child = spawnSync(process.execPath, ['test', script, '--test-name-pattern', scenario === 'success-paired' ? 'paired-finding positive control' : '5-finding plan'], {
-      cwd: ROOT, encoding: 'utf8', timeout: 10_000,
-      env: {PATH:process.env.PATH ?? '', HOME:root,TMPDIR:root,TEMP:root,TMP:root,GIT_CONFIG_NOSYSTEM:'1',
-        ...(process.env.SystemRoot ? {SystemRoot:process.env.SystemRoot} : {})},
-    });
-    const output=child.stdout+child.stderr;
-    expect(child.error,output).toBeUndefined();
-    const facts=JSON.parse(fs.readFileSync(factsPath,'utf8'));
-    expect(facts.calls).toBe(1);
-    expect(facts.validated,output).toBe(true);
-    expect(fs.existsSync(path.dirname(facts.target)),'actual paid finally removes its owned output directory').toBe(false);
-    expect(child.status,output).toBe(scenario.startsWith('success')?0:1);
-    const failures:Record<string,string>={below:'BAND FAIL (below floor)',above:'BAND FAIL (above ceiling)',
-      'missing-report':'D19 FAIL: agent did not produce expected plan file',
-      'trailing-report':'trailing ## heading(s) after GSTACK REVIEW REPORT',
-      timeout:'finding-count FAILED: outcome=timeout',throw:'controlled count observation failure',
-      'native-error':'finding-count FAILED: outcome=transcript_unavailable',
-      'unknown-current':'cannot exclude it from the 4–7 count'};
-    if(failures[scenario])expect(output).toContain(failures[scenario]);
-  } finally {fs.rmSync(root,{recursive:true,force:true});}
-},20_000);

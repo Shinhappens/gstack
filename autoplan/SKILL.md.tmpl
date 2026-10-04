@@ -204,7 +204,7 @@ Resolve SNAPSHOT_TOOL once:
 Fresh external RESTORE_PATH:
 ```bash
 {{SLUG_EVAL}}
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 mkdir -p "$GSTACK_STATE_ROOT/projects/$SLUG"
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-')
 DATETIME=$(date +%Y%m%d-%H%M%S)
@@ -224,7 +224,7 @@ Re-run: copy RESTORE_PATH's bytes to SOURCE_PLAN, then /autoplan.
 ### Step 2: Read context
 
 - Read CLAUDE.md, TODOS.md, git log -30, git diff against the base branch --stat
-- Discover design docs: `ls -t ~/.gstack/projects/$SLUG/*-design-*.md 2>/dev/null | head -1`
+- Discover design docs: `~/.claude/skills/gstack/bin/gstack-design-doc-find "$SLUG" "$BRANCH"` (prints the doc path, or nothing)
 - Detect UI scope: grep the plan for view/rendering terms (component, screen, form,
   button, modal, layout, dashboard, sidebar, nav, dialog). Require 2+ matches. Exclude
   false positives ("page" alone, "UI" in acronyms).
@@ -264,12 +264,12 @@ the tasks aggregator at Phase 4. Run all applicable skills and lazy sections ful
 - Search Before Building
 - Completion Status Protocol
 - Telemetry (run last)
-- Step 0: Detect base branch
+- Step 0: Detect platform and base branch
 - Review Readiness Dashboard
 - Plan File Review Report
 - Prerequisite Skill Offer (BENEFITS_FROM)
 - Outside Voice — Independent Plan Challenge
-- Design Outside Voices (parallel)
+- Design Outside Voices (independent)
 
 Follow ONLY the review-specific methodology, sections, and required outputs.
 
@@ -328,7 +328,7 @@ Immediately after each auto-decision, append one row to the plan file using Edit
 ## Decision Audit Trail
 
 | # | Phase | Decision | Classification | Principle | Rationale | Rejected |
-|---|-------|----------|-----------|-----------|----------|
+|---|-------|----------|----------------|-----------|-----------|----------|
 ```
 
 ---

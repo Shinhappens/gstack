@@ -132,7 +132,7 @@ describe('tracker-text wiring scanner', () => {
       // Carved: the pr-body trust-envelope read lives in Step 3.5c, which moved
       // into the on-demand readiness-gate section.
       'land-and-deploy/sections/readiness-gate.md.tmpl',
-      'scripts/resolvers/review.ts',
+      'scripts/resolvers/review-scope.ts',
     ];
     for (const rel of mustMention) {
       const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8');

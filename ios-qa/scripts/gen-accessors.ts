@@ -22,9 +22,9 @@
 
 import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, existsSync, copyFileSync, rmSync } from 'fs';
 import { join, resolve, dirname } from 'path';
-import { homedir } from 'os';
 import { createHash } from 'crypto';
 import { execSync } from 'child_process';
+import { resolveStateRoot } from '../../lib/state-root';
 
 export interface AccessorField {
   name: string;
@@ -771,7 +771,7 @@ function detectBuildId(): string {
 }
 
 export function defaultCacheRoot(): string {
-  return process.env.GSTACK_IOS_CACHE_ROOT ?? join(homedir(), '.gstack', 'cache', 'gen-accessors');
+  return process.env.GSTACK_IOS_CACHE_ROOT ?? join(resolveStateRoot(), 'cache', 'gen-accessors');
 }
 
 export function generate(inputs: GenInputs): GenResult {

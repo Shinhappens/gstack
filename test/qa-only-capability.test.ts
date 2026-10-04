@@ -3,15 +3,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {spawnSync} from 'node:child_process';
-import {E2E_TOUCHFILES, selectTests} from './helpers/touchfiles';
-
 const ROOT = path.resolve(import.meta.dir, '..');
-
-test('QA-only capability regressions select the no-fix case', () => {
-  expect(selectTests(['test/qa-only-capability.test.ts'], E2E_TOUCHFILES).selected).toEqual(['qa-only-no-fix']);
-});
-
-test.each(['success', 'omitted-tools', 'report-edit', 'source-edit', 'source-write'])
+test.each(['success', 'omitted-tools', 'report-edit', 'source-edit', 'source-write', 'preparation-late', 'charter-sidecar', 'memory-write', 'checkpoint-rewrite'])
   ('QA-only registered capability and no-fix contract: %s', scenario => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-tools-'));
     const bin = path.join(dir, 'bin');
@@ -20,16 +13,45 @@ test.each(['success', 'omitted-tools', 'report-edit', 'source-edit', 'source-wri
     const facts = path.join(dir, 'facts.json');
     fs.writeFileSync(path.join(bin, 'claude'), `#!${process.execPath}
 const fs = require('node:fs'), path = require('node:path');
+const {spawnSync} = require('node:child_process');
 await Bun.stdin.text();
 const args = process.argv.slice(2), at = args.indexOf('--tools');
 fs.writeFileSync(${JSON.stringify(facts)}, JSON.stringify({args}));
 const scenario = ${JSON.stringify(scenario)};
 const report = path.join(process.cwd(), 'qa-reports/qa-only-report.md');
 fs.mkdirSync(path.dirname(report), {recursive:true});
-fs.writeFileSync(report, '| **Total** | **7** |');
-const emit = (name,input) => console.log(JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',id:'fixture-'+name,name,input}]}}));
+let callId=0;
+const emit = (name,input,output) => {
+  const id='fixture-'+(++callId);
+  console.log(JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',id,name,input}]}}));
+  if(output!==undefined)console.log(JSON.stringify({type:'user',message:{content:[{type:'tool_result',tool_use_id:id,content:output}]}}));
+};
 console.log(JSON.stringify({type:'system',subtype:'init',tools:at < 0 ? ['Bash','Read','Write','Glob','Edit'] : args[at+1].split(',')}));
-emit('Write',{file_path:report,content:'| **Total** | **7** |'});
+const writeReport=(target=report)=>{
+  fs.writeFileSync(target,'| **Total** | **7** |');
+  emit('Write',{file_path:target,content:'| **Total** | **7** |'},'Write completed');
+};
+if(scenario!=='preparation-late')writeReport(scenario==='charter-sidecar'?path.join(path.dirname(report),'charters.md'):report);
+const guard=${JSON.stringify(path.join(ROOT, 'bin/gstack-qa-deadline'))}, deadline=path.join(process.cwd(),'qa-reports/deadline.json');
+let lastCommand='';
+for(const args of [['start',deadline,'30'],['run',deadline,'--',process.execPath,'--version']]){
+  const child=spawnSync(process.execPath,[guard,...args],{encoding:'utf8',timeout:5000});
+  if(child.error||child.status!==0)throw child.error||new Error(child.stderr);
+  lastCommand=[process.execPath,guard,...args].map(arg=>JSON.stringify(arg)).join(' ');
+  emit('Bash',{command:lastCommand},child.stdout+child.stderr);
+}
+if(scenario==='checkpoint-rewrite'){
+  const target=path.join(path.dirname(report),'exploration-001.json');
+  const content=JSON.stringify({observationCommand:lastCommand,observed:'Rewritten child output',hypothesis:'Check again',nextCommand:lastCommand});
+  fs.writeFileSync(target,content);emit('Write',{file_path:target,content},'Write completed');
+}
+if(scenario==='preparation-late'||scenario==='charter-sidecar')writeReport();
+if(scenario==='memory-write'){
+  const target=path.join(process.env.HOME,'memory','MEMORY.md');
+  fs.mkdirSync(path.dirname(target),{recursive:true});
+  fs.writeFileSync(target,'An operational learning.');
+  emit('Write',{file_path:target,content:'An operational learning.'},'Write completed');
+}
 if(scenario === 'report-edit' || scenario === 'source-edit') {
   const target = scenario === 'report-edit' ? report : path.join(process.cwd(),'index.html');
   const old_string = fs.readFileSync(target,'utf8');
@@ -67,8 +89,10 @@ mock.module(path.join(root,'test/helpers/e2e-helpers.ts'),()=>({
 mock.module(path.join(root,'test/helpers/session-runner.ts'),()=>({...actual,runSkillTest:async options=>{
   const tools=['Bash','Read','Write','Glob'];
   expect(options.allowedTools).toEqual(tools);expect(options.tools).toEqual(tools);
-  expect(options.maxTurns).toBe(40);expect(options.timeout).toBe(300000);
+  expect(options.maxTurns).toBe(40);expect(options.timeout).toBeGreaterThan(0);expect(options.timeout).toBeLessThanOrEqual(300000);
   expect(options.prompt).toContain('Write your report to '+options.workingDirectory+'/qa-reports/qa-only-report.md');
+  expect(options.prompt).toContain('Memory files and learning stores outside that directory are not authorized');
+  expect(options.prompt).toContain('Write the initial charters and final report to the same caller-owned file '+options.workingDirectory+'/qa-reports/qa-only-report.md');
   const launch={...options,timeout:2000,runId:undefined};
   if(scenario==='omitted-tools')delete launch.tools;
   const result=await runActual(launch);
@@ -102,8 +126,19 @@ await import(path.join(root,'test/skill-e2e-qa-workflow.test.ts'));
         expect(observed.args[observed.args.indexOf('--tools') + 1]).toBe('Bash,Read,Write,Glob');
         const editCount = observed.calls.filter((call: {tool:string}) => call.tool === 'Edit').length;
         expect(editCount).toBe(scenario.endsWith('-edit') ? 1 : 0);
-        if (scenario !== 'source-write') expect(observed.recorded.passed).toBe(!scenario.endsWith('-edit'));
-        if (scenario !== 'success') expect(child.stderr).toContain('toHaveLength(0)');
+        if (scenario === 'preparation-late' || scenario === 'charter-sidecar') {
+          expect(observed.recorded.passed).toBe(false);
+          expect(child.stderr).toContain('QA preparation:');
+        } else if (scenario === 'memory-write') {
+          expect(observed.recorded.passed).toBe(false);
+          expect(child.stderr).toContain('QA deadline: artifact outside owned directory');
+        } else if (scenario === 'checkpoint-rewrite') {
+          expect(observed.recorded.passed).toBe(false);
+          expect(child.stderr).toContain('QA checkpoint: observation differs');
+        } else {
+          if (scenario !== 'source-write') expect(observed.recorded.passed).toBe(!scenario.endsWith('-edit'));
+          if (scenario !== 'success') expect(child.stderr).toContain('toHaveLength(0)');
+        }
       }
     } finally {
       fs.rmSync(dir, {recursive:true,force:true});

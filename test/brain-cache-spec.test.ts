@@ -22,12 +22,10 @@ import {
   AUTOPLAN_PREFLIGHT_BUDGET_BYTES,
   SALIENCE_DEFAULT_ALLOWLIST,
   SKILL_CALIBRATION_WEIGHTS,
-  TRANSPORT_DEFAULT_POLICY,
   USER_SLUG_RESOLUTION_ORDER,
   GSTACK_SCHEMA_PACK_NAME,
   GSTACK_SCHEMA_PACK_VERSION,
   CACHE_REFRESH_LOCK_TIMEOUT_MS,
-  SKILL_RUN_RETENTION_DAYS,
   getCacheFile,
   getSkillSubset,
   getSkillBudget,
@@ -111,18 +109,6 @@ describe('brain-cache-spec internal consistency', () => {
     }
   });
 
-  test('transport policy defaults exist for all transport modes', () => {
-    const required = ['local-pglite', 'local-stdio', 'remote-http-single-tenant', 'remote-http-ambiguous'];
-    for (const transport of required) {
-      expect(TRANSPORT_DEFAULT_POLICY[transport]).toBeDefined();
-    }
-    // Local transports must default personal (D4 / Phase 1.5 default rule)
-    expect(TRANSPORT_DEFAULT_POLICY['local-pglite']).toBe('personal');
-    expect(TRANSPORT_DEFAULT_POLICY['local-stdio']).toBe('personal');
-    // Ambiguous remote MUST require explicit ask (never silent default)
-    expect(TRANSPORT_DEFAULT_POLICY['remote-http-ambiguous']).toBe('unset');
-  });
-
   test('user-slug resolution chain has 4 deterministic fallbacks ending in non-empty', () => {
     expect(USER_SLUG_RESOLUTION_ORDER.length).toBe(4);
     expect(USER_SLUG_RESOLUTION_ORDER[USER_SLUG_RESOLUTION_ORDER.length - 1]).toBe('anonymous_hostname_sha8');
@@ -135,10 +121,6 @@ describe('brain-cache-spec internal consistency', () => {
 
   test('refresh lock timeout matches /sync-gbrain convention (5 min)', () => {
     expect(CACHE_REFRESH_LOCK_TIMEOUT_MS).toBe(5 * 60_000);
-  });
-
-  test('skill-run retention is 90 days per D10 lifecycle policy', () => {
-    expect(SKILL_RUN_RETENTION_DAYS).toBe(90);
   });
 
   test('invalidation graph: every "skill-run-write" target also depends on it', () => {

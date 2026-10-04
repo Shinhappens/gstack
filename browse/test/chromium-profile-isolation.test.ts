@@ -1,12 +1,53 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { isProcessAlive, safeKill } from '../src/error-handling';
+import { isProcessAlive } from '../src/error-handling';
 import { readPidStartTime } from '../src/xvfb';
 
 const CLI = path.resolve(import.meta.dir, '../src/cli.ts');
 const LOCKS = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+
+function killDaemonGroup(pid: number): void {
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch (err: any) {
+    if (err?.code === 'ESRCH') return;
+    if (err?.code !== 'EPERM') throw err;
+    if (!isProcessAlive(pid)) return;
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch (leaderErr: any) {
+      if (leaderErr?.code === 'ESRCH') return;
+      throw err;
+    }
+  }
+}
+
+describe('Chromium profile isolation cleanup (#2908)', () => {
+  test('a group kill on an already-stopped daemon tolerates macOS EPERM', () => {
+    const exited = Bun.spawnSync([process.execPath, '-e', '0'], { timeout: 30_000 }).pid;
+    const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === -exited) throw Object.assign(new Error('kill() failed: EPERM'), { code: 'EPERM' });
+      if (pid === exited && signal === 0) throw Object.assign(new Error('kill() failed: ESRCH'), { code: 'ESRCH' });
+      throw Object.assign(new Error('unexpected signal target'), { code: 'EINVAL' });
+    }) as typeof process.kill);
+    try {
+      expect(() => killDaemonGroup(exited)).not.toThrow();
+    } finally { kill.mockRestore(); }
+  });
+
+  test('a group kill still surfaces EPERM while the daemon is alive', () => {
+    const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === -process.pid) throw Object.assign(new Error('kill() failed: EPERM'), { code: 'EPERM' });
+      if (pid === process.pid && signal === 0) return true;
+      throw Object.assign(new Error('unexpected signal target'), { code: 'EINVAL' });
+    }) as typeof process.kill);
+    try {
+      expect(() => killDaemonGroup(process.pid)).toThrow('EPERM');
+    } finally { kill.mockRestore(); }
+  });
+});
 
 describe.skipIf(process.platform === 'win32')('Chromium profile isolation (#2817)', () => {
   let scratch: string;
@@ -49,7 +90,7 @@ describe.skipIf(process.platform === 'win32')('Chromium profile isolation (#2817
     if (fs.existsSync(stateFile)) {
       daemonPid = JSON.parse(fs.readFileSync(stateFile, 'utf-8')).pid;
     }
-    if (daemonPid) safeKill(-daemonPid, 'SIGKILL');
+    if (daemonPid) killDaemonGroup(daemonPid);
     for (const child of children) child.kill('SIGKILL');
     await Promise.all(children.map(child => child.exited));
     fs.rmSync(scratch, { recursive: true, force: true });

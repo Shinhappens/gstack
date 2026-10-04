@@ -76,6 +76,10 @@ nativeFinding.nativeCall.questions[0].options = [
   { label: '1B Activity-primary (Codex)', description: 'Activity dominant ~7/12, notifications right rail; primary action beside title. Completeness 10/10.' },
   { label: '1C Three peer regions, decide later', description: 'Keep the plan as written; hard rejection #1 stays open. Completeness 3/10.' },
 ];
+// Run 37091743395 slice 8 (987a937b): the five answered native calls, byte-exact,
+// whose comma-less Step 0D title the focus predicate once rejected.
+const captured = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(ROOT, 'test/fixtures/design-ui-focus-capture.json'))}, 'utf8'))
+  .calls.map(({ preReview, observedAtMs, call }) => nativePlanCallFingerprint(call, observedAtMs, preReview));
 const unnumberedFinding = fp('unnumbered-finding', "Which region is the dashboard's primary anchor, and how is the page composed?", false);
 unnumberedFinding.nativeCall.questions[0].options = nativeFinding.nativeCall.questions[0].options;
 const finding = fp('finding', 'Which loading feedback should Save show?', false);
@@ -122,9 +126,13 @@ mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'
     expect(opts.isLastStep0AUQ(target)).toBe(false);
     expect(opts.isLastStep0AUQ(fp('focus', focus))).toBe(true);
     expect(opts.isLastStep0AUQ(paraphrase)).toBe(true);
+    // Census 36633323521 gate-census-7: the same Step 0D menu titled with "specific ones".
+    expect(opts.isLastStep0AUQ(fp('focus-ones', 'D1 — Review all 7 design dimensions, or focus on specific ones?'))).toBe(true);
     if (mode.startsWith('native-')) expect(opts.isLastStep0AUQ(nativeFocus)).toBe(true);
+    expect(opts.isLastStep0AUQ(captured[1])).toBe(true);
     for (const unrelated of ['Review all 4 design passes, or focus?',
       'Review all 7 engineering passes, or focus?', 'Review all 7 passes, or focus?',
+      'Review all 4 design passes or focus?', 'Review all 7 engineering passes or focus?', 'Review all 7 passes or focus?',
       'Which plan should receive all 7 design passes?']) {
       expect(opts.isLastStep0AUQ(fp('unrelated', unrelated))).toBe(false);
     }
@@ -134,6 +142,28 @@ mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'
     expect(opts.isReviewAUQ(nativeFinding)).toBe(true);
     expect(opts.isReviewAUQ(unnumberedFinding)).toBe(true);
     expect(opts.isReviewAUQ(finding)).toBe(true);
+    // Titles and option-label prefixes projected from Sep 29 local captures of the
+    // real skill. The first four went unrecognized, so the run timed out after
+    // four answered findings; issue-numbered option sets identify each finding.
+    const labeled = (id, question, labels) => {
+      const call = fp(id, question, false);
+      call.nativeCall.questions[0].options = labels.map(label => ({ label, description: '' }));
+      return call;
+    };
+    for (const [question, labels] of [
+      ['D7 — Issue 1: Codify the page hierarchy from approved Variant A in the plan?', ['1A) Full hierarchy with caps and overflo', '1B) Layout and read order only', '1C) Leave hierarchy out']],
+      ['D8 — Issue 2: How does the dashboard fit the existing app shell and navigation?', ['2A) Reuse existing shell, Dashboard nav ', '2B) Standalone minimal header, no nav it', '2C) Leave the shell unspecified']],
+      ['D9 — Issue 3: Add a user-visible interaction state table for every dashboard feature?', ['3A) Full state table with copy (recommen', '3B) Structure only, copy TBD', '3C) Leave states as listed']],
+      ['D10 — Issue 4: Confirmation pattern and content for "Mark all as read"?', ['4A) Keep modal, specify copy and labels ', '4B) No modal; immediate action plus undo', '4C) Keep modal, leave copy to implemente']],
+      ['Issue 1 — What does the user see first on a phone?', ['1A: Notifications first on sm, feed firs', '1B: Feed first everywhere', '1C: Bell badge + drawer on sm']],
+    ]) expect(opts.isReviewAUQ(labeled('captured-issue', question, labels))).toBe(true);
+    for (const [question, labels] of [
+      ['D11 — Update the approved mockups with these decisions?', ['A) Regenerate mockups (recommended)', 'B) Keep the current mockups']],
+      ['D12 — Which follow-up should I record?', ['1A) Record a TODO', '2B) Skip it']],
+      ['D13 — Which follow-up should I record?', ['1A) Record a TODO', '1A) Record it again']],
+      ['D14 — Record this follow-up?', ['1A) Record a TODO']],
+      ['D15 — Want outside design voices before the detailed review?', ['1A) Yes, run outside voices', '1B) No, proceed without']],
+    ]) expect(opts.isReviewAUQ(labeled('not-a-finding', question, labels))).toBe(false);
     const chosenFocus = mode.startsWith('native-') ? nativeFocus : mode === 'paraphrase' ? paraphrase : fp('focus', focus);
     const pendingCall = {...chosenFocus.nativeCall, answered: false, unansweredQuestionIndices: [0]};
     const pending = nativePlanCallFingerprint(pendingCall, 1000, true);
@@ -172,7 +202,10 @@ mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'
     expect(() => opts.pickAUQ(unboundBoard, unboundBoard, context)).toThrow('requires an owned native question');
     fs.writeFileSync(${JSON.stringify(facts)}, JSON.stringify({ calls, cwd: cwd, seeded: true }));
     if (mode === 'throw') throw new Error('controlled UI observation failure');
-    const observed = mode.startsWith('target-menu') ? [target, fp('other', 'Which artifact should I inspect?', false)]
+    const observed = mode === 'captured' ? captured
+      : mode === 'captured-no-focus' ? captured.filter((_, index) => index !== 1)
+      : mode === 'captured-focus-after-finding' ? [...captured.filter((_, index) => index !== 1), captured[1]]
+      : mode.startsWith('target-menu') ? [target, fp('other', 'Which artifact should I inspect?', false)]
       : mode === 'early-exit' ? [] : mode === 'focus-only' ? [chosenFocus]
       : mode === 'native-setup-only' ? [nativeFocus, nativeSetup]
       : mode === 'native-voices-only' ? [nativeFocus, declinedVoices]
@@ -215,12 +248,12 @@ await import(${JSON.stringify(path.join(ROOT, 'test/skill-e2e-plan-design-with-u
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 }
 
-test.each(['source', 'paraphrase', 'native-sequence', 'native-unnumbered', 'native-passes'])('UI gate seeds the exact target and accepts Design progress with an unselected no-UI alternative (%s)', mode => {
+test.each(['source', 'paraphrase', 'native-sequence', 'native-unnumbered', 'native-passes', 'captured'])('UI gate seeds the exact target and accepts Design progress with an unselected no-UI alternative (%s)', mode => {
   const result = exercise(mode);
   expect(result.code, result.output).toBe(0);
 }, 20_000);
 
-test.each(['target-menu', 'target-menu-design-system', 'focus-only', 'native-setup-only', 'native-voices-only', 'early-exit', 'timeout', 'exited', 'unanswered-finding', 'failed-finding', 'no-native-finding'])('UI gate rejects %s and removes its fixture', mode => {
+test.each(['target-menu', 'target-menu-design-system', 'focus-only', 'captured-no-focus', 'captured-focus-after-finding', 'native-setup-only', 'native-voices-only', 'early-exit', 'timeout', 'exited', 'unanswered-finding', 'failed-finding', 'no-native-finding'])('UI gate rejects %s and removes its fixture', mode => {
   const result = exercise(mode);
   expect(result.code, result.output).toBe(1);
   expect(result.output).toContain('plan-design-review with UI scope FAILED');

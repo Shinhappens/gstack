@@ -6,7 +6,6 @@ import { spawnSync } from 'node:child_process';
 import { createPendingQuestionRecorder, recordPendingQuestion, readPendingQuestion,
   pendingQuestionRecorderStatus } from './helpers/plan-count-pending-question';
 import { readPlanCountTranscript } from './helpers/plan-count-transcript';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import captured from './fixtures/pending-question-completion-ad.json';
 
 // Public question/result contents are retained; hook envelopes, paths and live
@@ -185,11 +184,5 @@ describe('scoped pending question completion payloads', () => {
       expect(result.stdout).toBe('');expect(result.stderr).toBe('');
       expect(f.status()).toEqual({status:'idle'});expect(f.read()).toBeUndefined();
     } finally {f.dispose();}
-  });
-
-  test('the completion regression and fixture select exactly the two opted-in paid workflows', () => {
-    for(const file of ['test/pending-question-completion.test.ts','test/fixtures/pending-question-completion-ad.json']) {
-      expect(selectTests([file],E2E_TOUCHFILES,[]).selected.sort()).toEqual(['autoplan-chain-pty','plan-ceo-mode-routing']);
-    }
   });
 });

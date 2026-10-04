@@ -79,7 +79,7 @@ if(resolveClaudeBinary()!==process.env.BROWSE_TERMINAL_BINARY)throw Error('fake 
 const log=(kind,extra={})=>fs.appendFileSync(events,JSON.stringify({kind,at:Date.now(),...extra})+'\n');
 const start=Date.now();let callbacks=0;
 const options={skillName:'plan-ceo-review',slashCommand:'/plan-ceo-review',followUpPrompt:'Review only the seeded collection fixture.',
-  isLastStep0AUQ:()=>false,isFirstReviewAUQ:()=>true,reviewCountCeiling:8,timeoutMs:22000,
+  isLastStep0AUQ:()=>false,isFirstReviewAUQ:()=>true,reviewCountCeiling:8,timeoutMs:mode==='deadline'?8000:22000,
   startupReadyMarker:'COLLECTION_FIXTURE_READY',
   observeSetupQuestions:mode==='hook-pending',env:{COLLECTION_MODE:mode,COLLECTION_EVENTS:events},
   ...(mode==='default'?{}:{isCollectionComplete:(transcript,fingerprints)=>{
@@ -89,7 +89,7 @@ const options={skillName:'plan-ceo-review',slashCommand:'/plan-ceo-review',follo
     if(mode==='deadline'){
       // Deliberately cross the real work deadline inside a synchronous caller.
       // No clock, timer, PTY, transcript or runner function is mocked.
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,Math.max(0,start+18200-Date.now()));
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,Math.max(0,start+3200-Date.now()));
       log('callback-return');
     }
     return true;

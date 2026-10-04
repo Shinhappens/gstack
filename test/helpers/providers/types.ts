@@ -3,8 +3,8 @@ import * as path from 'node:path';
 /**
  * Provider adapter interface — uniform contract for Claude, GPT, Gemini.
  *
- * Each adapter wraps an existing runner (session-runner.ts, codex-session-runner.ts,
- * gemini-session-runner.ts) and normalizes its per-provider result shape into the
+ * Each adapter wraps an existing runner or CLI (session-runner.ts,
+ * codex-session-runner.ts, the gemini CLI) and normalizes its per-provider result shape into the
  * RunResult below. The benchmark harness only talks to adapters through this
  * interface, never to the underlying runners directly.
  */

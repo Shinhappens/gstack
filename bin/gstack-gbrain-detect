@@ -44,8 +44,9 @@ import {
   readGbrainVersion,
 } from "../lib/gbrain-local-status";
 import { gbrainConfigDir, isTransactionModePooler } from "../lib/gbrain-exec";
+import { resolveStateRoot } from "../lib/state-root";
 
-const STATE_DIR = process.env.GSTACK_HOME || join(userHome(), ".gstack");
+const STATE_DIR = resolveStateRoot();
 const SCRIPT_DIR = __dirname;
 const CONFIG_BIN = join(SCRIPT_DIR, "gstack-config");
 // Honors GBRAIN_HOME with gbrain's own configDir() semantics (#2521:

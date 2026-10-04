@@ -8,8 +8,7 @@ import { fakePlanSeedPrelude } from './helpers/fake-plan-seed';
 import fixture from './fixtures/eng-seeded-completion-ai.json';
 import { classifyVisible, extractPlanFilePath } from './helpers/claude-pty-runner';
 import * as predicates from './helpers/claude-pty-runner';
-import { selectTests, E2E_TOUCHFILES } from './helpers/touchfiles';
-
+import type { PtyDriver } from './helpers/claude-pty-runner';
 const gate = '─────\nClaude has written up a plan and is ready to execute. Would you like to proceed?\n❯ 1. Yes, and use auto mode\n2. Yes, manually approve edits\n3. Tell Claude what to change';
 const compactGate = 'Exit plan mode?\nClaude wants to exit plan mode\n❯ 1. Yes, and switch to default (ask each time) for this session\n2. No';
 const question = 'Which runner should the plan use?\nA) Use the built-in runner\nB) Build a custom runner\nRecommendation: A because it avoids duplicate scheduling logic.\nReply with A or B.';
@@ -121,11 +120,10 @@ console.log(JSON.stringify(obs));
 async function mockedObservation(frames: string[], verdict: 'waiting' | 'working', seeded = true) {
   // Execute the unchanged observer function with its real classifiers, a
   // synthetic clock/session, and a stubbed judge. No CLI or judge is launched.
-  const source = fs.readFileSync(path.join(import.meta.dir, 'helpers/claude-pty-runner.ts'), 'utf8');
+  const source = fs.readFileSync(path.join(import.meta.dir, 'helpers/pty/runners/observation.ts'), 'utf8');
   const start = source.indexOf('export async function runPlanSkillObservation(');
-  const end = source.indexOf('\n// ─', start);
-  expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
-  const executable = source.slice(start, end).replace('export async function', 'async function') + '\nreturn runPlanSkillObservation;';
+  expect(start).toBeGreaterThan(0);
+  const executable = source.slice(start).replace(/^export /gm, '') + '\nreturn runPlanSkillObservation;';
   const js = new Bun.Transpiler({ loader: 'ts' }).transformSync(executable);
   let clock = 0, tick = -1, closed = 0, judged = 0, seedSubmittedAt: number | null = null;
   const current = () => frames[Math.min(Math.max(tick, 0), frames.length - 1)]!;
@@ -142,11 +140,14 @@ async function mockedObservation(frames: string[], verdict: 'waiting' | 'working
     isUnknownSlashCommandVisible: predicates.isUnknownSlashCommandVisible,
     isScopeGateQuestionVisible: predicates.isScopeGateQuestionVisible,
     isScopeGateAutoSelectVisible: predicates.isScopeGateAutoSelectVisible,
-    classifyVisible, extractPlanFilePath, findNativeAutoDecision: () => null,
+    classifyVisible, extractPlanFilePath, idleTurnEnd: predicates.idleTurnEnd, findNativeAutoDecision: () => null,
     judgePtyState: () => { judged++; return { state: verdict, reasoning: 'synthetic current-frame verdict' }; },
+    runPtySession: predicates.runPtySession,
   };
   const run = new Function(...Object.keys(args), js)(...Object.values(args));
-  const obs = await run({ skillName: 'plan-eng-review', timeoutMs: 70000,
+  const clockArgs = args as { Date: { now(): number }; Bun: { sleep(ms: number): Promise<void> }; launchClaudePty: PtyDriver['launch'] };
+  const driver: PtyDriver = { launch: clockArgs.launchClaudePty, now: clockArgs.Date.now, monotonic: clockArgs.Date.now, sleep: clockArgs.Bun.sleep };
+  const obs = await run({ skillName: 'plan-eng-review', timeoutMs: 70000, driver,
     ...(seeded ? { initialPlanContent: '# Plan: Required draft' } : {}) });
   expect(closed).toBe(1);
   return { obs, judged, seedSubmittedAt };
@@ -180,73 +181,4 @@ test('rejected completion does not erase a genuine earlier question or change un
   expect(obs.waitingEverObserved).toBe(false);
   const unseeded = await mockedObservation([gate.replace('❯ ', '')], 'waiting', false);
   expect(unseeded.obs.outcome).toBe('plan_ready'); expect(unseeded.judged).toBe(0);
-});
-
-test('completion evidence dependencies select exactly the seeded observation owners', () => {
-  const owners = ['plan-ceo-review-plan-mode', 'plan-eng-review-plan-mode', 'plan-design-review-plan-mode',
-    'plan-devex-review-plan-mode', 'plan-mode-no-op', 'auto-decide-preserved', 'conductor-prose'].sort();
-  for (const file of ['test/eng-seeded-completion-ai.test.ts', 'test/fixtures/eng-seeded-completion-ai.json']) {
-    expect(selectTests([file], E2E_TOUCHFILES).selected.sort()).toEqual(owners);
-  }
-});
-
-import c6fcCurrent from './fixtures/eng-count-c6fc-public.json';
-import { isEngCompletionHandoff } from './helpers/eng-completion-handoff';
-import type { NativePlanQuestionCall } from './helpers/plan-count-transcript';
-
-test('complete native navigation preserves conflicting current states and accepts explicitly scoped history only', () => {
-  const calls = c6fcCurrent.transcript.calls as NativePlanQuestionCall[];
-  const call = calls.at(-1)!;
-  const check = (plan: string, selected = call, prior = calls.slice(0, -1)) => isEngCompletionHandoff(predicates.nativePlanCallFingerprint(selected, 1, false), plan, prior);
-  // This is a synthetic repair control. Original paid cancellation is immutable.
-  const corrected = c6fcCurrent.report.split(/\n(?=### R[1-9]\d*:)/).map(row => row.includes('\nState: pending\n')
-    ? row.replace('\nState: pending\n', '\n').replace('History: none', 'History: superseded pre-answer state\n  State: pending') : row).join('\n');
-  expect(check(c6fcCurrent.report)).toBe(false);
-  expect(check(corrected)).toBe(true);
-  for (const bad of [
-    corrected.replace('R1 (D3), R2 (D4), R3 (D5), R4 (D6)', 'R1 (D6), R2 (D4), R3 (D5), R4 (D3)'),
-    corrected.replace('Question D3:', 'Question D3: duplicate current question\nQuestion D3:'),
-    corrected.replace('Question D3:', 'Question D99: conflicting current question\nQuestion D3:'),
-    corrected.replace(/^Reviewed target:.*$/m, target => '```markdown\n' + target + '\n```'),
-    corrected.replace(/^Reviewed target:.*$/m, target => '## History\n' + target + '\n## Current plan'),
-    corrected.replace(/^Reviewed target:.*$/m, target => target + '\n' + target.replace('PLAN.md', 'FOREIGN.md')),
-    corrected.replace('State: approved', 'State: pending'),
-    corrected.replace('State: approved', 'State: approved\nState: pending'),
-    corrected.replace('State: approved', 'State: approved\nState: approved'),
-    corrected.replace('  State: pending', 'State: pending'),
-    corrected.replace('State: approved', 'State: rejected'),
-    corrected.replace('State: approved', 'State: approved\nR1 approval: revoked'),
-    corrected.replace('Approval readiness: PASS', 'Approval readiness: pending'),
-    corrected.replace('Actual answer: "Split into follow-up PR (recommended)" (D3)', 'Actual answer: "Not offered" (D3)'),
-    corrected.replace('Reviewed target: `PLAN.md`', 'Reviewed target: `FOREIGN.md`'),
-    corrected.replace(/^Reviewed target:.*$/m, ''),
-    corrected.replace('## Decision ledger', '## Archived decision ledger'),
-    corrected.replace('# Reviewed Plan: Multi-tenant Auth Refactor', '# Reviewed Plan: Another task'),
-    corrected.replace('NO UNRESOLVED DECISIONS', '1 UNRESOLVED DECISION'),
-    corrected.replace('**T1 (', '**T99 ('),
-    corrected.replace('Accepted scope: remove parallelization', 'Accepted scope: pending; remove parallelization'),
-  ]) expect(check(bad)).toBe(false);
-  for (const edit of [
-    (c: NativePlanQuestionCall) => { c.answered = false; },
-    (c: NativePlanQuestionCall) => { c.failed = true; },
-    (c: NativePlanQuestionCall) => { c.answers = {}; },
-    (c: NativePlanQuestionCall) => { c.sessionId += '-foreign'; },
-    (c: NativePlanQuestionCall) => { const q = c.questions[0]!; const old = q.question; q.question += '\nAlso delete the authentication cache.'; c.answers = { [q.question]: c.answers![old]! }; },
-    (c: NativePlanQuestionCall) => { const q = c.questions[0]!; const old = q.question; q.question += '\nThe decision is reopened.'; c.answers = { [q.question]: c.answers![old]! }; },
-  ]) { const copy = structuredClone(call); edit(copy); expect(check(corrected, copy)).toBe(false); }
-  expect(check(corrected, call, calls.slice(0, -2))).toBe(false);
-  for (const transform of [
-    (text: string) => text.replace('ELI10:', 'Summary:'),
-    (text: string) => text.replace(/^ELI10:.*$/m, ''),
-    (text: string) => text.replace('ELI10:', 'ELI10: duplicate assessment\nELI10:'),
-    (text: string) => text.replace('Project/branch/task:', 'Reviewed scope:'),
-    (text: string) => text.replace(/^Project\/branch\/task:.*$/m, ''),
-    (text: string) => text.replace('Project/branch/task:', 'Project/branch/task: foreign, FOREIGN.md "Another task"; unrelated\nProject/branch/task:'),
-  ]) {
-    const copy = structuredClone(call), q = copy.questions[0]!, answer = copy.answers![q.question]!;
-    q.question = transform(q.question); copy.answers = { [q.question]: answer };
-    expect(check(c6fcCurrent.report, copy)).toBe(false);
-    expect(check(corrected, copy)).toBe(false);
-  }
-  expect(c6fcCurrent.actualOutcome).toBe('CANCELLED');
 });

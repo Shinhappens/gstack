@@ -16,7 +16,7 @@
 #               epilogue may sweep.
 #
 # Env overrides (for testing):
-#   GSTACK_STATE_DIR  — override ~/.gstack state directory
+#   GSTACK_HOME     — relocate the state root (chain: bin/gstack-state-root.sh)
 #   GSTACK_DIR        — override auto-detected gstack root
 #
 # NOTE: Uses set -uo pipefail (no -e) — telemetry must never exit non-zero
@@ -29,7 +29,9 @@ SCRIPT_DIR="$GSTACK_DIR/bin"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) command -v cygpath >/dev/null 2>&1 && SCRIPT_DIR="$(cygpath -m "$SCRIPT_DIR")" ;;
 esac
-STATE_DIR="${GSTACK_STATE_DIR:-$HOME/.gstack}"
+. "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select
+STATE_DIR="$_gstack_sr_root"
 ANALYTICS_DIR="$STATE_DIR/analytics"
 JSONL_FILE="$ANALYTICS_DIR/skill-usage.jsonl"
 PENDING_DIR="$ANALYTICS_DIR"  # .pending-* files live here
@@ -148,7 +150,7 @@ fi
 # can't be guessed or correlated by someone who knows your machine identity.
 INSTALL_ID=""
 if [ "$TIER" = "community" ]; then
-  ID_FILE="$HOME/.gstack/installation-id"
+  ID_FILE="$STATE_DIR/installation-id"
   if [ -f "$ID_FILE" ]; then
     INSTALL_ID="$(cat "$ID_FILE" 2>/dev/null)"
   fi

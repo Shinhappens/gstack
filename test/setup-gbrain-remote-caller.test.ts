@@ -7,7 +7,7 @@ import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { runAgentSdkTest, toSkillTestResult, passThroughNonAskUserQuestion } from './helpers/agent-sdk-runner';
 import { runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS } from './helpers/office-hours-attempt';
-import { publicEvents, redactPublicValue } from './helpers/setup-gbrain-sandbox';
+import { publicEvents, redactPublicValue, setupGbrainRemoteAnswer } from './helpers/setup-gbrain-sandbox';
 import { buildSetupGbrainFixture } from './helpers/setup-gbrain-fixture';
 import { resolveEvalModel } from '../lib/eval-model';
 
@@ -16,6 +16,24 @@ type Mode = 'success' | 'max-turns' | 'missing-registration' | 'missing-mode' | 
   | 'returned-api-error' | 'returned-execution-error' | 'returned-budget-error'
   | 'final-retain-error' | 'failed-retain-error' | 'cleanup-error' | 'close-error'
   | 'sdk-error' | 'deadline' | 'slow-setup' | 'rate-limit' | 'late' | 'owned-http';
+// Captured Step 5a question (census 36641820398, slice 20): the old actor matched
+// "skip" in the decline label and declined the registration the case asserts.
+const REGISTER_MCP_QUESTION = { header: 'Register MCP', multiSelect: false,
+  question: 'Give Claude Code a typed tool surface for gbrain? This registers `gbrain` as a user-scope HTTP MCP at http://127.0.0.1:1/mcp with the bearer token, replacing any prior `gbrain` MCP registration.',
+  options: [{ label: 'Yes (Recommended)', description: 'Run `claude mcp remove gbrain` then `claude mcp add --scope user --transport http gbrain <URL>`.' },
+    { label: 'No, skip registration', description: "Leave Claude Code's MCP config untouched." }] };
+test('Path 4 actor registers the MCP at Step 5a and declines every other gate', () => {
+  expect(setupGbrainRemoteAnswer(REGISTER_MCP_QUESTION)).toBe('Yes (Recommended)');
+  expect(setupGbrainRemoteAnswer({ header: 'MCP', question: 'Register gbrain as a Claude Code MCP server?',
+    options: [{ label: 'Skip for now' }, { label: 'Register' }] })).toBe('Register');
+  expect(setupGbrainRemoteAnswer({ question: 'Remote setup privacy gate', options: [{ label: 'Proceed (Recommended)' }, { label: 'Decline' }] })).toBe('Decline');
+  expect(setupGbrainRemoteAnswer({ header: 'Artifacts', question: 'Provision a private artifacts repo for gbrain?',
+    options: [{ label: 'Yes (Recommended)' }, { label: 'No thanks' }] })).toBe('No thanks');
+  expect(setupGbrainRemoteAnswer({ header: 'Repo policy', question: 'How should gbrain treat this remote when importing via MCP?',
+    options: [{ label: 'read-write (Recommended)' }, { label: 'read-only' }, { label: 'skip-for-now' }] })).toBe('skip-for-now');
+  expect(setupGbrainRemoteAnswer({ question: 'Pick a mode', options: [{ label: 'A' }, { label: 'B' }] })).toBe('B');
+});
+
 async function fixture(modes: Mode[], budget = 300_000, pathApi = path) {
   const evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-caller-evidence-'));
   const callbacks: Array<() => Promise<void>> = [], finalizers: Array<() => Promise<void>> = [];
@@ -49,6 +67,9 @@ async function fixture(modes: Mode[], budget = 300_000, pathApi = path) {
       const decision = await input.options.canUseTool('AskUserQuestion', { questions: [{ question,
         options: [{ label: 'Proceed' }, { label: 'Decline' }] }] }, {});
       expect(decision.updatedInput.answers[question]).toBe('Decline');
+      const register = REGISTER_MCP_QUESTION.question;
+      const registration = await input.options.canUseTool('AskUserQuestion', { questions: [REGISTER_MCP_QUESTION] }, {});
+      expect(registration.updatedInput.answers[register]).toBe('Yes (Recommended)');
       expect(await input.options.canUseTool('Read', { file_path: 'fixture' }, {})).toEqual({ behavior: 'allow', updatedInput: { file_path: 'fixture' } });
       const url = /Use this MCP URL: (http:\/\/[^ ]+)\./.exec(input.prompt)![1]!;
       const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}' });
@@ -108,7 +129,7 @@ async function fixture(modes: Mode[], budget = 300_000, pathApi = path) {
       expect(opts.userPrompt).toContain('Walk through Steps 4a, 4b, 4c, 5a, 8, 10 ONLY.');
       return runAgentSdkTest(opts);
     }, toSkillTestResult, passThroughNonAskUserQuestion, resolveClaudeBinary: () => '/not-executed/injected-query',
-    runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS, publicEvents, redactPublicValue, resolveEvalModel,
+    runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS, publicEvents, redactPublicValue, setupGbrainRemoteAnswer, resolveEvalModel,
     EvalCollector: class { addTest(row: any) { rows.push({ ...row, attempt: rows.length + 1 }); } async finalize() {} },
     // Inject only the three environment inputs read by the extracted paid callback.
     process: { env: { GSTACK_EVAL_DIR: evidenceRoot, PATH: process.env.PATH, EVALS_MODEL: process.env.EVALS_MODEL } },

@@ -99,8 +99,7 @@ describeE2E('plan-ceo-review plan-mode smoke (gate)', () => {
           `plan-ceo-review smoke FAILED: outcome=${obs.outcome}\n` +
             `${diagnosis}\n` +
             `Expected 'asked'. See plan-ceo-review/SKILL.md.tmpl: the Step 0 STOP rules ` +
-            `and the "One issue = one AskUserQuestion call" rule under "CRITICAL RULE — ` +
-            `How to ask questions".\n` +
+            `and the "One decision unit = one AskUserQuestion call" rule under "How to ask questions".\n` +
             `summary: ${obs.summary}\n` +
             `elapsed: ${obs.elapsedMs}ms\n` +
             `--- evidence (last 2KB visible) ---\n${obs.evidence}`,

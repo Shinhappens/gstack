@@ -19,14 +19,21 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, rmSync, mkdirSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { delimiter, join } from 'path';
 import { tmpdir } from 'os';
+import { spawnSync } from 'child_process';
 
 let TMP_HOME: string;
+let GBRAIN_STUB: string;
 const ORIGINAL_HOME = process.env.GSTACK_HOME;
 
 beforeEach(() => {
   TMP_HOME = mkdtempSync(join(tmpdir(), 'gstack-cache-test-'));
+  GBRAIN_STUB = mkdtempSync(join(tmpdir(), 'gstack-unreachable-gbrain-'));
+  writeFileSync(join(GBRAIN_STUB, 'gbrain'), '#!/bin/sh\necho "gbrain unreachable (test stub)" >&2\nexit 1\n', { mode: 0o755 });
+  writeFileSync(join(GBRAIN_STUB, 'gbrain.cmd'), '@echo gbrain unreachable (test stub) 1>&2\r\n@exit /b 1\r\n');
+  const pathKey = Object.keys(process.env).find(name => name.toLowerCase() === 'path') ?? 'PATH';
+  process.env[pathKey] = `${GBRAIN_STUB}${delimiter}${process.env[pathKey] ?? ''}`;
   process.env.GSTACK_HOME = TMP_HOME;
   // Reload the cache module fresh per test so it picks up the new HOME.
   delete require.cache[require.resolve('../bin/gstack-brain-cache')];
@@ -36,11 +43,20 @@ afterEach(() => {
   if (ORIGINAL_HOME) process.env.GSTACK_HOME = ORIGINAL_HOME;
   else delete process.env.GSTACK_HOME;
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+  rmSync(GBRAIN_STUB, { recursive: true, force: true });
 });
 
 async function importCache(): Promise<typeof import('../bin/gstack-brain-cache')> {
   return (await import('../bin/gstack-brain-cache')) as typeof import('../bin/gstack-brain-cache');
 }
+
+describe('brain-cache hermetic brain (#2829)', () => {
+  test('an installed gbrain is shadowed by the failing stub', () => {
+    const probe = spawnSync('gbrain', ['--version'], { encoding: 'utf8', shell: process.platform === 'win32', timeout: 10_000 });
+    expect(probe.status).toBe(1);
+    expect(probe.stderr).toContain('gbrain unreachable (test stub)');
+  });
+});
 
 describe('brain-cache paths', () => {
   test('cross-project entity (user-profile) lives in ~/.gstack/brain-cache/', async () => {

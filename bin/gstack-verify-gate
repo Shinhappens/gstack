@@ -12,7 +12,7 @@
 # NEVER runs until the user records it in the per-repo trust store:
 #   gstack-verify-gate --trust        (run from inside the repo)
 # The store maps realpath(repo root) -> sha256(command) at
-# ${GSTACK_HOME:-$HOME/.gstack}/verify-gate-trust (flat "path<TAB>hash",
+# $GSTACK_STATE_ROOT/verify-gate-trust (flat "path<TAB>hash",
 # 0600, atomic rewrite). Any edit to the declared command invalidates trust
 # until --trust is run again. Untrusted commands never block the turn.
 #
@@ -23,7 +23,15 @@
 set -uo pipefail
 
 TAB="$(printf '\t')"
-STORE="${GSTACK_HOME:-$HOME/.gstack}/verify-gate-trust"
+# Hook: source the state-root twin (never spawn gstack-paths). A broken
+# install fails open, like every other absence.
+_VG_TWIN="$(cd "$(dirname "$0")" && pwd)/gstack-state-root.sh"
+if [ ! -f "$_VG_TWIN" ] || ! . "$_VG_TWIN" 2>/dev/null; then
+  echo "verify-gate: $_VG_TWIN missing; gate skipped (reinstall with ./setup or /gstack-upgrade)"
+  exit 0
+fi
+GSTACK_STATE_ROOT="$(gstack_state_root; printf x)"; GSTACK_STATE_ROOT="${GSTACK_STATE_ROOT%x}"
+STORE="$GSTACK_STATE_ROOT/verify-gate-trust"
 
 _sha256() {
   if command -v shasum >/dev/null 2>&1; then
@@ -100,7 +108,7 @@ _json_escape() {
 # Args: $1 = root key, $2 = cmd sha256, $3 = cmd verbatim.
 _log_trust_grant() {
   local sec_dir log tty ts
-  sec_dir="${GSTACK_HOME:-$HOME/.gstack}/security"
+  sec_dir="$GSTACK_STATE_ROOT/security"
   log="$sec_dir/verify-gate-trust-grants.jsonl"
   tty=false
   [ -t 0 ] && tty=true
@@ -175,7 +183,7 @@ _session_key() {
   [ -n "$sid" ] || sid="ppid-$PPID"
   _sha256 "$sid|$(_trust_key)"
 }
-ATTEMPTS_DIR="${GSTACK_HOME:-$HOME/.gstack}/verify-gate-attempts"
+ATTEMPTS_DIR="$GSTACK_STATE_ROOT/verify-gate-attempts"
 COUNTER="$ATTEMPTS_DIR/$(_session_key)"
 
 # A first entry (stop_hook_active=false) starts a fresh blocking episode.

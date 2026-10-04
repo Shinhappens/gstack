@@ -2,10 +2,11 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { sharedLibsFingerprint } from '../../lib/review-evidence';
 import {
   SHARED_LIBS_ROOT, commitFixture, createSharedLibsFixture, fixtureGit, fixtureWrite,
-  fixtureWorkingTree, seedReviewSources, shellQuote, type SharedLibsFixture,
+  fixtureWorkingTree, seedReviewSources, shellQuote, snapshotFixture, type SharedLibsFixture, type SharedReviewResume, type SharedReviewStageActor,
 } from './shared-libs-eval-fixture';
 
 export type PathEligibilityCase = 'symlinks' | 'submodule' | 'ignored' | 'legacy' | 'assume-unchanged' | 'skip-worktree' | 'removed-filter';
@@ -15,6 +16,158 @@ export interface PathEligibilityFixture {
   beforeTree: string;
   sourcePaths: string[];
   rawPaths: string[];
+  resumed: SharedReviewResume;
+}
+
+function pathReviewState(f: SharedLibsFixture) {
+  const root = fs.realpathSync(f.root), repo = fs.realpathSync(f.repo), state = fs.realpathSync(f.state);
+  if (repo !== path.join(root, 'repo') || state !== path.join(root, 'state')) throw new Error('Foreign path fixture state');
+  const raw = Object.fromEntries(Object.entries(snapshotFixture(repo)).filter(([file, value]) =>
+    !file.split(path.sep).includes('.git') || /(?:^|\/)(?:config|info\/(?:attributes|exclude))$/.test(file)
+      || path.basename(file) === '.git' && !value.startsWith('dir:')));
+  return { root, repo, state, branch: fixtureGit(f, 'symbolic-ref', '--short', 'HEAD'),
+    head: fixtureGit(f, 'rev-parse', 'HEAD'), base: fixtureGit(f, 'rev-parse', 'origin/main'),
+    wtree: fixtureWorkingTree(f), index: fixtureGit(f, 'ls-files', '--stage', '-v'), raw };
+}
+
+export function seedPathReviewPrerequisites(f: SharedLibsFixture): SharedReviewResume {
+  const input = path.join(f.root, 'resumed-review-prerequisites.json');
+  const changedLines = fixtureGit(f, 'diff', '--numstat', 'origin/main').split('\n')
+    .reduce((sum, line) => sum + line.split('\t').slice(0, 2).reduce((n, value) => n + Number(value || 0), 0), 0);
+  if (!Number.isFinite(changedLines) || changedLines >= 50) throw new Error('Resumed path fixture requires a tiny no-edit diff');
+  const context = { kind: 'synthetic-path-review-prerequisites', synthetic: true, native_coverage: false,
+    binding: pathReviewState(f),
+    qa: { settled: true, required_probes: [{ id: 'retry-contract', status: 'passed',
+      result: 'Synthetic fixture input: Retry-After seconds/date parsing, ceiling and fallback probes passed.' }], findings: [] },
+    native_adversarial: { settled: true, status: 'completed', findings: [],
+      result: 'Synthetic fixture input: native adversarial review returned no findings.' },
+    structured_review: { required: false, reason: 'Tiny diff; no full-review, structured-review or P1 override requested.' } };
+  fs.writeFileSync(input, JSON.stringify(context, null, 2) + '\n', { mode: 0o600 });
+  return { input, checkCommand: `bun ${shellQuote(path.join(SHARED_LIBS_ROOT, 'test/helpers/shared-libs-path-fixture.ts'))} --check-review-prerequisites ${shellQuote(input)}` };
+}
+
+export function checkPathReviewPrerequisites(f: SharedLibsFixture, input: string) {
+  try {
+    if (input !== path.join(f.root, 'resumed-review-prerequisites.json')) throw new Error('Foreign prerequisite file');
+    const text = fs.readFileSync(input, 'utf8'), context = JSON.parse(text);
+    const current = JSON.stringify(context.binding) === JSON.stringify(pathReviewState(f));
+    const settled = current && context.kind === 'synthetic-path-review-prerequisites'
+      && context.synthetic === true && context.native_coverage === false
+      && context.qa?.settled === true && Array.isArray(context.qa.required_probes) && context.qa.required_probes.length === 1
+      && context.qa.required_probes.every((probe: any) => probe.id === 'retry-contract' && probe.status === 'passed'
+        && typeof probe.result === 'string' && probe.result.length > 0)
+      && Array.isArray(context.qa.findings) && context.qa.findings.length === 0
+      && context.native_adversarial?.settled === true && context.native_adversarial.status === 'completed'
+      && Array.isArray(context.native_adversarial.findings) && context.native_adversarial.findings.length === 0
+      && typeof context.native_adversarial.result === 'string' && context.native_adversarial.result.length > 0
+      && context.structured_review?.required === false;
+    return { synthetic: true, native_coverage: false, settled, current,
+      input_sha256: createHash('sha256').update(text).digest('hex'), context };
+  } catch {
+    return { synthetic: true, native_coverage: false, settled: false, current: false };
+  }
+}
+
+export function hasPathReviewPrerequisiteReceipt(events: any[], command: string, expected: ReturnType<typeof checkPathReviewPrerequisites>): boolean {
+  if (!expected.settled) return false;
+  const calls = new Set<string>();
+  let verified = false;
+  for (const event of events) for (const block of Array.isArray(event.message?.content) ? event.message.content : []) {
+    if (event.type === 'assistant' && block.type === 'tool_use' && block.name === 'Bash') {
+      if (block.input?.command === command) calls.add(block.id);
+      if (String(block.input?.command).includes('--finish')) return verified;
+    }
+    if (event.type !== 'user' || block.type !== 'tool_result' || block.is_error === true || !calls.has(block.tool_use_id)) continue;
+    const text = typeof block.content === 'string' ? block.content : Array.isArray(block.content)
+      ? block.content.filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n') : '';
+    try { verified = JSON.stringify(JSON.parse(text)) === JSON.stringify(expected); } catch { verified = false; }
+  }
+  return false;
+}
+
+export function createLifecyclePrerequisiteActor(f: SharedLibsFixture): SharedReviewStageActor {
+  const directory = path.join(fs.realpathSync(f.root), 'synthetic-stage-receipts');
+  fs.mkdirSync(directory, { mode: 0o700 });
+  const output = path.join(directory, 'current.json');
+  const actorCommand = `cat ${shellQuote(output)}`;
+  let state = pathReviewState(f), generation = 0;
+  const isolation = [state.root, state.repo, state.state];
+  const issued = new Map<string, { text: string; file: string; generation: number; settled: boolean }>();
+  const finishes = new Map<string, { command: string; generation: number }>();
+  const observe = () => {
+    const current = pathReviewState(f);
+    if (JSON.stringify([current.root, current.repo, current.state]) !== JSON.stringify(isolation)) throw new Error('Rebound synthetic stage fixture');
+    if (JSON.stringify(current) !== JSON.stringify(state)) { generation++; state = current; }
+    return current;
+  };
+  const beforeTool: SharedReviewStageActor['hooks']['PreToolUse'][number]['hooks'][number] = async (input, toolUseID) => {
+    if (input.hook_event_name !== 'PreToolUse') return {};
+    const current = observe();
+    const command = input.tool_name === 'Bash' ? (input.tool_input as any)?.command : undefined;
+    if (command === actorCommand) {
+      const id = input.tool_use_id;
+      if (fs.realpathSync(input.cwd) !== current.repo || !id || toolUseID !== undefined && id !== toolUseID || issued.has(id)
+        || fs.realpathSync(directory) !== directory || fs.existsSync(output) && fs.lstatSync(output).isSymbolicLink()) {
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Invalid synthetic stage invocation' } };
+      }
+      const evidence_paths = ['src/retry-worker.ts', 'src/retry-route.ts', 'lib/retry-after.ts'];
+      const fingerprint = sharedLibsFingerprint({ evidence_paths, helper_target: { path: 'lib/retry-after.ts', symbol: 'retrySeconds' } });
+      const changedLines = fixtureGit(f, 'diff', '--numstat', 'origin/main').split('\n')
+        .reduce((sum, line) => sum + line.split('\t').slice(0, 2).reduce((n, value) => n + Number(value || 0), 0), 0);
+      const tinyDiff = Number.isFinite(changedLines) && changedLines < 50;
+      const authoredEvidence = !!fingerprint && evidence_paths.every(source => {
+        const file = path.join(current.repo, source);
+        try { return fs.realpathSync(file) === file && fs.lstatSync(file).isFile() && fs.statSync(file).size > 0; }
+        catch { return false; }
+      });
+      const supported = tinyDiff && authoredEvidence;
+      const receipt = { kind: 'synthetic-lifecycle-stage-result', id: randomUUID(), tool_use_id: id,
+        synthetic: true, native_coverage: false, generation, binding: current,
+        deterministic_checks: { fixture_isolation: true, tiny_diff: tinyDiff, authored_evidence: authoredEvidence, fingerprint },
+        qa: { settled: supported, required_probes: [{ id: 'retry-contract', status: supported ? 'passed' : 'blocked',
+          result: 'Simulated fixture QA outcome, not execution of target tests.' }], findings: [] },
+        native_adversarial: { settled: supported, status: supported ? 'completed' : 'blocked', findings: [],
+          result: 'Simulated fixture adversarial outcome, not an actual native review.' },
+        ...(tinyDiff ? { structured_review: { required: false, reason: 'Tiny diff; no full-review override in this fixture.' } } : {}),
+        settled: supported };
+      const text = JSON.stringify(receipt), file = path.join(directory, `${receipt.id}.json`);
+      fs.writeFileSync(file, text, { flag: 'wx', mode: 0o600 });
+      fs.writeFileSync(output, text, { mode: 0o600 });
+      issued.set(id, { text, file, generation, settled: supported });
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' } };
+    }
+    if (typeof command === 'string' && command.includes('gstack-review-log') && command.includes('--finish')) {
+      finishes.set(input.tool_use_id, { command, generation });
+    }
+    return {};
+  };
+  return { actorCommand, hooks: { PreToolUse: [{ hooks: [beforeTool] }] },
+    history: () => [...issued.values()].map(receipt => JSON.parse(receipt.text)),
+    verify(events) {
+      try {
+        observe();
+        if (!issued.size || [...issued.values()].some(receipt => fs.readFileSync(receipt.file, 'utf8') !== receipt.text)) return false;
+        const calls = new Map<string, string>();
+        let consumed: string | undefined, final: string | undefined, finalReceipt: string | undefined, finished = false;
+        for (const event of events) for (const block of Array.isArray(event.message?.content) ? event.message.content : []) {
+          if (event.type === 'assistant' && block.type === 'tool_use' && block.name === 'Bash') {
+            calls.set(block.id, block.input?.command);
+            if (finishes.get(block.id)?.command === block.input?.command) { final = block.id; finalReceipt = consumed; finished = false; }
+          }
+          if (event.type !== 'user' || block.type !== 'tool_result') continue;
+          if (block.tool_use_id === final) finished = block.is_error !== true;
+          if (calls.get(block.tool_use_id) !== actorCommand) continue;
+          const receipt = issued.get(block.tool_use_id);
+          const text = typeof block.content === 'string' ? block.content : Array.isArray(block.content)
+            ? block.content.filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n') : '';
+          consumed = receipt && receipt.settled && block.is_error !== true
+            && JSON.stringify(JSON.parse(text)) === receipt.text ? block.tool_use_id : undefined;
+        }
+        const receipt = finalReceipt ? issued.get(finalReceipt) : undefined;
+        return !!receipt && finished && finalReceipt === [...issued.keys()].at(-1)
+          && final === [...finishes.keys()].at(-1) && receipt.generation === generation && finishes.get(final!)?.generation === generation;
+      } catch { return false; }
+    } };
 }
 
 function seedBoundSkip(f: SharedLibsFixture, finding: Record<string, any>): void {
@@ -150,9 +303,17 @@ export function preparePathEligibilityFixture(kind: PathEligibilityCase): PathEl
         + `\n// Authored caller changed after the prior decision (${kind}).\n`);
     }
     if (fixtureWorkingTree(f) !== beforeTree) throw new Error(`${kind}: fixture must retain the parent Git tree`);
-    return { fixture, current, beforeTree, sourcePaths, rawPaths };
+    return { fixture, current, beforeTree, sourcePaths, rawPaths, resumed: seedPathReviewPrerequisites(f) };
   } catch (error) {
     fs.rmSync(f.root, { recursive: true, force: true });
     throw error;
   }
+}
+
+if (import.meta.main) {
+  const [flag, input] = process.argv.slice(2);
+  if (flag !== '--check-review-prerequisites' || !input || !process.env.GSTACK_HOME) process.exit(2);
+  const f = { root: path.dirname(input), repo: process.cwd(), state: process.env.GSTACK_HOME,
+    env: { GSTACK_HOME: process.env.GSTACK_HOME } } as SharedLibsFixture;
+  console.log(JSON.stringify(checkPathReviewPrerequisites(f, input)));
 }

@@ -8,6 +8,18 @@ import { claudeOutsideExecutions } from './outside-voice-evidence';
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
 const text = (content: unknown): string => typeof content === 'string' ? content : Array.isArray(content)
   ? content.flatMap(block => block?.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n') : '';
+// Claude Code 2.1.284 frames a subagent report with one header line and indents
+// every report line by two spaces. Only a fully indented report is unwrapped;
+// a column-zero line inside the frame stays framed and earns no credit.
+// The same release appends its own column-zero agentId/usage trailer after the
+// indented report (run 36776104571); only that exact final trailer is removed.
+const trailer = /\nagentId: ([0-9a-f]{8,}) \(use SendMessage with to: '\1', summary: '<5-10 word recap>' to continue this agent\)\n<usage>(?:[a-z_]+: \d+\n)*[a-z_]+: \d+<\/usage>$/;
+const report = (content: string): string => {
+  const header = /^\[Subagent hand-back\] [^\n]*The report follows:\n/.exec(content);
+  if (!header) return content;
+  const lines = content.slice(header[0].length).replace(trailer, '').split('\n');
+  return lines.every(line => line === '' || line.startsWith('  ')) ? lines.map(line => line.slice(2)).join('\n') : content;
+};
 const object = (value: unknown): value is Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const parent = (event: any) => event?.parent_tool_use_id == null && event?.agentId == null && (event?.isSidechain == null || event?.isSidechain === false);
 // These are delivered executable blocks, not a shell interpreter. Only blank
@@ -22,7 +34,7 @@ function block(source: string, needle: string): string {
 }
 export function loadAutoplanDualCommandContract(root: string) {
   return { probe: block(readFileSync(join(root, 'autoplan/SKILL.md'), 'utf8'), 'echo "CODEX_MODE: $_CODEX_MODE"'),
-    outside: block(readFileSync(join(root, 'autoplan/sections/ceo-phase.md'), 'utf8'), '_gstack_codex_timeout_wrapper 600 codex exec') };
+    outside: block(readFileSync(join(root, 'autoplan/sections/ceo-phase.md'), 'utf8'), '_gstack_codex_timeout_wrapper 540 codex exec') };
 }
 export interface AutoplanDualEvidenceOptions {
   ownedRoots: string[];
@@ -160,13 +172,35 @@ export function autoplanDualVoiceEvidence(transcript: unknown[], options: Autopl
     }
     return seen.size > 0;
   };
+  // The exact probe may be followed by read-only diagnostics: double-quoted
+  // echoes of literal text and plain variables, one output line each, never
+  // naming CODEX_MODE. Their lines are the only output allowed after the mode.
+  const diagnosticEchoes = (command: string): number | null => {
+    const actual = code(command), contract = code(options.commands.probe);
+    if (!actual.startsWith(contract)) return null;
+    const suffix = actual.slice(contract.length);
+    if (suffix.includes('CODEX_MODE') ||
+        !/^(?:(?:;[ \t]*|\n)echo "(?:[^"$`\\\n]|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[A-Za-z0-9_ .,:=\/-]*)?\})*")+$/.test(suffix)) return null;
+    return suffix.match(/(?:;|\n)[ \t]*echo "/g)!.length;
+  };
+  let probeResult = 'no Bash call matched the canonical probe block';
+  let nonCanonicalProbes = 0;
   for (const call of calls.values()) {
-    if (call.name !== 'Bash' || typeof call.input.command !== 'string' || !canonical(call.input.command, options.commands.probe)) continue;
+    if (call.name !== 'Bash' || typeof call.input.command !== 'string') continue;
+    const echoes = canonical(call.input.command, options.commands.probe) ? 0 : diagnosticEchoes(call.input.command);
+    if (echoes === null) {
+      if (call.input.command.includes('CODEX_MODE')) nonCanonicalProbes++;
+      continue;
+    }
     result.probeToolUseId = call.id; delete result.probeMode;
-    if (!call.result || call.result.error) continue;
+    if (!call.result || call.result.error) { probeResult = call.result ? 'probe result is an error' : 'probe has no result'; continue; }
     const modes = [...call.result.content.matchAll(/^CODEX_MODE: ([a-z_]+)\r?$/gm)];
-    if (modes.length !== 1 || !call.result.content.trimEnd().endsWith(modes[0]![0])) continue;
-    result.probeToolUseId = call.id; result.probeMode = modes[0]![1];
+    const trailing = modes.length === 1 ? call.result.content.slice(modes[0]!.index! + modes[0]![0].length).trimEnd() : '';
+    if (modes.length !== 1 || (trailing ? trailing.replace(/^\r?\n/, '').split(/\r?\n/).length : 0) !== echoes) {
+      probeResult = `probe output has ${modes.length} CODEX_MODE line(s) and ${modes.length === 1 ? 'does not end with it' : 'needs exactly one'}`;
+      continue;
+    }
+    result.probeToolUseId = call.id; result.probeMode = modes[0]![1]; probeResult = 'mode recorded';
   }
   const native: Array<{ call: Call; snapshot: any; content: string }> = [];
   for (const call of calls.values()) {
@@ -182,7 +216,7 @@ export function autoplanDualVoiceEvidence(transcript: unknown[], options: Autopl
       if (sha(content) !== snapshot.sha256 ||
           !readFileSync(nativePath, 'utf8').includes(content)) continue;
       if (!/^Async agent launched successfully\./.test(call.result.content) &&
-          !new RegExp('^INPUT: ceo ' + snapshot.sha256 + '(?:\\r?\\n|$)').test(call.result.content.trimStart())) continue;
+          !new RegExp('^INPUT: ceo ' + snapshot.sha256 + '(?:\\r?\\n|$)').test(report(call.result.content).trimStart())) continue;
       native.push({ call, snapshot, content });
     } catch { /* Unowned, spec-only, foreign-phase and forged snapshots earn no voice credit. */ }
   }
@@ -226,6 +260,10 @@ export function autoplanDualVoiceEvidence(transcript: unknown[], options: Autopl
   }
   result.codexUnavailable ||= result.claudeVoiceFired && ['not_installed', 'not_authed', 'broken_install', 'model_unusable'].includes(result.probeMode ?? '');
   if (!result.claudeVoiceFired) result.reasons.push('No acknowledged current CEO phase dispatch');
-  if (!result.codexVoiceFired && !result.codexUnavailable) result.reasons.push('No acknowledged outside execution or actual unavailable probe result');
+  if (!result.codexVoiceFired && !result.codexUnavailable) {
+    result.reasons.push('No acknowledged outside execution or actual unavailable probe result');
+    result.reasons.push(`probeToolUseId=${result.probeToolUseId ?? 'none'} probeMode=${result.probeMode ?? 'none'} ` +
+      `canonicalMatch=${result.probeToolUseId ? 'yes' : 'no'} (${probeResult}; ${nonCanonicalProbes} non-canonical Bash call(s) mention CODEX_MODE)`);
+  }
   return result;
 }

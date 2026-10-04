@@ -182,6 +182,50 @@ describe('gen-skill-docs --out-dir (B2 render isolation)', () => {
     }
   });
 
+  // W7 regression contract: ./setup now passes --model <overlay> to every
+  // Claude render, and the default overlay is `claude`. That is only safe if
+  // `--model claude` renders exactly what the render without --model did.
+  test('gen:skill-docs:user --host claude --model claude is byte-identical to the render without --model', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-home-'));
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-model-claude-'));
+    const linkRoot = path.join(base, 'render', 'claude');
+    const files = (dir: string): Map<string, string> => {
+      const out = new Map<string, string>();
+      const walk = (d: string) => {
+        for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+          const p = path.join(d, entry.name);
+          if (entry.isDirectory()) walk(p);
+          else out.set(path.relative(dir, p), hashFile(p));
+        }
+      };
+      walk(dir);
+      return out;
+    };
+    try {
+      fs.writeFileSync(
+        path.join(tmpHome, 'gbrain-detection.json'),
+        JSON.stringify({ gbrain_local_status: 'ok', gbrain_version: '9.9.9' }),
+      );
+      const render = (out: string, extra: string[]) => spawnSync(
+        'bun',
+        ['run', 'gen:skill-docs:user', '--host', 'claude', '--out-dir', out, '--link-root', linkRoot, ...extra],
+        { cwd: ROOT, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, GSTACK_HOME: tmpHome } },
+      );
+      const plain = render(path.join(base, 'plain'), []);
+      expect(plain.status, plain.stderr).toBe(0);
+      const pinned = render(path.join(base, 'model-claude'), ['--model', 'claude']);
+      expect(pinned.status, pinned.stderr).toBe(0);
+      const a = files(path.join(base, 'plain'));
+      const b = files(path.join(base, 'model-claude'));
+      expect(a.size).toBeGreaterThan(50);
+      expect([...b.keys()].sort()).toEqual([...a.keys()].sort());
+      expect([...a].filter(([rel, hash]) => b.get(rel) !== hash).map(([rel]) => rel)).toEqual([]);
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 240_000);
+
   // ── External-host out-dir cases ─────────────────────────────
   // The former tree-mutating tests read codex/factory artifacts from out-dir
   // renders. That is only sound if an out-dir external render is (a) clean —

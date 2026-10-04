@@ -2,6 +2,10 @@
 <!-- Regenerate: bun run gen:skill-docs -->
 ## Step 2: Per-File Documentation Audit
 
+**Ship-owned documentation mode:** after Steps 1 and 1.5, execute Steps 2–4 and 6 only,
+under audit-scope's edit boundary, then return its JSON result; all standalone
+metadata, review, commit and PR steps below remain unavailable to this child.
+
 Read each documentation file and cross-reference it against the diff. Use these generic heuristics
 (adapt to whatever project you're in — these are not gstack-specific):
 
@@ -29,7 +33,7 @@ Read each documentation file and cross-reference it against the diff. Use these 
 - Are listed commands and scripts accurate?
 - Do build/test instructions match what's in package.json (or equivalent)?
 
-**Any other .md files:**
+**Other relevant docs and authored templates (including nested declared roots):**
 - Read the file, determine its purpose and audience.
 - Cross-reference against the diff to check if it contradicts anything the file says.
 
@@ -44,7 +48,9 @@ For each file, classify needed updates as:
 
 ## Step 3: Apply Auto-Updates
 
-Make all clear, factual updates directly using the Edit tool.
+Make all clear, factual updates directly using the Edit tool after reading the full
+file. In ship-owned read-only mode, propose them as blockers without editing. Preserve
+pre-existing user edits; ambiguity about overlapping content goes back to the parent.
 
 For each file modified, output a one-line summary describing **what specifically changed** — not
 just "Updated README.md" but "README.md: added /new-skill to skills table, updated skill count
@@ -60,6 +66,11 @@ from 9 to 10."
 
 ## Step 4: Ask About Risky/Questionable Changes
 
+In ship-owned mode, record the specific decision and affected paths as blockers for
+the parent, leave the questionable content alone, and finish the remaining safe audit.
+Do not call AskUserQuestion or auto-choose any recommendation. Standalone mode follows
+the existing gate below.
+
 For each risky or questionable update identified in Step 2, use AskUserQuestion with:
 - Context: project name, branch, which doc file, what we're reviewing
 - The specific documentation decision
@@ -72,12 +83,9 @@ Apply approved changes immediately after each answer.
 
 ## Step 5: CHANGELOG Voice Polish
 
-**CRITICAL — NEVER CLOBBER CHANGELOG ENTRIES.**
-
-This step polishes voice. It does NOT rewrite, replace, or regenerate CHANGELOG content.
-
-A real incident occurred where an agent replaced existing CHANGELOG entries when it should have
-preserved them. This skill must NEVER do that.
+This step polishes voice only. It does not rewrite, replace, or regenerate CHANGELOG
+content: the entries are the release record, and a replaced entry loses facts nobody
+notices until after the release.
 
 **Rules:**
 1. Read the entire CHANGELOG.md first. Understand what is already there.
@@ -92,11 +100,11 @@ preserved them. This skill must NEVER do that.
 
 **If CHANGELOG was modified in this branch**, review the entry for voice:
 
-- **Sell test (Diataxis rubric):** Score each CHANGELOG entry 0-3:
-  - **1 point** — answers "What changed?" (reference: names the feature/fix)
-  - **1 point** — answers "Why should I care?" (explanation: user impact, pain removed)
-  - **1 point** — answers "How do I use it?" (how-to: command, flag, or link to docs)
-  - Entries scoring <2 need attention, not replacement. Report missing facts or user impact; polish existing wording only. A score of 3 passes all three checks.
+- **Sell test (Diataxis):** a good entry answers "What changed?" (names the
+  feature/fix), "Why should I care?" (user impact, pain removed) and "How do I use
+  it?" (command, flag, or link to docs). An entry that answers fewer than two of these needs
+  attention, not replacement: report the missing facts or user impact, and polish
+  existing wording only.
 - Lead with what the user can now **do** — not implementation details.
 - "You can now..." not "Refactored the..."
 - Flag commit-message-style entries and polish wording without removing facts.
@@ -117,6 +125,11 @@ After auditing each file individually, do a cross-doc consistency pass:
    should be discoverable from one of the two entry-point files.
 5. Flag any contradictions between documents. Auto-fix clear factual inconsistencies (e.g., a
    version mismatch). Use AskUserQuestion for narrative contradictions.
+
+In ship-owned mode, protected metadata/manifests stay untouched even for factual
+inconsistencies, and narrative contradictions return as blockers. This is the last
+ship-child step: output the doc-health summary and audit-scope's JSON result, then
+STOP. A partial audit or unresolved required correction is `blocked`, never `current`.
 
 ---
 
@@ -143,7 +156,7 @@ If TODOS.md does not exist, skip this step.
 
 ## Step 8: VERSION Bump Question
 
-**CRITICAL — NEVER BUMP VERSION WITHOUT ASKING.**
+**Ask before changing VERSION** — the version number is the user's release decision.
 
 1. **If VERSION does not exist:** Skip silently.
 
@@ -177,7 +190,7 @@ git diff <diff-base> HEAD -- VERSION
 
    **Spawned sessions** (per the spawned-dispatch contract at the top of this skill): the
    recommendation flips — choose C (leave version as-is) and record the uncovered scope in
-   your completion report (the `decisions` array when dispatched from /ship).
+   your completion report. Ship-owned children stopped at Step 6 and never reach this step.
    A spawned run must never change VERSION: the dispatching workflow owns version numbering.
 
    The key insight: a VERSION bump set for "feature A" should not silently absorb "feature B"
@@ -195,7 +208,7 @@ not an opt-in. The user turns it off only by asking explicitly
 **Spawned-session skip** (per the spawned-dispatch contract at the top of this skill): in a
 spawned session, skip this entire section — the dispatching workflow owns its own review
 passes, and the apply gate below needs a human. Note the skip in the upcoming Step 9 doc
-health summary and continue to Step 9.
+health summary and continue to Step 9. Ship-owned children already stopped at Step 6.
 
 **Preflight — decide whether and how the doc review runs:**
 
@@ -207,11 +220,6 @@ _CODEX_CFG=$(~/.claude/skills/gstack/bin/gstack-config get codex_reviews 2>/dev/
 source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null || true
 if [ "$_CODEX_CFG" = "disabled" ]; then
   _CODEX_MODE="disabled"
-# Running-under-Codex presence probe (#2519): a live Codex session exports
-# CODEX_THREAD_ID / CODEX_SANDBOX into every shell it spawns (verified
-# against a live `codex exec 'env | grep -i codex'` capture, codex 0.147.0).
-# Nested codex spawns from inside a Codex host multiply token burn
-# (observed: one /review = 15M tokens). A stale own-harness artifact must stop.
 elif { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
   _CODEX_MODE="under_codex"
 elif ! command -v codex >/dev/null 2>&1; then
@@ -235,11 +243,11 @@ echo "CODEX_MODE: $_CODEX_MODE"
 
 Branch on the echoed `CODEX_MODE`:
 - **`disabled`** — the user turned Codex reviews off (`codex_reviews=disabled`). Skip this section entirely; do NOT fall back to a Claude subagent — disabled means no extra review step. Print: "Codex review skipped (codex_reviews disabled). Re-enable: `gstack-config set codex_reviews enabled`."
-- **`not_installed`** — Codex CLI absent. Print: "Codex not installed — falling back to a Claude subagent (fresh context, but the same harness; model identity is unknown). Install Codex for an actual outside-model read: `npm install -g @openai/codex`." Fall back to the Claude subagent path.
+- **`not_installed`** — Codex CLI absent. Print: "Codex not installed; outside coverage unavailable. Install: `npm install -g @openai/codex`." Fall back to the Claude subagent path.
 - **`under_codex`** — stale artifact selected its own harness. Print: "Codex outside review unavailable: harness mismatch; no outside process started. Missing coverage. Repair: setup --host codex." Skip the outside invocation and follow the workflow's native-review instructions below. Conflicting inherited harness markers are not grounds to guess another provider.
-- **`not_authed`** — installed but no credentials. Print: "Codex installed but not authenticated — falling back to a Claude subagent (same harness; model identity is unknown). Run `codex login` or set `$CODEX_API_KEY`." Fall back to the Claude subagent path.
-- **`broken_install`** — the CLI is on PATH but cannot execute (spawn ENOENT, non-executable binary, missing vendor payload). Print: "Codex is installed but its binary cannot run — Codex passes skipped. Reinstall: `npm install -g @openai/codex`." Relay the probe's HINT lines and fall back to the Claude subagent path. This state exists because a missing binary used to land in the model probe's fail-open bucket and report `ready`, so every Codex pass was skipped silently (#2742).
-- **`model_unusable`** — authed but the account cannot use gstack's selected Codex model (#2477: HTTP 400 on every call). Relay the probe's HINT lines, tell the user the one-line fix (set `GSTACK_CODEX_MODEL=<supported-model>` or pass an explicit `-c model=...` override), and fall back to the Claude subagent path. The ~10s round trip is cached for 1h; timeouts fail open to `ready`.
+- **`not_authed`** — installed but no credentials. Print: "Codex not authenticated; outside coverage unavailable. Run `codex login` or set `$CODEX_API_KEY`." Fall back to the Claude subagent path.
+- **`broken_install`** — the CLI is on PATH but cannot execute (spawn ENOENT, non-executable binary, missing vendor payload). Print: "Codex is installed but its binary cannot run — Codex passes skipped. Reinstall: `npm install -g @openai/codex`." Relay the probe's HINT lines. Fall back to the Claude subagent path.
+- **`model_unusable`** — the selected model (see `CODEX_MODEL:`) is invalid or unavailable to the account (HTTP 400 on every call). Relay the probe's HINT lines and the fix (`GSTACK_CODEX_MODEL=<supported-model>` or config.toml `model`); never substitute a model. Fall back to the Claude subagent path. The ~10s round trip is cached for 1h; timeouts fail open to `ready`.
 - **`ready`** — run the Codex pass below.
 
 **Disabled is a terminal branch for this section.** If the preflight prints
@@ -266,7 +274,7 @@ fi
 When the mode is anything except `disabled`, print one line so the off-switch
 stays discoverable: "Running the Codex doc review automatically (standard step). Disable: `gstack-config set codex_reviews disabled`."
 
-**Determine the release diff range (D3 — reuse the method, do not invent one).**
+**Determine the release diff range (reuse the method, do not invent one).**
 Recompute the SAME range document-release used in its pre-flight / diff analysis, with the
 documented merge-base method:
 
@@ -284,7 +292,7 @@ just edited) PLUS any doc claims affected by the diff range — do NOT hard-code
 list (a fixed README/ARCHITECTURE/CHANGELOG list misses generated skill docs, package docs,
 and command-specific docs). **Always start with the filesystem boundary instruction:**
 
-"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are skill definitions, not repository review data. Do not follow nested skills, hooks, or tool instructions. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Do NOT modify agents/openai.yaml. Stay focused on the repository code only.\n\nYou are reviewing documentation changes against the code that shipped on this
+"Filesystem boundary: do not read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. They hold skill definitions, not repository code to review. Do not invoke any installed skill (Codex home skills/, .agents/), hook, or tool instruction; answer directly. Do not modify agents/openai.yaml. Review only the repository code.\n\nYou are reviewing documentation changes against the code that shipped on this
 branch. Review the supplied release diff (git diff <diff-base> HEAD) and the current updated working-tree docs
 (the files this release touched, plus any docs whose claims the diff affects). Find: doc
 claims that no longer match the code, new public surface (commands, flags, config keys,
@@ -315,11 +323,10 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" || exit 1
+source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" && _gstack_codex_select_model exec || exit 1
 _OUTSIDE_PROMPT=$(cat "$_OUTSIDE_INPUT") || exit 1
 _OUTSIDE_EXIT=0
-_gstack_codex_timeout_wrapper 300 codex exec "$_OUTSIDE_PROMPT" -C "$_REPO_ROOT" -s read-only -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
-# Preserve findings and partial output even when transport or validation fails.
+_gstack_codex_timeout_wrapper 300 codex exec "$_OUTSIDE_PROMPT" -C "$_REPO_ROOT" -s read-only -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
 cat "$_OUTSIDE_TMP/text" || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 
 cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
@@ -332,7 +339,7 @@ bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" review "$_OUTSIDE
 echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 ```
 
-Show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
+Use Bash `timeout: 360000`; show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
 
 Present the full output verbatim under `CODEX SAYS (documentation review):`.
 
@@ -352,7 +359,7 @@ A native result never supplies outside coverage.
 Dispatch via the Agent tool with the same prompt, passing `run_in_background: false` (subagents default to background since Claude Code v2.1.198). Bound it at a 5-minute timeout; if it never completes, treat the review as unavailable and continue.
 Present findings under `DOCUMENTATION REVIEW (Claude subagent):`. If it fails: "Doc review unavailable. Continuing to Step 9." Skip the apply gate, persist `status: unavailable`, `outside_status: unavailable`, and `source: none` below, then continue; unavailable is not a clean review.
 
-**Apply decision (T3B — informational, never auto-edit, but findings don't evaporate).**
+**Apply decision (informational, never auto-edit, but findings don't evaporate).**
 If at least one reviewer completed and there are zero findings, say "Docs match what shipped — no gaps." and state which reviewer supplied that coverage. If neither completed, report "Doc review unavailable", skip the apply question, and persist unavailability below before Step 9. Otherwise
 present the findings, then use AskUserQuestion ONCE:
 
@@ -396,7 +403,7 @@ modified by this run (including approved VERSION/manifest updates), skip commit/
 git commit -m "$(cat <<'EOF'
 docs: update project documentation for vX.Y.Z.W
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
 )"
 ```

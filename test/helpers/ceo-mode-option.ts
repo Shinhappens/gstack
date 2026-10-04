@@ -146,10 +146,81 @@ function hasNativePostureProse(text: string, posture: RegExp): boolean {
   return hasPostAnswerCeoPosture(`● ${prose}`, posture);
 }
 
+const CLIPPED_PREFIX_MIN = 120;
+
+/**
+ * A review taller than the viewport can clip its heading and earlier questions
+ * before they ever render, and it truncates a long question with "…". Authenticate
+ * the visible tail from the Submit prompt backwards: every visible answer is an
+ * offered option, each question below the clip matches its native text (or a long
+ * native prefix before "…"), the mode question's target answer is visible, and only
+ * the topmost segment may be cut off above the viewport; a cut mode question must
+ * still show a long native tail. The native answer is verified again after Submit.
+ */
+function clippedReviewMatches(visible: string, selected: NativePlanQuestionCall,
+  modeQuestion: NativePlanQuestionCall['questions'][number], targetMode: CeoMode): boolean {
+  const compact = (text: string) => text.replace(/\s+/g, '');
+  let body = compact(visible.replace(/^[ \t]*[│┃] ?/gm, '').replace(/^[ \t]*[●⏺] ?/gm, ''));
+  if (!body.endsWith(BARLESS_SUBMIT_END) || /[←☐☒]/.test(body)) return false;
+  body = body.slice(0, -BARLESS_SUBMIT_END.length);
+  const modeIndex = selected.questions.indexOf(modeQuestion);
+  for (let i = selected.questions.length - 1; i >= 0; i--) {
+    const question = selected.questions[i]!;
+    const answers = (i === modeIndex
+      ? question.options.filter(o => modeTitle(o.label) === targetMode.replace(/\s+/g, ''))
+      : question.options).map(o => `→${compact(o.label)}`).filter(answer => body.endsWith(answer));
+    if (answers.length !== 1) return false;
+    body = body.slice(0, -answers[0]!.length);
+    const text = compact(question.question);
+    let shown = 0;
+    if (body.endsWith(text)) shown = text.length;
+    else if (body.endsWith('…')) {
+      for (let length = text.length - 1; length >= CLIPPED_PREFIX_MIN && !shown; length--) {
+        if (body.slice(0, -1).endsWith(text.slice(0, length))) shown = length + 1;
+      }
+    }
+    if (!shown) {
+      if (i > modeIndex || (i === modeIndex && body.replace(/…$/, '').length < CLIPPED_PREFIX_MIN)) return false;
+      return body.endsWith('…') ? text.includes(body.slice(0, -1)) : text.endsWith(body);
+    }
+    body = body.slice(0, -shown);
+    if (!body) return i <= modeIndex;
+  }
+  return 'Reviewyouranswers'.endsWith(body);
+}
+
+/**
+ * A packet can bundle setup tabs after the mode tab. Once the mode tab is
+ * answered, answer each later non-mode tab of the same unsubmitted call once,
+ * with the navigation rule (prerequisite pick, else option 1), so Submit is reachable.
+ */
+export function ceoModePacketTabAnswer(
+  visible: string, selected: NativePlanQuestionCall | undefined, transcript: PlanCountTranscript, answered: Set<string>,
+): { question: AskUserQuestionFingerprint; index: number } | null {
+  if (!selected || !selected.sessionId || !selected.toolUseId || transcript.status !== 'ready' ||
+      selected.questions.length < 2 || selected.questions.length > 4 || selected.questions.some(q => q.multiSelect)) return null;
+  const id = `${selected.sessionId}:${selected.toolUseId}`;
+  const current = transcript.calls.filter(call => `${call.sessionId}:${call.toolUseId}` === id);
+  if (current.length !== 1 || current[0]!.answered || current[0]!.failed ||
+      JSON.stringify(current[0]!.questions) !== JSON.stringify(selected.questions)) return null;
+  const bar = posturePacketBar(visible);
+  if (!bar || JSON.stringify(bar.headers) !== JSON.stringify(selected.questions.map(q => q.header.trim().replace(/\s+/g, ' ')))) return null;
+  const modeIndex = selected.questions.findIndex(q => q.options.filter(o => modeTitle(o.label)).length >= 2);
+  if (modeIndex < 0 || !bar.answered[modeIndex]) return null;
+  const question = capturePlanCountQuestion(visible, new Set(), 0, true, selected);
+  const tab = question?.nativeQuestionIndex;
+  if (!question || question.nativeCall !== selected || tab === undefined || tab <= modeIndex || bar.answered[tab] ||
+      JSON.stringify(question.options.map(o => o.label)) !== JSON.stringify(selected.questions[tab]!.options.map(o => o.label))) return null;
+  const key = `${id}:${tab}`;
+  if (answered.has(key)) return null;
+  answered.add(key);
+  return { question, index: planCountPrerequisitePick(question) ?? 1 };
+}
+
 /** Finish the selected native mode packet before waiting for its answer. */
 export function ceoModeSubmissionInput(
   visible: string, selected: NativePlanQuestionCall | undefined, targetMode: CeoMode,
-  transcript: PlanCountTranscript, submitted: Set<string>,
+  transcript: PlanCountTranscript, submitted: Set<string>, screenText = '',
 ): string | null {
   if (!selected || selected.answered || selected.failed || !selected.sessionId || !selected.toolUseId ||
       transcript.status !== 'ready' || selected.questions.length < 2 ||
@@ -161,16 +232,33 @@ export function ceoModeSubmissionInput(
   const modeQuestions = selected.questions.filter(q => q.options.filter(o => modeTitle(o.label)).length >= 2);
   if (modeQuestions.length !== 1 || findCeoModeOption(modeQuestions[0]!.options.map((o, i) =>
       ({index:i + 1, label:o.label})), targetMode) === null) return null;
-  const bar = posturePacketBar(visible);
-  if (!bar || !bar.answered.every(Boolean) || JSON.stringify(bar.headers) !== JSON.stringify(
-      selected.questions.map(q => q.header.trim().replace(/\s+/g, ' '))) ||
-      planCountSubmissionInput(visible) !== '\r') return null;
-  const rawBar = [...visible.matchAll(/←[^\r\n]+✔\s*Submit\s*→/g)].at(-1)!;
-  const preceding = visible.slice(0, rawBar.index);
-  if (/```|~~~|^\s*>|\b(?:example|quoted|source)[^:\n]*:\s*$/im.test(preceding)) return null;
   const compact = (text: string) => text.replace(/\s+/g, '');
-  const panel = compact(visible.slice(rawBar.index! + rawBar[0].length)
-    .replace(/^[ \t]*[│┃] ?/gm, '').replace(/^[ \t]*[●⏺] ?/gm, ''));
+  const quotedContext = /```|~~~|^\s*>|\b(?:example|quoted|source)[^:\n]*:\s*$/im;
+  const bar = posturePacketBar(visible);
+  let review: string;
+  if (bar) {
+    if (!bar.answered.every(Boolean) || JSON.stringify(bar.headers) !== JSON.stringify(
+        selected.questions.map(q => q.header.trim().replace(/\s+/g, ' '))) ||
+        planCountSubmissionInput(visible) !== '\r') return null;
+    const rawBar = [...visible.matchAll(/←[^\r\n]+✔\s*Submit\s*→/g)].at(-1)!;
+    if (quotedContext.test(visible.slice(0, rawBar.index))) return null;
+    review = visible.slice(rawBar.index! + rawBar[0].length);
+  } else {
+    // A review taller than the terminal scrolls its tab bar and heading off
+    // the viewport (run 36606688266). The viewport must still end at the
+    // focused Submit prompt; the accumulated screen text then supplies the
+    // one complete review panel, authenticated below exactly as with a bar.
+    const heading = screenText.lastIndexOf('Review your answers');
+    if (heading < 0 && compact(screenText).endsWith(BARLESS_SUBMIT_END) &&
+        clippedReviewMatches(visible, selected, modeQuestions[0]!, targetMode)) {
+      submitted.add(id);
+      return '\r';
+    }
+    if (heading < 0 || !compact(visible).endsWith(BARLESS_SUBMIT_END) ||
+        quotedContext.test(screenText.slice(0, heading).split('\n').slice(-3).join('\n'))) return null;
+    review = screenText.slice(heading);
+  }
+  const panel = compact(review.replace(/^[ \t]*[│┃] ?/gm, '').replace(/^[ \t]*[●⏺] ?/gm, ''));
   // Authenticate the complete review panel against native questions and
   // offered answers. An intended keypress or a selected-mode echo is not an ACK.
   let prefixes = ['Reviewyouranswers'];
@@ -291,7 +379,8 @@ function singleScopeBrief(text: string, descriptions: readonly string[], compari
     quote => quote.replace(/\?/g, '')) : text;
   const questions = questionText.replace(/\?[A-Za-z_][\w-]*=/g, '=').match(/\?/g);
   if ((questions?.length ?? 0) !== (proposalHeading ? 0 : 1) || /```|~~~|^\s*>/m.test(text)) return false;
-  const comparisonMarker = expansion
+  // The preamble requires the Note form for different-kind menus (Add/Defer/Skip, Defer/Keep).
+  const comparisonMarker = expansion || !comparison
     ? /Completeness:|Note:\s*options differ in kind, not coverage\s*[—–-]\s*no completeness score\./gi
     : /Completeness:/gi;
   const markers = [/Project\/branch\/task:/gi, /ELI10:/gi, /Stakes if (?:we pick )?wrong:/gi,
@@ -312,8 +401,10 @@ function singleScopeBrief(text: string, descriptions: readonly string[], compari
     if (!ratings.length || ratings.some(score => Number(score[1]) > 10)) return false;
   }
   return complete && (comparison ? /^[^.!?;\n]+ (?:vs|versus) [^.!?;\n]+\.$/.test(net)
-    : /^[^.!?;\n]+\.$/.test(net.replace(/\bvs\./gi, 'vs')));
+    : /^[^.!?\n]+\.$/.test(net.replace(/\bvs\./gi, 'vs')));
 }
+
+const KEEP_LABEL_WORDS = new Set(['keep', 'retain', 'include', 'the', 'and', 'all', 'scope', 'plan', 'planned', 'current', 'now', 'its']);
 
 /** Fixture-owned baseline for a completed scope-preservation decision. */
 export interface CeoPostureSource { path: string; content: string }
@@ -330,25 +421,27 @@ function hasCompletedScopePreservation(transcript: PlanCountTranscript, selected
   if (selectedPlans.length !== 1 || selectedPlans[0] !== name || plans.length !== 1 || plans[0] !== name ||
       !/\bHOLD SCOPE\b/.test(context) || /\b(?:SCOPE EXPANSION|SELECTIVE EXPANSION|SCOPE REDUCTION|historical|previous|example|hypothetical|withdrawn)\b/i.test(context)) return false;
   if (q.multiSelect || q.options.length !== 2 || !singleScopeBrief(q.question, q.options.map(o => o.description ?? ''), false)) return false;
-  const labels = q.options.map(o => o.label.replace(/\s*\(recommended\)\s*$/i, '').trim());
-  const kept = labels.map(label => /^Keep ([a-z][a-z -]{0,70}) in scope$/i.exec(label));
-  const index = kept.findIndex(Boolean);
-  if (index < 0 || kept.filter(Boolean).length !== 1 || call.answers?.[q.question] !== q.options[index]!.label) return false;
-  const subject = kept[index]![1]!.trim();
+  // One option keeps an item and the other defers it; the answer selects the
+  // keep option. Label and question wording are free.
+  const labels = q.options.map(o => o.label.replace(/\s*\(recommended\)\s*$/i, '').replace(/^[A-B][):.]\s*/i, '').trim());
+  const keeps = labels.map(label => /\b(?:keep|retain|include)\b/i.test(label) && !/\b(?:defer|todos?|drop|cut)\b/i.test(label));
+  const index = keeps.indexOf(true);
+  if (index < 0 || keeps.filter(Boolean).length !== 1 || !/\b(?:defer|todos?|later|drop|cut)\b/i.test(labels[1 - index]!) ||
+      call.answers?.[q.question] !== q.options[index]!.label) return false;
   const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  if (!new RegExp(`^Defer ${escape(subject)} to TODOS(?:\\.md)?$`, 'i').test(labels[1-index]!) ||
-      !new RegExp(`^D\\d+\\s*[—–-]\\s*Keep (?:the )?${escape(subject)}\\b[^?\\n]* in scope, or defer`, 'i').test(q.question)) return false;
   const body = q.question + '\n' + q.options[index]!.description;
   if (!q.options.every(o => typeof o.description === 'string' && o.description.trim()) ||
-      /\b(?:also|additionally|separately|expand(?:ing)? scope|outside (?:the )?(?:plan|scope)|and add|plus new|withdrawn|cancelled|canceled|retracted|revoked|hypothetical)\b/i.test(body)) return false;
-  // The choice retains an actual baseline requirement and names concrete
-  // failure/proof consequences, rather than merely repeating the mode label.
+      /\b(?:also|additionally|separately|expand(?:ing)? scope|outside (?:the )?(?:plan|scope)|and add|plus new|withdrawn|cancelled|canceled|retracted|revoked|hypothetical|historical)\b/i.test(body) ||
+      /^\s*(?:for )?example\b/i.test(q.question)) return false;
+  // The kept item is an actual baseline requirement of the plan, and the brief
+  // explains its consequences rather than merely repeating the mode label.
   const required = source.content.split('\n').filter(line => /^\s*-\s+/.test(line));
-  if (!required.some(line => new RegExp(`\\b${escape(subject)}\\b`, 'i').test(line)) ||
-      !new RegExp(`(?:${escape(name)} lists|the plan already states)\\b`, 'i').test(q.question)) return false;
-  if ([/\btests?\b/i, /\bauthz\b|\baccess\b/i, /\b(?:concurrent|duplicate|stale)\b/i,
-       /\b(?:delete.and.recreate|delete\+recreate|re-save)\b/i, /\b(?:pilot|reuse) metric\b/i]
-      .filter(pattern => pattern.test(body)).length < 2) return false;
+  const subjectWords = (labels[index]!.toLowerCase().match(/[a-z][a-z_-]{2,}/g) ?? [])
+    .filter(word => !KEEP_LABEL_WORDS.has(word));
+  if (!subjectWords.some(word => required.some(line => new RegExp(`\\b${escape(word)}\\b`, 'i').test(line)))) return false;
+  const rationale = [/ELI10:([\s\S]*?)(?=Stakes if (?:we pick )?wrong:)/i, /Stakes if (?:we pick )?wrong:([\s\S]*?)(?=Recommendation:)/i]
+    .map(part => part.exec(q.question)?.[1] ?? '').join(' ');
+  if ((rationale.match(/\S+/g) ?? []).length < 20) return false;
   const times = completedQuestionTimes(call, events); if (!times || times.answeredAt > Date.now()) return false;
   const own = events.filter(e => e.sessionId === selected.sessionId);
   const loaded = own.some(use => {
@@ -388,7 +481,9 @@ function hasAnsweredHoldPosture(transcript: PlanCountTranscript, selected: Nativ
     // standalone prose is published. Metadata and answer echoes do not count.
     // This recognizes posture language; it does not validate every scope choice.
     const context = /Project\/branch\/task:([\s\S]*?)(?=ELI10:)/i.exec(q.question)?.[1] ?? '';
-    const rationale = /ELI10:([\s\S]*?)(?=Stakes if (?:we pick )?wrong:)/i.exec(q.question)?.[1]?.trim() ?? '';
+    // The ELI10 and the Recommendation's reason are both the brief's own rationale.
+    const rationale = [/ELI10:([\s\S]*?)(?=Stakes if (?:we pick )?wrong:)/i, /Recommendation:[^\n]*?\bbecause\b([^\n]*)/i]
+      .map(part => part.exec(q.question)?.[1]?.trim() ?? '').join('\n');
     const offered = q.options.map(o => o.label.trim());
     if (!q.multiSelect && q.options.length >= 2 && q.options.length <= 4 && new Set(offered).size === offered.length &&
         offered.includes(call.answers?.[q.question] ?? '') && /\bHOLD SCOPE\b/i.test(context) &&
@@ -960,4 +1055,16 @@ export function nextCeoPostureContinuation(
     postureContinuations.set(seenQuestions, { modeId, packet: current });
   } else postureContinuations.set(seenQuestions, { modeId });
   return 'question';
+}
+
+/** HOLD SCOPE's own "Deferring current scope" menu: one question, exactly a
+ * Defer-to-TODOS option and a Keep-in-scope option. Returns the Keep index. */
+export function holdDeferKeepIndex(call: NativePlanQuestionCall | undefined): number | null {
+  if (call?.questions.length !== 1) return null;
+  const q = call.questions[0]!;
+  if (q.multiSelect || q.options.length !== 2) return null;
+  const labels = q.options.map(option => option.label.trim().replace(/^[A-Z][).:]\s+/, '').replace(/\s*\(recommended\)\s*$/i, ''));
+  const defer = labels.findIndex(label => /^Defer\b[^\n]*\bTODOS(?:\.md)?$/i.test(label));
+  const keep = labels.findIndex(label => /^Keep\b[^\n]*\bin scope$/i.test(label));
+  return defer >= 0 && keep >= 0 && defer !== keep ? keep + 1 : null;
 }

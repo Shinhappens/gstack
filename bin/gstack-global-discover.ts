@@ -13,6 +13,7 @@ import { existsSync, readdirSync, statSync, readFileSync, openSync, readSync, cl
 import { join, basename } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
+import { canonicalRemote } from "../lib/remote-identity";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -122,33 +123,11 @@ function windowToDate(window: string): Date {
 // ── URL normalization ──────────────────────────────────────────────────────
 
 export function normalizeRemoteUrl(url: string): string {
-  let normalized = url.trim();
-
-  // SSH → HTTPS: git@github.com:user/repo → https://github.com/user/repo
-  const sshMatch = normalized.match(/^(?:ssh:\/\/)?git@([^:]+):(.+)$/);
-  if (sshMatch) {
-    normalized = `https://${sshMatch[1]}/${sshMatch[2]}`;
-  }
-
-  // Strip .git suffix
-  if (normalized.endsWith(".git")) {
-    normalized = normalized.slice(0, -4);
-  }
-
-  // Lowercase the host portion
-  try {
-    const parsed = new URL(normalized);
-    parsed.hostname = parsed.hostname.toLowerCase();
-    normalized = parsed.toString();
-    // Remove trailing slash
-    if (normalized.endsWith("/")) {
-      normalized = normalized.slice(0, -1);
-    }
-  } catch {
-    // Not a valid URL (e.g., local:<path>), return as-is
-  }
-
-  return normalized;
+  // One identity per repository whichever way it was cloned (ssh, ssh:// with
+  // a port, https with credentials): the shared canonical remote from
+  // lib/remote-identity.ts, rendered as an https URL for display.
+  const id = canonicalRemote(url.trim());
+  return id.hosted ? `https://${id.canonical}` : url.trim();
 }
 
 // ── Git helpers ────────────────────────────────────────────────────────────

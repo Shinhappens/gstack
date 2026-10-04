@@ -114,7 +114,7 @@ Fence info-string options:
 
 ```
 ```mermaid title="Auth flow"        ← caption + aria-label
-```mermaid render=false             ← keep it as a code block (today's behavior)
+```mermaid render=false             ← keep it as a code block
 ```mermaid page=landscape           ← force this diagram onto a landscape page
 ```mermaid page=portrait            ← veto auto-landscape for this diagram
 ```
@@ -215,18 +215,11 @@ Metadata:
   --date "..."               Date for cover (defaults to today)
 ```
 
-## When Claude should run it
+## When to run it
 
-Watch for markdown-to-PDF intent. Any of these patterns → run `$P generate`:
-
-- "Can you make this markdown a PDF"
-- "Export it as a PDF"
-- "Turn this letter into a PDF"
-- "I need a PDF of the essay"
-- "Print this as a PDF for me"
-
-If the user has a `.md` file open and says "make it look nice", propose
-`$P generate --cover --toc` and ask before running.
+Run `$P generate` when the user wants markdown as a PDF. If the user has a `.md`
+file open and says "make it look nice", propose `$P generate --cover --toc` and ask
+before running.
 
 ## Debugging
 
@@ -237,10 +230,9 @@ If the user has a `.md` file open and says "make it look nice", propose
 - Diagram shows a red "failed to render" block → the parse error is printed in
   the block. If EVERY diagram fails with "diagram renderer:", the browser went
   away mid-run (Aside closed, or the fallback daemon died).
-- Fragmented text on copy-paste → highlight.js output (Phase 4). Retry with
-  `--no-syntax` once that flag exists. For now, remove fenced code blocks
-  and regenerate.
-- Paged.js timeout → probably no headings in the markdown. Drop `--toc`.
+- Fragmented text on copy-paste → remove fenced code blocks and regenerate
+  (no flag turns code styling off).
+- Exit 3 (`$P: --toc: …`) → TOC page numbers could not be verified against the printed PDF; the message says why. Drop `--toc`, or shorten very long TOC headings if it says the numbers did not settle.
 - "[remote image blocked]" placeholder in the output → add `--allow-network`
   (understand you're giving the markdown file permission to fetch from its
   image URLs).
@@ -254,7 +246,7 @@ stderr: Rendering HTML...        ← progress spinner (unless --quiet)
         Rendering PDF through Aside...   ← or "through gstack's browser"
         Done in 11.2s. 43 words · 22KB · /tmp/letter.pdf
 
-exit code: 0 success / 1 bad args / 2 render error / 3 Paged.js timeout
+exit code: 0 success / 1 bad args / 2 render error / 3 TOC page numbers failed
            / 4 no browser available (Aside not open, fallback not built)
 ```
 

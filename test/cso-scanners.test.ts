@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   importSarif, MAX_SCANNER_OUTPUT_BYTES, parseScannerOutput, scannerLocation,
   scannerPlans, validateScannerBaseUrl, type ScannerId, type ScannerPlan,
@@ -333,5 +335,91 @@ describe('CSO SARIF import boundary', () => {
     const result = importSarif(JSON.stringify(data), { sourceRoot: '/src' });
     expect(result.status).toBe('partial');
     expect(result.gaps[0].message).toContain('External SARIF');
+  });
+});
+
+// #3011: real scanner SARIF carries `uriBaseId`. Fixtures were captured from
+// semgrep 1.179.0 (`--sarif`, local rule) and trivy 0.75.0 (`fs` and `repo
+// <url>` misconfig scans); the trivy fs ROOTPATH was the capture machine's
+// checkout path, rewritten to /work/acme-app.
+describe('CSO SARIF uriBaseId mappings from real scanner output (#3011)', () => {
+  const fixture = (name: string) =>
+    JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures', 'cso-sarif', name), 'utf8'));
+  const importDoc = (doc: unknown, checkoutRoot?: string) =>
+    importSarif(JSON.stringify(doc), { sourceRoot: '/source', ...(checkoutRoot ? { checkoutRoot } : {}) });
+  const withBase = (uri: string, baseId: string, bases?: Record<string, unknown>, driver = 'CodeQL') => {
+    const data = sarif(sarifResult(uri));
+    const run = data.runs[0] as Record<string, any>;
+    run.tool.driver.name = driver;
+    if (bases) run.originalUriBaseIds = bases;
+    run.results[0].locations[0].physicalLocation.artifactLocation.uriBaseId = baseId;
+    return data;
+  };
+
+  test('semgrep %SRCROOT% (no originalUriBaseIds) resolves against the source root', () => {
+    const result = importDoc(fixture('semgrep-1.179.0.sarif'));
+    expect(result.gaps).toEqual([]);
+    expect(result.status).toBe('complete');
+    expect(result.candidates.map((c) => c.location?.path).sort()).toEqual(['lib/run.py', 'src/dir with space/run.py']);
+    expect(result.candidates[0].ruleId).toBe('subprocess-shell-true');
+  });
+
+  test('trivy fs ROOTPATH naming the checkout the run started on maps to the source root', () => {
+    const result = importDoc(fixture('trivy-0.75.0-fs.sarif'), '/work/acme-app');
+    expect(result.gaps).toEqual([]);
+    expect(result.candidates.map((c) => [c.ruleId, c.location?.path])).toEqual([['DS-0002', 'Dockerfile'], ['DS-0026', 'Dockerfile']]);
+  });
+
+  test('trivy fs ROOTPATH for another directory is rejected with a counted, named gap', () => {
+    const result = importDoc(fixture('trivy-0.75.0-fs.sarif'), '/work/other-app');
+    expect(result.status).toBe('partial');
+    expect(result.candidates).toHaveLength(0);
+    expect(result.gaps).toHaveLength(1);
+    expect(result.gaps[0].code).toBe('UNSAFE_LOCATION');
+    expect(result.gaps[0].message).toBe(
+      '2 SARIF result(s) could not be safely normalized and were not imported (first: rule DS-0002, base ROOTPATH=file:///work/acme-app/, path Dockerfile: URI base outside source root).',
+    );
+  });
+
+  test('a home-directory checkout matches before redaction, and gaps never echo the raw path', () => {
+    const doc = fixture('trivy-0.75.0-fs.sarif');
+    doc.runs[0].originalUriBaseIds.ROOTPATH.uri = 'file:///home/alice/code/acme-app/';
+    expect(importDoc(doc, '/home/alice/code/acme-app').candidates).toHaveLength(2);
+    const other = importDoc(doc, '/home/bob/code/acme-app');
+    expect(other.candidates).toHaveLength(0);
+    expect(other.gaps[0].message).not.toContain('/home/alice');
+  });
+
+  test('trivy repo <url> ROOTPATH (a URL folded into a path) is treated as undeclared', () => {
+    const doc = fixture('trivy-0.75.0-repo-url.sarif');
+    expect(importDoc(doc).candidates.map((c) => c.location?.path)).toEqual(['Dockerfile.build', 'Dockerfile.build']);
+    // Same scan run from a working directory other than `/`.
+    doc.runs[0].originalUriBaseIds.ROOTPATH.uri = 'file:///home/dev/https:/github.com/docker-library/hello-world/';
+    expect(importDoc(doc).gaps).toEqual([]);
+  });
+
+  test('declared bases inside the root, percent-encoded and Windows drive URIs resolve', () => {
+    const inside = importDoc(withBase('x.ts', 'SRC', { SRC: { uri: 'file:///source/pkg/' } }));
+    expect(inside.candidates[0].location?.path).toBe('pkg/x.ts');
+    const encoded = importDoc(withBase('x.ts', 'SRC', { SRC: { uri: 'file:///work/acme%20app/lib/' } }), '/work/acme app');
+    expect(encoded.candidates[0].location?.path).toBe('lib/x.ts');
+    const win = importDoc(withBase('x.ts', 'SRC', { SRC: { uri: 'file:///c:/Users/Dev/Acme/' } }), 'C:\\Users\\dev\\acme');
+    expect(win.candidates[0].location?.path).toBe('x.ts');
+  });
+
+  test.each([
+    ['an undeclared base from an unmapped scanner', withBase('x.ts', 'SRCROOT'), 'SRCROOT (undeclared)'],
+    ['semgrep %SRCROOT% declared outside the root', withBase('x.ts', '%SRCROOT%', { '%SRCROOT%': { uri: 'file:///etc/' } }, 'Semgrep OSS'), '%SRCROOT%=file:///etc/'],
+    ['a base that climbs out of the root', withBase('x.ts', 'SRC', { SRC: { uri: 'file:///source/../etc/' } }), 'SRC=file:///source/../etc/'],
+    ['a mapped base with an escaping uri', withBase('../secret', '%SRCROOT%', undefined, 'Semgrep OSS'), '%SRCROOT% (undeclared)'],
+    ['a nested base', withBase('x.ts', 'SRC', { SRC: { uri: 'pkg/', uriBaseId: 'ROOT' }, ROOT: { uri: 'file:///source/' } }), 'SRC=pkg/'],
+    ['a remote base', withBase('x.ts', 'SRC', { SRC: { uri: 'https://evil.test/' } }), 'SRC=https://evil.test/'],
+  ])('rejects %s and names it in the gap', (_label, doc, base) => {
+    const result = importDoc(doc, '/work/acme-app');
+    expect(result.candidates).toHaveLength(0);
+    expect(result.status).toBe('partial');
+    expect(result.gaps[0].message).toContain('1 SARIF result(s) could not be safely normalized and were not imported');
+    expect(result.gaps[0].message).toContain(`base ${base}`);
+    expect(result.gaps[0].message).toContain('rule js/sql-injection');
   });
 });

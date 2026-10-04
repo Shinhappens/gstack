@@ -61,9 +61,9 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.0
 
@@ -74,7 +74,7 @@ jobs:
       # bun install was 35s of a 55s job, all network. Cache keyed on the
       # lockfile; bun's install cache lives under ~/.bun/install/cache on
       # every platform.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.bun/install/cache
           key: windows-bun-${{ hashFiles('bun.lock') }}
@@ -146,8 +146,13 @@ jobs:
         # exclusions — don't resurrect a hand list in this file.
         env:
           GSTACK_FREE_JOBS: '2'
-          # Point os.tmpdir() at the runner temp so the shard logs land
-          # somewhere the artifact step below can glob.
+          # Same policy as the required Linux lane: process-supervision timing
+          # tests pass alone on this 4-vCPU runner but can stall under the
+          # two-shard load, so attributed failures get one serial retry
+          # (cap 5 files, truncation veto). Every flaky pass is appended to
+          # the ledger uploaded below, so repeats stay visible and ranked.
+          GSTACK_FREE_RETRY_FLAKY: '1'
+          GSTACK_FLAKE_LEDGER: ${{ runner.temp }}/flake-ledger.jsonl
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: bun run test:windows
@@ -170,11 +175,23 @@ jobs:
       # automatically, so no per-file entry is needed here.)
       - name: Upload full shard logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-free-test-shard-logs
-          path: ${{ runner.temp }}/gstack-free-test-*.log
+          path: |
+            .context/free-test-logs/gstack-free-test-*.log
+            ${{ runner.temp }}/gstack-free-test-*.log
+          include-hidden-files: true
           if-no-files-found: ignore
+
+      - name: Upload flake ledger
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: flake-ledger-windows
+          path: ${{ runner.temp }}/flake-ledger.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
 
   cookie-native-qualification:
     if: github.event_name == 'workflow_dispatch' && !inputs.dia_native_only && !inputs.native_diagnostics_only && !inputs.dia_launch_comparison && !inputs.dia_gui_readiness

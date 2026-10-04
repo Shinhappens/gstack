@@ -210,6 +210,10 @@ export function spawnTerminalAgent(opts: {
         },
         stdio: ['ignore', 'ignore', 'ignore'],
         windowsHide: true,
+        // A non-detached Windows child is killed with its parent's job, so an
+        // agent started by `browse connect` died when the CLI exited (#2637).
+        // The owner watchdog (BROWSE_OWNER_PID) still ends it with the daemon.
+        detached: process.platform === 'win32',
       });
     } catch (err) {
       clearAgentRecord(stateDir, reservation);

@@ -33,13 +33,13 @@ const TEST_DIR = import.meta.dir;
 // Both quote styles — a mechanical refactor to double quotes must not
 // silently drop a file from the invariant (fail-open is the defect class
 // this test exists to kill).
-const SELF_GATE_RE = /EVALS_TIER\s*===\s*['"](gate|periodic)['"]/g;
+const SELF_GATE_RE = /EVALS_TIER\s*===\s*['"](gate|periodic|marathon)['"]/g;
 // Consolidated gate helper (test/helpers/e2e-gate.ts). Both regexes stay
 // active: migrated files self-gate via `describeE2ETier('<tier>')` (or the
 // boolean form `e2eTierEnabled('<tier>')`), while stragglers still using the
 // raw predicate are caught by SELF_GATE_RE above. The tier argument maps to
 // the declared tier exactly like the raw predicate's tier literal did.
-const HELPER_GATE_RE = /\b(?:describeE2ETier|e2eTierEnabled)\(\s*['"](gate|periodic)['"]/g;
+const HELPER_GATE_RE = /\b(?:describeE2ETier|e2eTierEnabled)\(\s*['"](gate|periodic|marathon)['"]/g;
 
 /**
  * Ratchet, not amnesty (the contract KNOWN_MATRIX_GAPS pioneered before the
@@ -57,8 +57,6 @@ const KNOWN_UNREGISTERED = new Set([
   'test/skill-e2e-auq-matrix.test.ts',
   // Standalone periodic self-gated A/B probe; template-literal testNames (auq-ab-${label}), no E2E map key — fail-open-safe, runs on every periodic sweep.
   'test/skill-e2e-auq-verbose-vs-carved-ab.test.ts',
-  // bin-script pipeline test (spawns bun scripts, no model spend) that lives under the skill-e2e-* glob; no E2E map key exists for it.
-  'test/skill-e2e-memory-pipeline.test.ts',
 ]);
 
 describe('E2E tier alignment (touchfiles declaration vs test self-gate)', () => {
@@ -186,8 +184,8 @@ describe('E2E tier alignment (touchfiles declaration vs test self-gate)', () => 
       // Both self-gate shapes count: the raw predicate and the consolidated
       // helper (test/helpers/e2e-gate.ts documents this file as a consumer
       // that must recognize describeE2ETier/e2eTierEnabled).
-      const selfGated = /EVALS_TIER\s*===\s*['"](gate|periodic)['"]/.test(content)
-        || /\b(?:describeE2ETier|e2eTierEnabled)\(\s*['"](gate|periodic)['"]/.test(content);
+      const selfGated = /EVALS_TIER\s*===\s*['"](gate|periodic|marathon)['"]/.test(content)
+        || /\b(?:describeE2ETier|e2eTierEnabled)\(\s*['"](gate|periodic|marathon)['"]/.test(content);
       if (!usesNameSelection && selfGated) continue; // fail-open-safe standalone
 
       invisible.push(

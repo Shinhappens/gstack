@@ -5,52 +5,13 @@ import * as path from 'node:path';
 import { planDecisionCalibrations } from './fixtures/plan-decision-classification';
 import { buildPlanReviewDecisionPrompt } from './helpers/plan-review-decisions';
 import { ENG_BATCHING_FINDINGS } from './helpers/plan-review-cases';
-import { E2E_TOUCHFILES, E2E_TIERS, selectTests } from './helpers/touchfiles';
-
+import { generateAskUserFormat } from '../scripts/resolvers/preamble/generate-ask-user-format';
+import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 const ROOT = path.resolve(import.meta.dir, '..');
-const IDS = ['plan-ceo-finding-count', 'plan-eng-finding-count', 'plan-design-finding-count', 'plan-devex-finding-count',
-  'plan-eng-multi-finding-batching', 'plan-ceo-split-overflow', 'plan-decision-classification'].sort();
-
-test('semantic helper changes also select the separate DX analysis calibration', () => {
-  for (const file of ['test/helpers/plan-review-decisions.ts', 'test/plan-review-decisions.test.ts',
-    'test/helpers/plan-review-cases.ts', 'test/plan-review-cases.test.ts',
-    'test/skill-e2e-plan-decision-classification.test.ts', 'test/fixtures/plan-decision-classification.ts', 'test/plan-review-calibration.test.ts']) {
-    const shared = ['test/helpers/plan-review-decisions.ts', 'test/plan-review-decisions.test.ts',
-      'test/helpers/plan-review-cases.ts', 'test/plan-review-cases.test.ts'].includes(file);
-    const expected = shared ? [...IDS, 'plan-devex-peer-comparison-classification'] : [...IDS];
-    if (file === 'test/helpers/plan-review-decisions.ts' || file === 'test/plan-review-decisions.test.ts')
-      expected.push('plan-ceo-mode-routing');
-    // The UI gate now uses the shared picker for acknowledged native questions.
-    if (file === 'test/helpers/plan-review-cases.ts') expected.push('plan-design-with-ui-scope');
-    // plan-review-cases.test.ts also verifies the Eng template/renderer gate.
-    // Its direct behavioral consumers extend the unchanged helper-only set.
-    if (file === 'test/plan-review-cases.test.ts') expected.push(
-      'plan-eng-review', 'plan-eng-review-artifact', 'plan-review-report',
-      'plan-eng-review-plan-mode', 'plan-mode-no-op', 'conductor-prose',
-      'carve-section-loading', 'autoplan-chain-pty', 'plan-eng-finding-floor',
-      'plan-eng-review-format-coverage', 'plan-eng-review-format-kind',
-      'plan-ceo-review-prosons-cadence', 'plan-review-prosons-format',
-      'codex-offered-eng-review', 'codex-plan-eng-format-coverage',
-      'codex-plan-eng-format-kind', 'plan-eng-coverage-audit', 'autoplan-dual-voice',
-    );
-    expect(selectTests([file], E2E_TOUCHFILES, []).selected.sort()).toEqual(
-      expected.sort());
-  }
-  for (const id of IDS) expect(E2E_TIERS[id]).toBe('periodic');
-  expect(E2E_TOUCHFILES['plan-ceo-finding-count']).toContain('test/skill-e2e-plan-ceo-finding-count.test.ts');
-});
-
 test('calibration briefs preserve source-required structure and actual choices without phase/qid reliance', () => {
-  const format = fs.readFileSync(path.join(ROOT, 'scripts/resolvers/preamble/generate-ask-user-format.ts'), 'utf8');
+  const format = generateAskUserFormat({ skillName: 'plan-ceo-review', host: 'claude', paths: HOST_PATHS.claude } as TemplateContext);
   const split = fs.readFileSync(path.join(ROOT, 'docs/askuserquestion-split.md'), 'utf8');
-  const ceo = fs.readFileSync(path.join(ROOT, 'plan-ceo-review/sections/review-sections.md.tmpl'), 'utf8');
   for (const token of ['Project/branch/task:', 'ELI10:', 'Stakes if we pick wrong:', 'Recommendation:', 'Pros / cons:', 'Net:']) expect(format).toContain(token);
-  const todo = ceo.slice(ceo.indexOf('Only unanswered TODO proposals'), ceo.indexOf('For each TODO, describe:')).replace(/\s+/g, ' ');
-  expect(todo).toContain('Only unanswered TODO proposals reach this menu');
-  expect(todo).toContain('Do not ask again about an item already deferred, skipped or kept');
-  expect(todo).toContain('carry its actual answer and destination forward');
-  expect(todo).toContain('Resolve each remaining proposal through all four steps of 0D, using the menu below');
-  expect(todo).toContain('Never batch TODOs — one per question');
   for (const token of ['Include', 'Defer', 'Cut', 'Hold']) expect(split).toContain(token);
   const corpus = planDecisionCalibrations();
   expect(corpus).toHaveLength(4);

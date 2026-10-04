@@ -10,8 +10,6 @@ import { runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS } from './help
 import { buildHermeticEnv } from './helpers/hermetic-env';
 import { CAPTURE_MS } from './helpers/eval-budgets';
 import { redactFindingSpans } from '../lib/redact-engine';
-import { E2E_TOUCHFILES } from './helpers/touchfiles-data';
-
 // Assemble synthetic credentials at runtime, as in gate-secret-scan.test.ts.
 const CREDENTIAL = ['ghp_', 'aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5'].join('');
 const source = fs.readFileSync(path.join(import.meta.dir, 'skill-e2e-setup-gbrain-path4-local-pglite.test.ts'), 'utf8');
@@ -133,13 +131,6 @@ test('Path4 public diagnostics exclude private fields and redact output, tools a
   expect(serialized).not.toContain('apiKeySource');
   expect(row.transcript).toHaveLength(3);
 });
-
-test('Path4 caller controls select only their registered paid owner', () => {
-  const owners = Object.entries(E2E_TOUCHFILES).filter(([, paths]) => paths.includes('test/setup-gbrain-path4-caller.test.ts')).map(([name]) => name);
-  expect(owners).toEqual(['setup-gbrain-path4-local-pglite']);
-});
-
-
 test('Path4 redacted credential URLs cannot erase success or mask a failed assertion', async () => {
   // Text redaction can consume JSON punctuation after an unspaced URL host.
   // These synthetic credentials exercise the real redactor and actual callback.

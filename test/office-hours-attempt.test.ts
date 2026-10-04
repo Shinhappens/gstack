@@ -1,5 +1,6 @@
 /** Free recording fixtures; every runner and judge below is synthetic. */
 import { describe, expect, spyOn, test } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -421,6 +422,7 @@ await import(join(root, 'test/skill-e2e-office-hours-brain-writeback.test.ts'));
         EVALS: mode === 'disabled' ? '' : '1', EVALS_ALL: '', EVALS_TIER: 'periodic',
         EVALS_SELECTION_JSON: JSON.stringify({ selected: mode === 'unselected' ? [] : null, reason: 'free fixture' }),
         EVALS_PREFLIGHT_OK: '1', GSTACK_EVAL_DIR: evalDir, GSTACK_CLAUDE_CLI_VERSION: 'free fixture',
+        GSTACK_HOME: path.join(dir, 'state'),
       },
       stdout: 'pipe', stderr: 'pipe',
     });
@@ -605,7 +607,7 @@ const fakeJudgeRequest = async (body, options) => {
   const id = attempt;
   await new Promise(resolve => setTimeout(resolve, scenario === 'late-judge' ? 130 : 10));
   event({ kind: 'judge-ready', id, aborted: options?.signal?.aborted ?? false });
-  return { content: [{ type: 'text', text: JSON.stringify({ reason_substance: scenario === 'bad-score' ? 3 : 5, reasoning: 'fixture specific tradeoff' }) }] };
+  return { stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify({ reason_substance: scenario === 'bad-score' ? 3 : 5, reasoning: 'fixture specific tradeoff' }) }] };
 };
 mock.module('@anthropic-ai/sdk', () => ({ default: class { messages = { create: fakeJudgeRequest }; } }));
 globalThis.fetch = () => { throw new Error('No network is permitted in this free lifecycle fixture'); };
@@ -628,7 +630,7 @@ await import(path.join(root, 'test', ${JSON.stringify(file)}));
       env: {
         ...process.env, EVALS: '1', EVALS_ALL: '', EVALS_TIER: 'periodic', EVALS_PREFLIGHT_OK: '1',
         EVALS_SELECTION_JSON: JSON.stringify({ selected: [id], reason: 'free format lifecycle' }),
-        GSTACK_EVAL_DIR: evalDir, GSTACK_CLAUDE_CLI_VERSION: 'free fixture',
+        GSTACK_EVAL_DIR: evalDir, GSTACK_CLAUDE_CLI_VERSION: 'free fixture', GSTACK_HOME: path.join(dir, 'state'),
         ANTHROPIC_API_KEY: 'free-fixture', ANTHROPIC_AUTH_TOKEN: '', ANTHROPIC_BASE_URL: 'http://127.0.0.1:1',
       },
     });
@@ -649,7 +651,8 @@ describe('Plan format actual capture and judge lifecycle', () => {
         expect(output).not.toContain('Unhandled error between tests');
         const starts = events.filter(event => event.kind === 'start');
         expect(starts.map(({ timeout, maxTurns, model }) => ({ timeout, maxTurns, model })))
-          .toEqual([1, 2].map(() => ({ timeout: 300, maxTurns: 10, model: 'claude-opus-4-7' })));
+          .toEqual([1, 2].map(() => ({ timeout: 300, maxTurns: 10,
+            model: file.includes('plan-prosons') ? 'claude-opus-4-7' : resolveEvalModel('capture') })));
         expect(events.filter(event => event.kind === 'ready').map(event => event.fixtureExists)).toEqual([true, true]);
         expect(entries).toHaveLength(2);
         expect(entries.map(entry => entry.attempt)).toEqual([1, 2]);

@@ -93,7 +93,7 @@ export function main(argv = process.argv.slice(2)): number {
     }
     case 'mark': {
       const choice = positional[0] as FormatChoice | undefined;
-      if (!(FORMAT_CHOICES as readonly string[]).includes(choice)) {
+      if (!choice || !(FORMAT_CHOICES as readonly string[]).includes(choice)) {
         process.stderr.write(`usage: gstack-design-md.ts mark <${FORMAT_CHOICES.join('|')}> [DESIGN.md]\n`);
         return 2;
       }

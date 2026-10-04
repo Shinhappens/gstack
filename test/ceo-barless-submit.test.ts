@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { hasNativePostAnswerCeoPosture, nextCeoPostureContinuation } from './helpers/ceo-mode-option';
 import type { PlanCountTranscript } from './helpers/plan-count-transcript';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import captured from './fixtures/ceo-barless-submit-ac.json';
 
 const selectedAt = Date.parse(captured.provenance.modeRequestAt);
@@ -117,11 +116,5 @@ describe('bounded CEO barless packet submission', () => {
     p.t.assistantMessages.push({ sessionId: captured.modeCall.sessionId, timestamp: '2026-09-09T16:42:11.000Z',
       text: 'HOLD SCOPE: keep the saved-view feature fixed and make its failure handling rigorous.' });
     expect(hasNativePostAnswerCeoPosture(p.t, 'HOLD SCOPE', /hold\s*scope/i, selectedAt)).toBe(true);
-  });
-
-  test('the free test and fixture select only the mode-routing workflow', () => {
-    for (const file of ['test/ceo-barless-submit.test.ts', 'test/fixtures/ceo-barless-submit-ac.json']) {
-      expect(selectTests([file], E2E_TOUCHFILES, []).selected).toEqual(['plan-ceo-mode-routing']);
-    }
   });
 });

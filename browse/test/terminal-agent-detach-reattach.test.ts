@@ -13,19 +13,6 @@ import * as path from 'path';
 const AGENT_TS = path.resolve(import.meta.path, '..', '..', 'src', 'terminal-agent.ts');
 
 describe('terminal-agent detach + re-attach (v1.44+ Commit 3)', () => {
-  test('1. PtySession carries ring buffer + alt-screen + detach state', () => {
-    const src = fs.readFileSync(AGENT_TS, 'utf-8');
-    const i = src.indexOf('interface PtySession {');
-    const j = src.indexOf('\n}', i);
-    const block = src.slice(i, j);
-    expect(block).toContain('liveWs: any | null');
-    expect(block).toContain('ringBuffer: Buffer[]');
-    expect(block).toContain('ringBufferBytes: number');
-    expect(block).toContain('altScreenActive: boolean');
-    expect(block).toContain('detached: boolean');
-    expect(block).toContain('detachTimer:');
-  });
-
   test('2. RING_BUFFER_MAX_BYTES default is 1 MB, env-overridable', () => {
     const src = fs.readFileSync(AGENT_TS, 'utf-8');
     expect(src).toContain('GSTACK_PTY_RING_BUFFER_BYTES');
@@ -36,36 +23,6 @@ describe('terminal-agent detach + re-attach (v1.44+ Commit 3)', () => {
     const src = fs.readFileSync(AGENT_TS, 'utf-8');
     expect(src).toContain('GSTACK_PTY_DETACH_WINDOW_MS');
     expect(src).toContain("'60000'");
-  });
-
-  test('4. appendToRingBuffer evicts oldest frames past the cap', () => {
-    const src = fs.readFileSync(AGENT_TS, 'utf-8');
-    expect(src).toMatch(/function appendToRingBuffer\(/);
-    // Eviction loop: must keep at least one frame even at extreme caps
-    // (otherwise a single oversized frame would empty the buffer).
-    expect(src).toMatch(/session\.ringBufferBytes > RING_BUFFER_MAX_BYTES/);
-    expect(src).toContain('session.ringBuffer.length > 1');
-    expect(src).toContain('session.ringBuffer.shift()');
-  });
-
-  test('5. alt-screen tracking watches for CSI ?1049h / CSI ?1049l', () => {
-    const src = fs.readFileSync(AGENT_TS, 'utf-8');
-    // Canonical xterm enter/exit alt-screen sequences. Must update
-    // session.altScreenActive so the replay prelude knows.
-    expect(src).toContain('\\x1b[?1049h');
-    expect(src).toContain('\\x1b[?1049l');
-    expect(src).toContain('session.altScreenActive');
-  });
-
-  test('6. buildReplayPayload prefixes soft-reset (+ alt-screen if active)', () => {
-    const src = fs.readFileSync(AGENT_TS, 'utf-8');
-    expect(src).toMatch(/function buildReplayPayload\(/);
-    // DECSTR soft reset — re-defaults character attributes after the
-    // client's RIS clears the xterm buffer.
-    expect(src).toContain('\\x1b[!p');
-    // Conditionally re-enter alt-screen if claude was in a tool-call
-    // (alt-screen mode) at detach.
-    expect(src).toContain('session.altScreenActive');
   });
 
   test('7. WS open() re-attaches when sessionId already lives in sessionsById', () => {

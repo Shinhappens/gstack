@@ -8,14 +8,18 @@ const ROOT = path.resolve(import.meta.dir, '..');
 const BIN = path.join(ROOT, 'bin');
 
 // Each test owns its state and HTTP transport. The real logger backgrounds
-// sync while retaining stdout, so execSync also waits for that transport.
+// sync while retaining stdout, and run() waits for that transport: the
+// command's stdout goes through cat, which exits only after every holder of
+// the pipe (the backgrounded sync included) closes it. execSync alone does
+// not guarantee that wait (Bun 1.3.x returns when the direct child exits).
 // Letting it reach the configured backend made a slow curl exceed our 10s
 // command timeout before the local marker assertions could run.
 let tmpDir: string;
 const FIXTURE_SUPABASE_URL = 'https://telemetry.fixture.invalid';
 
 function run(cmd: string, env: Record<string, string> = {}): string {
-  return execSync(cmd, {
+  return execSync(`{ ${cmd}\n} | cat; exit "\${PIPESTATUS[0]}"`, {
+    shell: '/bin/bash',
     cwd: ROOT,
     env: {
       ...process.env,

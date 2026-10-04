@@ -8,6 +8,7 @@ import { defineHost, CROSS_MODEL_RESOLVERS, EXEC_STYLE_TOOL_REWRITES } from './d
 const gbrain = defineHost({
   name: 'gbrain',
   displayName: 'GBrain',
+  tier: 'instruction-only',
 
   frontmatter: {
     mode: 'allowlist',

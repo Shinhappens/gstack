@@ -3,9 +3,11 @@ import { spawnSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { usePrivateStateRoot } from './helpers/private-state-root';
 import { gitArgvIn } from './helpers/scratch-repo';
 
 const ROOT = path.resolve(import.meta.dir, '..');
+usePrivateStateRoot();
 const CAREFUL_SCRIPT = path.join(ROOT, 'careful', 'bin', 'check-careful.sh');
 const FREEZE_SCRIPT = path.join(ROOT, 'freeze', 'bin', 'check-freeze.sh');
 
@@ -1082,11 +1084,11 @@ describe('check-freeze.sh state-root resolution (#1459 / #1509)', () => {
 // ============================================================
 // gstack_hook_log_fire analytics sink follows the same state root (#1459)
 // ============================================================
-// The hook_fire record lands under ${GSTACK_HOME:-$HOME/.gstack}/analytics —
-// the SAME two-step chain every other analytics writer and reader uses
-// (gstack-skill-start, gstack-retro-metrics, gstack-analytics) — deliberately
-// NOT the plugin-aware state root the freeze FILE uses, so the usage log stays
-// one file. Logging is best-effort: an unwritable sink never changes the decision.
+// The hook_fire record lands under the resolved state root (bin/gstack-state-root.sh)
+// — the SAME root the freeze FILE and every other analytics writer and reader
+// (gstack-skill-start, gstack-retro-metrics, gstack-analytics) use, so the usage
+// log stays one file. Logging is best-effort: an unwritable sink never changes
+// the decision.
 describe('gstack_hook_log_fire writes under the resolved state root', () => {
   const BOUNDARY = '/Users/dev/project/src/';
   const OUTSIDE = '/Users/dev/other-project/index.ts';
@@ -1114,16 +1116,16 @@ describe('gstack_hook_log_fire writes under the resolved state root', () => {
     });
   });
 
-  test('plugin install: the freeze FILE is read from CLAUDE_PLUGIN_DATA but hook_fire still lands under $HOME/.gstack/analytics (one usage log)', () => {
+  test('plugin install: the freeze FILE and hook_fire both use CLAUDE_PLUGIN_DATA (one state root, one usage log)', () => {
     withFreezeDir(BOUNDARY, (pluginData) => {
       withEmptyDir((fakeHome) => {
         const { output } = runHook(FREEZE_SCRIPT, freezeInput(OUTSIDE),
           freezeEnv(pluginData, { HOME: fakeHome, CLAUDE_PLUGIN_ROOT: '/Plugins/GSTACK' }));
         expect(output.hookSpecificOutput?.permissionDecision).toBe('deny');
-        const rec = lastRecord(path.join(fakeHome, '.gstack', 'analytics', 'skill-usage.jsonl'));
+        const rec = lastRecord(path.join(pluginData, 'analytics', 'skill-usage.jsonl'));
         expect(rec.event).toBe('hook_fire');
         expect(rec.skill).toBe('freeze');
-        expect(fs.existsSync(path.join(pluginData, 'analytics'))).toBe(false);
+        expect(fs.existsSync(path.join(fakeHome, '.gstack', 'analytics'))).toBe(false);
       });
     });
   });

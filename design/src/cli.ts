@@ -12,7 +12,7 @@
  *   4. Print result JSON to stdout
  */
 
-import { COMMANDS } from "./commands";
+import { COMMANDS, OUTPUT_CONTRACT } from "./commands";
 import { generate } from "./generate";
 import { checkCommand } from "./check";
 import { compare } from "./compare";
@@ -26,6 +26,7 @@ import { generateDesignToCodePrompt } from "./design-to-code";
 import { serve } from "./serve";
 import { gallery } from "./gallery";
 import { normalizeIntFlag } from "./flag-utils";
+import { resolveImagePaths } from "./image-args";
 import {
   daemonStatus as daemonStatusClient,
   ensureDaemon,
@@ -33,6 +34,9 @@ import {
   shutdownDaemon,
 } from "./daemon-client";
 import { spawn as nodeSpawn } from "child_process";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 function parseArgs(argv: string[]): {
   command: string;
@@ -75,6 +79,7 @@ function printUsage(): void {
     console.log(`  ${name.padEnd(12)} ${info.description}`);
     console.log(`  ${"".padEnd(12)} ${info.usage}`);
   }
+  console.log(`\n${OUTPUT_CONTRACT}`);
   console.log("\nAuth: ~/.gstack/openai.json, then OPENAI_API_KEY env var");
   console.log("If OPENAI_API_KEY matches a current-directory .env file, the source is reported before billing.");
   console.log("Setup: $D setup");
@@ -107,19 +112,18 @@ async function runSetup(): Promise<void> {
 
   // Smoke test
   console.log("\nRunning smoke test (generating a simple image)...");
-  try {
-    await generate({
-      brief: "A simple blue square centered on a white background. Minimal, geometric, clean.",
-      output: "/tmp/gstack-design-smoke-test.png",
-      size: "1024x1024",
-      quality: "low",
-    });
-    console.log("\nSmoke test PASSED. Design generation is working.");
-  } catch (err: any) {
-    console.error(`\nSmoke test FAILED: ${err.message}`);
+  const smoke = await generate({
+    brief: "A simple blue square centered on a white background. Minimal, geometric, clean.",
+    output: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gstack-design-smoke-")), "smoke-test.png"),
+    size: "1024x1024",
+    quality: "low",
+  });
+  if (smoke.exitCode !== 0) {
+    console.error(`\nSmoke test FAILED: ${smoke.failures.map(f => f.reason).join("; ")}`);
     console.error("Check your API key and organization verification status.");
     process.exit(1);
   }
+  console.log("\nSmoke test PASSED. Design generation is working.");
 }
 
 async function main(): Promise<void> {
@@ -133,7 +137,7 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "generate":
-      await generate({
+      process.exitCode = (await generate({
         brief: flags.brief as string,
         briefFile: flags["brief-file"] as string,
         output: (flags.output as string) || "/tmp/gstack-mockup.png",
@@ -141,7 +145,7 @@ async function main(): Promise<void> {
         retry: normalizeIntFlag(flags.retry, { name: "retry", def: 0, min: 0 }),
         size: flags.size as string,
         quality: flags.quality as string,
-      });
+      })).exitCode;
       break;
 
     case "check":
@@ -149,9 +153,7 @@ async function main(): Promise<void> {
       break;
 
     case "compare": {
-      // Parse --images as glob or multiple files
-      const imagesArg = flags.images as string;
-      const images = await resolveImagePaths(imagesArg);
+      const images = await resolveImagePaths(flags.images as string, flags["images-file"] as string | undefined);
       const outputPath = (flags.output as string) || "/tmp/gstack-design-board.html";
       compare({ images, output: outputPath });
       // If --serve flag is set, publish the board.
@@ -195,9 +197,10 @@ async function main(): Promise<void> {
       break;
 
     case "variants":
-      await variants({
+      process.exitCode = await variants({
         brief: flags.brief as string,
         briefFile: flags["brief-file"] as string,
+        briefsFile: flags["briefs-file"] as string,
         // #2032: pass the RAW flag through — variants() normalizes at its
         // consumption site (a pre-parseInt here would silently truncate "3.7").
         count: flags.count,
@@ -209,7 +212,7 @@ async function main(): Promise<void> {
       break;
 
     case "iterate":
-      await iterate({
+      process.exitCode = await iterate({
         session: flags.session as string,
         feedback: flags.feedback as string,
         output: (flags.output as string) || "/tmp/gstack-iterate.png",
@@ -261,7 +264,7 @@ async function main(): Promise<void> {
     }
 
     case "evolve":
-      await evolve({
+      process.exitCode = await evolve({
         screenshot: flags.screenshot as string,
         brief: flags.brief as string,
         output: (flags.output as string) || "/tmp/gstack-evolved.png",
@@ -379,31 +382,6 @@ function openBrowser(url: string): void {
   } catch {
     console.error(`Open this URL in your browser: ${url}`);
   }
-}
-
-/**
- * Resolve image paths from a glob pattern or comma-separated list.
- */
-async function resolveImagePaths(input: string): Promise<string[]> {
-  if (!input) {
-    console.error("--images is required. Provide glob pattern or comma-separated paths.");
-    process.exit(1);
-  }
-
-  // Check if it's a glob pattern
-  if (input.includes("*")) {
-    const glob = new Bun.Glob(input);
-    const paths: string[] = [];
-    for await (const match of glob.scan({ absolute: true })) {
-      if (match.endsWith(".png") || match.endsWith(".jpg") || match.endsWith(".jpeg")) {
-        paths.push(match);
-      }
-    }
-    return paths.sort();
-  }
-
-  // Comma-separated or single path
-  return input.split(",").map(p => p.trim());
 }
 
 // Self-execution shortcut: when invoked with --daemon-mode, this same

@@ -303,9 +303,9 @@ console.log(JSON.stringify({plain:plain.exitReason,literal:literal.exitReason,se
     expect(added).toBeGreaterThan(-1); expect(args(1)[added + 1]).toBe(literal);
     expect(args(1).filter((_, i) => i !== added && i !== added + 1)).toEqual(args(0));
     const sectionArgs = args(2);
-    const instruction = launches[2].prompt.split('\n').find((line: string) => line.includes('with the Read tool BEFORE'));
+    const instruction = launches[2].prompt.split('\n').find((line: string) => /with the Read tool before/i.test(line));
     expect(sectionArgs).not.toContain('--append-system-prompt');
-    expect(instruction).toContain('you MUST actually Read that sections/ file with the Read tool BEFORE doing the work it covers');
+    expect(instruction).toMatch(/read that sections\/ file with the Read tool before doing the work it covers/i);
     expect(instruction).not.toContain('actual.md'); expect(instruction).not.toContain(dir);
     expect(sectionArgs.slice(sectionArgs.indexOf('--allowed-tools') + 1, sectionArgs.indexOf('--allowed-tools') + 8))
       .toEqual(['Read', 'Grep', 'Glob', 'Write', 'Edit', 'Agent', 'Bash']);
@@ -464,22 +464,37 @@ console.log(JSON.stringify(observed));`);
         expect(request).not.toHaveProperty('appendSystemPrompt');
         const skill=['fixture','ship','office-hours'][Math.floor((i-4)/2)]!;
         const skillPath=path.join(dir,skill,'SKILL.md');
-        const expected=`You are running an automated skill-execution test. No human is present, so AskUserQuestion is unavailable. The ONLY skill file you may read is this absolute path: ${skillPath}. Do NOT Glob/find/search for any other SKILL.md anywhere — especially nothing under ~/.claude or /Users.
-
-Read ${skillPath} and EXECUTE its workflow for this scenario:
-
-Complete the supplied scenario.
-
-Rules for this run:
-- Skip system-audit, environment-setup, telemetry, and unrelated codebase exploration. Read the supplied plan's referenced fixture files when its review requires them.
-- At any decision point that would call AskUserQuestion, silently pick the skill's recommended option and continue. Do NOT stop to ask.
-- This skill's body has been carved into on-demand sections/. When the skill gives a STOP-Read directive (for example "Read \`.../sections/<file>\` and execute it in full"), you MUST actually Read that sections/ file with the Read tool BEFORE doing the work it covers. Do not work from memory.
-- Resolve installed-root paths for section and companion Markdown files under ${dir}, where this fixture's skill package is copied.
-- Do NOT run git, gh, commit, push, or any mutating command.
-- When the workflow is complete, write the skill's final output (the full review report / ship plan, including any required report table) to ${path.join(dir,'REPORT.md')}.
-- After all required writes are complete, return a brief completion message and STOP. Do not reproduce the full report in the final response.`;
-        expect(request.prompt).toBe(expected);
+        // Harness properties, not its wording: the one allowed skill path, the
+        // scenario, AskUserQuestion fallback, section Read rule, no mutation,
+        // and the report destination.
+        expect(request.prompt.match(/\/[^\s]*SKILL\.md/g)?.every((file: string)=>file===skillPath)).toBe(true);
+        expect(request.prompt).toContain(`Read ${skillPath} and EXECUTE its workflow`);
+        expect(request.prompt).toContain('Complete the supplied scenario.');
+        expect(request.prompt).toMatch(/AskUserQuestion is unavailable/i);
+        expect(request.prompt).toMatch(/read that sections\/ file with the Read tool before/i);
+        expect(request.prompt).toMatch(/do not run git, gh, commit, push, or any mutating command/i);
+        expect(request.prompt).toContain(path.join(dir,'REPORT.md'));
       }
     }
   }finally{if(child.exitCode===null)child.kill();await child.exited;fs.rmSync(dir,{recursive:true,force:true});}
 },10000);
+
+// Run 36776104571: the agent printed the whole carved section with Bash sed ranges.
+test('section detection credits a complete Bash print of the section, never a partial one', async () => {
+  const { detectSectionReads } = await import('./helpers/auq-sdk-capture');
+  const file = path.resolve(import.meta.dir, '..', 'plan-ceo-review/sections/review-sections.md');
+  const content = fs.readFileSync(file, 'utf-8'), lines = content.split('\n');
+  const sed = (from: number, to: number, extra = '') => ({ tool: 'Bash',
+    input: { command: `sed -n ${from},${to}p /fixture/plan-ceo-review/sections/review-sections.md${extra}` },
+    output: lines.slice(from - 1, to).join('\n') });
+  const sections = new Map([['review-sections.md', content]]);
+  const ranges = [[1, 330], [330, 660], [660, 1100], [1100, lines.length]].map(([a, b]) => sed(a!, b!));
+  const read = (calls: Array<{ tool: string; input: any; output: string }>) => [...detectSectionReads(calls, sections)];
+  expect(read(ranges)).toEqual(['review-sections.md']);
+  expect(read([{ tool: 'Bash', input: { command: 'cat sections/review-sections.md' }, output: content }])).toEqual(['review-sections.md']);
+  expect(read(ranges.filter((_, i) => i !== 2))).toEqual([]);
+  expect(read([{ ...ranges[0]!, input: { command: 'head -330 PLAN.md' } }, ...ranges.slice(1)])).toEqual([]);
+  expect(read([{ tool: 'Bash', input: { command: 'cat sections/review-sections.md' }, output: '' }])).toEqual([]);
+  expect(read(ranges.map(call => ({ ...call, tool: 'Grep' })))).toEqual([]);
+  expect(read([{ tool: 'Read', input: { file_path: '/fixture/plan-ceo-review/sections/review-sections.md' }, output: '' }])).toEqual(['review-sections.md']);
+});

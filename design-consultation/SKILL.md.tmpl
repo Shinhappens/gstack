@@ -33,7 +33,7 @@ gbrain:
       render_as: "## Existing DESIGN.md (if any)"
     - id: prior-design-decisions
       kind: filesystem
-      glob: "~/.gstack/projects/{repo_slug}/*-design-*.md"
+      glob: "{gstack_state_root}/projects/{repo_slug}/*-design-*.md"
       sort: mtime_desc
       limit: 3
       render_as: "## Prior design decisions for this project"
@@ -89,9 +89,10 @@ A `PRODUCT.md` (impeccable's product-context file) already answers the product q
 Look for office-hours output:
 
 ```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 setopt +o nomatch 2>/dev/null || true  # zsh compat
 {{SLUG_EVAL}}
-ls ~/.gstack/projects/$SLUG/*office-hours* 2>/dev/null | head -5
+ls "$GSTACK_STATE_ROOT"/projects/$SLUG/*office-hours* 2>/dev/null | head -5
 ls .context/*office-hours* .context/attachments/*office-hours* 2>/dev/null | head -5
 ```
 
@@ -125,17 +126,14 @@ Phase 5: `DESIGN_READY` uses AI mockups on realistic product screens; `DESIGN_NO
 
 ## Phase 1: Product Context
 
-Confirm product context in Q1, pre-filled from the codebase; then ask the memorable-thing question.
+**AskUserQuestion Q1 — one brief that confirms context AND decides research.** Never ask a confirm-only question first. In the ELI10, state your pre-filled read (from README, product files or office-hours output): what the product is, who it's for, its space and project type (web app, dashboard, marketing site, editorial, internal tool, etc.). Options:
+- A) Context right — research what top products in this space do for design first
+- B) Context right — work from design knowledge only
+- C) Context wrong or incomplete — I'll correct it
 
-**AskUserQuestion Q1 — include ALL of these:**
-1. Confirm what the product is, who it's for, what space/industry
-2. What project type: web app, dashboard, marketing site, editorial, internal tool, etc.
-3. "Want me to research what top products in your space are doing for design, or should I work from my design knowledge?"
-4. **Explicitly say:** "At any point you can just drop into chat and we'll talk through anything — this isn't a rigid form, it's a conversation."
+Recommend A or B for this product, naming what research buys or costs here versus the other. **Explicitly say:** "At any point you can just drop into chat and we'll talk through anything — this isn't a rigid form, it's a conversation."
 
-Pre-fill context from README or office-hours output, then confirm it and the research preference in Q1.
-
-**Memorable-thing forcing question.** Before moving on, ask the user: *"What's the one
+**Memorable-thing forcing question.** After Q1's answer, in its own AskUserQuestion brief (never in Q1's call), ask: *"What's the one
 thing you want someone to remember after they see this product for the first time?"*
 
 Record the one-sentence answer: a feeling, visual, claim, or posture. Every subsequent design decision must serve it.

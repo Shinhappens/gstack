@@ -234,6 +234,30 @@ describe("MEDIUM demoted credential-shaped patterns (TENSION-1)", () => {
     expect(ids(`authToken: ${v}`)).toContain("env.kv"); // (iv) credential camel
     expect(ids(`clientSecret: ${v}`)).toContain("env.kv"); // (iv) credential camel
   });
+  // #2912 — a line that READS a secret from the environment holds no secret;
+  // it must not fire (and so must not be masked or withhold a /cso source file).
+  test("env.kv skips exact environment reads (#2912)", () => {
+    for (const line of [
+      'api_key=os.environ["AGENTOPS_API_KEY"]',
+      '        api_key=os.environ["AGENTOPS_API_KEY"]',
+      "LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY')",
+      'token = os.environ.get("GH_TOKEN")',
+      "API_KEY=process.env.OPENAI_API_KEY",
+      "SECRET_KEY=getenv(\"APP_SECRET_KEY\")",
+    ]) {
+      expect(ids(line)).not.toContain("env.kv");
+      expect(redactFindingSpans(`x=1\n${line}\n`, {})).toBe(`x=1\n${line}\n`);
+    }
+  });
+  test("env.kv still fires on real high-entropy keys beside or instead of an env read (#2912 negative controls)", () => {
+    const v = "Zq8vR2mN5tYb7Lc3Wd9K";
+    expect(ids(`SECRET_KEY = os.getenv('DJANGO_SECRET', '${v}')`)).toContain("env.kv");
+    expect(ids(`API_KEY=process.env.OPENAI_API_KEY||"${v}"`)).toContain("env.kv");
+    expect(ids(`API_KEY=os.environ["X"]+"${v}"`)).toContain("env.kv");
+    expect(ids(`API_KEY=os.environ_${v}`)).toContain("env.kv");
+    expect(ids(`API_KEY=getenv${v}`)).toContain("env.kv");
+    expect(ids(`API_KEY="${v}"`)).toContain("env.kv");
+  });
   test("env.kv stays MEDIUM (calibration: generic net, not a blocker)", () => {
     const f = scan("api_key=8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ", { repoVisibility: "private" })
       .findings.find((x) => x.id === "env.kv");

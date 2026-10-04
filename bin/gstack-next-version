@@ -165,7 +165,7 @@ function zeroBaseAtLocalWidth(versionPath: string, repoRoot: string): string {
 function readBaseVersion(base: string, versionPath: string, repoRoot: string, warnings: string[]): string {
   // git fetch is best-effort; we tolerate failure and fall back to whatever
   // origin/<base> currently points at.
-  runCommand("git", ["fetch", "origin", base, "--quiet"], 10000);
+  runCommand("git", ["fetch", "--no-auto-maintenance", "origin", base, "--quiet"], 10000);
   const r = runCommand("git", ["show", `origin/${base}:${versionPath}`]);
   if (!r.ok) {
     const assumed = zeroBaseAtLocalWidth(versionPath, repoRoot);
@@ -610,7 +610,7 @@ function fetchGitClaimed(
     // bounded) brings every missing tip local in a single round trip.
     spawnSync(
       "git",
-      ["fetch", "origin", ...pending.map((p) => `refs/heads/${p.branch}`), "--depth=1", "--no-tags"],
+      ["fetch", "--no-auto-maintenance", "origin", ...pending.map((p) => `refs/heads/${p.branch}`), "--depth=1", "--no-tags"],
       { encoding: "utf8", timeout: 15000, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
     );
     // One unservable ref (dangling sha on the server) fails the WHOLE batch
@@ -626,7 +626,7 @@ function fetchGitClaimed(
         retries++;
         spawnSync(
           "git",
-          ["fetch", "origin", `refs/heads/${branch}`, "--depth=1", "--no-tags"],
+          ["fetch", "--no-auto-maintenance", "origin", `refs/heads/${branch}`, "--depth=1", "--no-tags"],
           { encoding: "utf8", timeout: 5000, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
         );
         outcome = readClaim(branch, sha);

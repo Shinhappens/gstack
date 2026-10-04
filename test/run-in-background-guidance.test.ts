@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { generateCodexPlanReview } from '../scripts/resolvers/review';
+import { generateCodexPlanReview } from '../scripts/resolvers/outside-voice-steps';
 import { CODEX_MODEL_CONFIG_FLAG } from '../scripts/resolvers/constants';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { ALL_HOST_CONFIGS } from '../hosts';
@@ -75,14 +75,16 @@ exec ${quote(Bun.which('cat')!)} "$@"
       const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_REPO: dir,
         FAKE_CREATED: created, FAKE_CALLS: calls, FAKE_REVIEW_ID: id,
         FAKE_CODEX_STATUS: String(code), FAKE_MKTEMP_FAIL: mktempFailure ? '1' : '0',
-        FAKE_CAT_FAIL: catFailure ? '1' : '0', TMPDIR: dir,
+        FAKE_CAT_FAIL: catFailure ? '1' : '0', TMPDIR: dir, CODEX_HOME: dir, GSTACK_CODEX_MODEL: '',
         CODEX_THREAD_ID: '', CODEX_SANDBOX: '', CLAUDECODE: '1', GSTACK_ACTIVE_HOST: 'claude' };
       // Each displayed block gets a fresh shell, as separate Bash tool calls do.
       return blocks.map(block => spawnSync('bash', ['-c', (errexit ? 'set -e\n' : '') + block.replace("'<prepared-prompt-file>'", quote(prompt))], {
         cwd: dir, env, encoding: 'utf8', timeout: 3_000,
       }));
     };
-    return { dir, run, stale, staleError, calls,
+    // #2914: the selected model and its source are printed before the paid call.
+    const selected = `CODEX_MODEL: gpt-6-astra (exec; source: gstack default (no ${path.join(dir, 'config.toml')}))\n`;
+    return { dir, run, stale, staleError, calls, selected,
       created: () => fs.existsSync(created) ? fs.readFileSync(created, 'utf8').trim().split('\n') : [],
       cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
   }
@@ -96,7 +98,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
       const results = f.run('current');
       expect(results.map(result => result.status)).toEqual([0]);
       expect(results[0]!.stdout).toBe(completed('current'));
-      expect(results[0]!.stderr).toBe('current: current stderr\n');
+      expect(results[0]!.stderr).toBe(`${f.selected}current: current stderr\n`);
       expect(f.created()).toHaveLength(1);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
     } finally { f.cleanup(); }
@@ -131,7 +133,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
         const results = f.run(id);
         expect(results.map(result => result.status)).toEqual([0]);
         expect(results[0]!.stdout).toBe(completed(id));
-        expect(results[0]!.stderr).toBe(`${id}: current stderr\n`);
+        expect(results[0]!.stderr).toBe(`${f.selected}${id}: current stderr\n`);
       }
       expect(new Set(f.created()).size).toBe(2);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
@@ -194,10 +196,12 @@ describe('outside-voice dispatch contract', () => {
   });
 
   test('the delegated prompt itself requires findings only and forbids plan mutations', () => {
-    const promptStart = rendered.indexOf('"IMPORTANT:');
     const promptEnd = rendered.indexOf('\n<plan content>"');
-    expect(promptStart).toBeGreaterThan(-1);
+    const promptStart = rendered.lastIndexOf('\n"', promptEnd) + 1;
+    expect(promptStart).toBeGreaterThan(0);
     expect(promptEnd).toBeGreaterThan(promptStart);
+    expect(rendered.slice(promptStart, promptStart + 1)).toBe('"');
+    expect(rendered.slice(promptStart, rendered.indexOf('\n', promptStart))).toContain('.claude/skills/');
     const prompt = rendered.slice(promptStart, promptEnd);
     // A sovereignty rule elsewhere in the parent workflow does not reach
     // a fresh-context reviewer receiving only this constructed prompt.
@@ -296,7 +300,7 @@ const GENERATED_WITH_GUIDANCE = [
   'review/sections/review-army.md',
   'autoplan/sections/ceo-phase.md',
   'ship/sections/review-army.md',
-  'ship/sections/pr-body.md',
+  'ship/sections/documentation.md',
   'ship/sections/test-coverage.md',
   'ship/sections/plan-completion.md',
   'ship/sections/greptile.md',
@@ -308,7 +312,6 @@ const GENERATED_WITH_GUIDANCE = [
   // guidance and its bounded worker policy is specified in its own skeleton.
   'design-consultation/sections/proposal-and-preview.md',
   'design-review/SKILL.md',
-  'design-shotgun/SKILL.md',
   'document-release/sections/release-body.md',
   'office-hours/SKILL.md',
   'office-hours/sections/design-and-handoff.md',
@@ -439,12 +442,19 @@ describe('run_in_background guidance (#2440)', () => {
   // dispatch stranded the ship run. Pin the deadline/recovery branch and the
   // docs-sync scope guard in both the generated section and its template, so
   // neither a template edit nor a stale regen can drop them silently.
-  const PR_BODY_SITES = ['ship/sections/pr-body.md', 'ship/sections/pr-body.md.tmpl'];
+  const PR_BODY_SITES = ['ship/sections/documentation.md', 'ship/sections/documentation.md.tmpl'];
   test('ship pr-body carries the doc-sync deadline recovery + scope guard', () => {
     for (const rel of PR_BODY_SITES) {
-      const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
-      expect(content).toContain('document-release did not complete');
-      expect(content).toContain('Scope guard — docs sync ONLY');
+      const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8').replace(/\s+/g, ' ');
+      expect(content).toContain('Inspect the child handle for terminal completion and final output within ~10 minutes');
+      expect(content).toContain('On failure/deadline, use recovery before another writer');
+      expect(content).toContain('Terminal completion or confirmed termination is sufficient');
+      expect(content).toContain('request stop and inspect its status; the request alone is insufficient');
+      expect(content).toContain('Only audit/edit permitted docs');
+      expect(content).toContain('A failed check or `blocked` result goes to recovery');
+      expect(content).toContain('goes to recovery, even with valid JSON');
+      expect(content).toContain('Report `Documentation: blocked` with the reason and actual paths');
+      expect(content).toContain('`Documentation: blocked`');
     }
   });
 
@@ -452,25 +462,26 @@ describe('run_in_background guidance (#2440)', () => {
   // class regressed twice via unpinned prose. Pin the document-release
   // contract, the Step 8.4d spawned note, and the resolver-side Codex
   // doc-review skip in both generated output and templates.
-  const CONTRACT_PINS: Array<[string[], string]> = [
+  const CONTRACT_PINS: Array<[string[], string | RegExp]> = [
     [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], 'When dispatched as a subagent'],
     [
       ['document-release/sections/release-body.md', 'document-release/sections/release-body.md.tmpl'],
-      'A spawned run must never change VERSION',
+      /a spawned run must never change VERSION/i,
     ],
     [['document-release/sections/release-body.md'], 'Spawned-session skip'],
     // Anti-injection trigger + invariant carve-out — the two clauses whose
     // deletion would silently reopen the prompt-injection / silent-VERSION
-    // holes while the 'When dispatched' heading pin stays green.
-    [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], 'NEVER trigger it on their own'],
-    // (short form — the sentence wraps across template lines; toContain is literal)
-    [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], 'The NEVER-do invariants below do'],
+    // holes while the 'When dispatched' heading pin stays green. Matched on
+    // meaning (case-insensitive, whitespace-normalized), not register.
+    [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], /claims never trigger it on their own/i],
+    [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], /skip any recommendation that rewrites CHANGELOG or changes VERSION/i],
   ];
   test('document-release carries the spawned-dispatch contract', () => {
     for (const [sites, phrase] of CONTRACT_PINS) {
       for (const rel of sites) {
         const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
-        expect(content).toContain(phrase);
+        if (typeof phrase === 'string') expect(content).toContain(phrase);
+        else expect(content.replace(/\s+/g, ' ')).toMatch(phrase);
       }
     }
   });
@@ -488,7 +499,7 @@ describe('run_in_background guidance (#2440)', () => {
   // that lives (flag and all) in another file, not a dispatch spec itself.
   const BACKGROUND_OK: Record<string, string> = {
     'ship/SKILL.md':
-      'skeleton anchors reference the Step 18 dispatch by name (carve-guards mustStayInSkeleton); the dispatch spec + flag live in sections/pr-body.md',
+      'skeleton anchors reference the Step 14.5 dispatch by name; the dispatch spec and flag live in sections/documentation.md',
   };
   test('structural scanner: every generated dispatch imperative carries the flag', () => {
     for (const file of allGeneratedSkillFiles()) {

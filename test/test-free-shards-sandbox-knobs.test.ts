@@ -6,7 +6,7 @@
  * main() — these tests pin its two load-bearing inputs:
  *
  *   1. fullSuiteJobs(): env override wins, is deliberately UNclamped by
- *      MAX_FULL_SUITE_JOBS, and rejects garbage loudly (a silent fallback to
+ *      the per-platform cap, and rejects garbage loudly (a silent fallback to
  *      the default would saturate the sandbox's seccomp supervisor — the
  *      exact failure the knob exists to prevent).
  *   2. FreeShardOutcome.failingFiles: empty on pass, attributed files on
@@ -20,6 +20,8 @@ import { readFileSync } from 'node:fs';
 import {
   fullSuiteJobs,
   MAX_FULL_SUITE_JOBS,
+  MAX_LINUX_FULL_SUITE_JOBS,
+  maxFullSuiteJobs,
   runFreeShard,
 } from '../scripts/test-free-shards';
 
@@ -38,20 +40,31 @@ function withJobsEnv<T>(value: string | undefined, fn: () => T): T {
 
 describe('test-free-shards: fullSuiteJobs (GSTACK_FREE_JOBS override)', () => {
   test('unset and empty string both take the computed default — available CPUs, capped, floor 1', () => {
-    const expected = Math.max(1, Math.min(MAX_FULL_SUITE_JOBS, os.availableParallelism?.() ?? os.cpus().length));
+    const expected = Math.max(1, Math.min(maxFullSuiteJobs(), os.availableParallelism?.() ?? os.cpus().length));
     expect(withJobsEnv(undefined, fullSuiteJobs)).toBe(expected);
     // A stray `export GSTACK_FREE_JOBS=` must not throw.
     expect(withJobsEnv('', fullSuiteJobs)).toBe(expected);
   });
 
-  test.each([[0, 1], [1, 1], [2, 2], [4, 4], [8, 6]])(
-    '%i available CPUs default to %i serial shard processes regardless of host CPU count',
-    (availableCpus, expected) => {
+  test('Linux caps at 16 shard processes; macOS and Windows keep the cap of 6', () => {
+    expect(maxFullSuiteJobs('linux')).toBe(MAX_LINUX_FULL_SUITE_JOBS);
+    expect(MAX_LINUX_FULL_SUITE_JOBS).toBe(16);
+    expect(maxFullSuiteJobs('darwin')).toBe(MAX_FULL_SUITE_JOBS);
+    expect(maxFullSuiteJobs('win32')).toBe(MAX_FULL_SUITE_JOBS);
+    expect(MAX_FULL_SUITE_JOBS).toBe(6);
+  });
+
+  test.each([
+    ['darwin', 0, 1], ['darwin', 1, 1], ['darwin', 2, 2], ['darwin', 4, 4], ['darwin', 8, 6],
+    ['linux', 0, 1], ['linux', 4, 4], ['linux', 8, 8], ['linux', 16, 16], ['linux', 64, 16],
+  ] as const)(
+    '%s: %i available CPUs default to %i serial shard processes regardless of host CPU count',
+    (platform, availableCpus, expected) => {
       const available = spyOn(os, 'availableParallelism').mockReturnValue(availableCpus);
-      const cpus = spyOn(os, 'cpus').mockReturnValue(Array<os.CpuInfo>(16));
+      const cpus = spyOn(os, 'cpus').mockReturnValue(Array<os.CpuInfo>(64));
       try {
-        expect(withJobsEnv(undefined, fullSuiteJobs)).toBe(expected);
-        expect(withJobsEnv('', fullSuiteJobs)).toBe(expected);
+        expect(withJobsEnv(undefined, () => fullSuiteJobs(platform))).toBe(expected);
+        expect(withJobsEnv('', () => fullSuiteJobs(platform))).toBe(expected);
         expect(cpus).not.toHaveBeenCalled();
       } finally {
         available.mockRestore();
@@ -73,14 +86,14 @@ describe('test-free-shards: fullSuiteJobs (GSTACK_FREE_JOBS override)', () => {
       }));
       const { fullSuiteJobs } = await import(${JSON.stringify(import.meta.resolve('../scripts/test-free-shards'))});
       delete process.env.GSTACK_FREE_JOBS;
-      console.log(JSON.stringify([0, 1, 2, 4, 8].map(count => {
+      console.log(JSON.stringify([0, 1, 2, 4, 8, 32].map(count => {
         cpuCount = count;
-        return fullSuiteJobs();
+        return [fullSuiteJobs('darwin'), fullSuiteJobs('linux')];
       })));
     `], { timeout: 10_000 });
     expect(result.exitCode).toBe(0);
     expect(result.stderr.toString()).toBe('');
-    expect(JSON.parse(result.stdout.toString())).toEqual([1, 1, 2, 4, 6]);
+    expect(JSON.parse(result.stdout.toString())).toEqual([[1, 1], [1, 1], [2, 2], [4, 4], [6, 8], [6, 16]]);
   });
 
   test('a positive integer override is honored exactly (the sandbox recipe sets 2)', () => {
@@ -98,6 +111,20 @@ describe('test-free-shards: fullSuiteJobs (GSTACK_FREE_JOBS override)', () => {
     expect(step).toBeDefined();
     expect(step?.env?.GSTACK_FREE_JOBS).toBe('2');
     expect(withJobsEnv(step?.env?.GSTACK_FREE_JOBS, fullSuiteJobs)).toBe(2);
+  });
+
+  test('Windows CI retries attributed flakes serially and uploads every flaky pass', () => {
+    const source = readFileSync(new URL('../.github/workflows/windows-free-tests.yml', import.meta.url), 'utf8');
+    const workflow = Bun.YAML.parse(source) as {
+      jobs: Record<string, { steps: Array<{ name?: string; if?: string; run?: string; env?: Record<string, string>; with?: Record<string, unknown> }> }>;
+    };
+    const steps = workflow.jobs['windows-free-tests'].steps;
+    const suite = steps.find(step => step.run === 'bun run test:windows');
+    expect(suite?.env?.GSTACK_FREE_RETRY_FLAKY).toBe('1');
+    expect(suite?.env?.GSTACK_FLAKE_LEDGER).toBe('${{ runner.temp }}/flake-ledger.jsonl');
+    const upload = steps.find(step => step.name === 'Upload flake ledger');
+    expect(upload?.if).toBe('always()');
+    expect(upload?.with?.path).toBe('${{ runner.temp }}/flake-ledger.jsonl');
   });
 
   test('an explicit override does not probe the available CPUs', () => {
@@ -118,8 +145,8 @@ describe('test-free-shards: fullSuiteJobs (GSTACK_FREE_JOBS override)', () => {
     }
   });
 
-  test('override is deliberately NOT clamped by MAX_FULL_SUITE_JOBS (beefy boxes may raise it)', () => {
-    const above = MAX_FULL_SUITE_JOBS + 6;
+  test('override is deliberately NOT clamped by the platform cap (beefy boxes may raise it)', () => {
+    const above = MAX_LINUX_FULL_SUITE_JOBS + 6;
     expect(withJobsEnv(String(above), fullSuiteJobs)).toBe(above);
   });
 

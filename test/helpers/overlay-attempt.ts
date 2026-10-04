@@ -101,12 +101,14 @@ export function assessOverlayArms(fixture: OverlayFixture, overlay: OverlayTrial
   const measurementsValid = comparison.status !== 'incomplete' && [overlay, off].every((arm) =>
     arm.length === fixture.trials && Array.from(arm).every((trial) => trial?.passed));
   // Baseline completion is an experimental variable for literal scope. A valid
-  // OFF sample may score 0..3; ON must complete all three. Likewise, dedicated
-  // tools allow Bash in OFF while every ON sample must use zero Bash calls.
+  // OFF sample may score 0..3; ON must complete all three. Every ON trial has
+  // already passed its fixture's output check to count as a valid measurement.
   const correctnessPassed = measurementsValid && overlay.every((trial) => trial.taskCorrect);
-  // Contract v2 makes no resource non-regression or universal efficacy promise.
-  // Keep the original comparison verdict even when exact behavior passes.
-  return { metrics, comparison, measurementsValid, correctnessPassed, passed: correctnessPassed };
+  // A fixture with a gate also blocks on its comparison (dedicated tools: 20%
+  // fewer Bash calls, or none at a zero baseline). Without a gate the
+  // comparison verdict stays research evidence.
+  const gatePassed = measurementsValid && (fixture.gate?.(metrics) ?? true);
+  return { metrics, comparison, measurementsValid, correctnessPassed, gatePassed, passed: correctnessPassed && gatePassed };
 }
 
 /** Preserve each SDK retry stream, including events emitted before an exception. */

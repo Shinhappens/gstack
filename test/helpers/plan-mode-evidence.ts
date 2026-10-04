@@ -52,3 +52,27 @@ export function assertPlanModeWithEvidence(
     throw error;
   }
 }
+
+/**
+ * A seeded plan-mode review targeted the seeded plan without asking which
+ * target to review: either the auto-selection was observed (visible
+ * announcement or native seeded-plan selection) or seed-only plan content
+ * appeared in the review output after the slash command. The announcement's
+ * exact wording is not required.
+ */
+export function seededPlanTargeted(observation: PlanSkillObservation, seedTokens: readonly string[]): boolean {
+  return observation.scopeGateAutoSelectObserved === true
+    || seedTokens.some(token => observation.tokensObserved?.[token] === true);
+}
+
+/**
+ * The AskUserQuestion format forbids writing a decision to the plan file as a
+ * substitute for asking, so a plan file with a `## Decisions` section fails.
+ */
+export function assertNoPlanFileDecisions(observation: PlanSkillObservation, hasDecisions: (planFile: string) => boolean): void {
+  if (observation.outcome === 'plan_ready' && observation.planFile && hasDecisions(observation.planFile)) {
+    throw new Error(`plan file ${observation.planFile} carries a ## Decisions section: decisions must be asked ` +
+      `(AskUserQuestion or the prose fallback), not written to the plan as a substitute.\n` +
+      `--- evidence (last 2KB) ---\n${observation.evidence}`);
+  }
+}

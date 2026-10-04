@@ -8,7 +8,7 @@
 import { test, expect } from 'bun:test';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { describeE2ETier } from './helpers/e2e-gate';
-import { assertPlanModeWithEvidence } from './helpers/plan-mode-evidence';
+import { assertNoPlanFileDecisions, assertPlanModeWithEvidence, seededPlanTargeted } from './helpers/plan-mode-evidence';
 import {
   runPlanSkillObservation,
   planFileHasDecisionsSection,
@@ -47,6 +47,9 @@ Ignore Bun's native --shard flag because we want full control.
 None planned — will add later.
 `;
 
+// Seed-only names; seeing one after the slash command shows the review read the seeded plan.
+const SEED_PLAN_TOKENS = ['ShardManager', 'ResultMerger', 'test-shard-impl'];
+
 describeE2E('plan-eng-review plan-mode smoke (periodic)', () => {
   test('reaches a terminal outcome (asked or plan_ready) without silent writes', async () => {
     const obs = await runPlanSkillObservation({
@@ -66,23 +69,26 @@ describeE2E('plan-eng-review plan-mode smoke (periodic)', () => {
       }
       expect(['asked', 'plan_ready']).toContain(obs.outcome);
       assertReportAtBottomIfPlanWritten(obs);
+      assertNoPlanFileDecisions(obs, planFileHasDecisionsSection);
     });
   }, CAPTURE_LONG_MS);
 
   // D3-B / D4-B: when a plan with guaranteed-finding-triggering complexity
-  // is seeded, the skill MUST fire AskUserQuestion (or fall back to a
-  // Decisions section) before writing findings to the plan. The
-  // wrote_findings_before_asking outcome catches the precise transcript bug
-  // — model writes findings to the plan before any AUQ render.
+  // is seeded, the skill must ask (mcp AskUserQuestion or the prose fallback)
+  // before writing findings to the plan. The wrote_findings_before_asking
+  // outcome catches the transcript bug where the model writes findings to the
+  // plan before any question renders. A plan-file ## Decisions section is not
+  // a substitute for asking.
   test('STOP gate fires when seeded plan forces Step 0 findings', async () => {
     const obs = await runPlanSkillObservation({
       skillName: 'plan-eng-review',
       inPlanMode: true,
       initialPlanContent: SEED_PLAN_FORCING_FINDINGS,
       // Force the Conductor-style path: native AUQ disallowed → the model
-      // must use mcp__*__AskUserQuestion (outcome='asked') or fall back to
-      // writing Decisions ('plan_ready').
+      // must use mcp__*__AskUserQuestion or render the prose fallback
+      // (both observed as outcome='asked').
       extraArgs: ['--disallowedTools', 'AskUserQuestion'],
+      trackTokens: SEED_PLAN_TOKENS,
       timeoutMs: CAPTURE_MS,
     });
 
@@ -101,28 +107,24 @@ describeE2E('plan-eng-review plan-mode smoke (periodic)', () => {
         );
       }
 
-      if (obs.outcome === 'plan_ready') {
-        if (!obs.planFile || !planFileHasDecisionsSection(obs.planFile)) {
-          throw new Error(
-            `STOP-gate regression: plan_ready without ## Decisions section in ` +
-              `${obs.planFile ?? '<no plan file>'} — gate skipped after ToolSearch.\n` +
-              `--- evidence (last 2KB) ---\n${obs.evidence}`,
-          );
-        }
+      assertReportAtBottomIfPlanWritten(obs);
+      assertNoPlanFileDecisions(obs, planFileHasDecisionsSection);
+      if (obs.outcome !== 'asked') {
+        throw new Error(
+          `STOP-gate regression: outcome=${obs.outcome} — the seeded findings reached ` +
+            `${obs.planFile ?? 'plan_ready'} without a question.\n` +
+            `--- evidence (last 2KB) ---\n${obs.evidence}`,
+        );
       }
 
-      expect(['asked', 'plan_ready']).toContain(obs.outcome);
-      assertReportAtBottomIfPlanWritten(obs);
-
       // Plan-mode scope-gate bypass: with a seeded plan in plan mode, the gate
-      // must NOT render its "What should I review?" menu — it auto-selects B
-      // and announces it. Exception ordering in the template (plan-mode branch
-      // first) makes this deterministic even though the seed arrives as a
-      // pasted user message. Unseeded test 1 keeps its lenient contract: with
-      // no plan drafted, the "ask as normal" fallback legitimately renders the
-      // question.
+      // must NOT render its "What should I review?" menu, and the review must
+      // target the seeded plan. The announcement's exact wording is not graded.
+      // Unseeded test 1 keeps its lenient contract: with no plan drafted, the
+      // "ask as normal" fallback legitimately renders the question.
       expect(obs.scopeGateQuestionObserved ?? false).toBe(false);
-      expect(obs.scopeGateAutoSelectObserved ?? false).toBe(true);
+      console.log(`[plan-eng plan-mode] scope announcement observed: ${obs.scopeGateAutoSelectObserved ?? false}; seed tokens: ${JSON.stringify(obs.tokensObserved ?? {})}`);
+      expect(seededPlanTargeted(obs, SEED_PLAN_TOKENS), 'seeded plan was not targeted (scopeGateAutoSelectObserved or seed-only plan tokens)').toBe(true);
     });
   }, CAPTURE_LONG_MS);
 });

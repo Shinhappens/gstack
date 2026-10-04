@@ -38,6 +38,9 @@ import {
   spawnDaemonForTest,
   type SpawnedDaemon,
 } from "./daemon-tests-fixtures";
+import { usePrivateStateRoot } from "../../test/helpers/private-state-root";
+
+usePrivateStateRoot();
 
 let workDir: string;
 let stateFile: string;

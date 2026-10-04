@@ -47,6 +47,7 @@ describe.skipIf(process.platform === 'win32')('native Kiro setup installation', 
         const log = path.join(tmp, 'bun.log');
         const result = runBashScript([
           'set -e', helpers, 'log() { :; }', '_browser_hint() { :; }',
+          '_setup_arm_begin() { :; }', '_setup_arm_publish() { :; }', '_setup_row() { :; }',
           'bun_cmd() { printf "%s\\n" "$*" >> "$BUN_LOG"; }',
           'INSTALL_KIRO=1', `IS_WINDOWS=${windowsCopy}`, 'BROWSE_BIN=unused',
           '_BACKED_UP_SKILL_MDS=()', '_SKILL_BACKUP_ROOT="$HOME/backups"',

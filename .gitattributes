@@ -24,6 +24,10 @@ setup        text eol=lf
 bin/*        text eol=lf
 **/scripts/* text eol=lf
 
+# Dockerfiles build on Linux, and test/ci-image-cli-pin.test.ts joins their
+# `\`-continued RUN lines with a `\\\n` match; CRLF left each RUN split.
+Dockerfile*  text eol=lf
+
 # TypeScript/JavaScript: LF for portability across the bun toolchain.
 *.ts         text eol=lf
 *.tsx        text eol=lf

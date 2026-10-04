@@ -12,10 +12,11 @@
 import { test, expect } from 'bun:test';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { describeE2ETier } from './helpers/e2e-gate';
-import { assertPlanModeWithEvidence } from './helpers/plan-mode-evidence';
+import { assertNoPlanFileDecisions, assertPlanModeWithEvidence, seededPlanTargeted } from './helpers/plan-mode-evidence';
 import {
   runPlanSkillObservation,
   assertReportAtBottomIfPlanWritten,
+  planFileHasDecisionsSection,
 } from './helpers/claude-pty-runner';
 
 const describeE2E = describeE2ETier('periodic');
@@ -43,6 +44,9 @@ Only the happy path is designed. No empty states, no error states,
 no loading states. Mobile: "stacks on mobile."
 `;
 
+// Seed-only phrases; seeing one after the slash command shows the review read the seeded plan.
+const SEED_PLAN_TOKENS = ['Marketing landing page', 'testimonials carousel', '3 tier cards'];
+
 describeE2E('plan-design-review plan-mode smoke (periodic)', () => {
   test('reaches a terminal outcome (asked or plan_ready) without silent writes', async () => {
     const obs = await runPlanSkillObservation({
@@ -62,19 +66,21 @@ describeE2E('plan-design-review plan-mode smoke (periodic)', () => {
       }
       expect(['asked', 'plan_ready']).toContain(obs.outcome);
       assertReportAtBottomIfPlanWritten(obs);
+      assertNoPlanFileDecisions(obs, planFileHasDecisionsSection);
     });
   }, CAPTURE_LONG_MS);
 
   // Plan-mode scope-gate bypass: with a seeded UI-heavy plan in plan mode,
-  // the gate must NOT render its "What should I review?" menu — it
-  // auto-selects B and announces it, then proceeds to the pre-review audit
-  // and mockups. Mirrors the eng smoke's seeded STOP-gate test, without
+  // the gate must NOT render its "What should I review?" menu; the review
+  // targets the seeded plan, then proceeds to the pre-review audit and
+  // mockups. Mirrors the eng smoke's seeded STOP-gate test, without
   // --disallowedTools (native AUQ available is the common path here).
   test('scope gate auto-selects B when a plan is seeded in plan mode', async () => {
     const obs = await runPlanSkillObservation({
       skillName: 'plan-design-review',
       inPlanMode: true,
       initialPlanContent: SEED_PLAN_UI_HEAVY,
+      trackTokens: SEED_PLAN_TOKENS,
       timeoutMs: CAPTURE_MS,
     });
 
@@ -95,11 +101,13 @@ describeE2E('plan-design-review plan-mode smoke (periodic)', () => {
 
       expect(['asked', 'plan_ready']).toContain(obs.outcome);
       assertReportAtBottomIfPlanWritten(obs);
+      assertNoPlanFileDecisions(obs, planFileHasDecisionsSection);
 
-      // The bypass contract (exception ordering makes this deterministic even
-      // though the seed arrives as a pasted user message).
+      // The bypass contract: no scope menu, and the seeded plan is the target.
+      // The announcement's exact wording is not graded.
       expect(obs.scopeGateQuestionObserved ?? false).toBe(false);
-      expect(obs.scopeGateAutoSelectObserved ?? false).toBe(true);
+      console.log(`[plan-design plan-mode] scope announcement observed: ${obs.scopeGateAutoSelectObserved ?? false}; seed tokens: ${JSON.stringify(obs.tokensObserved ?? {})}`);
+      expect(seededPlanTargeted(obs, SEED_PLAN_TOKENS), 'seeded plan was not targeted (scopeGateAutoSelectObserved or seed-only plan tokens)').toBe(true);
     });
   }, CAPTURE_LONG_MS);
 });

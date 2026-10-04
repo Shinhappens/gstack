@@ -216,7 +216,7 @@ describe('gstack-slug ↔ remote-slug parity', () => {
     expect(gstack.status).toBe(0);
     expect(slugOf(gstack)).toBe('garrytan-gstack');
     // The cache file itself must have been overwritten (self-healing).
-    expect(fs.readFileSync(cacheFile, 'utf8').trim()).toBe('garrytan-gstack');
+    expect(fs.readFileSync(cacheFile, 'utf8').trim()).toBe('v2:garrytan-gstack');
   });
 
   test('hostile origin `url = ..` cannot become a ".." slug — basename fallback holds', () => {
@@ -230,7 +230,7 @@ describe('gstack-slug ↔ remote-slug parity', () => {
     expect(slugOf(r)).toBe('dotty');
     // The cache must hold the healed value, never the dot slug.
     const cacheFile = path.join(tmpHome, '.gstack', 'slug-cache', encodedCacheKey(repo));
-    expect(fs.readFileSync(cacheFile, 'utf8').trim()).toBe('dotty');
+    expect(fs.readFileSync(cacheFile, 'utf8').trim()).toBe('v2:dotty');
   });
 
   test('package.json wrapper root (no .git): sticky basename slug is PRESERVED — heal is stray-repo-shape only', () => {
@@ -252,7 +252,7 @@ describe('gstack-slug ↔ remote-slug parity', () => {
     const r = runSlug(inner, tmpHome);
     expect(r.status).toBe(0);
     expect(slugOf(r)).toBe('wrapperproj'); // NOT healed to acme-web
-    expect(fs.readFileSync(cacheFile, 'utf8').trim()).toBe('wrapperproj');
+    expect(fs.readFileSync(cacheFile, 'utf8').trim()).toBe('v2:wrapperproj');
   });
 
   test('sticky identity preserved (#2212): repo that adopted a remote after first use is NOT healed', () => {
@@ -267,6 +267,110 @@ describe('gstack-slug ↔ remote-slug parity', () => {
     const gstack = runSlug(repo, tmpHome);
     expect(gstack.status).toBe(0);
     expect(slugOf(gstack)).toBe('stickyproj');
-    expect(fs.readFileSync(cacheFile, 'utf8').trim()).toBe('stickyproj');
+    expect(fs.readFileSync(cacheFile, 'utf8').trim()).toBe('v2:stickyproj');
+  });
+  // ── Nested-group remotes (#3003) ─────────────────────────────────────────
+
+  const VECTORS: Array<{ url: string; slug: string }> = JSON.parse(
+    fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'remote-identity-vectors.json'), 'utf8'),
+  );
+  const vectorSlug = (url: string): string => VECTORS.find((v) => v.url === url)!.slug;
+
+  test('2/3/4-segment ssh+https remotes: both bins agree with the golden vectors', () => {
+    const urls = [
+      'https://github.com/garrytan/gstack.git',
+      'git@github.com:garrytan/gstack.git',
+      'https://gitlab.com/customer-a/product/repo.git',
+      'git@gitlab.com:customer-a/product/repo.git',
+      'ssh://git@gitlab.com:2222/customer-a/product/repo.git',
+      'https://gitlab.com/customer-b/product/repo.git',
+      'git@gitlab.example.com:group/sub/team/repo.git',
+      'https://gitlab.example.com/group/sub/team/repo',
+    ];
+    urls.forEach((url, i) => {
+      const repo = makeRepo(path.join(fixtures, `nested-${i}`), url);
+      expectParity(repo, tmpHome, vectorSlug(url));
+    });
+    // Same nested repo over ssh, https and ssh:// with a port → one bucket;
+    // a sibling group's repo with the same last two segments → a different one.
+    expect(vectorSlug('git@gitlab.com:customer-a/product/repo.git'))
+      .toBe(vectorSlug('ssh://git@gitlab.com:2222/customer-a/product/repo.git'));
+    expect(vectorSlug('https://gitlab.com/customer-b/product/repo.git'))
+      .not.toBe(vectorSlug('https://gitlab.com/customer-a/product/repo.git'));
+  });
+
+  test('pre-populated unversioned cache of a nested repo moves once, prints one notice, then stays git-free', () => {
+    const repo = makeRepo(path.join(fixtures, 'nested-cached'), 'git@gitlab.com:customer-a/product/repo.git');
+    const cacheDir = path.join(tmpHome, '.gstack', 'slug-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const cacheFile = path.join(cacheDir, encodedCacheKey(repo));
+    fs.writeFileSync(cacheFile, 'product-repo'); // pre-#3003 sticky value
+    fs.mkdirSync(path.join(tmpHome, '.gstack', 'projects', 'product-repo', 'checkpoints'), { recursive: true });
+
+    const first = runSlug(repo, tmpHome);
+    expect(first.status).toBe(0);
+    expect(slugOf(first)).toBe('product-repo-5eca1fe041984543');
+    expect(fs.readFileSync(cacheFile, 'utf8')).toBe('v2:product-repo-5eca1fe041984543');
+    expect(first.stderr).toContain(
+      'gstack now files this project under projects/product-repo-5eca1fe041984543; earlier data is still in projects/product-repo',
+    );
+    // The old bucket is left in place, never moved or deleted.
+    expect(fs.existsSync(path.join(tmpHome, '.gstack', 'projects', 'product-repo', 'checkpoints'))).toBe(true);
+
+    // Second resolve: a v2 cache hit — no notice and no remote lookup.
+    const shimDir = path.join(fixtures, 'git-shim');
+    fs.mkdirSync(shimDir, { recursive: true });
+    const realGit = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8', timeout: 10_000 }).stdout.trim();
+    const log = path.join(fixtures, 'git-calls.log');
+    fs.writeFileSync(path.join(shimDir, 'git'), `#!/usr/bin/env bash\necho "$*" >> "${log}"\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+    const second = spawnSync('bash', [SLUG_SCRIPT], {
+      cwd: repo,
+      env: { ...baseEnv(tmpHome), PATH: `${shimDir}:${process.env.PATH}` },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    expect(slugOf(second)).toBe('product-repo-5eca1fe041984543');
+    expect(second.stderr).toBe('');
+    const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '';
+    expect(calls).not.toContain('remote get-url');
+  });
+
+  test('unversioned sticky identity of a nested repo that is NOT the old last-two slug is kept (#2212)', () => {
+    const repo = makeRepo(path.join(fixtures, 'stickynested'), 'https://gitlab.com/customer-a/product/repo.git');
+    const cacheDir = path.join(tmpHome, '.gstack', 'slug-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const cacheFile = path.join(cacheDir, encodedCacheKey(repo));
+    fs.writeFileSync(cacheFile, 'stickynested');
+    const r = runSlug(repo, tmpHome);
+    expect(slugOf(r)).toBe('stickynested');
+    expect(fs.readFileSync(cacheFile, 'utf8')).toBe('v2:stickynested');
+    expect(r.stderr).toBe('');
+  });
+
+  test('--identity prints the canonical remote without credentials, and nothing on disk holds them', () => {
+    const user = 'ci-bot';
+    const secret = ['sentinel', 'tok', '81274'].join('-');
+    const repo = makeRepo(path.join(fixtures, 'creds'), `https://${user}:${secret}@GitLab.com:8443/customer-a/product/repo.git`);
+    const r = spawnSync('bash', [SLUG_SCRIPT, '--identity'], { cwd: repo, env: baseEnv(tmpHome), encoding: 'utf8', timeout: 10_000 });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('PROJECT_REMOTE=gitlab.com/customer-a/product/repo\n');
+    expect(r.stdout).toContain('SLUG=product-repo-5eca1fe041984543\n');
+    expect(r.stdout).toContain('LEGACY_SLUG=product-repo\n');
+    expect(r.stdout + r.stderr).not.toContain(secret);
+    const stateFiles = spawnSync('grep', ['-rl', secret, path.join(tmpHome, '.gstack')], { encoding: 'utf8', timeout: 10_000 });
+    expect(stateFiles.stdout).toBe('');
+  });
+
+  test('GSTACK_PROJECT_SLUG of "." or ".." is ignored instead of escaping projects/', () => {
+    const repo = makeRepo(path.join(fixtures, 'pinned'), 'https://github.com/acme/pinned.git');
+    for (const pin of ['.', '..', '/..']) {
+      const r = spawnSync('bash', [SLUG_SCRIPT], {
+        cwd: repo,
+        env: { ...baseEnv(tmpHome), GSTACK_PROJECT_SLUG: pin },
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      expect(slugOf(r)).toBe('acme-pinned');
+    }
   });
 });

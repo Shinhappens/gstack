@@ -15,7 +15,8 @@ if(scenario==='wrong-start')status.procStart+='0';
 if(scenario==='wrong-domain')status.pidDomain+='-different';
 if(scenario==='startup-waiting')status.waitingFor='permission prompt';
 fs.writeFileSync(statusFile,JSON.stringify(status));
-fs.writeFileSync(path.join(dir,'launch.json'),JSON.stringify({argv:process.argv.slice(2),planModeHint:process.env.GSTACK_PLAN_MODE??null,planModeForce:process.env.GSTACK_PLAN_MODE_FORCE??null,term:process.env.TERM??null,forceColor:process.env.FORCE_COLOR??null}));
+fs.writeFileSync(path.join(dir,'launch.json'),JSON.stringify({argv:process.argv.slice(2),planModeHint:process.env.GSTACK_PLAN_MODE??null,planModeForce:process.env.GSTACK_PLAN_MODE_FORCE??null,term:process.env.TERM??null,forceColor:process.env.FORCE_COLOR??null,
+ terminalEnv:Object.fromEntries(['CI','TERM','COLORTERM','FORCE_COLOR','NO_COLOR'].map(key=>[key,process.env[key]??null]))}));
 const event=(kind,value)=>fs.appendFileSync(events,JSON.stringify({kind,value,at:Date.now()})+'\n');
 const row=(type,content,stop)=>JSON.stringify({type,sessionId:sid,cwd,message:{role:type,content,stop_reason:stop}})+'\n';
 const text=s=>[{type:'text',text:s}];
@@ -30,7 +31,11 @@ let input='',seed='',submitted=false;
 process.stdin.setRawMode(true);process.stdin.resume();
 const hint='Try "refactor <filepath>"';
 if(scenario==='startup-prior-conversation')append('user',text('An earlier request'));
-if(scenario==='startup-terminal-placeholder-cursor')frame(process.env.TERM==='dumb'||!process.env.TERM?hint:'\x1b[7mT\x1b[27m\x1b[2m'+hint.slice(1)+'\x1b[22m');
+if(scenario==='startup-terminal-placeholder-cursor'){
+ const styled=process.env.TERM&&process.env.TERM!=='dumb'&&process.env.FORCE_COLOR!=='0'
+  &&(process.env.FORCE_COLOR==='1'||!process.env.CI&&!process.env.NO_COLOR);
+ frame(styled?'\x1b[7mT\x1b[27m\x1b[2m'+hint.slice(1)+'\x1b[22m':hint);
+}
 else if(scenario==='startup-ci-placeholder')frame(process.env.CI==='true'&&process.env.FORCE_COLOR!=='1'?hint:'\x1b[2m'+hint+'\x1b[22m');
 else if(scenario==='startup-ci-typed-hint')frame(hint);
 else if(scenario==='startup-placeholder-cursor')frame('\x1b[7mT\x1b[27m\x1b[2m'+hint.slice(1)+'\x1b[22m');
@@ -50,7 +55,13 @@ process.stdin.on('data',chunk=>{
  if(input==='\r'&&!submitted){
   submitted=true;input='';event('enter',seed);frame('');
   if(scenario==='no-ack')return;
-  append('user',text(scenario==='fused'?seed+'\n/plan-eng-review':seed));
+  if(scenario.startsWith('native-paste')){
+   const body=scenario==='native-paste-changed'?seed.replace('Keep','Alter'):scenario==='native-paste-fused'?seed+'\n/plan-eng-review':seed;
+   let native='\n\n<pasted_content id="1aab">\n'+body+'</pasted_content id="'+(scenario==='native-paste-mismatched'?'1aac':'1aab')+'">\n';
+   if(scenario==='native-paste-duplicate')native+=native;
+   if(scenario==='native-paste-appended')native+='/plan-eng-review';
+   append('user',scenario==='native-paste-block'?text(native):scenario==='native-paste-multiple-blocks'?[...text(native),...text('extra request')]:native);
+  }else append('user',text(scenario==='fused'?seed+'\n/plan-eng-review':seed));
   if(scenario==='duplicate')append('user',text(seed));
   if(scenario==='session-switch'){status.sessionId='bbbbbbbb-1111-2222-3333-aaaaaaaaaaaa';fs.writeFileSync(statusFile,JSON.stringify(status));return;}
   if(scenario==='foreign-cwd'){fs.writeFileSync(file,row('user',text(seed)).replace(cwd,cwd+'-other'));return;}
@@ -74,8 +85,10 @@ process.stdin.on('data',chunk=>{
    const current=scenario==='prose-question'?'\r\nWhich option do you prefer?\r\nA) Full review (recommended)\r\nB) Skip review\r\n❯ '
     :scenario.endsWith('multiline-current')?'\r\n  keep this draft'
     :scenario.endsWith('typed-current')?'keep this draft':'';
-   frame(current,history,scenario.endsWith('missing-current-top')||scenario==='unframed-current'?'':rule,
+   // The native CLI can write end_turn before it repaints; the stale empty box must not count.
+   const paint=()=>frame(current,history,scenario.endsWith('missing-current-top')||scenario==='unframed-current'?'':rule,
     scenario.endsWith('missing-current-bottom')||scenario==='unframed-current'?'':scenario==='mismatched-current-rules'?rule.slice(1):rule);
+   if(scenario==='late-repaint-typed-current')setTimeout(paint,60);else paint();
    if(scenario==='stray-prompt-after-current')process.stdout.write('\r❯ keep this later draft');
   },180);return;
  }

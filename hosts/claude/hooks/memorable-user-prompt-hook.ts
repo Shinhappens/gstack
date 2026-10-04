@@ -58,6 +58,9 @@ import {
 import { wrapUntrustedTrackerContent } from '../../../lib/tracker-guard';
 import { scan } from '../../../lib/redact-engine';
 import { hasRepoPolicyStore, repoPolicyTier } from '../../../lib/gbrain-repo-policy-client';
+import { LOG_RATE_LIMIT_MS, logHookError as sharedLogHookError } from './hook-log';
+
+export { LOG_RATE_LIMIT_MS };
 
 export const BUDGET_MS = 4500;
 export const STDIN_CAP_BYTES = 1024 * 1024;
@@ -74,7 +77,6 @@ export const RECHECK_CAP_MS = 500;
 export const OUTCOME_MIN_MS = 80;
 /** Kept back from the clock when an outcome append is given the rest of it. */
 export const OUTCOME_RESERVE_MS = 50;
-export const LOG_RATE_LIMIT_MS = 10 * 60 * 1000;
 export const ENVELOPE_SOURCE = 'memorable recall (third-party)';
 export const SINK = 'memorable-recall';
 export const CONSENT = 'memorable_recall=on';
@@ -84,8 +86,6 @@ export const PAYLOAD_CLASS = 'claude-user-prompt-json->local-vendor-cli';
 const HOOK_NAME = 'memorable-user-prompt-hook';
 /** Per-KiB allowance added to the scan admission check: ~1.5x the measured worst case of scan(). */
 const SCAN_MS_PER_KIB = 1;
-/** Distinct rate-limit keys remembered at once (the marker file is rewritten on every log line). */
-const RATE_LIMIT_KEYS = 32;
 /** Candidate objects tried by the tolerant stdout parser before giving up (bounds a hostile brace soup). */
 const JSON_CANDIDATES = 64;
 const GIT_MAX_BUFFER = 64 * 1024;
@@ -299,44 +299,16 @@ export function resolveVendor(env: Record<string, string | undefined>, homeDir: 
   return onPath && executable(onPath) ? onPath : null;
 }
 
-function stateRoot(): string {
-  return process.env.GSTACK_STATE_ROOT || process.env.GSTACK_HOME || process.env.GSTACK_STATE_DIR
-    || path.join(os.homedir(), '.gstack');
-}
-
 /**
- * Best-effort, rate-limited: a message with the same `key` (default: the
- * message itself) within LOG_RATE_LIMIT_MS is not re-logged, so a vendor that
- * fails on every prompt with a different timestamp in its stderr still costs
- * one line per ten minutes, and two alternating failures cost two. The marker
- * (up to RATE_LIMIT_KEYS live `digest:ts` lines) is per hook so hooks never
- * contend. The log is chmod 0600 on every append: sibling hooks create the
- * same file without a mode, and it can name the session's cwd and vendor
+ * Best-effort, rate-limited (hook-log.ts): a message with the same `key`
+ * (default: the message itself) within LOG_RATE_LIMIT_MS is not re-logged, so
+ * a vendor that fails on every prompt with a different timestamp in its stderr
+ * still costs one line per ten minutes, and two alternating failures cost two.
+ * The log is 0600 on every append; it can name the session's cwd and vendor
  * diagnostics.
  */
 export function logHookError(msg: string, nowMs: number = Date.now(), key: string = msg): void {
-  try {
-    const root = stateRoot();
-    fs.mkdirSync(root, { recursive: true });
-    const marker = path.join(root, `hook-errors.${HOOK_NAME}.last`);
-    const digest = sha256Hex(key).slice(0, 16);
-    const live: string[] = [];
-    try {
-      for (const line of fs.readFileSync(marker, 'utf8').split('\n')) {
-        const [d, ts] = line.trim().split(':');
-        if (!d || !ts || nowMs - Number(ts) >= LOG_RATE_LIMIT_MS) continue;
-        if (d === digest) return;
-        live.push(line.trim());
-      }
-    } catch { /* no marker yet */ }
-    live.push(`${digest}:${nowMs}`);
-    fs.writeFileSync(marker, `${live.slice(-RATE_LIMIT_KEYS).join('\n')}\n`, { mode: 0o600 });
-    const log = path.join(root, 'hook-errors.log');
-    fs.appendFileSync(log, `${new Date(nowMs).toISOString()} ${HOOK_NAME}: ${msg}\n`, { mode: 0o600 });
-    if (process.platform !== 'win32') { try { fs.chmodSync(log, 0o600); } catch { /* not ours to tighten */ } }
-  } catch {
-    // best-effort; never block the session because logging failed
-  }
+  sharedLogHookError(HOOK_NAME, msg, { rateLimit: { nowMs, key } });
 }
 
 function readStdin(maxBytes: number, timeoutMs: number): Promise<{ buf: Buffer; oversize: boolean; timedOut: boolean }> {

@@ -15,6 +15,7 @@
  *   restores state. Falls back to clean slate on any failure.
  */
 
+import type { ChildProcess } from 'node:child_process';
 import { chromium, type Browser, type BrowserContext, type BrowserContextOptions, type Page, type Locator, type Cookie } from 'playwright';
 import { writeSecureFile, mkdirSecure } from './file-permissions';
 import { addConsoleEntry, addNetworkEntry, addDialogEntry, networkBuffer, type DialogEntry } from './buffers';
@@ -174,6 +175,12 @@ export function probePoisonedChromiumBundle(chromiumExecutablePath: string): voi
   );
 }
 
+/** Playwright's public Browser type omits `process()`, which only browsers we launched provide. */
+function launchedProcess(browser: Browser | null | undefined): ChildProcess | null {
+  const withProcess = browser as (Browser & { process?: () => ChildProcess | null }) | null | undefined;
+  return typeof withProcess?.process === 'function' ? withProcess.process() : null;
+}
+
 /**
  * Resolve why the underlying Chromium ChildProcess is going away.
  *
@@ -196,7 +203,7 @@ export async function resolveDisconnectCause(browser: Browser | null): Promise<'
   // obtained via connectOverCDP() (or a stub in tests) has no such method —
   // calling it blind throws inside the disconnect handler, which killed the
   // whole daemon with "browser?.process is not a function".
-  const proc = typeof browser?.process === 'function' ? browser.process() : null;
+  const proc = launchedProcess(browser);
   if (proc && proc.exitCode === null && proc.signalCode === null) {
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 1000);
@@ -599,7 +606,7 @@ export class BrowserManager {
     // #2709: record the child's identity so the CLI can reap a survivor after
     // daemon shutdown. `.process()` exists here — we launched this browser.
     {
-      const proc = typeof this.browser.process === 'function' ? this.browser.process() : null;
+      const proc = launchedProcess(this.browser);
       this.chromiumProcInfo = proc?.pid
         ? { pid: proc.pid, startTime: readPidStartTime(proc.pid) }
         : null;
@@ -955,7 +962,7 @@ export class BrowserManager {
           this.context ? this.context.close() : Promise.resolve(),
           raceTimeout(this.closeRaceMs),
         ]).catch(() => {});
-      } else {
+      } else if (this.browser) {
         // Launched mode: close the browser we spawned.
         this.browser.removeAllListeners('disconnected');
         // Grab the child handle BEFORE the race: nulling this.browser after a
@@ -963,7 +970,7 @@ export class BrowserManager {
         // caller's event loop (and keep-alive connections into test servers)
         // open forever — the intermittent whole-suite wedge. If graceful close
         // doesn't finish in time, the child gets SIGKILL, not freedom.
-        const child = this.browser.process?.();
+        const child = launchedProcess(this.browser);
         const closed = await Promise.race([
           this.browser.close().then(() => true as const),
           raceTimeout(this.closeRaceMs),
@@ -976,7 +983,7 @@ export class BrowserManager {
     }
     if (previousBrowser && previousBrowser !== currentBrowser) {
       previousBrowser.removeAllListeners('disconnected');
-      const child = previousBrowser.process?.();
+      const child = launchedProcess(previousBrowser);
       const closed = await Promise.race([
         previousBrowser.close().then(() => true), raceTimeout(this.closeRaceMs),
       ]).catch(() => false);
@@ -2029,10 +2036,12 @@ export class BrowserManager {
           tabSessions.delete(id);
           console.log(`[browse] Tab closed (id=${id}, remaining=${pages.size})`);
           // If the closed tab was active, switch to another
-          const state = pages === this.pages ? this : this.handoffPrevious?.pages === pages ? this.handoffPrevious : null;
-          if (state?.activeTabId === id) {
-            const remaining = [...pages.keys()];
-            state.activeTabId = remaining.length > 0 ? remaining[remaining.length - 1] : 0;
+          const remaining = [...pages.keys()];
+          const fallback = remaining.length > 0 ? remaining[remaining.length - 1]! : 0;
+          if (pages === this.pages) {
+            if (this.activeTabId === id) this.activeTabId = fallback;
+          } else if (this.handoffPrevious?.pages === pages && this.handoffPrevious.activeTabId === id) {
+            this.handoffPrevious.activeTabId = fallback;
           }
           break;
         }

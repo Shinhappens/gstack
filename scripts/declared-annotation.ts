@@ -22,9 +22,9 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 import { SIGNAL_MAP, type Dimension, ALL_DIMENSIONS } from './psychographic-signals';
+import { resolveStateRoot } from '../lib/state-root';
 
 const STRONG_HIGH = 0.7;
 const STRONG_LOW = 0.3;
@@ -61,11 +61,7 @@ interface DeveloperProfile {
 }
 
 function stateRoot(): string {
-  return (
-    process.env.GSTACK_STATE_ROOT ||
-    process.env.GSTACK_HOME ||
-    path.join(os.homedir(), '.gstack')
-  );
+  return resolveStateRoot();
 }
 
 function readProfile(): DeveloperProfile | null {

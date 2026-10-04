@@ -19,7 +19,9 @@ export function readinessVerdictProblems(kind: 'ready' | 'unknown', output: stri
       problems.push('unknown result claims GREEN or capability OK');
   }
   for (const claim of output.matchAll(/\b(?:semantic search|writes?|write readiness|write availability)[^.!?\n]{0,60}\b(?:ready|verified|proven|confirmed|working)\b/gi)) {
-    if (!/\b(?:not|never|without|unknown|unverified)\b/i.test(claim[0]))
+    const clauseStart = Math.max(...['.', '!', '?', '\n', ';'].map((stop) => output.lastIndexOf(stop, claim.index!)));
+    const subject = output.slice(clauseStart + 1, claim.index!);
+    if (!/\b(?:not|never|without|unknown|unverified)\b/i.test(claim[0]) && !/\b(?:nothing|neither|none|no)\b/i.test(subject))
       problems.push('read-only check claims semantic search or write readiness');
   }
   return problems;

@@ -27,7 +27,7 @@ function runnerDependencies(root: string, entries: string[]): string[] {
     const source = fs.readFileSync(file, 'utf8').replace(/^#![^\n]*(?:\n|$)/, '\n');
     let audited = source;
     if (relative === 'test/helpers/test-selection.ts') {
-      if (createHash('sha256').update(source).digest('hex') !== '4d2fbcb6249e8d22453d25bfe9b18ee0f4568bbec071918675c38a455d4e1e08') {
+      if (createHash('sha256').update(source).digest('hex') !== '052ad5a52472bcb41db04c9f21fe6a819e9547768468f7e5d390e0014b567677') {
         throw new Error('Re-audit the historical touchfile map loader before excluding its computed import');
       }
       audited = source.replace('`const m = await import(${JSON.stringify(dataPath)});`,', "'',");
@@ -64,7 +64,7 @@ describe('paid/free dependency boundary', () => {
     expect(paid.length).toBeGreaterThan(0);
     const all = workflowJudgeDependencies(ROOT, paid);
     for (const dependencies of [runner, all]) {
-      expect(dependencies).toContain('scripts/test-strict-output.ts');
+      expect(dependencies).toContain('scripts/lib/shard-engine.ts');
       expect(dependencies).toContain('test/helpers/test-selection.ts');
       expect(dependencies).not.toContain('scripts/eval-flake-rank.ts');
       for (const freeOnly of FREE_ONLY_PR_FILES) expect(dependencies).not.toContain(freeOnly);
@@ -147,7 +147,7 @@ describe('paid/free dependency boundary', () => {
       'scripts/test-free-shards.ts', 'scripts/test-strict-output.ts',
       'test/eng-scope-entry-ap.test.ts', 'test/helpers/plan-floor-review.ts',
       'test/plan-floor-permission.test.ts', 'test/plan-floor-review.test.ts',
-      'test/plan-review-cases.test.ts', 'test/plan-scope-recovery-av.test.ts',
+      'test/plan-review-cases.test.ts', 'test/plan-scope-selection.test.ts',
       'test/strict-output-formats.test.ts',
     ];
     const result = computePaidCaseSelection({ profile: 'pr', env: {}, changedFiles });
@@ -182,7 +182,7 @@ describe('paid/free dependency boundary', () => {
     const real = computePaidCaseSelection({ profile: 'pr', env: {},
       changedFiles: [file, 'plan-ceo-review/SKILL.md.tmpl'] });
     expect(real.coverage?.mode).toBe('pr');
-    expect(real.selection.e2e).toContain('plan-ceo-review-benefits');
+    expect(real.selection.e2e).toContain('auq-format-gate');
     expect(real.selection.judges).toContain('plan-ceo-review/SKILL.md modes');
     expect(real.selection.e2e?.every(id => PR_PROFILE_CASE_IDS.includes(id as typeof PR_PROFILE_CASE_IDS[number]))).toBe(true);
   });

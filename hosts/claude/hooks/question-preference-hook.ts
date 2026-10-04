@@ -10,7 +10,9 @@
  *      enforcement is skipped for this question (D18 — hash IDs are
  *      observed-only, never used as preference keys).
  *   2. Look up door_type from scripts/question-registry.ts (default two-way).
- *   3. Read preferences with precedence: project-local > global (D8).
+ *   3. Resolve the project bucket from gstack-slug's versioned slug-cache
+ *      entry for cwd (#2901); unresolved identity fails open to ASKING.
+ *      Read preferences with precedence: project-local > global (D8).
  *   4. Apply:
  *        never-ask + one-way → pass through (safety override; one-way always asks).
  *        never-ask + two-way + marker → deny with auto-decided recommendation
@@ -42,11 +44,13 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { runBin, repoRoot } from './spawn-bin';
 import { isConductor } from '../../../lib/is-conductor';
 import { classifyQuestion } from '../../../scripts/one-way-doors';
 import { SPAWNED_ESCAPE_SENTENCE, CONDUCTOR_SPAWNED_DENY_REASON, spawnedByEnv } from './spawned-directive';
+import { resolveStateRoot } from '../../../lib/state-root';
+import { readVersionedSlugCache } from '../../../lib/bin-context';
+import { logHookError as sharedLogHookError } from './hook-log';
 
 interface HookStdin {
   session_id?: string;
@@ -66,25 +70,10 @@ interface HookStdin {
 const MARKER_RE = /<gstack-qid:([a-z0-9-]{1,64})>/i;
 const RECOMMENDED_LABEL_RE = /\(recommended\)\s*$/i;
 
-function stateRoot(): string {
-  return (
-    process.env.GSTACK_STATE_ROOT ||
-    process.env.GSTACK_HOME ||
-    path.join(os.homedir(), '.gstack')
-  );
-}
+const stateRoot = (): string => resolveStateRoot();
 
 function logHookError(msg: string): void {
-  try {
-    const sr = stateRoot();
-    fs.mkdirSync(sr, { recursive: true });
-    fs.appendFileSync(
-      path.join(sr, 'hook-errors.log'),
-      `${new Date().toISOString()} question-preference-hook: ${msg}\n`,
-    );
-  } catch {
-    // last-resort swallow
-  }
+  sharedLogHookError('question-preference-hook', msg);
 }
 
 function readStdin(): Promise<string> {
@@ -297,13 +286,25 @@ function extractRecommended(
   return { recommended: undefined, ambiguous: false };
 }
 
-function slugFromCwd(cwd: string | undefined): string {
-  // Mirror gstack-slug's basename fallback. The full slug resolver shells out
-  // to git, which is too expensive on a hot hook path; the basename is close
-  // enough for preference lookup (preferences are keyed by question_id, slug
-  // is just the directory bucket).
-  if (!cwd) return 'unknown';
-  return path.basename(cwd);
+type ProjectSlug = { slug: string } | { unresolved: string };
+
+/**
+ * The bucket gstack-question-preference writes to (#2901): the same slug
+ * bin/gstack-slug resolves, read from its versioned per-path slug-cache entry
+ * (lib/bin-context.ts key encoding) so this hot path never spawns git. The
+ * skill preamble runs gstack-slug in this cwd before any question, so a miss
+ * means identity is genuinely unknown: the caller then asks instead of
+ * auto-deciding (a basename guess filed never-ask under a bucket no writer
+ * uses, and a project-local always-ask could be silently overridden by a
+ * global never-ask). GSTACK_PROJECT_SLUG wins, as in gstack-slug.
+ */
+function resolveProjectSlug(cwd: string | undefined): ProjectSlug {
+  const envSlug = (process.env.GSTACK_PROJECT_SLUG || '').trim().replace(/[^a-zA-Z0-9._-]/g, '');
+  if (envSlug && envSlug !== '.' && envSlug !== '..') return { slug: envSlug };
+  if (!cwd) return { unresolved: 'the hook input has no cwd' };
+  const cached = readVersionedSlugCache(stateRoot(), cwd);
+  if (cached) return { slug: cached };
+  return { unresolved: `no versioned gstack-slug cache entry for ${cwd}` };
 }
 
 function markAutoDecided(sessionId: string | undefined, toolUseId: string | undefined): void {
@@ -392,7 +393,7 @@ async function main(): Promise<void> {
   // we deny only if ALL questions have marker + never-ask + safe door type.
   // Mixed cases pass through so the user still gets to answer.
   const registry = loadRegistry();
-  const slug = slugFromCwd(stdin.cwd);
+  const project = resolveProjectSlug(stdin.cwd);
   const memoryNuggets = loadMemoryNuggets(stdin.session_id);
 
   // Compute Layer 8 memory context inline: any nuggets matching the
@@ -428,7 +429,12 @@ async function main(): Promise<void> {
     const marker = qText.match(MARKER_RE);
     if (!marker) { fullyAutoDecidable = false; break; }
     const questionId = marker[1];
-    const pref = lookupPreference(slug, questionId);
+    if ('unresolved' in project) {
+      logHookError(`never-ask not applied to ${questionId}, asking instead: project identity unresolved (${project.unresolved})`);
+      fullyAutoDecidable = false;
+      break;
+    }
+    const pref = lookupPreference(project.slug, questionId);
     if (!pref.preference || pref.preference === 'always-ask') { fullyAutoDecidable = false; break; }
 
     const entry = registry[questionId];

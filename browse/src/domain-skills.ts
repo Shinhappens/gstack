@@ -35,9 +35,9 @@
 import { promises as fs } from 'fs';
 import { open as fsOpen, constants as fsConstants } from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { createHash } from 'crypto';
 import type { Page } from 'playwright';
+import { resolveStateRoot } from '../../lib/state-root';
 
 export type SkillState = 'quarantined' | 'active' | 'global';
 export type SkillScope = 'project' | 'global';
@@ -63,7 +63,7 @@ export interface DomainSkillRow {
 const PROMOTE_THRESHOLD = 3;
 
 function gstackHome(): string {
-  return process.env.GSTACK_HOME || path.join(os.homedir(), '.gstack');
+  return resolveStateRoot();
 }
 
 function globalFile(): string {

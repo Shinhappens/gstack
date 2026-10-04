@@ -1,8 +1,8 @@
 /** Execute the actual generated redaction fence before observable dispatch/sinks. */
 import { beforeAll, afterAll, describe, test, expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, symlinkSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 
 const ROOT = resolve(import.meta.dir, '..');
 let output: string;
@@ -27,7 +27,15 @@ function runScan(host: 'claude' | 'codex', body: string, scanner: 'real' | 'brok
   const bin = join(runtime, 'bin');
   const sinks = join(scratch, 'sinks');
   const temps = join(scratch, 'tmp');
-  for (const dir of [bin, sinks, temps]) mkdirSync(dir, { recursive: true });
+  const systemTemps = join(scratch, 'system-tmp');
+  const shims = join(scratch, 'shims');
+  for (const dir of [bin, sinks, temps, systemTemps, shims]) mkdirSync(dir, { recursive: true });
+  const realMktemp = Bun.which('mktemp');
+  if (!realMktemp) throw new Error('mktemp is required for the spec redaction fixture');
+  writeFileSync(join(shims, 'mktemp'), `#!/usr/bin/env bash
+if [ "$#" -eq 0 ]; then exec '${realMktemp}' '${systemTemps}/tmp.XXXXXXXX'; fi
+exec '${realMktemp}' "$@"
+`, { mode: 0o755 });
   writeFileSync(join(bin, 'gstack-config'), '#!/usr/bin/env bash\nprintf "public\\n"\n', { mode: 0o755 });
   if (scanner === 'real') symlinkSync(join(ROOT, 'bin/gstack-redact'), join(bin, 'gstack-redact'));
   if (scanner === 'broken') writeFileSync(join(bin, 'gstack-redact'), '#!/usr/bin/env bash\nexit 70\n', { mode: 0o755 });
@@ -51,12 +59,16 @@ rm -f "$REDACT_FILE"
 `;
   try {
     const result = Bun.spawnSync(['bash', '-c', script], { cwd: scratch,
-      env: { ...process.env, GSTACK_ROOT: runtime, GSTACK_BIN: bin, SINK_DIR: sinks, TMPDIR: temps },
+      env: { ...process.env, PATH: `${shims}${delimiter}${process.env.PATH ?? ''}`,
+        GSTACK_ROOT: runtime, GSTACK_BIN: bin, SINK_DIR: sinks, TMPDIR: temps },
       stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
     });
-    return { code: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString(),
+    const stdout = result.stdout.toString();
+    const printed = /^REDACT_FILE: (.+)$/m.exec(stdout)?.[1];
+    return { code: result.exitCode, stdout, stderr: result.stderr.toString(),
       sinks: readdirSync(sinks).map(name => ({ name, body: readFileSync(join(sinks, name), 'utf8') })),
-      pending: readdirSync(temps).map(name => readFileSync(join(temps, name), 'utf8')) };
+      pending: [temps, systemTemps].flatMap(dir => readdirSync(dir).map(name => readFileSync(join(dir, name), 'utf8'))),
+      printed: printed && existsSync(printed) ? readFileSync(printed, 'utf8') : undefined };
   } finally { rmSync(scratch, { recursive: true, force: true }); }
 }
 
@@ -79,6 +91,7 @@ for (const host of ['claude', 'codex'] as const) {
       expect(result.code).toBe(2);
       expect(result.sinks).toEqual([]);
       expect(result.pending).toEqual([body + '\n']);
+      expect(result.printed).toBe(body + '\n');
       expect(result.stderr).toContain('paused');
     });
     for (const scanner of ['broken', 'missing'] as const) {

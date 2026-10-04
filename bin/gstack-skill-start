@@ -11,8 +11,11 @@
 # Enumerated divergences from the inline original (plan EOV5):
 #   - Paths resolve $0-relative (works for every host + install layout) instead
 #     of gen-time interpolation.
-#   - --parent-pid carries the HARNESS pid for session counting ($PPID inside
-#     this script is the ephemeral tool-call shell — wrong identity).
+#   - Session identity is the HARNESS pid, derived here: the nearest non-shell
+#     ancestor ($PPID inside this script is the ephemeral tool-call shell —
+#     wrong identity). --parent-pid still overrides it. The rendered command
+#     passes no "$PPID" (#2763: worktree-isolated Claude Code sessions refuse
+#     variables and fallbacks in the start command).
 #   - State paths honor ${GSTACK_HOME} (EOV7); the inline original hardcoded
 #     ~/.gstack in the bootstrap half.
 #   - SESSION_ID / TEL_START are echoed (the inline shell vars never survived
@@ -36,7 +39,7 @@ BASH_COMPAT=50
 
 SKILL_NAME=""
 MODEL_OVERLAY="none"
-PARENT_PID="$PPID"
+PARENT_PID=""
 BRAIN_HEALTH="no"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -49,9 +52,29 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$SKILL_NAME" ] || SKILL_NAME="unknown"
 
+# Harness pid: walk up from the calling shell past shell wrappers. Claude
+# Code runs this under a per-call `bash -c`, whose parent is the harness; a
+# host that execs the command directly is already the parent. Without a
+# usable ps (some Windows shells) the immediate parent stands.
+if [ -z "$PARENT_PID" ]; then
+  PARENT_PID="$PPID"
+  _hops=0
+  while [ "$_hops" -lt 8 ]; do
+    _comm=$(ps -o comm= -p "$PARENT_PID" 2>/dev/null | head -1) || break
+    _comm=${_comm##*/}; _comm=${_comm#-}
+    case "$_comm" in bash|sh|zsh|dash|ksh|mksh|ash|fish|busybox) ;; *) break ;; esac
+    _up=$(ps -o ppid= -p "$PARENT_PID" 2>/dev/null | tr -d ' ')
+    case "$_up" in ''|*[!0-9]*|0|1) break ;; esac
+    PARENT_PID="$_up"
+    _hops=$((_hops + 1))
+  done
+fi
+
 _SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 _BIN="$_SCRIPT_DIR"
-_GH="${GSTACK_HOME:-$HOME/.gstack}"
+. "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select
+_GH="$_gstack_sr_root"
 
 # OV4: strip instruction markers from any passthrough text before echoing it
 # into the blessed tool result. Prior-session/repo content must not be able to

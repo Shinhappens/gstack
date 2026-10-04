@@ -3,6 +3,8 @@ import { defineHost, CROSS_MODEL_RESOLVERS, GBRAIN_RESOLVERS, EXEC_STYLE_TOOL_RE
 const openclaw = defineHost({
   name: 'openclaw',
   displayName: 'OpenClaw',
+  tier: 'instruction-only',
+  capabilities: { toolExecution: true, questions: 'prose', planMode: false, delegation: true, browser: true, safetyHooks: 'advisory' },
 
   extraPathRewrites: [
     { from: 'CLAUDE.md', to: 'AGENTS.md' },

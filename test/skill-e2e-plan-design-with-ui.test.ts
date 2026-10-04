@@ -29,18 +29,27 @@ const designFocusBoundary = (fp: AskUserQuestionFingerprint): boolean =>
     // Require the source Step 0D question or its retained native paraphrase.
     // A target menu can mention a design system without reviewing this plan.
     return /^I(?:['’]ve| have) rated this plan (?:10(?:\.0+)?|[0-9](?:\.\d+)?)\/10 on design completeness\.[\s\S]*\bWant me to focus on specific areas instead of all 7\?/i.test(text)
-      || /^Review all 7 design (?:dimensions|passes), or focus(?: on specific areas)?\?$/i.test(text.split(/\r?\n/, 1)[0]!);
+      || /^Review all 7 design (?:dimensions|passes),? or focus(?: on [^?\n]+)?\?$/i.test(text.split(/\r?\n/, 1)[0]!);
   });
 
 // Require a choice about the supplied UI, not a workflow offer after focus.
-// Both the question and an offered remedy must describe concrete UI behavior.
+// The review labels each finding's options with its issue number and a letter
+// ("3A", "3B"; review-sections.md), so a complete issue-labeled option set
+// identifies a Design finding whatever vocabulary its title uses. Otherwise both
+// the question and an offered remedy must describe concrete UI behavior.
+const issueLabeled = (options: Array<{ label: string }>): boolean => {
+  const labels = options.map(({ label }) => /^\s*(\d+)([A-Z])(?=[):.\s]|$)/.exec(label));
+  return labels.length >= 2 && labels.every(Boolean)
+    && new Set(labels.map(match => match![1])).size === 1
+    && new Set(labels.map(match => match![2])).size === labels.length;
+};
 const uiChoice = /\b(?:layout|compos(?:e|ed|ition)|anchor|regions?|panels?|notifications?|activity|quick actions?|loading|skeletons?|empty|errors?|success|modals?|toasts?|buttons?|links?|copy|typography|fonts?|spacing|contrast|colors?|breakpoints?|responsive|keyboard|focus (?:order|trap|management)|aria|a11y|accessibility)\b/i;
 const designReviewFinding = (fp: AskUserQuestionFingerprint): boolean =>
   fp.nativeCall?.answered === true && !fp.nativeCall.failed && !designFocusBoundary(fp) && fp.nativeCall.questions.some(({ question, options }) => {
     const title = question.split(/\r?\n/, 1)[0]!.trim().replace(/^D\d+(?:\.\d+)?\s*[—–:-]\s*/i, '');
     const setup = /\b(?:outside (?:design )?voices|cross[ -]project learnings|review (?:target|scope|mode)|what should I (?:design[ -])?review|which (?:artifact|plan|file))\b/i;
-    return !setup.test(title) && uiChoice.test(title)
-      && options.some(option => uiChoice.test(`${option.label} ${option.description}`));
+    return !setup.test(title) && (issueLabeled(options)
+      || (uiChoice.test(title) && options.some(option => uiChoice.test(`${option.label} ${option.description}`))));
   });
 
 describeE2E('/plan-design-review with UI scope (gate)', () => {

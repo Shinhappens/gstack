@@ -3,8 +3,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { JUDGE_MS, CAPTURE_MS } from './helpers/eval-budgets';
 import { SESSION_DRAIN_GRACE_MS } from './helpers/session-runner';
-import { E2E_TOUCHFILES } from './helpers/touchfiles';
-
 const source=fs.readFileSync(path.join(import.meta.dir,'skill-e2e-review-army.test.ts'),'utf8');
 async function exercise(scenarios: Array<'success'|'timeout'|'wrong-report'|'browse-error'>, fixturePath = path) {
   const setups:any[]=[],done:any[]=[],callbacks:any[]=[],rows:any[]=[],calls:any[]=[];
@@ -15,7 +13,7 @@ async function exercise(scenarios: Array<'success'|'timeout'|'wrong-report'|'bro
     beforeAll:(fn:any)=>setups.push(fn),afterAll:(fn:any)=>done.push(fn),
     describeIfSelected:(_title:string,names:string[],fn:any)=>{if(names.includes('review-army-consensus'))fn();},
     testConcurrentIfSelected:(name:string,fn:any,timeout:number)=>{expect(name).toBe('review-army-consensus');callbacks.push(fn);outer=timeout;},
-    createEvalCollector:()=>({}),finalizeEvalCollector:()=>{},logCost:()=>{},spawnSync:()=>({status:0}),path:fixturePath,os:{tmpdir:()=>'/tmp'},
+    createEvalCollector:()=>({}),finalizeEvalCollector:()=>{},logCost:()=>{},spawnSync:(_cmd:string,args:string[])=>({status:0,stdout:args[0]!=='diff'?'':args.includes('--shortstat')?' 1 file changed, 12 insertions(+)\n':'diff --git a/auth_controller.rb b/auth_controller.rb\n'}),path:fixturePath,os:{tmpdir:()=>'/tmp'},
     fs:{mkdirSync:()=>{},readdirSync:()=>[],mkdtempSync:(p:string)=>p+'owned',writeFileSync:(p:string,s:string)=>files.set(p,s),copyFileSync:()=>{},rmSync:()=>{},
       existsSync:(p:string)=>files.has(p),readFileSync:(p:string)=>p.startsWith(sourceRoot+fixturePath.sep)?'synthetic fixture bytes '.repeat(30):files.get(p)},
     extractSkillSections:()=> 'Review instructions',REVIEW_ARMY_E2E_SECTIONS:[],
@@ -60,8 +58,4 @@ test('Consensus caller fixture preserves success and semantic failure under eith
     expect(x.errors[0]).toBeUndefined(); expect(x.errors[1]).toBeDefined();
     expect(x.rows.map(r=>r.passed)).toEqual([true,false]);
   }
-});
-
-test('Consensus lifecycle controls select the existing consensus owner only',()=>{
-  expect(Object.entries(E2E_TOUCHFILES).filter(([,paths])=>paths.includes('test/review-consensus-lifecycle.test.ts')).map(([name])=>name)).toEqual(['review-army-consensus']);
 });

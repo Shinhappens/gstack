@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
+import { sharedLibsFingerprint } from '../../lib/review-evidence';
 
 interface StartContext {
   repo: string;
@@ -422,7 +423,7 @@ function inspectsFile(source: string, file: string, returnedPath: boolean, expec
 }
 
 /** Inspect native public tool blocks only; narration and instruction contents are not evidence. */
-export function hasTrustedReviewStartRead(events: unknown[], expected: StartContext): boolean {
+function nativeToolPairs(events: unknown[]) {
   const pending = new Map<string, { tool: string; input: any; at: number }>();
   const pairs: { tool: string; input: any; at: number; returnedAt: number; text: string }[] = [];
   let position = 0;
@@ -443,6 +444,107 @@ export function hasTrustedReviewStartRead(events: unknown[], expected: StartCont
     }
   }
 
+  return pairs;
+}
+
+interface CheckerContext extends StartContext {
+  helper: string;
+  finding: any;
+  reusable: boolean;
+  coveredPaths: string[];
+}
+
+export function hasTrustedSharedLibsCheck(events: unknown[], expected: CheckerContext): boolean {
+  const identity = sharedLibsFingerprint(expected.finding);
+  const paths = sourcePaths(expected.repo);
+  const samePaths = (left: unknown, right: unknown): boolean => Array.isArray(left) && Array.isArray(right)
+    && left.every(value => typeof value === 'string') && right.every(value => typeof value === 'string')
+    && new Set(left).size === left.length && new Set(right).size === right.length
+    && left.length === right.length && left.every(value => right.includes(value));
+  if (!identity || !Array.isArray(expected.coveredPaths)
+    || !expected.coveredPaths.every(file => expected.finding.evidence_paths.includes(file))
+    || expected.reusable && !samePaths(expected.coveredPaths, expected.finding.evidence_paths)) return false;
+  const environment = new Map([['GSTACK_HOME', expected.state], ['SLUG', expected.slug]]);
+  const invocations = (source: string) => {
+    const calls = withDirectories(commands(source), paths.normalize(expected.repo), paths, environment);
+    return calls.filter((call, index) => {
+      const executable = expandVariables(call.words[0], call.variables);
+      if (!executable || literalPath(executable, call.cwd, paths) !== paths.normalize(expected.helper)
+        || call.cwd !== paths.normalize(expected.repo) || call.variables.get('GSTACK_HOME') !== expected.state
+        || ['|', '&', '||', ')'].includes(call.after)
+        || call.before === '&&' && calls[index - 1]?.words[0] !== 'cd') return false;
+      return calls.slice(0, index).every((prefix, offset) => {
+        if (prefix.substitutions.length || ['||', '&', '(', ')'].includes(prefix.before)) return false;
+        if (prefix.words[0] === 'cd') return prefix.after === ';' || prefix.after === '&&';
+        if (prefix.words.every(word => /^[A-Za-z_]\w*=/.test(word))) return prefix.after === ';';
+        return offset === index - 1 && prefix.after === '|' && ['cat', 'printf', 'echo'].includes(prefix.words[0]);
+      });
+    }).map(call => ({ ...call, last: call === calls.at(-1),
+      words: call.words.map(word => expandVariables(word, call.variables) ?? word) }));
+  };
+  const pairs = nativeToolPairs(events);
+  const bash = pairs.filter(pair => pair.tool === 'Bash' && typeof pair.input?.command === 'string');
+  for (const start of bash) {
+    const direct = invocations(start.input.command).some(call => call.last && call.words.length === 3
+      && call.words[1] === '--start' && call.words[2] === 'review');
+    const startCalls = commands(start.input.command);
+    const base = startCalls.length === 3 && startCalls[0].words.length === 1
+      ? /^DIFF_BASE=\$\(([\s\S]*)\)$/.exec(startCalls[0].words[0]) : null;
+    const baseCalls = base ? commands(base[1]) : [];
+    const batched = baseCalls.length === 1 && baseCalls[0].words.length === 4
+      && baseCalls[0].before === '' && baseCalls[0].after === ''
+      && baseCalls[0].words[0] === 'git' && baseCalls[0].words[1] === 'merge-base'
+      && /^origin\/[A-Za-z0-9_./-]+$/.test(baseCalls[0].words[2]) && baseCalls[0].words[3] === 'HEAD'
+      && startCalls[0].before === '' && startCalls[0].after === ';' && startCalls[1].after === ';'
+      && ['', ';'].includes(startCalls[2].after)
+      && startCalls[1].words.length === 3
+      && literalPath(startCalls[1].words[0], expected.repo, paths) === paths.normalize(expected.helper)
+      && startCalls[1].words[1] === '--start' && startCalls[1].words[2] === 'review'
+      && startCalls[2].words.length === 3 && startCalls[2].words[0] === 'git'
+      && startCalls[2].words[1] === 'diff' && startCalls[2].words[2] === '$DIFF_BASE';
+    const assigned = startCalls.length === 2 && startCalls[0].words.length === 1
+      ? /^([A-Za-z_]\w*)=\$\(([\s\S]*)\)$/.exec(startCalls[0].words[0]) : null;
+    const echoed = assigned && startCalls[0].after === ';' && startCalls[1].words.length === 2
+      && startCalls[1].words[0] === 'echo' && startCalls[1].words[1] === `$${assigned[1]}`
+      && invocations(assigned[2]).some(call => call.words.length === 3
+        && call.words[1] === '--start' && call.words[2] === 'review');
+    if (!direct && !echoed && !batched) continue;
+    const printed = batched ? start.text.trim().split('\n')[0] : start.text.trim();
+    const token = /^(?:[A-Za-z_]\w*=)?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/.exec(printed)?.[1];
+    if (!token) continue;
+    for (const check of bash) {
+      if (check.at <= start.returnedAt) continue;
+      const invocation = invocations(check.input.command).find(call => call.last && call.words[1] === '--check-shared-libs'
+        && call.words[2] === token && (call.words.length === 3 || call.words.length === 5 && call.words[3] === '<'
+          && literalPath(call.words[4], call.cwd, paths)) && ['', ';'].includes(call.after));
+      if (!invocation) continue;
+      let receipt: any;
+      try { receipt = JSON.parse(check.text); } catch { continue; }
+      const record = receipt?.review_start;
+      const snapshot = receipt?.snapshot;
+      if (receipt?.reusable !== expected.reusable || receipt.fingerprint !== identity
+        || record?.skill !== 'review' || record.repo !== expected.repo || record.branch !== expected.branch
+        || record.wtree !== expected.wtree || typeof expected.startedAt !== 'string'
+        || record.started_at !== expected.startedAt || snapshot?.wtree !== expected.wtree
+        || snapshot.branch_id !== createHash('sha256').update(expected.branch).digest('hex')
+        || !samePaths(snapshot.covered_paths, expected.coveredPaths)) continue;
+      const reads = pairs.filter(pair => pair.at > start.returnedAt && pair.returnedAt < check.at && pair.text.trim());
+      if (!expected.finding.evidence_paths.every((relative: string) => {
+        const file = paths.join(expected.repo, relative);
+        return reads.some(read => read.tool === 'Read' && typeof read.input?.file_path === 'string'
+          && literalPath(read.input.file_path, expected.repo, paths) === file
+          || read.tool === 'Bash' && typeof read.input?.command === 'string'
+          && inspectsFile(read.input.command, file, containsPath(read.text, file), expected));
+      })) continue;
+      if (bash.some(finish => finish.at > check.returnedAt && invocations(finish.input.command).some(call =>
+        call.words.length === 4 && call.words[2] === '--finish' && call.words[3] === token))) return true;
+    }
+  }
+  return false;
+}
+
+export function hasTrustedReviewStartRead(events: unknown[], expected: StartContext): boolean {
+  const pairs = nativeToolPairs(events);
   for (const start of pairs) {
     if (start.tool !== 'Bash' || typeof start.input?.command !== 'string'
       || !topLevelCommands(commands(start.input.command)).some(call => {

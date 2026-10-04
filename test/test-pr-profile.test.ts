@@ -32,10 +32,9 @@ const select = (options: Partial<Parameters<typeof selectPrProfile>[0]> = {}) =>
 describe('fast PR coverage policy', () => {
   test('canonical short probes exist in the unchanged broad gate census', () => {
     expect(() => validatePrProfileInventory()).not.toThrow();
-    expect(PR_PROFILE_CASE_IDS).toContain('plan-ceo-review-benefits');
     expect(PR_PROFILE_CASE_IDS).toContain('plan-review-report');
     expect(PR_PROFILE_CASE_IDS).toContain('auq-format-gate');
-    for (const tier of Object.values(PR_PROFILE_MAPS.tiers)) expect(['gate', 'periodic']).toContain(tier);
+    for (const tier of Object.values(PR_PROFILE_MAPS.tiers)) expect(['gate', 'periodic', 'marathon']).toContain(tier);
   });
 
   test('keeps relevant short probes and the failing CEO quality obligation; reports broad work', () => {
@@ -149,6 +148,17 @@ describe('fast PR coverage policy', () => {
     expect(result.e2e).toEqual(['ceo-smoke']);
     expect(result.unknownFiles).toEqual([]);
     expect(result.needsFullValidation).toBe(false);
+  });
+
+  test('marathon cases are deferred to their non-blocking lane, even on full fallback', () => {
+    const marathon: PrProfileMaps = { ...maps, tiers: { ...maps.tiers, 'ceo-full': 'marathon' } };
+    for (const changedFiles of [['plan-ceo-review/SKILL.md.tmpl'], ['lib/new-runtime.ts']]) {
+      const result = select({ maps: marathon, changedFiles });
+      expect(result.e2e).not.toContain('ceo-full');
+      expect(result.deferred.find(({ id }) => id === 'ceo-full')).toEqual({ id: 'ceo-full', tier: 'marathon',
+        reason: 'Full end-to-end marathon coverage; non-blocking lane, not executed by the PR gate' });
+    }
+    expect(() => select({ maps: marathon, profile: ['ceo-full'] })).toThrow('broad gate census');
   });
 
   test('rejects stale profile IDs, incorrect tiers, missing cadence, and unknown selections', () => {

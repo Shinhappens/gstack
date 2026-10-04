@@ -70,7 +70,7 @@ command -v knip >/dev/null 2>&1 && echo "DEADCODE: knip"
 # Shell linting
 command -v shellcheck >/dev/null 2>&1 && ls *.sh scripts/*.sh bin/*.sh 2>/dev/null | head -1 | xargs -I{} echo "SHELL: shellcheck"
 
-# GBrain presence (D6) — only report as a dimension if gbrain is actually
+# GBrain presence — only report as a dimension if gbrain is actually
 # set up; otherwise skip so machines without gbrain aren't penalized.
 if command -v gbrain >/dev/null 2>&1 && [ -f "$HOME/.gbrain/config.json" ]; then
   echo "GBRAIN: gbrain doctor --json (wrapped in timeout 5s)"
@@ -177,7 +177,7 @@ Score each category on a 0-10 scale using this rubric:
 | Tests | 28% | All pass (exit 0) | >95% pass | >80% pass | <=80% pass |
 | Dead code | 13% | Clean (exit 0) | <5 unused exports | <20 unused | >=20 unused |
 | Shell lint | 9% | Clean (exit 0) | <5 issues | >=5 issues | N/A (skip) |
-| GBrain (D6) | 10% | doctor=ok, queue<10, pushed <24h | doctor=warnings OR queue<100 OR pushed <72h | doctor broken OR queue>=100 OR pushed >=72h | N/A (gbrain not installed) |
+| GBrain | 10% | doctor=ok, queue<10, pushed <24h | doctor=warnings OR queue<100 OR pushed <72h | doctor broken OR queue>=100 OR pushed >=72h | N/A (gbrain not installed) |
 
 **Parsing tool output for counts:**
 Use the complete captured output, not the displayed tail. A zero match count cannot
@@ -189,21 +189,27 @@ make a non-zero checker exit `CLEAN`; retain its failure and diagnostic output.
 - **knip:** Count lines reporting unused exports, files, or dependencies.
 - **shellcheck:** Count distinct findings (lines starting with "In ... line").
 
-**Composite score:**
-```
-composite = (typecheck_score * 0.22) + (lint_score * 0.18) + (test_score * 0.28) + (deadcode_score * 0.13) + (shell_score * 0.09) + (gbrain_score * 0.10)
-```
+**Composite score:** compute it in code, not by hand. Pass each category's
+score, or `null` when it was skipped (tool not available — includes GBrain when
+gbrain is not installed); skipped weight is redistributed proportionally among
+the scored categories:
 
-If a category is skipped (tool not available — includes GBrain when gbrain
-is not installed), redistribute its weight proportionally among the
-remaining categories.
+```bash
+bun -e '
+const w = { typecheck: 0.22, lint: 0.18, test: 0.28, deadcode: 0.13, shell: 0.09, gbrain: 0.10 };
+const s = { typecheck: <N|null>, lint: <N|null>, test: <N|null>, deadcode: <N|null>, shell: <N|null>, gbrain: <N|null> };
+const scored = Object.keys(w).filter(k => s[k] !== null);
+const total = scored.reduce((t, k) => t + w[k], 0);
+console.log(scored.length ? "COMPOSITE: " + (scored.reduce((t, k) => t + s[k] * w[k], 0) / total).toFixed(1) : "COMPOSITE: N/A");
+'
+```
 
 Always report coverage: list the checked categories and the unavailable categories
 with their reasons. Label a numeric composite with skipped categories as **partial
 coverage**. If zero checks executed, report **N/A — no checks ran**, do not compute
 a numeric composite, and skip numeric history persistence and trend calculation.
 
-**GBrain sub-score computation (D6):**
+**GBrain sub-score computation:**
 
 ```
 doctor_component: 10 if `gbrain doctor --json | jq -r .status` == "ok";
@@ -284,7 +290,7 @@ DETAILS: Lint (3 warnings)
 ```
 
 Only when a numeric composite exists, append one JSONL line to
-`~/.gstack/projects/$SLUG/health-history.jsonl`. Zero-check and capture-error runs
+`$GSTACK_STATE_ROOT/projects/$SLUG/health-history.jsonl` (the `PROJECT_DIR` printed above). Zero-check and capture-error runs
 must leave any existing history unchanged:
 
 ```json
@@ -298,20 +304,20 @@ Fields:
 - `typecheck`, `lint`, `test`, `deadcode`, `shell`, `gbrain` -- individual category scores (integer 0-10)
 - `duration_s` -- total time for all tools in seconds
 
-If a category was skipped, set its value to `null`. Pre-D6 history entries
-won't have a `gbrain` field — treat them as `null` for trend comparison
-and start new tracking from the first post-D6 run.
+If a category was skipped, set its value to `null`. Treat a history entry
+with no `gbrain` field as `null` for that category.
 
 ---
 
 ## Step 6: Trend Analysis + Recommendations
 
-Read the last 10 entries from `~/.gstack/projects/$SLUG/health-history.jsonl` (if the
+Read the last 10 entries from `$GSTACK_STATE_ROOT/projects/$SLUG/health-history.jsonl` (if the
 file exists and has prior entries).
 
 ```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 {{SLUG_SETUP}}
-tail -10 ~/.gstack/projects/$SLUG/health-history.jsonl 2>/dev/null || echo "NO_HISTORY"
+tail -10 "$GSTACK_STATE_ROOT"/projects/$SLUG/health-history.jsonl 2>/dev/null || echo "NO_HISTORY"
 ```
 
 **Compare like-for-like coverage.** For each history row, form the set of categories
@@ -357,12 +363,12 @@ Prioritize suggestions by impact (weight * score deficit):
 ```
 RECOMMENDATIONS (by impact)
 ============================
-1. [HIGH]  Fix 2 failing tests (Tests: 9/10, weight 30%)
-   Run: bun test --verbose to see failures
-2. [MED]   Address 12 lint warnings (Lint: 6/10, weight 20%)
+1. [HIGH]  Address 12 lint warnings (Lint: 6/10, weight 18%)
    Run: biome check . --write to auto-fix
-3. [LOW]   Remove 4 unused exports (Dead code: 7/10, weight 15%)
+2. [MED]   Remove 4 unused exports (Dead code: 7/10, weight 13%)
    Run: knip --fix to auto-remove
+3. [LOW]   Fix 2 failing tests (Tests: 9/10, weight 28%)
+   Run: bun test --verbose to see failures
 ```
 
 Rank by `weight * (10 - score)` descending. Only show categories below 10.

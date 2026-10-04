@@ -9,9 +9,13 @@
 # a model read the code. Caller-supplied binding fields are always discarded.
 # Plan-tier rows retain their legacy binding behavior.
 set -euo pipefail
+export GIT_OPTIONAL_LOCKS=0
+export GIT_CONFIG_PARAMETERS="${GIT_CONFIG_PARAMETERS:+$GIT_CONFIG_PARAMETERS }'core.fsmonitor=false' 'core.untrackedCache=false'"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 eval "$("$SCRIPT_DIR/gstack-slug" 2>/dev/null)"
-GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
+. "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select
+GSTACK_HOME="$_gstack_sr_root"
 mkdir -p "$GSTACK_HOME/projects/$SLUG"
 
 INPUT="${1:-}"
@@ -27,6 +31,7 @@ case "$(uname -s)" in
     fi
     ;;
 esac
+export GSTACK_REVIEW_LOG="$GSTACK_REVIEW_DIR/$BRANCH-reviews.jsonl"
 
 # Compute binding fields (best-effort; empty outside a git repo).
 COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || true)
@@ -51,8 +56,15 @@ if [ "$INPUT" = --start ]; then
   '
   exit $?
 fi
+if [ "$INPUT" = --check-shared-libs ] && [ "$#" -eq 2 ]; then
+  GSTACK_REVIEW_TOKEN="$2" bun -e '
+    const { checkSharedLibsReuse } = await import(process.env.GSTACK_REVIEW_LIB);
+    console.log(JSON.stringify(checkSharedLibsReuse(JSON.parse(await Bun.stdin.text()), process.env.GSTACK_REVIEW_TOKEN)));
+  '
+  exit $?
+fi
 if [ "$#" -ne 1 ] && { [ "$#" -ne 3 ] || [ "${2:-}" != --finish ]; }; then
-  echo 'Usage: gstack-review-log JSON [--finish TOKEN] | --start SKILL' >&2
+  echo 'Usage: gstack-review-log JSON [--finish TOKEN] | --start SKILL | --check-shared-libs TOKEN < finding.json' >&2
   exit 1
 fi
 

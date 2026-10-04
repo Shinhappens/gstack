@@ -377,7 +377,9 @@ export function exchangeSetupKey(setupKey: string, sessionExpiresSeconds?: numbe
 
 /**
  * Validate a token and return its info if valid.
- * Returns null for expired, revoked, or unknown tokens.
+ * Returns null for expired, revoked, or unknown tokens, and for unexchanged
+ * setup keys: a setup key authenticates only the /connect exchange, never a
+ * bearer request.
  * Root token returns a special root info object.
  */
 export function validateToken(token: string): TokenInfo | null {
@@ -396,7 +398,7 @@ export function validateToken(token: string): TokenInfo | null {
   }
 
   const info = tokens.get(token);
-  if (!info) return null;
+  if (!info || info.type !== 'session') return null;
 
   // Check expiry
   if (info.expiresAt && new Date(info.expiresAt) < new Date()) {

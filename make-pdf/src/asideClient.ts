@@ -38,8 +38,6 @@ export interface PdfOptions {
   outline?: boolean;
   printBackground?: boolean;
   preferCSSPageSize?: boolean;
-  /** Wait (≤3s, non-fatal) for Paged.js before printing. */
-  toc?: boolean;
 }
 
 /**
@@ -77,7 +75,6 @@ export function pdfStepOptions(opts: PdfOptions): PdfStepOptions {
   if (opts.outline === true) o.generateDocumentOutline = true;
   if (opts.printBackground === true) o.printBackground = true;
   if (opts.preferCSSPageSize === true) o.preferCSSPageSize = true;
-  if (opts.toc === true) o.waitForPagedJs = true;
   return o;
 }
 

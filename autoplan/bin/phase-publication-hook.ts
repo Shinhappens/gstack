@@ -2,24 +2,43 @@
 /** A native parent publication barrier at Autoplan's exact Read boundaries. */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { extractImplementationPlan, checkPhaseImplementation, acceptedBlocks } from '../../bin/gstack-autoplan-snapshot';
 import { autoplanPhaseCompletions } from '../../lib/autoplan-phase-publication';
-import { readOwnedClaudePublicTranscript, type ClaudeParentPublicEvent } from '../../lib/claude-public-transcript';
+import { readOwnedClaudePublicTranscript, nativePathSpelling, ownedNativePath, sameNativePath,
+  type ClaudeParentPublicEvent, type OwnedTranscriptReason } from '../../lib/claude-public-transcript';
+import { resolveStateRoot } from '../../lib/state-root';
 
 const PHASES = ['ceo', 'design', 'dx', 'eng', 'tasks'] as const;
 type Phase = typeof PHASES[number];
 type Event = ClaudeParentPublicEvent;
 type Use = Event & { kind: 'use' };
+type Tool = Extract<Event, { toolUseId: string }>;
+type Turn = Extract<Event, { kind: 'end_turn' | 'user_turn' }>;
+const isUse = (e: Event): e is Use => e.kind === 'use';
 const number: Record<Phase, number> = { ceo: 1, design: 2, dx: 2.5, eng: 3, tasks: 4 };
 const object = (x: unknown): x is Record<string, any> => x !== null && typeof x === 'object' && !Array.isArray(x);
 const positive = (x: unknown): x is number => Number.isSafeInteger(x) && (x as number) > 0;
 const hash = (x: string | Buffer) => createHash('sha256').update(x).digest('hex');
-const ownPath = (value: unknown): value is string => typeof value === 'string' && path.isAbsolute(value) && path.normalize(value) === value;
+/** Fold the native spelling first, then require it to be absolute and already normal (`..` stays rejected). */
+const ownPath = (value: unknown): value is string => ownedNativePath(value);
+/** One native spelling on both sides of every path compare. */
+const samePath = (a: unknown, b: unknown): boolean => sameNativePath(a, b);
+/** Claude's Read expands a leading ~ before the tool runs; resolve the same file. */
+const requestedPath = (cwd: string, file: string) =>
+  nativePathSpelling(path.resolve(cwd, file.replace(/^~(?=[\\/]|$)/, () => os.homedir())));
+/**
+ * Claude records the model's file_path verbatim in the journal but hands
+ * PreToolUse its resolved form (C:\x/y becomes C:\x\y). Compare that one field
+ * as the file it names; every other field stays exact.
+ */
+const nativeToolInput = (input: unknown, cwd: string): unknown =>
+  object(input) && typeof input.file_path === 'string' ? { ...input, file_path: requestedPath(cwd, input.file_path) } : input;
 class BoundaryError extends Error {}
-const fail = (reason: string): never => { throw new BoundaryError(reason); };
+function fail(reason: string): never { throw new BoundaryError(reason); }
 export interface PublicationHookInput {
   hook_event_name: 'PreToolUse'; session_id: string; transcript_path: string; cwd: string;
   tool_name: string; tool_use_id: string; tool_input: Record<string, unknown>; agent_id?: string | null;
@@ -29,7 +48,7 @@ interface Invocation { activePlan: string; restorePath: string; originalSha256: 
 
 /** Stable, bounded regular bytes; links never establish an artifact identity. */
 function read(file: string, immutable = false): string {
-  if (!ownPath(file) || fs.realpathSync(file) !== file) fail('Artifact path is unavailable or aliased.');
+  if (!ownPath(file) || !samePath(fs.realpathSync(file), file)) fail('Artifact path is unavailable or aliased.');
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     const before = fs.fstatSync(fd, { bigint: true });
@@ -47,7 +66,7 @@ function read(file: string, immutable = false): string {
 
 function phaseName(file: unknown, cwd: string): Phase | undefined {
   if (typeof file !== 'string') return;
-  const requested = path.resolve(cwd, file);
+  const requested = requestedPath(cwd, file);
   const name = /^((?:ceo|design|dx|eng)-phase|tasks-aggregator)\.md$/.exec(path.basename(requested));
   if (!name || path.basename(path.dirname(requested)) !== 'sections' ||
       path.basename(path.dirname(path.dirname(requested))) !== 'autoplan') return;
@@ -57,17 +76,38 @@ function phaseName(file: unknown, cwd: string): Phase | undefined {
 function driver(file: unknown, cwd: string, root: string): Phase | undefined {
   const phase = phaseName(file, cwd);
   if (!phase) return;
-  const requested = path.resolve(cwd, file as string);
-  const canonical = path.join(root, 'autoplan', 'sections', path.basename(requested));
-  if (fs.realpathSync(requested) !== canonical || fs.realpathSync(canonical) !== canonical)
-    fail('Autoplan phase entry belongs to a different or unavailable installation. Restore this invocation’s hook installation before retrying.');
-  return phase;
+  const requested = requestedPath(cwd, file as string), base = path.basename(requested);
+  const canonical = path.join(root, 'autoplan', 'sections', base), actual = fs.realpathSync(requested);
+  if (samePath(fs.realpathSync(canonical), canonical)) {
+    if (samePath(actual, canonical)) return phase;
+    // setup serves the gbrain :user render (#2569) from exactly one render root,
+    // whose section links point back into it. That render is this installation
+    // only at its exact path and only with the install's bytes after that rewrite.
+    const render = userRenderRoot();
+    if (render && samePath(actual, path.join(render, 'autoplan', 'sections', base)) &&
+        read(actual) === renderSectionBase(read(canonical), render)) return phase;
+  }
+  return fail('Autoplan phase entry belongs to a different or unavailable installation. Restore this invocation’s hook installation before retrying.');
+}
+
+/** setup's `${GSTACK_USER_RENDER_DIR:-$GSTACK_STATE_ROOT/render/claude}`, realpath'd. */
+function userRenderRoot(): string | undefined {
+  const configured = process.env.GSTACK_USER_RENDER_DIR || path.join(resolveStateRoot(), 'render', 'claude');
+  try { return fs.realpathSync(path.resolve(nativePathSpelling(configured))); } catch { return; }
+}
+
+/** scripts/gen-skill-docs.ts rewriteSectionBase, which writes that render. */
+function renderSectionBase(content: string, linkRoot: string): string {
+  return content.replace(
+    /~\/\.claude\/skills\/gstack\/([^\s)`"'*]+\/sections\/)/g,
+    (_m, p1: string) => `${linkRoot}/${p1}`,
+  );
 }
 
 interface Consumer { phase: Phase; content?: string; kind: 'Read' | 'Agent' }
 function artifactName(file: unknown, cwd: string, includeClose = false): Phase | undefined {
   if (typeof file !== 'string') return;
-  const requested = path.resolve(cwd, file), base = path.basename(requested);
+  const requested = requestedPath(cwd, file), base = path.basename(requested);
   const match = /^autoplan-(ceo|design|dx|eng)-.+$/.exec(path.basename(path.dirname(requested)));
   if (!match || !['methodology.md', 'methodology.json', 'native-prompt.md', 'snapshot.json',
     'source-implementation.md', `${match[1]}-implementation.md`, ...(includeClose ? ['close-packet.md'] : [])].includes(base)) return;
@@ -113,10 +153,10 @@ function consumption(use: { name?: string; input?: Record<string, unknown> }, cw
   init: Invocation, includeClose = false): Consumer | undefined {
   if (use.name === 'Read') {
     const direct = driver(use.input?.file_path, cwd, root);
-    if (direct) return { phase: direct, kind: 'Read', content: read(fs.realpathSync(path.resolve(cwd, use.input!.file_path as string))) };
+    if (direct) return { phase: direct, kind: 'Read', content: read(fs.realpathSync(requestedPath(cwd, use.input!.file_path as string))) };
     const phase = artifactName(use.input?.file_path, cwd, includeClose);
     if (!phase) return;
-    const file = path.resolve(cwd, use.input!.file_path as string), base = path.basename(file);
+    const file = requestedPath(cwd, use.input!.file_path as string), base = path.basename(file);
     if (base === 'methodology.md' || base === 'methodology.json') {
       const m = methodology(path.join(path.dirname(file), 'methodology.md'), phase, init);
       return { phase, kind: 'Read', content: base === 'methodology.md' ? m.content : m.manifestBytes };
@@ -151,8 +191,9 @@ function textResult(event: Event): string | undefined {
 
 /** Authenticate the existing direct-create result; this does not prove its shell command's origin. */
 function checkpointResult(result: Event, entered: Event[], init: Invocation): { phase: Phase; path: string } | undefined {
-  const use = entered.find(e => e.kind === 'use' && e.toolUseId === result.toolUseId);
-  if (result.kind !== 'result' || use?.name !== 'Bash' || use.order >= result.order) return;
+  if (result.kind !== 'result') return;
+  const use = entered.find((e): e is Use => isUse(e) && e.toolUseId === result.toolUseId);
+  if (use?.name !== 'Bash' || use.order >= result.order) return;
   const text = textResult(result);
   if (text === undefined) return;
   const output = JSON.parse(text);
@@ -176,9 +217,10 @@ function initArguments(command: unknown, root: string): string[] | undefined {
   const match = new RegExp(String.raw`^\s*(?:cd\s+${literal}\s*(?:\n|&&)\s*)?(?:bun|${literal}/bun)\s+(${literal})\s+init\s+(${literal})\s+(${literal})\s+(${literal})\s*$`).exec(normalized);
   if (!match) return;
   const args = match.slice(1).map(x => /^["']/.test(x!) ? x!.slice(1, -1) : x!)
-    // Git Bash accepts forward slashes; retain all other canonical-path checks.
-    .map(x => process.platform === 'win32' ? x.replaceAll('/', '\\') : x);
-  if (!args.every(ownPath) || fs.realpathSync(args[0]!) !== path.join(root, 'bin', 'gstack-autoplan-snapshot.ts')) return;
+    // Git Bash accepts forward slashes and hands native programs /c/x as C:/x.
+    // Fold that spelling only; every canonical-path check still applies.
+    .map(x => nativePathSpelling(x, path));
+  if (!args.every(ownPath) || !samePath(fs.realpathSync(args[0]!), path.join(root, 'bin', 'gstack-autoplan-snapshot.ts'))) return;
   return args.slice(1);
 }
 
@@ -194,10 +236,10 @@ function invocation(events: Event[], root: string): Invocation {
     const text = textResult(results[0]!);
     if (text === undefined) fail('Autoplan initialization did not succeed. Complete the existing init step first.');
     const result = JSON.parse(text);
-    if (!object(result) || result.sourcePlan !== fs.realpathSync(args[0]!) || result.activePlan !== args[1] ||
-        result.restorePath !== args[2] || typeof result.reused !== 'boolean' || !positive(result.originalBytes) ||
+    if (!object(result) || !samePath(result.sourcePlan, fs.realpathSync(args[0]!)) || !samePath(result.activePlan, args[1]) ||
+        !samePath(result.restorePath, args[2]) || typeof result.reused !== 'boolean' || !positive(result.originalBytes) ||
         !/^[a-f0-9]{64}$/.test(result.originalSha256)) fail('Autoplan initialization does not match the successful native request.');
-    if (result.reused && bound?.activePlan === result.activePlan && bound.restorePath === result.restorePath) continue;
+    if (result.reused && bound && bound.activePlan === result.activePlan && bound.restorePath === result.restorePath) continue;
     chosen = result;
     bound = { activePlan: result.activePlan, restorePath: result.restorePath,
       originalSha256: result.originalSha256, start: results[0]!.order };
@@ -206,7 +248,9 @@ function invocation(events: Event[], root: string): Invocation {
   const restore = read(bound.restorePath, true), active = read(bound.activePlan);
   const reference = JSON.stringify(bound.restorePath).replace(/--/g, '\\u002d\\u002d');
   if (hash(restore) !== bound.originalSha256 || Buffer.byteLength(restore) !== chosen.originalBytes ||
-      !active.startsWith(`<!-- /autoplan restore point: ${reference} -->\n`) || bound.activePlan === bound.restorePath)
+      // Claude's Edit rewrites a CRLF plan's line endings, including init's LF header line.
+      !/^\r?\n/.test(active.slice(`<!-- /autoplan restore point: ${reference} -->`.length)) ||
+      !active.startsWith(`<!-- /autoplan restore point: ${reference} -->`) || bound.activePlan === bound.restorePath)
     fail('Autoplan initialization artifacts do not match this parent invocation.');
   return bound;
 }
@@ -217,11 +261,11 @@ export function autoplanReadRange(use: Use, result: Event, content: string, hist
     if (use.name !== 'Read' || result.kind !== 'result' || result.toolUseId !== use.toolUseId ||
         result.sessionId !== use.sessionId || result.isError !== false || result.order <= use.order || !object(result.file)) return;
     if (textResult(result) !== 'Wasted call — file unchanged since your last Read. Refer to that earlier tool_result instead.' ||
-        !isDeepStrictEqual(result.file, { filePath: use.input?.file_path })) break;
+        !isDeepStrictEqual(Object.keys(result.file), ['filePath']) || !samePath(result.file.filePath, use.input?.file_path)) break;
     // Pinned native dedup requires the same offset/limit and a non-truncated prior
     // Read. Seeded-context notices without that native delivery supply no range.
     const prior = history.filter((e): e is Use => e.kind === 'use' && e.name === 'Read' &&
-      e.sessionId === use.sessionId && e.order < use.order && e.input?.file_path === use.input?.file_path).at(-1);
+      e.sessionId === use.sessionId && e.order < use.order && samePath(e.input?.file_path, use.input?.file_path)).at(-1);
     if (!prior || (prior.input?.offset ?? 1) !== (use.input?.offset ?? 1) || prior.input?.limit !== use.input?.limit) return;
     const sameRecord = (a: Event, b: Event) => isDeepStrictEqual({ ...a, order: 0 }, { ...b, order: 0 });
     const uses = history.filter((e): e is Use => e.kind === 'use' && e.sessionId === prior.sessionId && e.toolUseId === prior.toolUseId);
@@ -233,10 +277,12 @@ export function autoplanReadRange(use: Use, result: Event, content: string, hist
     use = uses[0]!; result = replies[0]!;
   }
   const f = result.file, lines = content.split('\n');
-  if (f.filePath !== use.input?.file_path || typeof f.content !== 'string' || !positive(f.startLine) || !positive(f.numLines) ||
+  if (!samePath(f.filePath, use.input?.file_path) || typeof f.content !== 'string' || !positive(f.startLine) || !positive(f.numLines) ||
       f.totalLines !== lines.length || f.startLine + f.numLines - 1 > lines.length || (use.input?.offset ?? 1) !== f.startLine ||
       (use.input?.limit !== undefined && (!positive(use.input.limit) || f.numLines > use.input.limit)) ||
-      f.content !== lines.slice(f.startLine - 1, f.startLine - 1 + f.numLines).join('\n')) return;
+      // Claude's Read reports a CRLF line without its CR; nothing else may differ.
+      f.content.replace(/\r(?=\n|$)/g, '') !==
+        lines.slice(f.startLine - 1, f.startLine - 1 + f.numLines).join('\n').replace(/\r(?=\n|$)/g, '')) return;
   return { start: f.startLine, end: f.startLine + f.numLines - 1 };
 }
 
@@ -280,7 +326,7 @@ function closePacket(file: string, phase: Phase, init: Invocation, current = tru
 
 /** A skill hook survives end_turn; unrelated human intervals are never phase evidence. */
 function disarmed(events: Event[], root: string): boolean {
-  const human = events.filter(e => e.kind === 'user_turn').at(-1);
+  const human = events.filter((e): e is Turn => e.kind === 'user_turn').at(-1);
   return !!human && !human.autoplan && events.some(e => e.kind === 'end_turn' && e.order < human.order) &&
     !events.some(e => e.kind === 'use' && e.name === 'Bash' && e.order > human.order && initArguments(e.input?.command, root));
 }
@@ -288,12 +334,12 @@ function disarmed(events: Event[], root: string): boolean {
 /** Only exact reversible successful Edits can establish a report-only change. */
 function verifyCloseEdits(events: Event[], closeOrder: number, init: Invocation): void {
   const edits = events.filter((e): e is Use => e.kind === 'use' && e.order > closeOrder &&
-    ['Write', 'Edit'].includes(e.name ?? '') && e.input?.file_path === init.activePlan);
+    ['Write', 'Edit'].includes(e.name ?? '') && samePath(e.input?.file_path, init.activePlan));
   if (!edits.length) return;
   const current = read(init.activePlan);
   let prior = current;
   for (const use of edits.toReversed()) {
-    const results = events.filter(e => e.kind === 'result' && e.toolUseId === use.toolUseId);
+    const results = events.filter((e): e is Tool => e.kind === 'result' && e.toolUseId === use.toolUseId);
     if (results.length !== 1) fail('An active-plan mutation is pending after the close Read. Wait for its result, then verify the current close input.');
     if (results[0]!.isError === true) continue;
     const input = use.input;
@@ -321,17 +367,18 @@ function verifyCloseEdits(events: Event[], closeOrder: number, init: Invocation)
 }
 
 function requirePublication(phase: Phase, entryOrder: number, entered: Event[], init: Invocation, current: boolean, checkpoint?: string): void {
+  const native = (e: Event) => e.kind === 'use' && typeof e.input?.file_path === 'string' ? nativePathSpelling(e.input.file_path) : undefined;
   const closeReads = entered.filter((e): e is Use => e.kind === 'use' && e.name === 'Read' && e.order >= entryOrder &&
-    ownPath(e.input?.file_path) && path.basename(e.input.file_path) === 'close-packet.md' &&
-    path.dirname(path.dirname(e.input.file_path)) === path.dirname(init.restorePath) &&
-    path.basename(path.dirname(e.input.file_path)).startsWith(`autoplan-${phase}-`));
+    ownPath(native(e)) && path.basename(native(e)!) === 'close-packet.md' &&
+    samePath(path.dirname(path.dirname(native(e)!)), path.dirname(init.restorePath)) &&
+    path.basename(path.dirname(native(e)!)).startsWith(`autoplan-${phase}-`));
   if (!closeReads.length) fail(`Finish the existing Phase ${number[phase]} close procedure and Read its complete current close packet before entering the next phase.`);
-  const latestPath = closeReads.at(-1)!.input!.file_path as string;
+  const latestPath = native(closeReads.at(-1)!)!;
   const content = closePacket(latestPath, phase, init, current), covered = new Set<number>();
   if (checkpoint && JSON.parse(/^Binding: (.+)$/m.exec(content)![1]!).checkpointPath !== checkpoint)
     fail(`The Phase ${number[phase]} close packet belongs to an earlier checkpoint. Complete the current phase's close procedure with its fixed checkpoint.`);
   let closeOrder = -1;
-  for (const use of closeReads.filter(e => e.input?.file_path === latestPath)) {
+  for (const use of closeReads.filter(e => native(e) === latestPath)) {
     const results = entered.filter(e => e.kind === 'result' && e.toolUseId === use.toolUseId);
     if (results.length !== 1) continue;
     const range = autoplanReadRange(use, results[0]!, content, entered);
@@ -341,7 +388,7 @@ function requirePublication(phase: Phase, entryOrder: number, entered: Event[], 
   }
   if (covered.size !== content.split('\n').length) fail(`Read every line of the current Phase ${number[phase]} close packet successfully before entering the next phase.`);
   const pending = entered.some(e => e.kind === 'use' && e.order > closeOrder && ['Write', 'Edit'].includes(e.name ?? '') &&
-    e.input?.file_path === init.activePlan && !entered.some(r => r.kind === 'result' && r.toolUseId === e.toolUseId));
+    samePath(e.input?.file_path, init.activePlan) && !entered.some(r => r.kind === 'result' && r.toolUseId === e.toolUseId));
   if (pending) fail('An active-plan mutation is pending after the close Read. Wait for its result, then verify the current close input.');
   if (current) verifyCloseEdits(entered, closeOrder, init);
   const messages = entered.filter((e): e is Event & { kind: 'message' } => e.kind === 'message' && e.order > closeOrder);
@@ -370,12 +417,12 @@ function evaluatePublication(input: PublicationHookInput, root: string, events: 
     if (pendingRead ? input.tool_name !== 'Read' || events.some(e =>
       (e.kind === 'use' || e.kind === 'result') && e.toolUseId === input.tool_use_id) :
       current.length !== 1 || current[0]!.kind !== 'use' || current[0]!.name !== input.tool_name ||
-        !isDeepStrictEqual(current[0]!.input, input.tool_input)) fail('Current native phase-entry identity is unavailable. Retry this phase-entry tool after the journal is available.');
+        !isDeepStrictEqual(nativeToolInput(current[0]!.input, input.cwd), nativeToolInput(input.tool_input, input.cwd))) fail('Current native phase-entry identity is unavailable. Retry this phase-entry tool after the journal is available.');
     const before = pendingRead ? events : events.filter(e => e.order < current[0]!.order);
     // Pinned Claude retains skill hooks after end_turn. Only an authenticated
     // later human request can release the old invocation; tool results and
     // compaction never do. A native slash or an actual init re-arms the guard.
-    const human = before.filter(e => e.kind === 'user_turn').at(-1);
+    const human = before.filter((e): e is Turn => e.kind === 'user_turn').at(-1);
     if (disarmed(before, root)) {
       if (pendingRead) fail('Current native phase-entry identity is unavailable after this invocation ended.');
       return { allow: true };
@@ -403,8 +450,8 @@ function evaluatePublication(input: PublicationHookInput, root: string, events: 
         } else if (!preparedCheckpoints.has(created.phase)) preparedCheckpoints.set(created.phase, created.path);
         continue;
       }
-      if (use.kind !== 'use' || !['Read', 'Agent'].includes(use.name ?? '')) continue;
-      const results = entered.filter(e => e.kind === 'result' && e.toolUseId === use.toolUseId);
+      if (!isUse(use) || !['Read', 'Agent'].includes(use.name ?? '')) continue;
+      const results = entered.filter((e): e is Tool => e.kind === 'result' && e.toolUseId === use.toolUseId);
       if (results.length !== 1 || results[0]!.isError !== false || results[0]!.order <= use.order) continue;
       let next: Consumer | undefined;
       try { next = consumption(use, input.cwd, root, init, true); } catch { continue; }
@@ -439,9 +486,69 @@ function evaluatePublication(input: PublicationHookInput, root: string, events: 
   }
 }
 
+/**
+ * A worktree session gets the repository root as CLAUDE_PROJECT_DIR while its
+ * journal is rooted in the linked worktree. Only git's own two-way link makes
+ * a directory that worktree: <root>/.git/worktrees/<name>/gitdir names
+ * <worktree>/.git, and that file names the same admin entry back.
+ */
+export function linkedWorktrees(projectDir: string): string[] {
+  let entries: fs.Dirent[];
+  const admin = path.join(projectDir, '.git', 'worktrees');
+  try { entries = fs.readdirSync(admin, { withFileTypes: true }); } catch { return []; }
+  return entries.filter(entry => entry.isDirectory()).slice(0, 256).flatMap(entry => {
+    try {
+      const link = path.join(admin, entry.name);
+      // worktree.useRelativePaths writes each side relative to its own file's directory.
+      const forward = /^([^\r\n]+)\r?\n?$/.exec(fs.readFileSync(path.join(link, 'gitdir'), 'utf8'))?.[1];
+      if (!forward) return [];
+      const gitFile = nativePathSpelling(path.resolve(link, nativePathSpelling(forward)));
+      if (path.basename(gitFile) !== '.git' || !fs.lstatSync(gitFile).isFile()) return [];
+      const back = /^gitdir: ([^\r\n]+)\r?\n?$/.exec(fs.readFileSync(gitFile, 'utf8'))?.[1];
+      if (!back || nativePathSpelling(fs.realpathSync(path.resolve(path.dirname(gitFile), nativePathSpelling(back)))) !==
+          nativePathSpelling(fs.realpathSync(link))) return [];
+      const worktree = nativePathSpelling(fs.realpathSync(path.dirname(gitFile)));
+      return ownPath(worktree) ? [worktree] : [];
+    } catch { return []; }
+  });
+}
+
 export function publicationHookOutput(decision: PublicationDecision): object {
   return decision.allow ? {} : { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
     permissionDecisionReason: `[autoplan] ${decision.reason}` } };
+}
+
+const GUIDE = 'https://github.com/garrytan/gstack/blob/main/docs/autoplan-guard-troubleshooting.md';
+type OwnedRead = ReturnType<typeof readOwnedClaudePublicTranscript>;
+/** Positive identity conflicts: retrying cannot change them, so they deny with the supported fallback. */
+const HARD_CAUSE: Partial<Record<OwnedTranscriptReason, string>> = {
+  competing_root: 'The session journal has more than one conversation root, so this session cannot be identified.',
+  foreign_cwd: "The session journal was started in a different project directory than this hook's project.",
+  sidechain: "The session journal's first turn or its ancestry is a sidechain record, not the parent session.",
+  agent: "The session journal's conversation ancestry passes through a subagent record.",
+  cycle: "The session journal's parent links form a cycle.",
+};
+const guidance = (code: string, read?: OwnedRead) =>
+  `(code ${code}, Claude Code ${read?.diagnostic?.claudeVersion ?? 'version unknown'}). Troubleshooting: ${GUIDE}`;
+
+/**
+ * Narrow advisory (D1): the journal parsed, held still across two reads and
+ * holds this tool_use, but its root shape is one this guard does not know.
+ * No permissionDecision, so Claude Code's own permission check still runs.
+ */
+function unverifiedEntry(code: string, read: OwnedRead): object {
+  try {
+    const dir = path.join(resolveStateRoot(), 'analytics');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, 'autoplan-guard.jsonl'), JSON.stringify({ ts: new Date().toISOString(),
+      event: 'unverified_phase_entry', reason: code, claude_code_version: read.diagnostic?.claudeVersion ?? null,
+      record_types: read.diagnostic?.rootShape ?? [] }) + '\n');
+  } catch { /* A logging failure never changes the verdict. */ }
+  const notice = `phase publication was NOT verified for this session (journal shape ${code})`;
+  return { systemMessage: `[autoplan] ${notice}. ${guidance(code, read)}`,
+    hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: `[autoplan] ${notice}: this Claude Code journal ` +
+      'shape is not recognized, so this phase entry proceeds unverified. Publish each completed phase report as your ' +
+      'own parent assistant text before entering the next phase, exactly as the workflow requires.' } };
 }
 
 /** Claude's pending tool record can flush after hook entry; wait only for that identity. */
@@ -455,20 +562,39 @@ export async function runPublicationHook(value: unknown, root: string): Promise<
     if (!candidate({ name: input.tool_name, input: input.tool_input }, input.cwd)) return {};
     // Native hooks override this environment value with the session's project
     // root. Bash cd changes input.cwd, not the journal's original ownership.
-    const projectCwd = process.env.CLAUDE_PROJECT_DIR ?? input.cwd;
+    // On Windows the hook env spells it C:/...; the journal records C:\...
+    const projectCwd = nativePathSpelling(process.env.CLAUDE_PROJECT_DIR ?? input.cwd);
     if (!ownPath(projectCwd)) fail('Native parent project directory is unavailable.');
+    const journal = nativePathSpelling(input.transcript_path), owners = [projectCwd, ...linkedWorktrees(projectCwd)];
     const deadline = performance.now() + 2_000;
+    let read: OwnedRead | undefined, stable: string | undefined;
     do {
-      const snapshot = readOwnedClaudePublicTranscript(input.transcript_path, projectCwd, input.session_id);
-      if (snapshot.transcript.status === 'ready') {
-        if (snapshot.events.some(e => e.kind === 'use' && e.toolUseId === input.tool_use_id))
-          return publicationHookOutput(evaluateAutoplanPublication(input, root, snapshot.events));
-        if (input.tool_name === 'Read' && evaluatePublication(input, root, snapshot.events, true).allow)
+      const reads = [readOwnedClaudePublicTranscript(journal, projectCwd, input.session_id)];
+      if (reads[0]!.transcript.reason === 'foreign_cwd')
+        for (const owner of owners.slice(1)) reads.push(readOwnedClaudePublicTranscript(journal, owner, input.session_id));
+      read = reads.find(r => r.transcript.status === 'ready') ?? reads.find(r => r.transcript.reason !== 'foreign_cwd') ?? reads[0]!;
+      if (read.transcript.status === 'ready') {
+        if (read.events.some(e => e.kind === 'use' && e.toolUseId === input.tool_use_id))
+          return publicationHookOutput(evaluateAutoplanPublication(input, root, read.events));
+        if (input.tool_name === 'Read' && evaluatePublication(input, root, read.events, true).allow)
           return {};
       }
+      const code = read.transcript.reason, cause = code && HARD_CAUSE[code];
+      if (cause) fail(`Publication guard cannot verify this session: ${cause} Fallback: run /plan-ceo-review, then ` +
+        `/plan-devex-review, then /plan-eng-review by hand, or start a new session. ${guidance(code, read)}`);
+      // Unflushed records, a missing current tool_use, malformed or changing
+      // bytes and identity failures stay deny-and-retry.
+      const shape = read.diagnostic;
+      if (code?.startsWith('unrecognized_shape:') && shape?.complete && shape.toolUseIds.includes(input.tool_use_id)) {
+        if (stable === shape.sha256) return unverifiedEntry(code, read);
+        stable = shape.sha256;
+      } else stable = undefined;
       await new Promise(resolve => setTimeout(resolve, 50));
     } while (performance.now() < deadline);
-    fail('Native parent evidence has not reached the journal yet. Retry this phase-entry tool; no missing-publication conclusion has been made.');
+    const code = read?.transcript.reason;
+    fail(`${code === 'changing' ? 'Claude Code was still writing the session journal on every read.'
+      : 'Native parent evidence has not reached the journal yet.'} Retry this phase-entry tool; no missing-publication ` +
+      `conclusion has been made.${code ? ` ${guidance(code, read)}` : ''}`);
   } catch (error) {
     return publicationHookOutput({ allow: false, reason: error instanceof BoundaryError
       ? error.message : 'Hook installation or native evidence is unavailable. Restore this Autoplan installation before retrying.' });

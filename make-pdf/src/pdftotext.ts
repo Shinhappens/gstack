@@ -113,8 +113,8 @@ export function resolvePdftotext(env: NodeJS.ProcessEnv = process.env): Pdftotex
 }
 
 /**
- * Locate a poppler companion tool (pdffonts, pdfimages, pdftoppm) used by the
- * emoji render gate. Mirrors resolvePdftotext's resolution order:
+ * Locate a poppler companion tool (pdffonts, pdfimages, pdftoppm, pdfinfo,
+ * pdftotext) used by the e2e render gates. Mirrors resolvePdftotext's resolution order:
  *   1. $GSTACK_<TOOL>_BIN env override (e.g. GSTACK_PDFFONTS_BIN)
  *   2. PATH via Bun.which
  *   3. standard POSIX locations (Homebrew + distro)
@@ -123,7 +123,7 @@ export function resolvePdftotext(env: NodeJS.ProcessEnv = process.env): Pdftotex
  * cleanly rather than failing on a box without full poppler-utils.
  */
 export function resolvePopplerTool(
-  tool: "pdffonts" | "pdfimages" | "pdftoppm",
+  tool: "pdffonts" | "pdfimages" | "pdftoppm" | "pdfinfo" | "pdftotext",
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
   const override = resolveOverride(env[`GSTACK_${tool.toUpperCase()}_BIN`], env);

@@ -13,6 +13,7 @@ import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { E2E_TIERS, E2E_TOUCHFILES } from './helpers/touchfiles';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 import {
@@ -30,6 +31,33 @@ import {
   runPaidShards,
   summarize,
   summaryExitCode,
+  tierSkipReason,
+  marathonSkipReason,
+  CASE_SHARDED_FILES,
+  CASE_TEST_NAMES,
+  caseTestNamePattern,
+  expandCaseShards,
+  fileCaseRegistration,
+  resolvePaidShardBudget,
+  retriesForFiles,
+  shardCaseId,
+  shardFile,
+  shardSlug,
+  verifySliceResults,
+  selectPaidTestFiles,
+  buildRunManifest,
+  parseRunManifest,
+  classifyTrialShard,
+  sliceExitCode,
+  guardTrialRecords,
+  parseJUnitCases,
+  caseIdForTestName,
+  shardTrial,
+  excludedCasesNamePattern,
+  runCaseDiagnosis,
+  caseFile,
+  parseCliOptions,
+  type CaseTrialPlan,
   type ShardOutcome,
 } from '../scripts/test-paid-shards';
 
@@ -60,11 +88,170 @@ describe('paid test enumeration', () => {
     const files = collectPaidTestFiles();
     expect(files.length).toBeGreaterThan(0);
     expect(files.every(isPaidTestFile)).toBe(true);
-    expect(PAID_TEST_GLOBS.length).toBe(7);
+    expect(PAID_TEST_GLOBS.length).toBe(6);
 
     const shards = planPaidShards(files);
     expect(shards.flat().sort()).toEqual([...files].sort());
     expect(shards.every((shard) => shard.length === 1)).toBe(true);
+  });
+});
+
+describe('tier lane skip (B5)', () => {
+  const file = 'test/skill-e2e-sample.test.ts';
+  const touchfiles = { 'sample-gate': [file, 'sample/**'], 'sample-periodic': [file], other: ['x/**'] };
+  const tiers = { 'sample-gate': 'gate', 'sample-periodic': 'periodic', other: 'periodic' };
+  const reg = { 'sample-gate': [file] } as Record<string, string[]>;
+
+  test('a fully static file with only other-tier ids is skipped with its reason', () => {
+    const source = "describeIfSelected('Sample', ['sample-gate'], () => { testIfSelected('sample-gate', async () => {}); });";
+    expect(tierSkipReason(file, source, 'periodic', reg, tiers)).toBe('skipped: no E2E_TIERS id has tier periodic');
+    expect(tierSkipReason(file, source, 'gate', reg, tiers)).toBeNull();
+  });
+
+  test('a comment or path that quotes another-tier id cannot change the decision', () => {
+    const source = "// see 'other' and 'sample-periodic' for context\nconst dir = 'sample-periodic/fixtures';\n" +
+      "testIfSelected('sample-gate', async () => {});";
+    expect(tierSkipReason(file, source, 'periodic', reg, tiers)).toBe('skipped: no E2E_TIERS id has tier periodic');
+    expect(tierSkipReason(file, source, 'gate', reg, tiers)).toBeNull();
+  });
+
+  test('computed registrations, unregistered literal ids and id-less files keep today\'s scheduling', () => {
+    for (const source of [
+      "describeIfSelected(name, keys, () => {});",
+      "describeIfSelected('Sample', [...keys], () => {});",
+      "testConcurrentIfSelected(`sample-${label}`, async () => {});",
+      "runSkillTest({ testName: `sample-${label}` });",
+      "testIfSelected(caseName, async () => {});",
+    ]) expect(tierSkipReason(file, source, 'periodic', reg, tiers)).toBeNull();
+    expect(tierSkipReason(file, "testIfSelected('sample-periodic', async () => {});", 'periodic', reg, tiers)).toBeNull();
+    expect(tierSkipReason(file, "testIfSelected('sample-gate', async () => {});", 'periodic', {}, tiers)).toBeNull();
+    expect(tierSkipReason(file, "testIfSelected('sample-gate', async () => {});", 'gate', touchfiles, tiers)).toBeNull();
+  });
+
+  test('the real constructed-name diagram file stays scheduled in both lanes', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'test/skill-e2e-diagram.test.ts'), 'utf8');
+    for (const tier of ['gate', 'periodic'] as const) expect(tierSkipReason('test/skill-e2e-diagram.test.ts', source, tier)).toBeNull();
+  });
+
+  test('the weekly gate census alone drops the LLM judges, with the reason in the manifest', () => {
+    const census = buildRunManifest({ tier: 'gate', sliceCount: 7, evalsAll: true, skipJudges: true, env: { EVALS_ALL: '1' } });
+    const judge = census.entries.find(entry => entry.file === 'test/skill-llm-eval.test.ts');
+    expect(judge).toMatchObject({ status: 'excluded', reason: 'skipped: LLM judges run in the periodic census and PR gate lanes' });
+    for (const tier of ['gate', 'periodic'] as const) {
+      const lane = buildRunManifest({ tier, sliceCount: 7, evalsAll: true, env: { EVALS_ALL: '1' } });
+      expect(lane.entries.find(entry => entry.file === 'test/skill-llm-eval.test.ts')?.status).toBe('planned');
+    }
+    const workflow = fs.readFileSync(path.join(ROOT, '.github/workflows/evals-periodic.yml'), 'utf8');
+    expect(workflow.match(/--skip-judges/g)).toHaveLength(1);
+    expect(workflow).toMatch(/--tier gate --emit-plan \/tmp\/gate-census-plan\/manifest\.json --slice-budget 540 --jobs 2 --skip-judges/);
+  });
+});
+
+describe('marathon tier lane', () => {
+  const file = 'test/skill-e2e-sample.test.ts';
+  const reg = { 'sample-gate': [file], 'sample-long': [file] } as Record<string, string[]>;
+  const tiers = { 'sample-gate': 'gate', 'sample-long': 'marathon' };
+
+  test('a marathon-declared file never enters the gate or periodic lane', () => {
+    const source = "const describeE2E = describeE2ETier('marathon');";
+    expect(classifyPaidTestFile(source, 'marathon')).toEqual({ included: true, reason: "declares tier 'marathon'" });
+    for (const tier of ['gate', 'periodic'] as const) {
+      expect(classifyPaidTestFile(source, tier)).toEqual({ included: false, reason: "declares tier 'marathon' only" });
+    }
+    expect(marathonSkipReason(file, source, {}, {})).toBeNull();
+  });
+
+  test('marathon selects positively: only declared files or files registering a marathon case', () => {
+    expect(marathonSkipReason(file, "testIfSelected('sample-long', async () => {});", reg, tiers)).toBeNull();
+    expect(marathonSkipReason(file, "testIfSelected(name, async () => {});", reg, tiers)).toBeNull();
+    const gateOnly = { 'sample-gate': [file] };
+    for (const source of ["testIfSelected('sample-gate', async () => {});", "testIfSelected(name, async () => {});", ''])
+      expect(marathonSkipReason(file, source, gateOnly, tiers)).toBe('skipped: declares no marathon tier and registers no marathon case');
+    const periodic = "const describeE2E = describeE2ETier('periodic');";
+    expect(classifyPaidTestFile(periodic, 'marathon')).toEqual({ included: false, reason: "declares tier 'periodic' only" });
+  });
+
+  test('a registered marathon case keeps its gate sibling scheduled in the gate lane', () => {
+    const source = "testIfSelected('sample-gate', async () => {}); testIfSelected('sample-long', async () => {});";
+    expect(tierSkipReason(file, source, 'gate', reg, tiers)).toBeNull();
+    expect(tierSkipReason(file, source, 'periodic', reg, tiers)).toBe('skipped: no E2E_TIERS id has tier periodic');
+  });
+
+  test('the live marathon lane only plans files that carry marathon work, never the LLM judges', () => {
+    const { selected, excluded } = selectPaidTestFiles(collectPaidTestFiles(), 'marathon');
+    expect(selected).not.toContain('test/skill-llm-eval.test.ts');
+    for (const file of selected) {
+      const source = fs.readFileSync(path.join(ROOT, file), 'utf8');
+      expect(marathonSkipReason(file, source), file).toBeNull();
+    }
+    expect(selected.length + excluded.length).toBe(collectPaidTestFiles().length);
+  });
+});
+
+describe('case-sharded files', () => {
+  // Paid cases only: `if (!evalsEnabled) test(...)` blocks are free checks.
+  const caseNames = (source: string) => [...source.matchAll(
+    /(?<![.\w])(?<!if \(!evalsEnabled\) )(?:testConcurrentIfSelected|testIfSelected|test(?:\.serial|\.concurrent)?)\(\s*(['"])(.+?)\1/g,
+  )].map(match => match[2]!);
+
+  for (const file of CASE_SHARDED_FILES) {
+    test(`${file}: every Bun case is a registered E2E case, so every case gets a shard`, () => {
+      const source = fs.readFileSync(path.join(ROOT, file), 'utf8');
+      const { registered, known } = fileCaseRegistration(file, source);
+      expect(known).toBe(true);
+      expect(caseNames(source).sort()).toEqual(registered.map(id => CASE_TEST_NAMES[id] ?? id).sort());
+      const keys = (['gate', 'periodic', 'marathon'] as const).flatMap(tier => expandCaseShards([file], tier));
+      expect(keys.map(key => shardCaseId(key)).sort()).toEqual([...registered].sort());
+      for (const key of keys) expect(shardFile(key)).toBe(file);
+    });
+  }
+
+  test('every case in a case-sharded file has exactly one owner, so --case can select it', () => {
+    for (const file of CASE_SHARDED_FILES) {
+      const { registered } = fileCaseRegistration(file, fs.readFileSync(path.join(ROOT, file), 'utf8'));
+      for (const id of registered) expect(caseFile(id), id).toBe(file);
+    }
+    expect(caseFile('plan-design-review-plan-mode')).toBe('test/skill-e2e-design.test.ts');
+    expect(caseFile('plan-design-review-plan-mode-smoke')).toBe('test/skill-e2e-plan-design-plan-mode.test.ts');
+    expect(() => caseFile('carve-section-loading')).toThrow(/registered by .*; it needs exactly one/);
+  });
+
+  test('a case key runs exactly its case: exact name pattern, own eval slug, per-case supervision', () => {
+    const pattern = new RegExp(caseTestNamePattern(['design-review-detector-shim']));
+    expect(pattern.test('Design review detector shim E2E design-review-detector-shim')).toBe(true);
+    expect(pattern.test('Design review detector shim E2E design-review-detector-shim-dom')).toBe(false);
+    expect(new RegExp(caseTestNamePattern(['plan-review-report'])).test('Plan Review Report E2E /plan-eng-review writes GSTACK REVIEW REPORT to plan file')).toBe(true);
+    const key = 'test/skill-e2e-plan.test.ts#plan-ceo-review';
+    expect(shardSlug([key])).toBe('skill-e2e-plan--plan-ceo-review');
+    expect(shardSlug([key])).not.toBe(shardSlug(['test/skill-e2e-plan.test.ts#plan-eng-review']));
+    expect(retriesForFiles([key])).toBe(retriesForFiles(['test/skill-e2e-plan.test.ts']));
+    const whole = resolvePaidShardBudget(['test/skill-e2e-plan.test.ts']);
+    const one = resolvePaidShardBudget([key]);
+    expect(one.policyId).toBe(whole.policyId);
+    expect(one.timeoutMs).toBeLessThan(whole.timeoutMs);
+    expect(planPaidShards([key, 'test/skill-e2e-plan.test.ts#plan-eng-review', 'test/a.test.ts'], { maxFilesPerShard: 3 }))
+      .toEqual([['test/a.test.ts'], [key], ['test/skill-e2e-plan.test.ts#plan-eng-review']]);
+  });
+
+  test('manifests plan each case once and results must execute exactly that case', () => {
+    const manifest = buildRunManifest({ tier: 'gate', sliceBudgetMs: 540_000, jobs: 2, evalsAll: true, env: { EVALS_ALL: '1' } });
+    const planned = manifest.entries.filter(entry => entry.status === 'planned');
+    for (const file of CASE_SHARDED_FILES) {
+      expect(planned.some(entry => entry.file === file)).toBe(false);
+      const gateIds = Object.keys(E2E_TOUCHFILES).filter(id => E2E_TOUCHFILES[id]!.includes(file) && E2E_TIERS[id] === 'gate');
+      expect(planned.filter(entry => shardFile(entry.file) === file).map(entry => shardCaseId(entry.file)).sort()).toEqual(gateIds.sort());
+    }
+    const results = Array.from({ length: manifest.sliceCount }, (_, i) => ({ version: 1 as const, tier: 'gate' as const, sliceIndex: i + 1, sliceCount: manifest.sliceCount,
+      outcomes: planned.filter(entry => entry.slice === i + 1).map(entry => ({ files: [entry.file], status: 'passed' as const, exitCode: 0, elapsedMs: 1,
+        executedTests: shardCaseId(entry.file) ? 3 : 1, skippedTests: shardCaseId(entry.file) ? 2 : 0, ...(entry.budget ? { budget: entry.budget } : {}) })) }));
+    expect(verifySliceResults(manifest, results).problems.filter(problem => problem.includes('Case shard'))).toEqual([]);
+    const empty = structuredClone(results);
+    const victim = empty.flatMap(result => result.outcomes).find(outcome => shardCaseId(outcome.files[0]!))!;
+    victim.skippedTests = victim.executedTests;
+    expect(verifySliceResults(manifest, empty).problems).toContain(`Case shard must execute exactly its one case: ${victim.files[0]}`);
+    const whole: any = structuredClone(manifest);
+    whole.entries.push({ file: CASE_SHARDED_FILES[0], slice: 1, status: 'planned', estimatedMs: 1 });
+    expect(() => parseRunManifest(JSON.stringify(whole))).toThrow('one registered case per shard');
   });
 });
 
@@ -410,5 +597,116 @@ describe('all-skipped pass census', () => {
     expect(codexLine).toContain('all 8 tests SKIPPED');
     expect(codexLine).toContain('verified nothing');
     expect(reviewLine).not.toContain('SKIPPED');
+  });
+});
+
+describe('isolated trial shards: record, classification and slice exit', () => {
+  const plan: CaseTrialPlan = { kind: 'behavior', panel: { n: 3, k: 2 }, quarantined: false };
+  const key = (n: number) => `test/skill-e2e-review.test.ts#review-sql-injection~t${n}`;
+  const base = { status: 'passed' as const, executedTests: 1, skippedTests: 0, elapsedMs: 5 };
+  const none = { records: [], contract: null };
+
+  test('trial keys keep their case id, file and index', () => {
+    expect(shardCaseId(key(2))).toBe('review-sql-injection');
+    expect(shardFile(key(2))).toBe('test/skill-e2e-review.test.ts');
+    expect(shardTrial(key(2))).toBe(2);
+    expect(shardTrial('test/skill-e2e-review.test.ts#review-sql-injection')).toBeNull();
+    expect(shardSlug([key(2)])).toBe('skill-e2e-review--review-sql-injection.t2');
+  });
+
+  test('classification: verdicts versus harness problems', () => {
+    const c = (over: Partial<ShardOutcome>, evidence: { records: any[]; contract: string | null } = none) =>
+      classifyTrialShard({ ...base, ...over }, 'review-sql-injection', 1, plan, evidence);
+    expect(c({}).outcome).toBe('passed');
+    expect(c({}, { records: [], contract: 'handoff missing' })).toMatchObject({ outcome: 'failed', failure_class: 'contract', error: 'handoff missing' });
+    expect(c({ status: 'failed' }, { records: [{ passed: false, exit_reason: 'timeout', timeout_at_turn: 9, error: 'x' }], contract: null }))
+      .toMatchObject({ outcome: 'failed', failure_class: 'timeout', timeout_at_turn: 9 });
+    expect(c({ status: 'failed' }, { records: [{ passed: false, error: 'expected 3' }], contract: null })).toMatchObject({ outcome: 'failed', failure_class: 'assertion' });
+    expect(c({ status: 'timed-out', executedTests: null, skippedTests: null })).toMatchObject({ outcome: 'failed', failure_class: 'timeout' });
+    expect(c({ status: 'failed', executedTests: null, skippedTests: null })).toMatchObject({ outcome: 'failed', failure_class: 'infra' });
+    expect(c({ status: 'failed', executedTests: 0, skippedTests: 0 })).toMatchObject({ outcome: 'failed', failure_class: 'infra' });
+    expect(c({ executedTests: 1, skippedTests: 1 })).toMatchObject({ outcome: 'skipped' });
+    for (const over of [{ status: 'never-started' as const }, { status: 'passed-empty' as const }, { executedTests: 2 },
+      { runnerError: 'spawn failed' }, { executedTests: 0, skippedTests: 0 }]) {
+      expect(c(over).outcome, JSON.stringify(over)).toBeNull();
+    }
+  });
+
+  test('slice exit: rule shards stay strict; failed trials never red the runner, missing records do', () => {
+    const trial = (outcome: 'passed' | 'failed' | null) => ({ status: outcome === 'failed' ? 'failed' as const : 'passed' as const,
+      trial: { case: 'c', trial: 1, ...plan, outcome, cost_usd: 0, duration_ms: 1, ...(outcome === null ? { harness: 'never started' } : {}) } });
+    expect(sliceExitCode([{ status: 'passed' }, trial('failed')])).toBe(0);
+    expect(sliceExitCode([{ status: 'failed' }, trial('passed')])).toBe(1);
+    expect(sliceExitCode([{ status: 'passed' }, trial(null)])).toBe(1);
+    expect(sliceExitCode([{ status: 'timed-out' }])).toBe(1);
+    const hollow = guardTrialRecords([{ ...trial('passed'), status: 'passed-empty' as const }]);
+    expect(hollow[0]!.trial!.outcome).toBeNull();
+    expect(sliceExitCode(hollow)).toBe(1);
+  });
+
+  test('runPaidShards binds each trial to its case, index and panel and records its outcome', async () => {
+    const evalDirBase = fs.mkdtempSync(path.join(os.tmpdir(), 'trial-shards-'));
+    try {
+      const script = (fail: boolean) => `const fs = require('fs'), path = require('path');
+const dir = process.env.GSTACK_EVAL_DIR; fs.mkdirSync(dir, { recursive: true });
+const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith('GSTACK_EVAL_') || k === 'EVALS_SELECTION_JSON'));
+fs.writeFileSync(path.join(dir, 'env.json'), JSON.stringify(env));
+fs.writeFileSync(path.join(dir, 'run.json'), JSON.stringify({ tests: [{ name: 'review-sql-injection', passed: ${!fail}, cost_usd: 0.5,
+  duration_ms: 1, exit_reason: ${fail ? "'timeout'" : "'success'"}, timeout_at_turn: 4, model: 'm' }] }));
+console.log("Ran 1 tests across 1 files. [1ms]"); process.exit(${fail ? 1 : 0});`;
+      const summary = await runPaidShards([[key(1)], [key(2)], [key(3)]], {
+        jobs: 3, evalDirBase, log: () => {}, trials: { [key(1)]: plan, [key(2)]: plan, [key(3)]: plan },
+        commandFor: files => ({ command: process.execPath, args: ['-e', script(files[0] === key(2))] }),
+      });
+      const byKey = (n: number) => summary.outcomes.find(o => o.files[0] === key(n))!;
+      expect(byKey(1).trial).toMatchObject({ case: 'review-sql-injection', trial: 1, outcome: 'passed', cost_usd: 0.5, model: 'm' });
+      expect(byKey(2).trial).toMatchObject({ trial: 2, outcome: 'failed', failure_class: 'timeout', exit_reason: 'timeout', timeout_at_turn: 4 });
+      expect(sliceExitCode(summary.outcomes)).toBe(0);
+      const env = JSON.parse(fs.readFileSync(path.join(evalDirBase, 'shards', shardSlug([key(3)]), 'env.json'), 'utf8'));
+      expect(env).toMatchObject({ GSTACK_EVAL_CASE_ID: 'review-sql-injection', GSTACK_EVAL_KIND: 'behavior', GSTACK_EVAL_TRIAL: '3',
+        GSTACK_EVAL_PANEL_N: '3', GSTACK_EVAL_PANEL_K: '2', GSTACK_EVAL_POLICY_VERSION: '1' });
+      expect(JSON.parse(env.EVALS_SELECTION_JSON).selected).toEqual(['review-sql-injection']);
+    } finally { fs.rmSync(evalDirBase, { recursive: true, force: true }); }
+  });
+
+  test('file shards exclude isolated names; JUnit cases map to registry ids or stay unattributed', () => {
+    const pattern = new RegExp(excludedCasesNamePattern(['review-sql-injection']));
+    expect(pattern.test('suite > review-sql-injection')).toBe(false);
+    expect(pattern.test('suite > review-enum-completeness')).toBe(true);
+    const cases = parseJUnitCases(`<testsuites><testsuite name="f">
+  <testcase name="review-sql-injection" classname="s" time="1.5" />
+  <testcase name="review-enum-completeness" classname="s" time="0.1"><failure type="TimeoutError" message="test &amp; timed out" /></testcase>
+  <testcase name="plain helper" classname="" time="0"><skipped /></testcase>
+</testsuite></testsuites>`);
+    expect(cases).toEqual([
+      { name: 'review-sql-injection', classname: 's', outcome: 'passed', timeMs: 1500 },
+      { name: 'review-enum-completeness', classname: 's', outcome: 'failed', timeMs: 100, failureType: 'TimeoutError', message: 'test & timed out' },
+      { name: 'plain helper', classname: '', outcome: 'skipped', timeMs: 0 },
+    ]);
+    expect(caseIdForTestName('review-sql-injection')).toBe('review-sql-injection');
+    expect(caseIdForTestName(CASE_TEST_NAMES['plan-review-report']!)).toBe('plan-review-report');
+    expect(caseIdForTestName('plain helper')).toBeNull();
+  });
+
+  test('--case/--trials: local diagnosis flags are validated and never combine with CI modes', () => {
+    expect(parseCliOptions(['--case', 'review-sql-injection', '--trials', '5'], {})).toMatchObject({ caseId: 'review-sql-injection', trials: 5 });
+    expect(() => parseCliOptions(['--trials', '3'], {})).toThrow('--trials requires --case');
+    expect(() => parseCliOptions(['--case', 'no-such-case'], {})).toThrow('live E2E case id');
+    expect(() => parseCliOptions(['--case', 'review-sql-injection', '--report', '/tmp/r'], {})).toThrow('local diagnosis');
+    expect(caseFile('review-sql-injection')).toBe('test/skill-e2e-review.test.ts');
+  });
+
+  test('--case runs the CI panel runner and prints its panelVerdict', async () => {
+    const evalDirBase = fs.mkdtempSync(path.join(os.tmpdir(), 'case-diagnosis-'));
+    const lines: string[] = [];
+    try {
+      const verdict = await runCaseDiagnosis('review-sql-injection', { trials: 3, evalDirBase, log: line => lines.push(line), jobs: 3,
+        commandFor: files => ({ command: process.execPath, args: ['-e',
+          `console.log("Ran 1 tests across 1 files. [1ms]"); process.exit(${files[0]!.endsWith('~t3') ? 1 : 0});`] }) });
+      // A rule case keeps its meaning locally: every trial must pass.
+      expect(verdict).toMatchObject({ case: 'review-sql-injection', kind: 'rule', panel: { n: 3, k: 3 }, passed: 2, status: 'FAIL' });
+      expect(lines.join('\n')).toContain('--case review-sql-injection: 3 trial(s) of test/skill-e2e-review.test.ts');
+      expect(lines.join('\n')).toContain('FAIL 2/3 (✓✓✗)');
+    } finally { fs.rmSync(evalDirBase, { recursive: true, force: true }); }
   });
 });

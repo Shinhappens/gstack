@@ -1214,7 +1214,7 @@ Binary Images:
       { status: 1, stdout: '', stderr: '' }, { status: 0, stdout: '', stderr: '' },
       { status: 0, stdout: 'truncated-private-row', stderr: '' },
       { status: null, stdout: null, stderr: null, error: new Error('synthetic-private-error') },
-    ]) expect(inspectUidProcesses(23456, performance.now() + 10_000, {}, (() => result) as typeof spawnSync)).toEqual({ available: false });
+    ]) expect(inspectUidProcesses(23456, performance.now() + 10_000, {}, (() => result) as unknown as typeof spawnSync)).toEqual({ available: false });
   });
 
   test('numeric UID process filtering runs through the real global process table', () => {
@@ -1251,7 +1251,7 @@ Binary Images:
       { status: 113, stdout: '', stderr: 'Could not find domain for user uid: 23456' },
       { status: null, stdout: null, stderr: null, error: new Error('synthetic-private-error') },
     ]) {
-      const observation = inspectUserDomain(23456, performance.now() + 10_000, {}, (() => result) as typeof spawnSync);
+      const observation = inspectUserDomain(23456, performance.now() + 10_000, {}, (() => result) as unknown as typeof spawnSync);
       expect(observation.state).toBe('unavailable');
       expect(observation.structure).toBeUndefined();
       expect(JSON.stringify(observation)).not.toContain('synthetic-private');

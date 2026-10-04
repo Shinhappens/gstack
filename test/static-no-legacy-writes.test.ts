@@ -128,14 +128,6 @@ describe('#1671 invariant: no production code writes to builder-profile.jsonl', 
     expect(offending).toEqual([]);
   });
 
-  test('office-hours/SKILL.md uses --log-session, not raw echo append', () => {
-    const skill = fs.readFileSync(path.join(ROOT, 'office-hours/SKILL.md'), 'utf-8');
-    // The two known writer call-sites must use the new subcommand.
-    expect(skill).toContain('gstack-developer-profile --log-session');
-    // And must NOT contain the old echo-append pattern.
-    expect(skill).not.toMatch(/echo\s+['"][^'"]*['"]?\s*>>\s*["'][^"']*builder-profile\.jsonl/);
-  });
-
   test('office-hours/SKILL.md.tmpl uses --log-session, not raw echo append', () => {
     const tmpl = fs.readFileSync(path.join(ROOT, 'office-hours/SKILL.md.tmpl'), 'utf-8');
     expect(tmpl).toContain('gstack-developer-profile --log-session');

@@ -73,10 +73,6 @@ async function recordAttempt(name: string, body: (run: typeof runSkillTest) => P
   if (failed) throw failure;
 }
 
-const TPA_TESTS = [
-  'tpa-present', 'tpa-absent-linux', 'tpa-broken', 'tpa-absent-darwin', 'tpa-apple-ban',
-];
-
 /** Extract the Third-Party Web Actions section from the generated ship skill. */
 function contractSection(): string {
   const full = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md'), 'utf-8');
@@ -96,8 +92,16 @@ interface ShimSpec {
 /** Build a shim dir + workDir with the extracted contract; returns paths + env. */
 function setupCase(spec: ShimSpec, extraDocs: Record<string, string> = {}) {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpa-e2e-'));
+  // Shims live outside the agent's cwd: a `.shims/` dir in its `ls -la` led an
+  // agent to read the uname shim, run /usr/bin/uname, and skip the Darwin
+  // branch as "not really macOS" (CI run 37073429415).
+  const shimRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tpa-path-'));
+  const removeAll = () => {
+    fs.rmSync(workDir, { recursive: true, force: true });
+    fs.rmSync(shimRoot, { recursive: true, force: true });
+  };
   try {
-    const shimDir = path.join(workDir, '.shims');
+    const shimDir = path.join(shimRoot, 'bin');
     fs.mkdirSync(shimDir, { recursive: true });
 
     if (spec.aside !== 'absent') {
@@ -106,9 +110,12 @@ function setupCase(spec: ShimSpec, extraDocs: Record<string, string> = {}) {
         : '#!/bin/sh\necho "aside: daemon not reachable — make sure Aside Browser is running" >&2\nexit 1\n';
       fs.writeFileSync(path.join(shimDir, 'aside'), body, { mode: 0o755 });
     }
+    const kernel = spec.uname === 'Darwin'
+      ? { release: '24.6.0', machine: 'arm64' }
+      : { release: '6.8.0-79-generic', machine: 'x86_64' };
     fs.writeFileSync(
       path.join(shimDir, 'uname'),
-      `#!/bin/sh\necho "${spec.uname}"\n`,
+      `#!/bin/sh\ncase "$1" in\n  -r) echo "${kernel.release}" ;;\n  -m|-p) echo "${kernel.machine}" ;;\n  -n) echo "devbox" ;;\n  -a) echo "${spec.uname} devbox ${kernel.release} ${kernel.machine}" ;;\n  *) echo "${spec.uname}" ;;\nesac\n`,
       { mode: 0o755 },
     );
 
@@ -145,10 +152,10 @@ function setupCase(spec: ShimSpec, extraDocs: Record<string, string> = {}) {
     return {
       workDir,
       env: { PATH: childPath },
-      cleanup: () => fs.rmSync(workDir, { recursive: true, force: true }),
+      cleanup: removeAll,
     };
   } catch (error) {
-    try { fs.rmSync(workDir, { recursive: true, force: true }); }
+    try { removeAll(); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'TPA fixture setup and cleanup failed'); }
     throw error;
   }
@@ -179,7 +186,9 @@ const COMMON = {
   runId,
 } as const;
 
-describeIfSelected('third-party-actions consent gate', TPA_TESTS, () => {
+describeIfSelected('third-party-actions consent gate', [
+  'tpa-present', 'tpa-absent-linux', 'tpa-broken', 'tpa-absent-darwin', 'tpa-apple-ban',
+], () => {
   // aside present → the consent question offers the Aside drive.
   testIfSelected('tpa-present', async () => recordAttempt('tpa-present', async run => {
     const { workDir, env, cleanup } = setupCase({ aside: 'ok', uname: 'Darwin' });
@@ -303,7 +312,7 @@ describeIfSelected('third-party-actions consent gate', TPA_TESTS, () => {
       // passes; a rendered consent option offering a drive fails.
       expect(text).not.toMatch(/^\s*[A-D]\)[^\n]*(drive|browse|Aside)/im);
       expect(text).not.toMatch(/drive\s+account\.apple\.com/i);
-      expect(text).toMatch(/app-specific password/i);
+      expect(text).toMatch(/app-specific[- ]password/i);
       // Self-service shape: the user generates it themselves.
       expect(text).toMatch(/generate|any device|fastlane-credentials/i);
     } finally { cleanup(); }

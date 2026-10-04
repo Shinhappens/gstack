@@ -1,14 +1,5 @@
 /** Ground truth for the existing plan fixtures, independent of review phase. */
 import type { NativeQuestion } from './plan-skill-questions';
-
-export const CEO_FINDINGS = [
-  { id: 'dispatcher', description: 'Decide whether PaymentService should reuse the existing WebhookDispatcher instead of bypassing it for namespace separation.' },
-  { id: 'sql', description: 'Decide a safe parameterized user lookup instead of interpolating untrusted request.params.userId into raw SQL.' },
-  { id: 'email', description: 'Decide the failure/recovery contract for notification email after the payment transaction commits; the proposed inline email leg has no catch, outbox, or retry.' },
-  { id: 'tests', description: 'Decide regression coverage for the new PaymentService path; existing platform tests do not cover this new handler and no new tests are planned.' },
-  { id: 'queries', description: 'Decide how to eliminate or justify the per-order lookup loop instead of batching the webhook order reads.' },
-];
-
 export const CEO_PAIRED_FINDINGS = [
   { id: 'receipt-test', description: 'Independently decide happy-path processPayment test coverage asserting the correct receipt after a successful Stripe charge.' },
   { id: 'failure-test', description: 'Independently decide Stripe 502/timeout coverage asserting one retry with backoff and then clean failure.' },
@@ -21,15 +12,6 @@ export const CEO_SCOPE_CANDIDATES = [
   { id: 'E4', description: 'The whole Telegram bot API integration: include, defer, or cut it.' },
   { id: 'E5', description: 'The whole Mattermost REST plugin integration: include, defer, or cut it.' },
 ];
-
-export const DESIGN_FINDINGS = [
-  { id: 'primary-action', description: 'Decide how Save becomes the primary action instead of sharing equal visual weight with Reset, Cancel, and Export.' },
-  { id: 'spacing', description: 'Decide a consistent vertical section rhythm instead of mixed 16px, 24px, and 32px gaps.' },
-  { id: 'contrast', description: 'Decide accessible error-message contrast instead of the proposed approximately 3:1 red-on-pink treatment.' },
-  { id: 'typography', description: 'Decide a coherent form-label type hierarchy instead of inconsistent 14px, 16px, and 18px labels.' },
-  { id: 'save-feedback', description: 'Decide progress feedback for the 2–5 second Save action instead of leaving the interface apparently frozen.' },
-];
-
 export const DEVEX_FINDINGS = [
   { id: 'persona', description: 'Decide a specific target developer persona instead of shipping for everyone.' },
   { id: 'first-run-benchmark', description: 'Decide measurement/benchmarking of time to hello world instead of leaving first-run duration unknown.' },
@@ -37,15 +19,6 @@ export const DEVEX_FINDINGS = [
   { id: 'aha', description: 'Decide a concrete interactive demo or aha moment in the getting-started flow instead of documentation alone.' },
   { id: 'peer-comparison', description: 'Produce grounded comparative analysis of peer SDK developer experiences and its implications for this plan instead of ignoring existing solutions.' },
 ];
-
-export const ENG_FINDINGS = [
-  { id: 'shared-cache', description: 'Decide ownership/isolation of AuthCache instead of two services mutating one module-level global cache.' },
-  { id: 'swallowed-errors', description: 'Decide explicit handling of the swallowed error classes in validateAndDispatch rather than keeping three nested catch blocks that hide failures.' },
-  { id: 'legacy-regression', description: 'Decide regression tests for the rewritten legacyAuthFlow behavior.' },
-  { id: 'parallel-idp', description: 'Decide parallelizing the five independent IDP validation calls instead of running them sequentially.' },
-  { id: 'complexity', description: 'Decide whether to reduce or justify the 12-file/four-new-class scope and complexity.' },
-];
-
 export const ENG_BATCHING_FINDINGS = [
   { id: 'retry-library', description: 'Decide reuse of existing job-library retry hooks instead of a custom inline backoff scheduler per worker.' },
   { id: 'retry-duplication', description: 'Decide consolidation of the copied retry envelope across five workers.' },

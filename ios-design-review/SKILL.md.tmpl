@@ -92,9 +92,15 @@ For each screen in the app, score 0-10 and explain what would push it to 10:
 ## Output
 
 Write a markdown report to
-`~/.gstack/projects/<slug>/ios-design-review-<date>.md`. Include the
-screenshots inline. The CEO/eng review skills can reference this report
-when planning UI changes.
+`$GSTACK_STATE_ROOT/projects/<slug>/ios-design-review-<date>.md`, using the
+`PROJECT_DIR` this block prints:
+
+```bash
+{{SLUG_SETUP}}
+```
+
+Include the screenshots inline. The CEO/eng review skills can reference this
+report when planning UI changes.
 
 ## Failure modes
 

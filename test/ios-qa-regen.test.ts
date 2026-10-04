@@ -48,6 +48,8 @@ function copyIntoFakeInstall(workDir: string): { root: string; launcher: string 
   copyFileSync(join(ROOT, 'bin', 'gstack-ios-qa-regen'), launcher);
   chmodSync(launcher, 0o755);
   copyFileSync(join(ROOT, 'ios-qa', 'scripts', 'gen-accessors.ts'), join(scriptsDir, 'gen-accessors.ts'));
+  mkdirSync(join(root, 'lib'), { recursive: true });
+  copyFileSync(join(ROOT, 'lib', 'state-root.ts'), join(root, 'lib', 'state-root.ts'));
   for (const [template] of SAFE_TEMPLATE_MAP) {
     copyFileSync(join(ROOT, 'ios-qa', 'templates', template), join(templatesDir, template));
   }

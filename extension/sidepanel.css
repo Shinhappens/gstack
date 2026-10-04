@@ -274,18 +274,6 @@ body::after {
   gap: 3px;
   animation: slideIn 150ms ease-out;
 }
-.agent-tool {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 4px 8px;
-  background: rgba(245, 158, 11, 0.06);
-  border-left: 2px solid var(--amber-500);
-  border-radius: 0 4px 4px 0;
-  font-size: 12px;
-  font-family: var(--font-system);
-  margin: 2px 0;
-}
 .tool-icon {
   flex-shrink: 0;
   font-size: 11px;
@@ -295,32 +283,6 @@ body::after {
   color: var(--text-body);
   line-height: 1.5;
   word-break: break-word;
-}
-/* Collapsed reasoning disclosure */
-.agent-reasoning {
-  margin: 4px 0;
-}
-.agent-reasoning summary {
-  cursor: pointer;
-  font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--text-meta);
-  padding: 3px 0;
-  user-select: none;
-  list-style: none;
-}
-.agent-reasoning summary::before {
-  content: '▶ ';
-  font-size: 9px;
-}
-.agent-reasoning[open] summary::before {
-  content: '▼ ';
-}
-.agent-reasoning summary:hover {
-  color: var(--text-label);
-}
-.agent-reasoning .agent-tool {
-  margin-left: 4px;
 }
 /* Legacy classes kept for compat */
 .tool-name {
@@ -864,22 +826,6 @@ body::after {
   opacity: 0.3;
   cursor: not-allowed;
 }
-.stop-btn {
-  width: 26px;
-  height: 26px;
-  background: var(--error);
-  border: none;
-  border-radius: var(--radius-sm);
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  cursor: pointer;
-  flex-shrink: 0;
-  line-height: 26px;
-  text-align: center;
-}
-.stop-btn:hover { background: #dc2626; }
-.stop-btn:active { transform: scale(0.93); }
 
 /* ─── Footer ──────────────────────────────────────────── */
 footer {
@@ -1023,19 +969,6 @@ footer {
   transition: border-color 150ms;
 }
 .port-input:focus { border-color: var(--amber-500); }
-
-/* ─── Experimental Banner ─────────────────────────────── */
-.experimental-banner {
-  background: rgba(59, 130, 246, 0.08);
-  border: 1px solid rgba(59, 130, 246, 0.15);
-  color: var(--zinc-400);
-  padding: 6px 12px;
-  border-radius: 6px;
-  font-size: 11px;
-  margin: 6px 12px;
-  text-align: left;
-  flex-shrink: 0;
-}
 
 /* ─── Browser Tab Bar ─────────────────────────────────── */
 .browser-tabs {

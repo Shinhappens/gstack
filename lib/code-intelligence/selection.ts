@@ -12,11 +12,11 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { homedir } from "os";
 import { dirname, join, resolve } from "path";
 import { execFileSync } from "child_process";
 import { hasRepoPolicyStore, repoPolicyTier } from "../gbrain-repo-policy-client";
 import type { CodeProviderId, OpClass } from "./contract";
+import { resolveStateRoot } from "../state-root";
 
 export interface Selection {
   provider: CodeProviderId | null;
@@ -31,7 +31,7 @@ export interface Selection {
 const EMPTY: Selection = { provider: null, consents: {}, roots: {}, declined: false };
 
 function storePath(env: NodeJS.ProcessEnv = process.env): string {
-  const home = env.GSTACK_HOME || join(env.HOME || homedir(), ".gstack");
+  const home = resolveStateRoot(env);
   return join(home, "code-intelligence.json");
 }
 

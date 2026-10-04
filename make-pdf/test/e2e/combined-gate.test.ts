@@ -22,7 +22,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { copyPasteGate, resolvePdftotext } from "../../src/pdftotext";
-import { browserAvailable, NO_BROWSER_REASON } from "./browser-available";
+import { browserAvailable, NO_BROWSER_REASON } from "../../../test/helpers/browser-available";
 
 const FIXTURE = path.resolve(__dirname, "../fixtures/combined-gate.md");
 const EXPECTED = path.resolve(__dirname, "../fixtures/combined-gate.expected.txt");

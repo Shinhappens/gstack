@@ -5,7 +5,6 @@ import * as path from 'node:path';
 import { findCeoModeOption, hasNativePostAnswerCeoPosture } from './helpers/ceo-mode-option';
 import { parseNumberedOptions } from './helpers/claude-pty-runner';
 import { readPlanCountTranscript, type NativePublicToolEvent } from './helpers/plan-count-transcript';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import captured from './fixtures/ceo-expansion-auq-ac.json';
 
 const posture = /\b(expansion|10x|delight|dream|cathedral|opt[\s-]?in)\b/i;
@@ -117,11 +116,5 @@ describe('CEO expansion posture in a completed native decision brief', () => {
       (records: Records) => { records.splice(6, 1); },
       (records: Records) => { records[6]!.message.content[0]!.is_error = true; },
     ]) expect(matches(replay(change))).toBe(false);
-  });
-
-  test('the new free test and captured fixture select the paid mode-routing case', () => {
-    for (const file of ['test/ceo-expansion-auq.test.ts', 'test/fixtures/ceo-expansion-auq-ac.json']) {
-      expect(selectTests([file], E2E_TOUCHFILES, []).selected).toEqual(['plan-ceo-mode-routing']);
-    }
   });
 });

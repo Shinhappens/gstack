@@ -38,7 +38,9 @@ if [ -z "${HOME:-}" ]; then
   exit 0
 fi
 
-GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
+_gstack_migration_dir="${BASH_SOURCE[0]//\\//}"; _gstack_migration_dir="${_gstack_migration_dir%/*}"
+. "${_gstack_migration_dir}/../../bin/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: ${_gstack_migration_dir}/../../bin/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select; GSTACK_HOME="$_gstack_sr_root"
 MIGRATIONS_DIR="$GSTACK_HOME/.migrations"
 DONE_TOUCH="$MIGRATIONS_DIR/v1.37.0.0.done"
 CONFIG_BIN="$HOME/.claude/skills/gstack/bin/gstack-config"

@@ -82,12 +82,14 @@ user pick the one to fix.
 
 ## Phase 5: Add regression test
 
-Write a test in `test/fixtures/ios-fix/<bug-slug>.test.ts` that:
+Write a regression test with the project's own test runner and conventions
+(the test command in CLAUDE.md; if it has none, ask the user and record the
+answer there). The test:
 
 1. Loads the pre-bug snapshot.
 2. Restores it via `POST /state/restore`.
-3. Asserts the post-fix behavior on a real device (gated
-   `GSTACK_HAS_IOS_DEVICE=1`, periodic tier).
+3. Asserts the post-fix behavior on a real device, skipped when no device is
+   connected.
 
 Commit the snapshot fixture + test file alongside the fix.
 
@@ -96,6 +98,6 @@ Commit the snapshot fixture + test file alongside the fix.
 | Symptom | Action |
 |---|---|
 | 3 iterations, bug still present | STOP, report to user with current best hypothesis |
-| `409 schema_mismatch` on /state/restore after rebuild | Re-codegen accessors (`swift run gen-accessors`), re-snapshot |
+| `409 schema_mismatch` on /state/restore after rebuild | Regenerate accessors with `/ios-sync` (`gstack-ios-qa-regen`), re-snapshot |
 | Device disconnects mid-fix | Daemon auto-reconnects; resume from Phase 4 |
 | Build fails | Revert Swift edits; investigate compile error before re-applying fix |

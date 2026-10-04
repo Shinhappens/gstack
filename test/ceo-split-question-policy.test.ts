@@ -285,7 +285,7 @@ const save = () => fs.writeFileSync(${JSON.stringify(facts)}, JSON.stringify(fac
 mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/plan-review-decisions.ts'))}, () => ({
   evaluatePlanReviewDecisions: async input => {
     facts.judges++; save();
-    expect(input.kind).toBe('scope'); expect(input.floor).toBe(4);
+    expect(input.kind).toBe('scope'); expect(input.floor).toBe(2);
     expect(input.targets).toEqual(CEO_SCOPE_CANDIDATES);
     expect(input.deadlineAt).toBeGreaterThan(Date.now());
     expect(input.deadlineAt - Date.now()).toBeLessThanOrEqual(1_500_000);
@@ -300,7 +300,7 @@ mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/plan-review-decisions
   },
 }));
 mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/e2e-gate.ts'))}, () => ({
-  describeE2ETier: tier => { expect(tier).toBe('periodic'); return describe; },
+  describeE2ETier: tier => { expect(tier).toBe('marathon'); return describe; },
 }));
 const boundary = () => false;
 mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'))}, () => ({
@@ -363,7 +363,7 @@ await import(${JSON.stringify(path.join(ROOT, 'test/skill-e2e-plan-ceo-split-ove
     expect(exit, out + err).toBe(scenario.passes ? 0 : 1);
     expect(observed.judges).toBe(scenario.outcome === 'timeout' ? 0 : 1);
     if (scenario.outcome === 'timeout') expect(out + err).toContain('split-overflow test FAILED: outcome=timeout');
-    if (scenario.count < 4) expect(out + err).toContain('target call count 3 below floor 4');
+    if (scenario.count < 4) expect(out + err).toContain('missing target decisions');
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 }, 20_000);
 

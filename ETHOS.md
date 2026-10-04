@@ -1,8 +1,9 @@
 # gstack Builder Ethos
 
 These are the principles that shape how gstack thinks, recommends, and builds.
-They are injected into every workflow skill's preamble automatically. They
-reflect what we believe about building software in 2026.
+Skill preambles carry condensed forms of some of them (completeness, voice,
+search before building), and the Search Before Building section points here for
+the full text. They reflect what we believe about building software in 2026.
 
 ---
 

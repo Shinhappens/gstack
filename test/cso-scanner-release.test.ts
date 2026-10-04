@@ -118,9 +118,9 @@ describe('CSO scanner qualification workflow', () => {
     expect(anonymousStage.env.GH_TOKEN).toBe('${{ github.token }}');
     for(const value of ['--signer-workflow "$signer_workflow"','--signer-digest "$signer_digest"','--source-digest "$source_commit"','cso-attestation-evidence.ts digest','provenanceStatementDigest','sbomStatementDigest'])expect(raw).toContain(value);
     expect(raw).not.toContain('cso-scanner-staging');
-    const docker = fs.readFileSync(path.join(ROOT, 'lib/cso/docker.ts'), 'utf8');
+    const docker = fs.readFileSync(path.join(ROOT, 'lib/cso/docker.ts'), 'utf8').replace(/\s+/g, '');
     for (const flag of ["'--pull=never'", "'--read-only'", "'--cap-drop','ALL'", "'no-new-privileges:true'", "'seccomp=builtin'", "'--log-driver=none'", "'--network'"]) expect(docker).toContain(flag);
-    expect(docker).toContain("['rm','--force','--volumes',id]"); expect(docker).toContain('Pinned runtime image declares writable volumes');
+    expect(docker).toContain("['rm','--force','--volumes',id]"); expect(docker).toContain('Pinnedruntimeimagedeclareswritablevolumes');
     expect(raw).toContain('cso-scanner-catalog.ts assemble'); expect(raw).toContain('cso-scanner-catalog.ts validate-transition lib/cso/scanner-images/catalog.json promotion/catalog-proposal.json'); expect(raw).toContain('gh pr create --base main');
     expect(raw).toContain('branch="cso-scanner-catalog-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"'); expect(raw).not.toContain('branch="cso-scanner-catalog-$GITHUB_RUN_ID"');
     const publicPromotion = raw.indexOf('Recheck public visibility and anonymous pulls before promotion');

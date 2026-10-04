@@ -55,36 +55,34 @@ describe('empty find must not fall through to cwd (#2483)', () => {
     expect(out.trim()).toBe('');
   });
 
-  test('rendered Context Recovery uses the guarded form at both find sites', () => {
+  test('Context Recovery uses the guarded form at both find sites', () => {
+    // The listing moved from the rendered fence into bin/gstack-context-recovery
+    // (#2763); the render is one literal command with no find at all.
     const rendered = generateContextRecovery(makeCtx());
-    const bareSites = rendered.split('xargs ls -t').length - 1;
-    expect(bareSites).toBe(0);
-    const guardedSites = rendered.split('xargs -r ls -t').length - 1;
-    expect(guardedSites).toBe(2);
+    expect(rendered).not.toContain('xargs');
+    expect(rendered).toContain('gstack-context-recovery');
+    const script = fs.readFileSync(path.join(ROOT, 'bin', 'gstack-context-recovery'), 'utf-8');
+    expect(script.split('xargs ls -t').length - 1).toBe(0);
+    expect(script.split('xargs -r ls -t').length - 1).toBe(2);
   });
 
-  test('live block: empty checkpoints dir yields NO checkpoint, not a cwd file', () => {
-    const rendered = generateContextRecovery(makeCtx());
-    const m = rendered.match(/_LATEST_CP=\$\(.*\)/);
-    expect(m).not.toBeNull();
-    const line = m![0];
-
+  test('live helper: empty checkpoints dir yields NO checkpoint, not a cwd file', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-home-'));
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-cwd-'));
     try {
       // Fresh install shape: the checkpoints dir exists but is EMPTY,
       // and the cwd holds a decoy markdown file.
-      const proj = path.join(home, 'projects', 'unknown');
+      const proj = path.join(home, 'projects', 'decoy-proj');
       fs.mkdirSync(path.join(proj, 'checkpoints'), { recursive: true });
       fs.writeFileSync(path.join(cwd, 'DECOY.md'), '# not a checkpoint\n');
-
-      const script = `_PROJ="${proj}"\n${line.replace(/\$\{_PROJ\}|"\$_PROJ"/g, '"$_PROJ"')}\necho "LATEST_CP=[$_LATEST_CP]"`;
-      const out = execSync(`bash -c '${script.replace(/'/g, `'\\''`)}'`, {
+      const out = execSync(`"${path.join(ROOT, 'bin', 'gstack-context-recovery')}"`, {
         cwd,
         encoding: 'utf-8',
         timeout: 30_000,
+        env: { ...process.env, GSTACK_HOME: home, GSTACK_PROJECT_SLUG: 'decoy-proj' },
       });
-      expect(out).toContain('LATEST_CP=[]');
+      expect(out).toContain('--- RECENT ARTIFACTS ---');
+      expect(out).not.toContain('LATEST_CHECKPOINT');
       expect(out).not.toContain('DECOY.md');
     } finally {
       fs.rmSync(home, { recursive: true, force: true });

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import Anthropic from '@anthropic-ai/sdk';
-import { armJudge, callJudge, JudgeRefusalError } from './helpers/llm-judge';
+import { ARM_JUDGE_SCHEMA, armJudge, callJudge, JudgeRefusalError, judgeRecommendation, RECOMMENDATION_JUDGE_SCHEMA } from './helpers/llm-judge';
+import { gradeAuqRecommendation } from './helpers/auq-sdk-capture';
 
 describe('frontier Claude judge compatibility', () => {
   let originalKey: string | undefined;
@@ -106,7 +107,33 @@ describe('frontier Claude judge compatibility', () => {
     } as never);
     await expect(callJudge('score this', 'claude-fable-5-1', { max_tokens: 1024 }))
       .rejects.toThrow('Judge response truncated at max_tokens=1024');
-    expect(diagnostics).not.toHaveBeenCalled();
+    expect(diagnostics).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(diagnostics.mock.calls[0][0])).toMatchObject({ stopReason: 'max_tokens', textBlocks: ['{"score":4}'] });
+  });
+
+  test('retains public truncation evidence without accepting a score or exposing private blocks', async () => {
+    const text = '{"clarity":4,"completeness":4,"actionability":4,"reasoning":"Partial response"}';
+    create.mockResolvedValue({
+      id: 'msg_truncated', _request_id: 'req_truncated', model: 'claude-fable-5-1', stop_reason: 'max_tokens',
+      content: [
+        { type: 'thinking', thinking: 'PRIVATE_THINKING', signature: 'PRIVATE_SIGNATURE' },
+        { type: 'text', text },
+        { type: 'redacted_thinking', data: 'PRIVATE_REDACTED' },
+      ],
+      usage: { input_tokens: 1000, output_tokens: 8192, thinking: 'PRIVATE_USAGE' },
+    } as never);
+    await expect(callJudge('score the complete workflow', 'claude-fable-5-1'))
+      .rejects.toThrow('Judge response truncated at max_tokens=8192');
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0].max_tokens).toBe(8192);
+    expect(diagnostics).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(diagnostics.mock.calls[0][0])).toEqual({
+      type: 'llm-judge-response-parse-error', responseId: 'msg_truncated', requestId: 'req_truncated',
+      model: 'claude-fable-5-1', stopReason: 'max_tokens',
+      usage: { input_tokens: 1000, output_tokens: 8192, cache_creation_input_tokens: null, cache_read_input_tokens: null },
+      textBlocks: [text], error: { name: 'Error', message: 'Judge response truncated at max_tokens=8192 (model=claude-fable-5-1)' },
+    });
+    expect(diagnostics.mock.calls[0][0]).not.toContain('PRIVATE_');
   });
 
   test('keeps text-only responses and explicit model options working', async () => {
@@ -168,8 +195,37 @@ describe('frontier Claude judge compatibility', () => {
     }
   });
 
+  // Census 36641820398 slice 7: Haiku's free-form reply left inner quotes unescaped.
+  const CENSUS_UNESCAPED_REPLY = '```json\n{"reason_substance": 4, "reasoning": "The clause is concrete and option-specific ("at 1/10 every dimension has gaps and none are obviously safe to skip") but does not explicitly compare the chosen option (A) against alternatives B or C in the because-clause itself\u2014the comparison lives in the surrounding context, not in the reason block."}\n```';
+  const CENSUS_BRIEF = 'D1 \u2014 Review all 7 design dimensions?\nRecommendation: A because at 1/10 every dimension has gaps and none are obviously safe to skip.\nA) All 7 dimensions (recommended)';
+
+  test('recommendation judge requests structured output, so quoted evidence cannot break its JSON', async () => {
+    create.mockResolvedValue({ stop_reason: 'end_turn', content: [{ type: 'text',
+      text: JSON.stringify({ reason_substance: 4, reasoning: 'Concrete ("at 1/10 every dimension has gaps") but no comparison.' }) }] } as never);
+    const score = await judgeRecommendation(CENSUS_BRIEF);
+    expect(score.reason_substance).toBe(4);
+    expect(score.reason_text).toBe('at 1/10 every dimension has gaps and none are obviously safe to skip.');
+    expect(create.mock.calls[0][0].output_config).toEqual({ format: { type: 'json_schema', schema: RECOMMENDATION_JUDGE_SCHEMA } });
+    expect(create.mock.calls[0][0].model).toBe('claude-haiku-4-5-20251001');
+  });
+
+  test('the captured unescaped reply is unparseable free-form text and fails without a score', async () => {
+    create.mockResolvedValue({ stop_reason: 'end_turn', content: [{ type: 'text', text: CENSUS_UNESCAPED_REPLY }] } as never);
+    await expect(callJudge('score this', 'claude-haiku-4-5-20251001')).rejects.toThrow(SyntaxError);
+    create.mockClear();
+    create.mockResolvedValue({ stop_reason: 'end_turn', content: [{ type: 'text', text: CENSUS_UNESCAPED_REPLY }] } as never);
+    await expect(gradeAuqRecommendation(CENSUS_BRIEF)).rejects.toThrow(SyntaxError);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  test('a weak structured score still fails the substance bar', async () => {
+    create.mockResolvedValue({ stop_reason: 'end_turn', content: [{ type: 'text',
+      text: JSON.stringify({ reason_substance: 1, reasoning: 'Boilerplate.' }) }] } as never);
+    expect((await gradeAuqRecommendation('Recommendation: A because it is better.')).substance).toBe(1);
+  });
+
   test('arm judge sends no unsupported temperature to Fable', async () => {
-    create.mockResolvedValue({ content: [
+    create.mockResolvedValue({ stop_reason: 'end_turn', content: [
       { type: 'thinking', thinking: '', signature: 'fixture' },
       { type: 'text', text: '{"over_engineering":0,"construct":"none","reasoning":"Scoped change"}' },
     ] } as never);
@@ -177,5 +233,6 @@ describe('frontier Claude judge compatibility', () => {
     const request = create.mock.calls[0][0];
     expect(request.model).toBe('claude-fable-5-1');
     expect(request).not.toHaveProperty('temperature');
+    expect(request.output_config).toEqual({ format: { type: 'json_schema', schema: ARM_JUDGE_SCHEMA } });
   });
 });

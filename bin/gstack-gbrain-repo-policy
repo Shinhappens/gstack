@@ -50,12 +50,22 @@
 #   migration actually changes anything. Idempotent: running twice is safe.
 #
 # Env:
-#   GSTACK_HOME — override ~/.gstack state directory (aligns with other
-#                 gstack-* bins; used heavily in tests).
+#   GSTACK_HOME — override the state root (the shared chain in
+#                 bin/gstack-state-root.sh; used heavily in tests).
+#
+# Deny tiers merge across state roots: when the resolved root is not
+# ~/.gstack, `get` also reads ~/.gstack/gbrain-repo-policy.json and returns
+# its deny or read-only tier when that is more restrictive. Nothing is written
+# there. Docs: https://github.com/garrytan/gstack/blob/main/docs/state-root.md
 set -euo pipefail
 
-STATE_DIR="${GSTACK_HOME:-$HOME/.gstack}"
+. "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select
+STATE_DIR="$_gstack_sr_root"
 POLICY_FILE="$STATE_DIR/gbrain-repo-policy.json"
+gstack_legacy_root_select
+LEGACY_POLICY_FILE=""
+[ -n "$_gstack_legacy_root" ] && [ -f "$_gstack_legacy_root/gbrain-repo-policy.json" ] && LEGACY_POLICY_FILE="$_gstack_legacy_root/gbrain-repo-policy.json"
 SCHEMA_VERSION=2
 
 die() { echo "gstack-gbrain-repo-policy: $*" >&2; exit 2; }
@@ -177,6 +187,23 @@ ensure_file() {
   fi
 }
 
+_tier_rank() {
+  case "$1" in deny) echo 0 ;; read-only) echo 1 ;; read-write) echo 2 ;; *) echo 3 ;; esac
+}
+
+# merge_legacy_tier KEY TIER — TIER, or the other root's deny/read-only tier
+# when that is more restrictive. Never more permissive than TIER.
+merge_legacy_tier() {
+  local key="$1" tier="$2" other
+  if [ -z "$LEGACY_POLICY_FILE" ]; then printf '%s\n' "$tier"; return 0; fi
+  other=$(jq -r --arg key "$key" '.[$key] // "none"' "$LEGACY_POLICY_FILE" 2>/dev/null) || other="none"
+  case "$other" in
+    deny|read-only)
+      if [ "$(_tier_rank "$other")" -lt "$(_tier_rank "$tier")" ]; then tier="$other"; fi ;;
+  esac
+  printf '%s\n' "$tier"
+}
+
 # get --batch — bulk lookup for ingest gates. One URL per stdin line, one
 # tier per stdout line, input order preserved. Reuses normalize() (the same
 # code path single `get` uses) per line. Prints `none` where single `get`
@@ -190,6 +217,18 @@ ensure_file() {
 # fails hard (exit 2) instead and names the recovery path.
 cmd_get_batch() {
   require_jq
+  if [ -n "$LEGACY_POLICY_FILE" ] && ! jq empty "$LEGACY_POLICY_FILE" 2>/dev/null; then
+    die "policy store $LEGACY_POLICY_FILE is corrupt (invalid JSON) — refusing batch read. Inspect or remove it; its deny tiers apply to every state root."
+  fi
+  if [ ! -f "$POLICY_FILE" ] && [ -n "$LEGACY_POLICY_FILE" ]; then
+    local url key
+    while IFS= read -r url || [ -n "$url" ]; do
+      key=$(normalize "$url")
+      if [ -z "$key" ]; then printf 'none\n'; continue; fi
+      merge_legacy_tier "$key" none
+    done
+    return 0
+  fi
   if [ ! -f "$POLICY_FILE" ]; then
     # No store = no policy was ever set. Every URL is `none`; don't create
     # the file just for a read (matches cmd_list).
@@ -211,7 +250,7 @@ cmd_get_batch() {
       printf 'none\n'
       continue
     fi
-    jq -r --arg key "$key" '.[$key] // "none"' "$POLICY_FILE"
+    merge_legacy_tier "$key" "$(jq -r --arg key "$key" '.[$key] // "none"' "$POLICY_FILE")"
   done
 }
 
@@ -235,7 +274,13 @@ cmd_get() {
     return 0
   fi
   ensure_file
-  jq -r --arg key "$key" '.[$key] // "unset"' "$POLICY_FILE"
+  local tier
+  tier=$(jq -r --arg key "$key" '.[$key] // "unset"' "$POLICY_FILE")
+  if [ -n "$LEGACY_POLICY_FILE" ] && ! jq empty "$LEGACY_POLICY_FILE" 2>/dev/null; then
+    echo "gstack-gbrain-repo-policy: ignoring corrupt $LEGACY_POLICY_FILE (inspect or remove it)" >&2
+    LEGACY_POLICY_FILE=""
+  fi
+  merge_legacy_tier "$key" "$tier"
 }
 
 cmd_set() {

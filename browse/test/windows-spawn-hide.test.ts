@@ -66,6 +66,12 @@ describe('windowsHide on Windows-reachable spawns (#1835)', () => {
     expectHideNearEvery(SRC('terminal-agent-control.ts'), '(Bun as any).spawn(', 700);
   });
 
+  test('terminal-agent spawn is detached on Windows so it outlives the CLI that started it (#2637)', () => {
+    const control = SRC('terminal-agent-control.ts');
+    const at = control.indexOf('(Bun as any).spawn(');
+    expect(control.slice(at, at + 1000)).toContain("detached: process.platform === 'win32'");
+  });
+
   test('SWEEP: every direct child_process call in src/ passes windowsHide (#2160, #2415)', () => {
     // Full-census tripwire: a NEW child_process call site without windowsHide
     // fails CI. Each exemption carries a reason — an interactive console

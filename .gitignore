@@ -32,6 +32,7 @@ lib/cso/images/gstack-cso-preparation
 .opencode/
 .slate/
 .cursor/
+.copilot/
 .openclaw/
 .hermes/
 .gbrain/
@@ -59,6 +60,6 @@ docs/throughput-*.json
 .sources/
 
 # SPM build output from the gen-accessors tool (built in place by
-# skill-e2e-ios-swift-build; regenerates on every run — never commit)
+# test/ios-qa-swift-build.test.ts; regenerates on every run — never commit)
 ios-qa/scripts/gen-accessors-tool/.build/
 ios-qa/scripts/gen-accessors-tool/Package.resolved

@@ -11,9 +11,9 @@ const ROOT = path.resolve(import.meta.dir, '..');
 const source = fs.readFileSync(path.join(ROOT, 'test/skill-e2e-design.test.ts'), 'utf8');
 const id = 'plan-design-review-plan-mode';
 
-// Same source-evaluation pattern as plan-tune-cathedral-fixture.test.ts: run
-// the real suite registration and selected callback, without importing paid
-// initialization. All filesystem mutations stay in this standalone fixture.
+// Source-evaluation pattern: run the real suite registration and selected
+// callback, without importing paid initialization. All filesystem mutations
+// stay in this standalone fixture.
 async function exercise(mode: 'success' | 'max-turns' | 'first-timeout' | 'second-timeout' | 'saved-timeout' | 'empty-summary' | 'write-failure' | 'unchanged-seed' | 'no-additions' | 'short-plan' | 'api-error' | 'plan-read-failure' | 'attempt-deadline') {
   const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-design-free-')));
   const home = path.join(scratch, 'home'); fs.mkdirSync(home);
@@ -87,33 +87,18 @@ async function exercise(mode: 'success' | 'max-turns' | 'first-timeout' | 'secon
       expect(opts.publicStreamDiagnostics).toBe(true);
       expect(opts.signal).toBeInstanceOf(AbortSignal); sdkSignal = opts.signal;
       expect(opts.signal.aborted).toBe(false);
-      // Bind the complete actual compact-delivery prompt, not selected snippets.
-      expect(new Bun.CryptoHasher('sha256').update(opts.prompt).digest('hex'))
-        .toBe('2fa957ab9d56850a1629a845d6fe0ee5a1cb7c0843ab6555b621971d270604cb');
       expect(opts.testName).toBe(id); expect(opts.maxTurns).toBe(15); expect(opts.timeout).toBe(CAPTURE_MS);
       for (const key of ['model', 'tools', 'allowedTools', 'appendSystemPrompt', 'env']) expect(opts).not.toHaveProperty(key);
-      expect(opts.prompt).toContain('Review the plan in ./plan.md');
-      expect(opts.prompt).toContain('Review all 7 design passes');
-      expect(opts.prompt).toContain('0-10 and explain what would make it a 10');
-      expect(opts.prompt).toContain('preserve the unresolved-decisions pass');
-      expect(opts.prompt).toContain('interaction state table, empty states, responsive behavior');
-      expect(opts.prompt).toContain('full required review report');
-      expect(opts.prompt).toContain('Write before publishing a completed walkthrough');
-      expect(opts.prompt).toContain('Read plan.md back to verify the saved changes');
-      expect(opts.prompt).toContain('Then return a brief, concrete summary');
-      expect(opts.prompt).toContain('execute every required pass and lazy-section Read');
-      expect(opts.prompt).toContain('Retain all required report fields, design decisions, diagrams, ratings, and explanations');
-      expect(opts.prompt).toContain('use the canonical tables and decision IDs');
-      expect(opts.prompt).toContain('Specify each design requirement once');
-      expect(opts.prompt).toContain('instead of repeating that specification');
-      expect(opts.prompt).toContain('concise score rationales and 10/10 explanations');
+      // The harness prompt's properties, in order; its wording is free.
+      expect(opts.prompt).toContain('plan-design-review/SKILL.md');
+      expect(opts.prompt).toContain('plan-design-review/sections/review-sections.md');
+      expect(opts.prompt).toContain('./plan.md');
       const ordered = ['Read every lazy section', 'Review all 7 design passes',
-        'EDIT plan.md', 'Keep the saved review compact',
-        'Persist that complete plan and review with Write', 'Read plan.md back',
+        'EDIT plan.md', 'Persist that complete plan and review with Write', 'Read plan.md back',
         'Then return a brief, concrete summary'].map(text => opts.prompt.indexOf(text));
       expect(ordered.every(index => index >= 0)).toBe(true);
       expect(ordered).toEqual([...ordered].sort((a, b) => a - b));
-      expect(opts.prompt).toContain('Do NOT try to browse any URLs');
+      expect(opts.prompt).toMatch(/do not try to browse any URLs/i);
       inputVerified = true; launched = true;
       if (mode === 'attempt-deadline') return await new Promise((_resolve, reject) => {
         opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true });

@@ -1,7 +1,7 @@
 import type { Page } from 'playwright';
 import {
-  CookieImportError, cookieDomainMatches, importCookies, importCookiesViaCdp,
-  listDomains, listProfiles, normalizeCookieDomain, withCookieReadRetry,
+  CookieImportError, assertCookieDatabase, cookieDomainMatches, importCookies, importCookiesViaCdp,
+  listDomains, listProfiles, normalizeCookieDomain, resolveBrowserInfo, withCookieReadRetry,
   type ProfileEntry,
 } from './cookie-import-browser';
 import { clearCookieTargetStorage, validateCookieAuthOptions, validateCookieStorageSupport, verifyCookieAuthentication, type CookieAuthVerificationOptions } from './cookie-auth-verification';
@@ -78,6 +78,36 @@ export async function getCookieProfiles(browser: string, domains: string[] = [],
   return { profiles, recommendedProfile };
 }
 
+type ProfileSuggestion = Array<ProfileEntry & { matches?: boolean; unavailable?: boolean }>;
+
+function profileSelectionError(browser: string, profiles: ProfileSuggestion, domains: string[]): CookieImportError {
+  const { name, aliases } = resolveBrowserInfo(browser);
+  if (!profiles.length) {
+    assertCookieDatabase(browser, 'Default');
+    return new CookieImportError(`${name} profiles changed while selecting. Retry with --profile "<dir>", or run \`$B cookie-import-browser ${aliases[0]}\` to choose in the picker.`, 'profile_required');
+  }
+  const retry = `Retry with --profile "<dir>", or run \`$B cookie-import-browser ${aliases[0]}\` to choose in the picker.`;
+  const list = (entries: ProfileSuggestion) => entries.map(entry => entry.name).join(', ');
+  const unreadable = profiles.filter(entry => entry.unavailable);
+  const matching = profiles.filter(entry => entry.matches === true);
+  const scope = domains.join(', ');
+  if (unreadable.length) {
+    const found = matching.length ? ` Profiles with cookies for ${scope}: ${list(matching)}.` : '';
+    return new CookieImportError(`${name} profiles ${list(unreadable)} could not be read (the browser may be locking them). Close ${name} and retry, or pass --profile.${found}`, 'profile_required');
+  }
+  if (!domains.length) return new CookieImportError(`${name} has several profiles: ${list(profiles)}. ${retry}`, 'profile_required');
+  if (matching.length > 1) return new CookieImportError(`${name} has several profiles with cookies for ${scope}: ${list(matching)}. ${retry}`, 'profile_required');
+  return new CookieImportError(`No ${name} profile has cookies for ${scope}. Check the domain and that you are signed in to it in ${name}.`, 'profile_required');
+}
+
+function appBoundMessage(browser: string, result: { count: number; failureReasons?: Record<string, number> }): string {
+  const { name } = resolveBrowserInfo(browser);
+  const recovery = 'Sign in manually: run `$B handoff`, sign in to the intended account in the window that opens, then run `$B resume` (needs a display). See BROWSER.md, Platform limits.';
+  if (result.count) return `Some ${name} cookies use App-Bound Encryption and were skipped, so the session may not be restored. Check with \`$B reload\` (or --verify-auth); if you are signed out, run \`$B handoff\`, sign in, then \`$B resume\`.`;
+  if (result.failureReasons?.decryption_failed) return `${name} cookies could not be imported: some use App-Bound Encryption and others could not be decrypted. ${recovery}`;
+  return `Some selected ${name} cookies use App-Bound Encryption, which gstack cannot decrypt for this browser. ${recovery}`;
+}
+
 export function validateCookieTarget(target: CookieImportTarget): URL {
   try {
     const url = new URL(target.url);
@@ -119,13 +149,15 @@ export async function runCookieImport(
     if (!profile) {
       const suggestion = await getCookieProfiles(options.browser, selected);
       profile = suggestion.recommendedProfile;
-      if (!profile) throw new CookieImportError('Choose a source profile explicitly; matching profiles are ambiguous, unavailable, or empty.', 'profile_required');
+      if (!profile) throw profileSelectionError(options.browser, suggestion.profiles, selected);
     }
     const domains = options.all
       ? (await withCookieReadRetry(() => listDomains(options.browser, profile!))).domains.map(entry => entry.domain)
       : selected;
     let result = await withCookieReadRetry(() => importCookies(options.browser, domains, profile));
-    if (result.count === 0 && result.failureReasons?.unsupported_encryption && process.platform === 'win32') {
+    const appBound = process.platform === 'win32' && result.failureReasons?.unsupported_encryption && !resolveBrowserInfo(options.browser).windowsNative
+      ? appBoundMessage(options.browser, result) : undefined;
+    if (!appBound && result.count === 0 && result.failureReasons?.unsupported_encryption && process.platform === 'win32') {
       const failed = result.failed;
       result = await importCookiesViaCdp(options.browser, domains, profile);
       result.failed = Math.max(result.failed, failed - result.count);
@@ -141,7 +173,7 @@ export async function runCookieImport(
       outcome: (result.failed ? 'failed' : 'empty') as 'empty' | 'imported' | 'partial' | 'failed',
       reset: 'not_requested' as 'not_requested' | 'cleared' | 'failed',
       verification: { verified: false, reason: 'not_requested' } as { verified: boolean; reason: string; status?: number },
-      message: result.failed ? 'No cookies imported; cookies could not be decrypted.' : 'No matching cookies found.',
+      message: appBound ?? (result.failed ? 'No cookies imported; cookies could not be decrypted.' : 'No matching cookies found.'),
     };
     if (!result.count) {
       if (options.verifyAuth) receipt.verification.reason = 'no_cookies_imported';
@@ -178,7 +210,7 @@ export async function runCookieImport(
     receipt.imported = result.count;
     receipt.domainCounts = result.domainCounts;
     receipt.outcome = result.failed ? 'partial' : 'imported';
-    receipt.message = result.failed ? 'Some cookies could not be decrypted.' : 'Cookie copy complete.';
+    receipt.message = appBound ?? (result.failed ? 'Some cookies could not be decrypted.' : 'Cookie copy complete.');
     if (options.verifyAuth) {
       try {
         validateCookieTarget(target);
@@ -194,5 +226,7 @@ export async function runCookieImport(
 }
 
 export function formatCookieImportResult(result: Awaited<ReturnType<typeof runCookieImport>>): string {
-  return `Imported ${result.imported} cookies from ${result.browser} (profile: ${result.profile}); ${result.failed} failed to decrypt. ${result.message} Storage reset: ${result.reset}. Authentication: ${result.verification.reason}.`;
+  const reasons = Object.entries(result.failureReasons).sort(([a], [b]) => a.localeCompare(b)).map(([key, count]) => `${key}=${count}`);
+  const reasonText = reasons.length ? ` Failure reasons: ${reasons.join(', ')}.` : '';
+  return `Imported ${result.imported} cookies from ${result.browser} (profile: ${result.profile}); ${result.failed} failed to decrypt. ${result.message}${reasonText} Storage reset: ${result.reset}. Authentication: ${result.verification.reason}.`;
 }

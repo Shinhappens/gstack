@@ -15,9 +15,7 @@
 //     token cost. Same rationale as test/setup-gbrain-path4-structure.test.ts.
 //   - The correct invocation form and the stale one differ only by
 //     `bun run ` + `.ts`, right next to each other in the same files —
-//     exactly the kind of drift a cheap structural check exists to catch,
-//     matching this repo's convention (e.g. test/memory-ingest-no-put_page.test.ts
-//     pinning fix #1346).
+//     exactly the kind of drift a cheap structural check exists to catch.
 
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
@@ -76,10 +74,8 @@ describe('setup-gbrain templates (skeleton + sections) — bin invocation paths'
     );
   });
 
-  test('the silent-bulk mention uses bun run + .ts (R2, transcript-gate section)', () => {
-    expect(transcriptGate).toContain(
-      'bun run ~/.claude/skills/gstack/bin/gstack-memory-ingest.ts --bulk --quiet'
-    );
+  test('the gate never bulk-ingests before the user answers (transcript-gate section)', () => {
+    expect(transcriptGate).not.toMatch(/gstack-memory-ingest\.ts --bulk/);
   });
 
   test('the post-answer full-sync step uses bun run + .ts (R3, transcript-gate section)', () => {
@@ -88,21 +84,28 @@ describe('setup-gbrain templates (skeleton + sections) — bin invocation paths'
     );
   });
 
-  test('the preamble-hook incremental-sync mention uses bun run + .ts (R4, transcript-gate section)', () => {
-    expect(transcriptGate).toContain(
-      'bun run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts --incremental --quiet'
-    );
+  test('no skill-start hook is claimed to ingest transcripts; /sync-gbrain is named (transcript-gate section)', () => {
+    expect(transcriptGate).not.toMatch(/every skill\s+start/i);
+    expect(transcriptGate).toContain('/sync-gbrain');
   });
 
-  test('the neighboring gstack-config line in the post-answer block is untouched (bash script, no extension)', () => {
-    expect(transcriptGate).toContain(
-      '~/.claude/skills/gstack/bin/gstack-config set transcript_ingest_mode <choice>'
-    );
+  test('the post-answer gstack-config line stores a mode value, not the answer letter (bash script, no extension)', () => {
+    expect(transcriptGate).toContain('~/.claude/skills/gstack/bin/gstack-config set transcript_ingest_mode');
+    expect(transcriptGate).not.toContain('transcript_ingest_mode <choice>');
   });
+});
 
-  test('the prose-only mention naming the tool as a sentence subject is left unchanged (KTD4 — not a literal invocation; Step 10 verdict, skeleton)', () => {
-    expect(tmpl).toContain('gstack-memory-ingest now persists staged transcripts to');
-  });
+describe('transcript consent question is gated on `gstack-config has`', () => {
+  const syncTmpl = fs.readFileSync(path.join(ROOT, 'sync-gbrain', 'SKILL.md.tmpl'), 'utf-8');
+  for (const [name, text] of [['setup-gbrain transcript gate', transcriptGate], ['sync-gbrain', syncTmpl]] as const) {
+    test(`${name} checks presence with has before asking, and never asks spawned or headless sessions`, () => {
+      const hasAt = text.indexOf('gstack-config has transcript_ingest_mode');
+      expect(hasAt).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf('AskUserQuestion', hasAt)).toBeGreaterThan(hasAt);
+      for (const v of ['recent', 'all', 'off']) expect(text).toContain(`\`${v}\``);
+      expect(text).toMatch(/spawned[\s\S]{0,40}headless[\s\S]{0,80}do not ask/i);
+    });
+  }
 });
 
 describe('setup-gbrain/memory.md — bin invocation paths', () => {

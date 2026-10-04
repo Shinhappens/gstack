@@ -4,20 +4,23 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { sharedLibsFingerprint } from '../lib/review-evidence';
-import { hasTrustedReviewStartRead } from './helpers/shared-libs-review-start-evidence';
+import { hasTrustedReviewStartRead, hasTrustedSharedLibsCheck } from './helpers/shared-libs-review-start-evidence';
 import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { describeE2ETier, e2eTierEnabled } from './helpers/e2e-gate';
 import { EvalCollector } from './helpers/eval-store';
 import {
   addBranchAndRawOverlay, createSharedLibsFixture, fixtureGit, fixtureWrite, fixtureWorkingTree,
   installHostileGitConfig, installInterpreterCanary, installNormalizingFilter,
-  isInternalClaudeGitRequest,
+  isGuardedGitRequest, isInternalClaudeGitRequest,
   installSourceShims, readRequests, reviewLifecycleInstructions, reviewPrompt, reviewRevalidationPrompt,
-  reviewRecords, runSharedCapture, runSharedInteractive, seedOpportunitySources,
+  reviewRecords, runSharedCapture, runSharedInteractive, seedLifecycleFirstPass, seedOpportunitySources,
   seedReviewSources, seedSkippedAdvisory, snapshotFixture, specialistFixture,
-  sharedReadOnlyViolations, standaloneInstructions, toolCommandTrace, type SharedLibsFixture,
-  SharedCaptureAccumulator, type SharedCaptureAttempt,
+  sharedReadOnlyViolations, loadedInstructions, standaloneInstructions, toolCommandTrace, type SharedLibsFixture,
+  SharedCaptureAccumulator, type SharedCaptureAttempt, SHARED_LIBS_ROOT,
 } from './helpers/shared-libs-eval-fixture';
+import {
+  seedPathReviewPrerequisites, checkPathReviewPrerequisites, hasPathReviewPrerequisiteReceipt, createLifecyclePrerequisiteActor,
+} from './helpers/shared-libs-path-fixture';
 
 const describeE2E = describeE2ETier('gate');
 const collector = e2eTierEnabled('gate') ? new EvalCollector('e2e') : null;
@@ -42,7 +45,9 @@ async function recordCapture(attempt: SharedCaptureAttempt, scenario: string, na
       duration_ms: result?.duration ?? result?.durationMs ?? 0,
       cost_usd: result?.costEstimate?.estimatedCost ?? result?.costUsd ?? 0,
       model: result?.model, turns_used: result?.costEstimate?.turnsUsed ?? result?.turnsUsed ?? 0,
-      transcript: [...(result?.transcript ?? result?.events ?? []), { fixture_requests: result?.providerRequests ?? [] }], output: result?.output ?? '',
+      transcript: [...(result?.transcript ?? result?.events ?? []), { fixture_requests: result?.providerRequests ?? [],
+        ...(result?.fixtureStageReceipts ? { prerequisite_receipts: result.fixtureStageReceipts } : {}),
+        ...(result?.fixturePrerequisiteSource ? { prerequisite_source: result.fixturePrerequisiteSource, prerequisite_native_coverage: false } : {}) }], output: result?.output ?? '',
       error: [failure ? String(failure) : '', result?.costKnown === false
         ? 'No terminal billing event; actual cost is unknown. Raw usage is retained in the transcript.' : ''].filter(Boolean).join('\n') || undefined,
       exit_reason: result?.exitReason ?? 'capture_threw' });
@@ -83,9 +88,8 @@ function assertReadOnly(f: SharedLibsFixture, before: Record<string, string>, re
     expect(request.args).not.toContain('add');
     expect(request.args).not.toContain('write-tree');
     expect(request.args).not.toContain('hash-object');
-    expect(request.args).toContain('--no-lazy-fetch');
-    expect(request.args).toContain('core.fsmonitor=false');
-    expect(request.args).toContain('log.showSignature=false');
+    // Every repository read carries the complete gstack-safe-git prefix, environment included.
+    expect(isGuardedGitRequest(request), JSON.stringify(request)).toBe(true);
   }
   for (const request of requests.filter(row => row.tool === 'gh' && row.args[0] === 'api')) {
     expect(request.method).toBe('GET');
@@ -104,7 +108,7 @@ describeE2E('Shared-code safety and review lifecycle (gate)', () => {
       const instructions = standaloneInstructions(f);
       const before = snapshotFixture(f.root);
       await recordCapture(attempt, 'audit', 'shared-libs-read-only', () => runSharedCapture(f, 'shared-libs-read-only',
-        `Run /deslop-shared-libs for this repository using ${instructions}. Include relevant uncommitted source in your audit. Return the skill's report in conversation.`), result => {
+        `Run /deslop-shared-libs for this repository. Include relevant uncommitted source in your audit. Return the skill's report in conversation.${loadedInstructions(instructions)}`, attempt), result => {
         assertReadOnly(f, before, result);
         expect(result.output).toMatch(/uncommitted|overlay|raw/i);
         expect(result.output).toContain(f.tip.slice(0, 7));
@@ -127,7 +131,7 @@ describeE2E('Shared-code safety and review lifecycle (gate)', () => {
       const instructions = standaloneInstructions(f);
       const before = snapshotFixture(f.root);
       await recordCapture(attempt, 'audit', 'shared-libs-unsupported-git', () => runSharedCapture(f, 'shared-libs-unsupported-git',
-        `Run /deslop-shared-libs for this repository using ${instructions}. Return the review report.`), result => {
+        `Run /deslop-shared-libs for this repository. Return the review report.${loadedInstructions(instructions)}`, attempt), result => {
         assertReadOnly(f, before, result);
         expect(result.output).toMatch(/unavailable|unsupported|cannot|could not|coverage|limited/i);
         const calls = readRequests(f).filter(row => row.tool === 'git' && !isInternalClaudeGitRequest(row, toolCommandTrace(result)));
@@ -150,12 +154,15 @@ describeE2E('Shared-code safety and review lifecycle (gate)', () => {
         seedReviewSources(f);
         const instructions = reviewLifecycleInstructions(f);
         const input = specialistFixture(f);
+        const stageActor = createLifecyclePrerequisiteActor(f);
+        const seed = seedLifecycleFirstPass(f);
         let questions: any[] = [];
         await recordCapture(attempt, choose, 'shared-libs-review-lifecycle', async () => {
-          const capture = await runSharedInteractive(f, 'shared-libs-review-lifecycle', reviewPrompt(f, instructions, input), choose);
+          const capture = await runSharedInteractive(f, 'shared-libs-review-lifecycle', reviewPrompt(f, instructions, input, stageActor, seed), choose, { stageActor, attempt });
           questions = capture.questions;
           return capture.result;
         }, result => {
+          expect(stageActor.verify(result.events ?? []), 'consume a current invoked synthetic stage result before final persistence').toBe(true);
           expect(questions.length).toBeGreaterThan(0);
           const worker = fs.readFileSync(path.join(f.repo, 'src/retry-worker.ts'), 'utf8');
           expect(worker).not.toContain('unusedRetryDiagnostic');
@@ -168,6 +175,11 @@ describeE2E('Shared-code safety and review lifecycle (gate)', () => {
             completed: true, converged: true });
           expect(last.review_binding.state).toBe('verified');
           expect(last.review_binding.branch_id).toBe(createHash('sha256').update('feature/a').digest('hex'));
+          // The seeded pass-1 token stays unused; the model's own post-edit start binds the final record.
+          expect(last.review_binding.started_at).not.toBe(seed.startedAt);
+          expect(last.review_binding.start_wtree).not.toBe(seed.startWtree);
+          expect(result.toolCalls.some((call: any) => call.tool === 'Read' && call.input?.file_path === seed.observation)
+            || toolCommandTrace(result).some(command => command.includes(seed.observation))).toBe(true);
           // Earlier cycles cannot stand in for the final zero-edit record. Both
           // the explicit choice and its original identity must survive there.
           const findings = last.findings || [];
@@ -219,12 +231,17 @@ describeE2E('Shared-code safety and review lifecycle (gate)', () => {
         const input = path.join(f.root, 'current-advisory.jsonl');
         const { action: _priorAction, ...current } = prior;
         fs.writeFileSync(input, JSON.stringify({ ...current, specialist: 'maintainability' }) + '\n');
+        const resumed = seedPathReviewPrerequisites(f);
+        const prerequisites = checkPathReviewPrerequisites(f, resumed.input);
+        expect(prerequisites.settled).toBe(true);
         let questions: any[] = [];
         await recordCapture(attempt, change, 'shared-libs-review-revalidation', async () => {
-          const capture = await runSharedInteractive(f, 'shared-libs-review-revalidation', reviewRevalidationPrompt(f, instructions, input), 'skip');
+          const capture = await runSharedInteractive(f, 'shared-libs-review-revalidation', reviewRevalidationPrompt(f, instructions, input, resumed), 'skip', { attempt, prerequisiteSource: 'synthetic-fixture-input' });
           questions = capture.questions;
           return capture.result;
         }, result => {
+          expect(checkPathReviewPrerequisites(f, resumed.input)).toEqual(prerequisites);
+          expect(hasPathReviewPrerequisiteReceipt(result.events ?? [], resumed.checkCommand, prerequisites)).toBe(true);
           if (change === 'unchanged') expect(questions.length).toBe(0);
           else expect(questions.length).toBeGreaterThan(0);
           const trace = toolCommandTrace(result).join('\n');
@@ -235,7 +252,19 @@ describeE2E('Shared-code safety and review lifecycle (gate)', () => {
           const rows = reviewRecords(f).filter(row => row.skill === 'review');
           expect(rows.length).toBeGreaterThanOrEqual(2);
           const last = rows.at(-1);
-          if (change === 'unchanged' || change === 'filtered') {
+          if (trace.includes('--check-shared-libs')) {
+            expect(last).toMatchObject({ completed: true, converged: true, review_binding: { state: 'verified' } });
+            expect(hasTrustedSharedLibsCheck(result.events ?? result.transcript ?? [], {
+              helper: path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log'),
+              repo: f.repo, directory: path.join(f.state, 'projects/fixture-shared-libs/.review-starts'),
+              state: f.state, slug: 'fixture-shared-libs',
+              branch: fixtureGit(f, 'symbolic-ref', '--quiet', '--short', 'HEAD'), wtree: fixtureWorkingTree(f),
+              startedAt: last.review_binding.started_at, finding: current, reusable: change === 'unchanged',
+              coveredPaths: change === 'unchanged' ? current.evidence_paths
+                : last.findings.find((finding: any) => finding.advisory && finding.action === 'skipped'
+                  && finding.fingerprint === current.fingerprint)?.snapshot_covered_paths,
+            })).toBe(true);
+          } else if (change === 'unchanged' || change === 'filtered') {
             // A true hash comparison cannot substitute for the trusted capture and path checks.
             expect(hasTrustedReviewStartRead(result.events ?? result.transcript ?? [], {
               repo: f.repo, directory: path.join(f.state, 'projects/fixture-shared-libs/.review-starts'),
@@ -245,8 +274,8 @@ describeE2E('Shared-code safety and review lifecycle (gate)', () => {
             })).toBe(true);
             expect(trace).toContain('check-attr');
             expect(trace).toMatch(/ls-files[^\n]*(?:--stage|-s\b)|lstat|stat\s|test\s+-L|\[\s+-L/);
+            if (change === 'unchanged') expect(trace).toContain('canReuseSharedLibsAdvisory');
           }
-          if (change === 'unchanged') expect(trace).toContain('canReuseSharedLibsAdvisory');
           expect(last.review_binding.branch_id).toBe(createHash('sha256').update(change === 'branch' ? 'feature-a' : 'feature/a').digest('hex'));
           if (change === 'unchanged') {
             expect((last.findings || []).some((finding: any) => finding.advisory)).toBe(false);

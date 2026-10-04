@@ -5,8 +5,6 @@ import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readPlanFloorTarget } from './helpers/plan-floor-target';
 import { createFakeBunCli } from './helpers/fake-bun-cli';
-import { selectTests, E2E_TOUCHFILES } from './helpers/touchfiles';
-
 const ROOT = path.resolve(import.meta.dir, '..');
 const SID = '11111111-2222-3333-4444-555555555555';
 const START = Date.parse('2026-09-10T04:46:45Z');
@@ -80,13 +78,6 @@ test('changed or linked plan, invalid clock, linked journal and oversized source
     fs.unlinkSync(f.journal); fs.renameSync(real, f.journal); fs.truncateSync(f.journal, 32 * 1024 * 1024 + 1); expect(f.check().status).toBe('error');
   } finally { f.cleanup(); }
 });
-
-test('new delivery helper and controls select all four existing floor owners', () => {
-  for (const file of ['test/helpers/plan-floor-target.ts', 'test/plan-floor-target.test.ts']) {
-    expect(selectTests([file], E2E_TOUCHFILES).selected.sort()).toEqual(['plan-ceo-finding-floor', 'plan-design-finding-floor', 'plan-devex-finding-floor', 'plan-eng-finding-floor']);
-  }
-});
-
 test('compiled fake CLI preserves Claude arguments and stdin without a shebang launcher', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-floor-cli-'));
   try {

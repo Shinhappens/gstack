@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { gbrainInvocation, buildGbrainEnv } from '../lib/gbrain-exec';
 import { parseSourcesList } from '../lib/gbrain-sources';
+import { resolveStateRoot } from '../lib/state-root';
 
 type Verdict = { status: 'ready' | 'unknown' | 'skipped' | 'source'; reason: string; source_id?: string; page_count?: number };
 
@@ -20,7 +20,7 @@ function readCapability(): Verdict {
   try {
     root = realpathSync(repo.stdout.trim());
     const pinPath = join(root, '.gbrain-source');
-    const statePath = join(process.env.GSTACK_HOME || join(homedir(), '.gstack'), '.gbrain-sync-state.json');
+    const statePath = join(resolveStateRoot(), '.gbrain-sync-state.json');
     if (statSync(pinPath).size > 512 || statSync(statePath).size > 64 * 1024)
       return unknown('sync state or source pin exceeds the read limit');
     pin = readFileSync(pinPath, 'utf8').trim();

@@ -1,9 +1,11 @@
 /** Public start/read/finish subsequences, not retrospective passing lifecycle evidence. */
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { hasTrustedReviewStartRead } from './helpers/shared-libs-review-start-evidence';
+import { createSharedLibsFixture, fixtureGit, fixtureWorkingTree, seedReviewSources } from './helpers/shared-libs-eval-fixture';
+import { seedPathReviewPrerequisites, checkPathReviewPrerequisites, hasPathReviewPrerequisiteReceipt } from './helpers/shared-libs-path-fixture';
 
 // Exact public native events from CI merge264f48d7/head16358ef, slice4,
 // attempts1(filtered) and2(unchanged). Thinking/narration are never read here.
@@ -286,7 +288,9 @@ describe('trusted review-start observations', () => {
     expect(hasTrustedReviewStartRead(run.events, run.expected)).toBe(false);
   });
 
-  test('the actual paid verifier consumes the matcher result and preserves adjacent checks', () => {
+  test.each(captured.map((run: any, index: number) => ({ ...run, index }))
+    .filter((run: any) => ['unchanged', 'filtered'].includes(run.scenario)).map((run: any) => run.index))(
+    'the actual paid verifier consumes the matcher result and preserves adjacent checks (%i)', index => {
     const source = readFileSync(path.join(import.meta.dir, 'skill-e2e-shared-libs.test.ts'), 'utf8');
     const scenario = source.slice(source.indexOf("test('shared-libs-review-revalidation'"));
     const marker = '}, result => {';
@@ -294,11 +298,23 @@ describe('trusted review-start observations', () => {
     const body = scenario.slice(start, scenario.indexOf('\n        });', start));
     expect(start).toBeGreaterThan(marker.length);
     const verify = new Function('deps', 'result', new Bun.Transpiler({ loader: 'ts' }).transformSync(`const { change, questions, expect, toolCommandTrace,
-      reviewRecords, createHash, path, f, fixtureGit, fixtureWorkingTree, hasTrustedReviewStartRead } = deps;
+      reviewRecords, createHash, path, f, fixtureGit, fixtureWorkingTree, hasTrustedReviewStartRead,
+      resumed, prerequisites, checkPathReviewPrerequisites, hasPathReviewPrerequisiteReceipt } = deps;
       ${body}`));
-    for (const index of captured.keys()) {
-      const run = replay(index);
-      if (!['unchanged', 'filtered'].includes(run.scenario)) continue;
+    const f = createSharedLibsFixture('start-verifier');
+    try {
+      seedReviewSources(f);
+      const original = replay(index);
+      const run = JSON.parse(JSON.stringify(original)
+        .replaceAll(path.dirname(original.expected.repo), f.root)
+        .replaceAll(original.expected.wtree, fixtureWorkingTree(f)));
+      const resumed = seedPathReviewPrerequisites(f);
+      const prerequisites = checkPathReviewPrerequisites(f, resumed.input);
+      expect(prerequisites.settled).toBe(true);
+      run.events.unshift(
+        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'prerequisites', name: 'Bash', input: { command: resumed.checkCommand } }] } },
+        { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'prerequisites', content: JSON.stringify(prerequisites) }] } },
+      );
       const trace = 'gstack-review-read\ngit check-attr filter -- src/retry-route.ts lib/retry-after.ts\ngit ls-files --stage\ncanReuseSharedLibsAdvisory';
       const last = { skill: 'review', review_binding: { started_at: run.expected.startedAt,
         branch_id: createHash('sha256').update(run.expected.branch).digest('hex') },
@@ -308,9 +324,8 @@ describe('trusted review-start observations', () => {
       const deps = { change: run.scenario, questions: run.scenario === 'unchanged' ? [] : [{}], expect,
         toolCommandTrace: () => [trace], reviewRecords: () => [
           { skill: 'review', findings: [{ advisory: true, action: 'skipped' }] }, last,
-        ], createHash, path: path.posix, f: { repo: run.expected.repo,
-          state: run.expected.directory.replace(/\/projects\/fixture-shared-libs\/\.review-starts$/, '') },
-        fixtureGit: () => run.expected.branch, fixtureWorkingTree: () => run.expected.wtree,
+        ], createHash, path: path.posix, f, fixtureGit, fixtureWorkingTree,
+        resumed, prerequisites, checkPathReviewPrerequisites, hasPathReviewPrerequisiteReceipt,
         hasTrustedReviewStartRead: (events: unknown[], expected: any) => {
           matcherCalls++; expect(events).toBe(run.events); expect(expected).toEqual(run.expected);
           return hasTrustedReviewStartRead(events, expected);
@@ -321,7 +336,7 @@ describe('trusted review-start observations', () => {
       expect(() => verify({ ...deps, toolCommandTrace: () => ['gstack-review-read'] }, result)).toThrow();
       expect(() => verify({ ...deps, questions: run.scenario === 'unchanged' ? [{}] : [] }, result)).toThrow();
       expect(() => verify({ ...deps, reviewRecords: () => [] }, result)).toThrow();
-    }
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
   });
 });
 

@@ -87,14 +87,13 @@ describe('session-runner timeout kills the whole process group', () => {
   }, 60_000);
 });
 
-describe('all three provider runners carry the group-kill wiring', () => {
-  // Source pin, not behavior: codex/gemini need their real binaries for a
+describe('both CLI provider runners carry the group-kill wiring', () => {
+  // Source pin, not behavior: codex needs its real binary for a
   // behavioral run, but the kill wiring is identical code — a runner that
   // drops `detached` or reverts to a bare kill() re-opens the orphan class.
   const runners = [
     'test/helpers/session-runner.ts',
     'test/helpers/codex-session-runner.ts',
-    'test/helpers/gemini-session-runner.ts',
   ];
   for (const rel of runners) {
     test(`${path.basename(rel)}: detached spawn + killProcessGroup, no bare timeout kill`, () => {

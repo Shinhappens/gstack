@@ -1,8 +1,18 @@
-import { defineHost, CROSS_MODEL_RESOLVERS } from './define-host';
+import { defineHost, CROSS_MODEL_RESOLVERS, preambleToolGlossary } from './define-host';
 
 const hermes = defineHost({
   name: 'hermes',
   displayName: 'Hermes',
+  tier: 'instruction-only',
+  capabilities: { toolExecution: true, questions: 'native', planMode: false, delegation: true, browser: true, safetyHooks: 'advisory' },
+
+  // Hermes indexes skills by frontmatter name, first match wins (#2825).
+  frontmatter: {
+    mode: 'allowlist',
+    keepFields: ['name', 'description'],
+    descriptionLimit: null,
+    nameMatchesDirectory: true,
+  },
 
   extraPathRewrites: [
     { from: 'CLAUDE.md', to: 'AGENTS.md' },
@@ -19,6 +29,8 @@ const hermes = defineHost({
     'the Read tool': 'the read_file tool',
     'the Write tool': 'the patch tool',
     'the Edit tool': 'the patch tool',
+    // #2015: Hermes asks through clarify.
+    ...preambleToolGlossary('**Hermes tool names:** `AskUserQuestion` means your `clarify` tool (one question per call, options as choices); there is no `mcp__*__AskUserQuestion` variant.'),
   },
 
   suppressedResolvers: [

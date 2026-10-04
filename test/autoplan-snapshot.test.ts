@@ -501,9 +501,8 @@ describe('installed snapshot helper in fresh shells', () => {
   });
 
   test('all affected live workflow selectors include the executable continuity contract', () => {
-    for (const name of ['autoplan-chain-pty', 'autoplan-dual-voice', 'carve-section-loading']) {
+    for (const name of ['autoplan-dual-voice', 'carve-section-loading']) {
       expect(E2E_TOUCHFILES[name]).toContain('bin/gstack-autoplan-snapshot.ts');
-      expect(E2E_TOUCHFILES[name]).toContain('test/autoplan-snapshot.test.ts');
     }
   });
 });

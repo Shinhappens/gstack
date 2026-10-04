@@ -4,7 +4,7 @@
  * Asserts the schema pack is well-formed and matches the v1.48 plan:
  *   - Exactly 8 page types (7 entities + 1 take)
  *   - Frontmatter shape is internally consistent
- *   - Retention policies match SKILL_RUN_RETENTION_DAYS spec
+ *   - Retention policies (skill-run pages archive after 90 days)
  *   - Link verbs only reference declared verbs
  *   - JSON payload shape is acceptable to mcp__gbrain__schema_apply_mutations
  *

@@ -71,7 +71,14 @@ and current state. **If `state == "CLOSED"`: STOP**, the PR closed without mergi
 Only START makes the first attempt. Immediately before either merge command, repeat
 readback and Step 1's local HEAD/branch/cleanliness check. Retargeting or local changes
 invalidate readiness; `--match-head-commit` protects head, not destination.
+Each merge block re-runs the CI gate with Step 3.5's approvals (also for `--auto`,
+which waits on required checks only). A gate exit means no merge ran: **STOP** with
+its output. Only branch protection or a merge queue makes check-to-merge
+atomic.
 ```bash
+CI_GATE=$(~/.claude/skills/gstack/bin/gstack-ci-gate --repo "$REPO" --pr "$PR_NUMBER" --expect-head "$PR_HEAD" "${CI_OVERRIDE[@]}")
+echo "$CI_GATE"
+case "${CI_GATE%%$'\n'*}" in "VERDICT PASS $PR_HEAD"|"VERDICT NO_CHECKS $NO_CI_APPROVED_HEAD") ;; *) exit 1 ;; esac
 MERGE_ATTEMPT=auto
 MERGE_EXIT=0
 MERGE_ERROR=$(gh pr merge "$MERGE_FLAG" --auto --delete-branch "$PR_NUMBER" --repo "$REPO" --match-head-commit "$PR_HEAD" 2>&1) || MERGE_EXIT=$?
@@ -80,9 +87,11 @@ Return to readback, even on exit 0. Only DIRECT permits **one direct fallback**:
 readback has confirmed OPEN, no auto request and no queue entry, and the auto attempt
 returned one of the two documented rejection classes: auto-merge disabled, or PR
 already clean/unstable with nothing required pending. The latter does not mean
-auto-merge is disabled. Recheck required CI as in Step 2 before the fallback; failures
-or unknown check results stop, even if GitHub calls the PR mergeable.
+auto-merge is disabled.
 ```bash
+CI_GATE=$(~/.claude/skills/gstack/bin/gstack-ci-gate --repo "$REPO" --pr "$PR_NUMBER" --expect-head "$PR_HEAD" "${CI_OVERRIDE[@]}")
+echo "$CI_GATE"
+case "${CI_GATE%%$'\n'*}" in "VERDICT PASS $PR_HEAD"|"VERDICT NO_CHECKS $NO_CI_APPROVED_HEAD") ;; *) exit 1 ;; esac
 MERGE_ATTEMPT=direct
 MERGE_EXIT=0
 MERGE_ERROR=$(gh pr merge "$MERGE_FLAG" --delete-branch "$PR_NUMBER" --repo "$REPO" --match-head-commit "$PR_HEAD" 2>&1) || MERGE_EXIT=$?
@@ -107,7 +116,7 @@ Squash/rebase merge readback guard:
 git fetch "https://github.com/$REPO.git" "$BASE_BRANCH"
 git diff --quiet "$MERGE_SHA" FETCH_HEAD || git log --oneline --decorate -1 "$MERGE_SHA" FETCH_HEAD
 ```
-- If the worktree is clean and only needs to stop looking diverged after a squash merge, prefer a named local branch at the merge commit, for example `git switch -c "codex/post-merge-pr-$PR_NUMBER" "$MERGE_SHA"`. Avoid detached HEAD in Codex Desktop worktrees because git action workers often expect `git symbolic-ref --short HEAD` to return a branch. Do not force-push or reset a user's branch unless they explicitly ask.
+- If the worktree is clean and only needs to stop looking diverged after a squash merge, prefer a named local branch at the merge commit over a detached HEAD, for example `git switch -c "post-merge/pr-$PR_NUMBER" "$MERGE_SHA"` (use the host's branch prefix where it has one, such as `codex/` in Codex Desktop, whose git action workers expect `git symbolic-ref --short HEAD` to return a branch). Do not force-push or reset a user's branch unless they explicitly ask.
 
 Worktree cleanup — non-destructive, candidate-based:
 ```bash

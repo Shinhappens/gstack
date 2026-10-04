@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { generateKeyPairSync } from 'node:crypto';
 import { AssertionWitnessBinding, CsoError, VerificationObservation, canonical, sha256 } from '../lib/cso/contracts';
 import { canonicalStartPlan, canonicalTestPlan, patchHash, treeHash, validateRepairBundle, verifyRepair } from '../lib/cso/verification';
-import { AssertionWitnessSession, assertionWitnessReplayHash, testExecutionPassed, validateStoredAssertionWitnessReceipt } from '../lib/cso/witness';
+import { AssertionWitnessSession, assertionWitnessChildCommand, assertionWitnessReplayHash, testExecutionPassed, validateStoredAssertionWitnessReceipt } from '../lib/cso/witness';
 
 const roots:string[]=[];
 const temporary=()=>{const root=fs.mkdtempSync(path.join(os.tmpdir(),'cso-witness-'));roots.push(root);return root;};
@@ -67,5 +67,43 @@ describe('CSO authenticated external assertion witness',()=>{
   test('a signed forged reporter diagnostic cannot mint a runtime-tested bundle',async()=>{
     const root=temporary(),session=new AssertionWitnessSession(root,Date.now()+60_000),handle=session.handle(stable('before')),observation:VerificationObservation={booted:true,legitimate:true,security:'intended_failure',existingTests:false,output:'external verifier passed',inputHash:''},command={executable:'/usr/local/bin/node',args:['--test','--test-reporter=tap','./app.test.js']},forged="# Subtest: app.test.js\nok 1 - app.test.js\n1..1\n# tests 1\n# pass 1\n# fail 0\n# cancelled 0\n";
     const receipt=await handle.attest(observation,[{command,code:0,output:forged,minimumPassingTests:1}]);expect(receipt.externalAssertionsPassed).toBe(true);expect(receipt.diagnosticTestsPassed).toBe(false);expect(receipt.executions[0].reportedPassed).toBe(false);
+  });
+});
+
+describe('CSO assertion witness child command selection',()=>{
+  test('a Bun host runs the witness module directly with the scrubbed POSIX environment',()=>{
+    expect(assertionWitnessChildCommand({execPath:'/usr/local/bin/bun',platform:'linux',modulePath:'/repo/lib/cso/witness.ts'})).toEqual({
+      file:'/usr/local/bin/bun',args:['/repo/lib/cso/witness.ts','--child'],env:{PATH:'/usr/bin:/bin',LANG:'C.UTF-8',LC_ALL:'C.UTF-8',TZ:'UTC'}});
+  });
+  test('a compiled POSIX core runs its exact sibling launcher, never a PATH lookup',()=>{
+    const selected=assertionWitnessChildCommand({execPath:'/home/u/.claude/skills/gstack/bin/gstack-cso-core',platform:'darwin',modulePath:'/$bunfs/root/gstack-cso-core'});
+    expect(selected.file).toBe('/home/u/.claude/skills/gstack/bin/gstack-cso-launcher');
+    expect(selected.args).toEqual(['__cso-assertion-witness']);
+    expect(selected.env.PATH).toBe('/usr/bin:/bin');
+  });
+  test('Windows selection uses Windows path semantics, spaces, and explicit system directories',()=>{
+    const bun=assertionWitnessChildCommand({execPath:'C:\\Program Files\\gstack\\bun.exe',platform:'win32',modulePath:'C:\\gstack\\lib\\cso\\witness.ts'});
+    expect(bun).toEqual({file:'C:\\Program Files\\gstack\\bun.exe',args:['C:\\gstack\\lib\\cso\\witness.ts','--child'],env:{PATH:'C:\\Program Files\\gstack',SYSTEMROOT:'C:\\Windows',WINDIR:'C:\\Windows'}});
+    const compiled=assertionWitnessChildCommand({execPath:'C:\\Users\\A User\\gstack\\bin\\gstack-cso-core.exe',platform:'win32',modulePath:'B:\\~BUN\\root\\gstack-cso-core.exe',systemRoot:'D:\\Win',windir:'D:\\Win'});
+    expect(compiled).toEqual({file:'C:\\Users\\A User\\gstack\\bin\\gstack-cso-launcher.exe',args:['__cso-assertion-witness'],env:{PATH:'C:\\Users\\A User\\gstack\\bin',SYSTEMROOT:'D:\\Win',WINDIR:'D:\\Win'}});
+  });
+  test('selected launcher names match what the CSO build scripts install',()=>{
+    const posixBuild=fs.readFileSync(path.resolve(import.meta.dir,'../scripts/build-cso.sh'),'utf8'),windowsBuild=fs.readFileSync(path.resolve(import.meta.dir,'../scripts/build-cso-windows.ps1'),'utf8');
+    expect(posixBuild).toContain('bin/gstack-cso-core$CSO_EXE');expect(posixBuild).toContain('bin/gstack-cso-launcher$CSO_EXE');expect(windowsBuild).toContain("'gstack-cso-launcher.exe'");
+    expect(path.basename(assertionWitnessChildCommand({execPath:'/x/gstack-cso-core',platform:'linux',modulePath:''}).file)).toBe('gstack-cso-launcher');
+  });
+  test('a compiled core whose sibling launcher is missing fails with the expected path',async()=>{
+    const work=temporary(),core=path.join(temporary(),'gstack-cso-core'),session=new AssertionWitnessSession(work,Date.now()+60_000,core),handle=session.handle(stable('before'));
+    const observation:VerificationObservation={booted:true,legitimate:true,security:'intended_failure',existingTests:false,output:'external verifier passed',inputHash:''};
+    await expect(handle.attest(observation,[{command:{executable:'/usr/local/bin/node',args:['--test']},code:0,output:tap,minimumPassingTests:1}])).rejects.toThrow(`Assertion witness launcher is missing: ${path.join(path.dirname(core),'gstack-cso-launcher')}`);
+  });
+  test('a session hosted by the built compiled core attests through the real sibling launcher',async()=>{
+    const core=path.resolve(import.meta.dir,'../bin',process.platform==='win32'?'gstack-cso-core.exe':'gstack-cso-core');
+    if(!fs.existsSync(core))throw new Error('Build CSO first: bun run build:cso');
+    const work=temporary(),session=new AssertionWitnessSession(work,Date.now()+60_000,core),handle=session.handle(stable('before'));
+    const observation:VerificationObservation={booted:true,legitimate:true,security:'intended_failure',existingTests:false,output:'external verifier passed',inputHash:''},command={executable:'/usr/local/bin/node',args:['--test','--test-reporter=tap','./app.test.js']};
+    const receipt=await handle.attest(observation,[{command,code:0,output:tap,minimumPassingTests:1}]);
+    expect(receipt).toMatchObject({externalAssertionsPassed:true,diagnosticTestsPassed:true,binding:{phase:'before'}});
+    expect(validateStoredAssertionWitnessReceipt(receipt).keyId).toBe(session.keyId);
   });
 });

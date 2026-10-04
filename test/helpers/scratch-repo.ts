@@ -29,20 +29,8 @@ export function gitIn(repoDir: string, args: string): string {
 }
 
 /** Argv-array variant for callers that avoid shell quoting. */
-export function gitArgvIn(repoDir: string, args: string[], timeout = 5000) {
-  return spawnSync('git', [...GIT_HERMETIC_ARGS, ...args], { cwd: repoDir, timeout });
-}
-
-/** Create a scratch repo (mkdtemp) with an initial commit; caller cleans up. */
-export function makeScratchRepo(prefix: string, files: Record<string, string> = { 'src.txt': 'v1\n' }): string {
-  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  gitIn(repoDir, 'init -q -b main');
-  for (const [name, content] of Object.entries(files)) {
-    fs.writeFileSync(path.join(repoDir, name), content);
-  }
-  gitIn(repoDir, `add ${Object.keys(files).join(' ')}`);
-  gitIn(repoDir, 'commit -q -m init');
-  return repoDir;
+export function gitArgvIn(repoDir: string, args: string[], timeout = 5000, env?: NodeJS.ProcessEnv) {
+  return spawnSync('git', [...GIT_HERMETIC_ARGS, ...args], { cwd: repoDir, timeout, env });
 }
 
 /** Recursively find files with a given suffix under a directory. */

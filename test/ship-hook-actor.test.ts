@@ -13,9 +13,9 @@ import { DEFAULT_SHARD_TIMEOUT_MS, retriesForFiles } from '../scripts/test-paid-
 const cases: ShipHookCase[] = ['ship-managed-hook-refresh', 'ship-unmanaged-hook-consent', 'ship-local-hook-preservation'];
 type Fault = 'skip-guard' | 'skip-consent' | 'ask-overwrite' | 'direct-install' | 'read-receipts' | 'edit-policy' | 'tamper-receipts' | 'repeat-question' | 'rate-limit';
 
-test('whole-file supervision covers every F5 case and the unchanged Bun retry', () => {
+test('whole-file supervision covers every F5 case run once', () => {
   for (const [file, count] of [['test/skill-e2e-ship-hook-refresh.test.ts', 1], ['test/skill-e2e-ship-hook-consent.test.ts', 2]] as const) {
-    expect(retriesForFiles([file])).toBe(1);
+    expect(retriesForFiles([file])).toBe(0);
     expect(count * CAPTURE_MS * (retriesForFiles([file]) + 1) + 120000).toBeLessThanOrEqual(DEFAULT_SHARD_TIMEOUT_MS);
   }
 });

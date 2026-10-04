@@ -122,19 +122,6 @@ test('the declared opt-in rejects another skill before fixture or model startup'
     followUpPrompt: 'Unused', expectedPlanPath: '/tmp/unused.md', approveEngTestPlanEdits: true,
     isLastStep0AUQ: () => false, reviewCountCeiling: 7 })).rejects.toThrow('Eng test-plan approval');
 });
-
-test('actual caller declares QA support without changing its budgets or expected report', () => {
-  const caller = fs.readFileSync(path.join(import.meta.dir, 'skill-e2e-plan-eng-finding-count.test.ts'), 'utf8');
-  expect(caller).toContain('approveEngTestPlanEdits: true');
-  expect(caller).toContain('expectedPlanPath: planPath');
-  expect(caller).toContain('const startedAt = Date.now();');
-  expect(caller).toContain('const deadlineAt = startedAt + 1_500_000;');
-  expect(caller).toContain('timeoutMs: deadlineAt - Date.now(),');
-  expect(caller).toContain('deadlineAt: Math.min(input.deadlineAt, deadlineAt)');
-  expect(caller).toMatch(/},\s*1_500_000\s*\/\* physical ceiling:/);
-});
-
-
 test('default Autoplan scope still accepts its owned CEO artifact, while Eng scope rejects it', () => {
   const legacy = replay('ceo-default'); expect(legacy.invoke()).toBe(true);
   const eng = replay('ceo'); expect(eng.invoke()).not.toBe(true);

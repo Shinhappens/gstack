@@ -432,3 +432,55 @@ for (const context of ['## History','## Archived source','Quoted source:\n'])
     plan=plan.replace(target,'').replace('## Decision ledger',`${context}\n\n${target}\n\n## Decision ledger`);
     expect(inlineEvaluate(call,plan)).toBe(false);
   });
+
+// Import the actual paid registration in an isolated Bun child; only its native
+// runner is controlled. Collection stops once FLOOR distinct review decisions are
+// acknowledged, and the unchanged floor verdict still decides the outcome.
+test.each([
+  { scenario: 'floor settled', outcome: 'collection_complete', reviewCount: 3, passes: true },
+  { scenario: 'batched below floor', outcome: 'plan_ready', reviewCount: 2, passes: false },
+  { scenario: 'ceiling', outcome: 'ceiling_reached', reviewCount: 7, passes: true },
+  { scenario: 'timeout', outcome: 'timeout', reviewCount: 3, passes: false },
+])('actual batching registration stops at the proven floor: $scenario', async ({ outcome, reviewCount, passes }) => {
+  const ROOT = path.resolve(import.meta.dir, '..');
+  const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'batching-registration-')));
+  const factsPath = path.join(temp, 'facts.json');
+  const runner = path.join(ROOT, 'test/helpers/claude-pty-runner.ts');
+  const script = path.join(temp, 'registration.test.ts');
+  fs.writeFileSync(script, `
+import { describe, expect, mock } from 'bun:test';
+import * as fs from 'node:fs';
+import * as real from ${JSON.stringify(runner)};
+const facts = { runs: 0, stops: [] as boolean[], ceiling: 0, preconfigured: false };
+const save = () => fs.writeFileSync(${JSON.stringify(factsPath)}, JSON.stringify(facts));
+const fp = (signature: string, preReview: boolean, administrative?: string) => ({ signature, preReview, administrative, promptSnippet: signature, options: [], observedAtMs: 1 });
+mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/e2e-gate.ts'))}, () => ({
+  describeE2ETier: (tier: string) => { expect(tier).toBe('periodic'); return describe; },
+}));
+mock.module(${JSON.stringify(runner)}, () => ({ ...real, runPlanSkillCounting: async (opts: any) => {
+  facts.runs++; facts.ceiling = opts.reviewCountCeiling; facts.preconfigured = opts.preconfiguredReviewActor;
+  const setup = [fp('s1', true), fp('s2', true)];
+  const review = [fp('r1', false), fp('r2', false), fp('r3', false)];
+  facts.stops = [
+    opts.isCollectionComplete({ status: 'ready', calls: [], assistantMessages: [] }, [...setup, ...review.slice(0, 2)]),
+    opts.isCollectionComplete({ status: 'ready', calls: [], assistantMessages: [] }, [...setup, ...review.slice(0, 2), fp('h', false, 'completion-handoff')]),
+    opts.isCollectionComplete({ status: 'ready', calls: [], assistantMessages: [] }, [...setup, ...review]),
+  ];
+  save();
+  return { outcome: ${JSON.stringify(outcome)}, summary: 'controlled', evidence: 'controlled', elapsedMs: 1,
+    fingerprints: [...setup, ...review].slice(0, 2 + ${reviewCount}), step0Count: 2, reviewCount: ${reviewCount}, administrativeCount: 0 };
+} }));
+await import(${JSON.stringify(path.join(ROOT, 'test/skill-e2e-plan-eng-multi-finding-batching.test.ts'))});
+`);
+  try {
+    const child = Bun.spawn([process.execPath, 'test', script], { cwd: ROOT, stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
+      env: { PATH: process.env.PATH ?? '', HOME: temp, TMPDIR: temp, TEMP: temp, TMP: temp, GIT_CONFIG_NOSYSTEM: '1', EVALS_HERMETIC: '1',
+        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) } });
+    const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    const facts = JSON.parse(fs.readFileSync(factsPath, 'utf8'));
+    expect(exit, out + err).toBe(passes ? 0 : 1);
+    expect(facts).toEqual({ runs: 1, stops: [false, false, true], ceiling: 7, preconfigured: true });
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});

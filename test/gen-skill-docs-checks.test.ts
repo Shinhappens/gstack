@@ -43,10 +43,15 @@ describe('generator artifact and dry-run contract', () => {
     expect(generated.artifacts.some(a => a.relativePath === '.agents/skills/gstack-codex/SKILL.md')).toBe(false);
     expect(fs.readFileSync(path.join(render, 'ship/SKILL.md'), 'utf-8')).toContain('~/.claude/skills/gstack/ship/sections/');
     expect(generated.artifacts.flatMap(a => validateGeneratedArtifact(render, a))).toEqual([]);
-    expect(generated.artifacts.filter(a => a.kind === 'asset')).toEqual([
+    expect(generated.artifacts.filter(a => a.kind === 'asset').sort((a, b) => a.relativePath.localeCompare(b.relativePath))).toEqual([
       { relativePath: 'review/design-checklist.md', kind: 'asset', host: 'claude' },
       { relativePath: 'lib/dom-dump.js', kind: 'asset', host: 'claude' },
-    ]);
+      ...ALL_HOST_NAMES.filter(host => includesSkill(getHostConfig(host), 'qa')).map(host => ({
+        relativePath: host === 'claude' ? 'qa/templates/functional-report-template.md'
+          : `${getHostConfig(host).hostSubdir}/skills/gstack-qa/templates/functional-report-template.md`,
+        kind: 'asset', host,
+      })),
+    ].sort((a, b) => a.relativePath.localeCompare(b.relativePath)));
   });
 
   test('include-minus-skip semantics share one predicate', () => {

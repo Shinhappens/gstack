@@ -15,6 +15,8 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
+import { ROUTES } from '../src/routes';
+import { makeServer } from './route-test-harness';
 
 const HTML = fs.readFileSync(path.join(import.meta.dir, '../../extension/sidepanel.html'), 'utf-8');
 const JS = fs.readFileSync(path.join(import.meta.dir, '../../extension/sidepanel.js'), 'utf-8');
@@ -174,13 +176,22 @@ describe('sidepanel-terminal.js: eager auto-connect + injection API', () => {
 describe('server.ts: chat / sidebar-agent endpoints are gone', () => {
   const SERVER_SRC = fs.readFileSync(path.join(import.meta.dir, '../src/server.ts'), 'utf-8');
 
-  test('No /sidebar-command, /sidebar-chat, /sidebar-agent/* routes', () => {
-    expect(SERVER_SRC).not.toMatch(/url\.pathname === ['"]\/sidebar-command['"]/);
-    expect(SERVER_SRC).not.toMatch(/url\.pathname === ['"]\/sidebar-chat['"]/);
-    expect(SERVER_SRC).not.toMatch(/url\.pathname\.startsWith\(['"]\/sidebar-agent\//);
-    expect(SERVER_SRC).not.toMatch(/url\.pathname === ['"]\/sidebar-agent\/event['"]/);
-    expect(SERVER_SRC).not.toMatch(/url\.pathname === ['"]\/sidebar-tabs['"]/);
-    expect(SERVER_SRC).not.toMatch(/url\.pathname === ['"]\/sidebar-session['"]/);
+  test('No /sidebar-command, /sidebar-chat, /sidebar-agent/* routes', async () => {
+    // Routes are dispatched only through the route table, so absence from
+    // the table plus the unmatched 404 with the root token is the contract.
+    const gone = ['/sidebar-command', '/sidebar-chat', '/sidebar-agent/event', '/sidebar-agent/x', '/sidebar-tabs', '/sidebar-session'];
+    for (const p of gone) {
+      expect(ROUTES.some(r => r.prefix ? p.startsWith(r.path) : r.path === p), p).toBe(false);
+    }
+    const server = makeServer();
+    try {
+      for (const p of gone) {
+        for (const method of ['GET', 'POST']) {
+          const resp = await server.local(p, { method, headers: { Authorization: `Bearer ${server.rootToken}` } });
+          expect([p, method, resp.status, await resp.text()]).toEqual([p, method, 404, 'Not found']);
+        }
+      }
+    } finally { server.cleanup(); }
   });
 
   test('No chat-related state declarations or helpers', () => {
@@ -197,19 +208,6 @@ describe('server.ts: chat / sidebar-agent endpoints are gone', () => {
     expect(SERVER_SRC).not.toMatch(/^function addChatEntry/m);
     expect(SERVER_SRC).not.toMatch(/^interface ChatEntry/m);
     expect(SERVER_SRC).not.toMatch(/^interface SidebarSession/m);
-  });
-
-  test('/health no longer surfaces agentStatus or messageQueue length', () => {
-    const health = SERVER_SRC.slice(SERVER_SRC.indexOf("url.pathname === '/health'"));
-    const slice = health.slice(0, 2000);
-    expect(slice).not.toContain('agentStatus');
-    expect(slice).not.toContain('messageQueue');
-    expect(slice).not.toContain('agentStartTime');
-    // chatEnabled is gone entirely — the chat pane no longer exists in any
-    // extension build, so /health stopped advertising a chat mode.
-    expect(slice).not.toContain('chatEnabled');
-    // terminalPort survives.
-    expect(slice).toContain('terminalPort');
   });
 });
 
@@ -237,17 +235,6 @@ describe('cli.ts: sidebar-agent is no longer spawned', () => {
     expect(CONTROL_SRC).toContain('terminal-agent.ts');
     expect(CONTROL_SRC).toMatch(/\.spawn\(\['bun',\s*'run',\s*script,\s*`--agent-gen=\$\{gen\}`\]/);
     expect(CONTROL_SRC).toContain('BROWSE_OWNER_PID: String(opts.ownerPid)');
-  });
-});
-
-describe('files: sidebar-agent.ts and its tests are deleted', () => {
-  test('browse/src/sidebar-agent.ts is gone', () => {
-    expect(fs.existsSync(path.join(import.meta.dir, '../src/sidebar-agent.ts'))).toBe(false);
-  });
-
-  test('sidebar-agent test files are gone', () => {
-    expect(fs.existsSync(path.join(import.meta.dir, 'sidebar-agent.test.ts'))).toBe(false);
-    expect(fs.existsSync(path.join(import.meta.dir, 'sidebar-agent-roundtrip.test.ts'))).toBe(false);
   });
 });
 

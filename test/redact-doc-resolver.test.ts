@@ -25,7 +25,7 @@ describe("REDACT_INVOCATION_BLOCK", () => {
     const block = generateRedactInvocationBlock(ctx, ["pre-issue"]);
     expect(block).toContain("mktemp");
     expect(block).toContain("--from-file");
-    expect(block).toMatch(/EXACT bytes/);
+    expect(block).toMatch(/exact bytes/i);
   });
 
   test("encodes exit-code branches 3/2/0", () => {

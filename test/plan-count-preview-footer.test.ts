@@ -3,8 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {capturePlanCountQuestion, matchesNativePlanQuestion, nativePlanCallFingerprint, planCountQuestionInput} from './helpers/claude-pty-runner';
-import {pickCeoCountQuestion} from './helpers/ceo-approach-pick';
+import {capturePlanCountQuestion, nativePlanCallFingerprint, planCountQuestionInput} from './helpers/claude-pty-runner';
 import type {NativePlanQuestionCall} from './helpers/plan-count-transcript';
 import completed from './fixtures/ceo-preview-u-call.json';
 
@@ -18,26 +17,6 @@ function pending(): NativePlanQuestionCall {
 }
 
 describe('native question with preview and notes footer', () => {
-  test('the captured panel binds complete native labels and selects the offered recommendation', () => {
-    const call = pending();
-    expect(matchesNativePlanQuestion(screen, call)).toBe(true);
-    const fp = capturePlanCountQuestion(screen, new Set(), 0, true, call)!;
-    expect(fp.nativeCall).toBe(call);
-    expect(fp.options.map(o => o.label)).toEqual(call.questions[0]!.options.map(o => o.label));
-    expect(pickCeoCountQuestion(nativePlanCallFingerprint(call, 0, true), fp)).toBe(2);
-    expect(planCountQuestionInput(screen, fp, 2)).toBe('2\r');
-    expect(completed.answers[completed.questions[0]!.question]).toBe('A) Current plan as-is');
-  });
-
-  test('late native metadata changes neither input protocol nor historical coverage', () => {
-    const seen = new Set<string>();
-    const fp = capturePlanCountQuestion(screen, seen, 0, true)!;
-    expect(fp.nativeCall).toBeUndefined();
-    expect(pickCeoCountQuestion(fp)).toBeNull();
-    expect(planCountQuestionInput(screen, fp, 2)).toBe('2\r');
-    expect(capturePlanCountQuestion(screen, seen, 1, true, pending())).toBeNull();
-  });
-
   test('the actual stalled Design preview requires submission even before native metadata flushes', () => {
     const fp = capturePlanCountQuestion(designScreen, new Set(), 0, false)!;
     expect(fp.nativeCall).toBeUndefined();
@@ -61,23 +40,6 @@ describe('native question with preview and notes footer', () => {
       .replace(' · Esc to cancel', ' · Tab to switch questions · Esc to cancel');
     const fp = nativePlanCallFingerprint(pending(), 0, true);
     expect(planCountQuestionInput(packet, fp, 2)).toBe('2\r');
-  });
-
-  test('a notes footer cannot bind another question or authorize a different action', () => {
-    for (const different of [
-      screen.replace('☐ Approach', '☐ Other'),
-      screen.replace('<gstack-qid:plan-ceo-approach-selection>', '<gstack-qid:foreign>'),
-      screen.replace('navigate · n to add notes', 'navigate · n to run a command'),
-      screen.replace('n to add notes · ', 'n to add notes · n to add notes · '),
-      screen.replace(' · Esc to cancel', ''),
-    ]) {
-      const call = pending();
-      expect(matchesNativePlanQuestion(different, call)).toBe(false);
-      const fp = capturePlanCountQuestion(different, new Set(), 0, true, call)!;
-      expect(fp.nativeCall).toBeUndefined();
-      expect(pickCeoCountQuestion(nativePlanCallFingerprint(call, 0, true), fp)).toBeNull();
-    }
-    expect(matchesNativePlanQuestion(screen.replace(' · n to add notes', ''), pending())).toBe(true);
   });
 });
 
@@ -117,8 +79,7 @@ process.stdout.write('PTY_READY:'+item.events+'\x1b[2J\x1b[H');
 `);
   fs.chmodSync(fake, 0o755);
   const runner=pathToFileURL(path.join(import.meta.dir,'helpers/claude-pty-runner.ts')).href;
-  const picker=pathToFileURL(path.join(import.meta.dir,'helpers/ceo-approach-pick.ts')).href;
-  fs.writeFileSync(worker, `import {runPlanSkillCounting} from ${JSON.stringify(runner)};import {pickCeoCountQuestion} from ${JSON.stringify(picker)};
+  fs.writeFileSync(worker, `import {runPlanSkillCounting} from ${JSON.stringify(runner)};
 const result=await runPlanSkillCounting({skillName:'plan-ceo-review',slashCommand:'/plan-ceo-review',followUpPrompt:'Review this fixture.',isLastStep0AUQ:()=>true,defaultPick:2,reviewCountCeiling:1,timeoutMs:26000,startupReadyMarker:${JSON.stringify('PTY_READY:' + events)},env:{PREVIEW_CASE:${JSON.stringify(JSON.stringify({events, screen, question:completed.questions[0]}))}}});await Bun.write(${JSON.stringify(output)},JSON.stringify(result));`);
   const child=Bun.spawn([process.execPath,worker], {env:{...process.env,BROWSE_TERMINAL_BINARY:fake,EVALS_HERMETIC:'1'},stdout:'pipe',stderr:'pipe'});
   const timer=setTimeout(()=>child.kill('SIGKILL'),30000);

@@ -19,7 +19,6 @@ import { resolveEvalModel } from '../../lib/eval-model';
 
 const GSTACK_DEV_DIR = path.join(os.homedir(), '.gstack-dev');
 const HEARTBEAT_PATH = path.join(GSTACK_DEV_DIR, 'e2e-live.json'); // heartbeat stays global
-const PROJECT_DIR = path.dirname(getProjectEvalDir()); // ~/.gstack/projects/$SLUG/
 
 /** Sanitize test name for use as filename: strip leading slashes, replace / with - */
 export function sanitizeTestName(name: string): string {
@@ -65,14 +64,15 @@ export const STARTUP_GRACE_MS = 90_000;
  *  Pinned by test/session-runner-startup-grace.test.ts. */
 export const STARTUP_GRACE_CI_FLOOR_MS = 300_000;
 /** Existing pipe-drain allowance; never adds model work time. */
-export const SESSION_DRAIN_GRACE_MS = 5_000;
+export { SESSION_DRAIN_GRACE_MS } from './session-drain-policy';
+import { SESSION_DRAIN_GRACE_MS } from './session-drain-policy';
 
 const BROWSE_ERROR_PATTERNS = [
   /Unknown command: \w+/,
   /Unknown snapshot flag: .+/,
   /ERROR: browse binary not found/,
   /Server failed to start/,
-  /no such file or directory.*browse/i,
+  /no such file or directory.*\bbrowse(?:\.exe)?(?=$|[\s'":),])/i,
 ];
 
 // --- Testable NDJSON parser ---
@@ -247,6 +247,10 @@ export async function runSkillTest(options: {
   startupGraceMs?: number;
   /** Cancel the owned process group when an enclosing attempt expires. */
   signal?: AbortSignal;
+  nativeLifecycle?: {
+    onSpawn(pid: number): void;
+    onSettled(input: { deadline: number; exited: boolean }): Promise<void>;
+  };
 }): Promise<SkillTestResult> {
   const startTime = Date.now();
   options.signal?.throwIfAborted();
@@ -288,7 +292,7 @@ Runner entry UTC: ${new Date(startTime).toISOString()}
 Hard deadline UTC: ${new Date(deadline).toISOString()}
 Completion reserve starts UTC: ${new Date(deadline - reserve).toISOString()}
 Setup, CLI startup and API queueing consume this same window; it never resets.
-Before source Reads and after each saved checkpoint, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. Compare that observed UTC time with the times above. When remaining time is at most ${reserve / 1000} seconds, prioritize the remaining required completion outputs and verification. No required content or gate may be skipped. If the clock read fails, report timing unavailable; do not invent remaining time or restart the deadline.`;
+Before source Reads, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. After each saved checkpoint, compare the latest evidence capture's printed completedAt with the times above; run that clock read again only when no capture has completed since your last clock read. When remaining time is at most ${reserve / 1000} seconds, prioritize the remaining required completion outputs and verification. No required content or gate may be skipped. If the clock read fails, report timing unavailable; do not invent remaining time or restart the deadline.`;
     systemPrompt = systemPrompt ? `${systemPrompt}\n\n${notice}` : notice;
   }
 
@@ -297,7 +301,7 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
   const safeName = testName ? sanitizeTestName(testName) : null;
   if (runId) {
     try {
-      runDir = path.join(PROJECT_DIR, 'e2e-runs', runId);
+      runDir = path.join(path.dirname(getProjectEvalDir()), 'e2e-runs', runId);
       fs.mkdirSync(runDir, { recursive: true });
     } catch { /* non-fatal */ }
   }
@@ -461,7 +465,7 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
   phaseTimer = setTimeout(() => killRun(true), Math.max(0, startTime + startupGraceMs - Date.now()));
   proc.stdin!.on('error', () => { /* exit handling reports early child failure */ });
   if (signal?.aborted || Date.now() >= deadline) onAbort();
-  else proc.stdin!.end(prompt);
+  else if (!options.nativeLifecycle) proc.stdin!.end(prompt);
   /** Called once by the read loop on the first NDJSON byte. */
   const armWorkPhase = (elapsedMs: number): void => {
     clearTimeout(phaseTimer);
@@ -481,8 +485,11 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
   const decoder = new TextDecoder();
   let buf = '';
   const projectLine = options.publicStreamDiagnostics ? publicStreamProjection(startTime) : (line: string) => line;
+  let lifecycleFailure: unknown;
 
   try {
+    options.nativeLifecycle?.onSpawn(proc.pid!);
+    if (options.nativeLifecycle && !signal?.aborted && Date.now() < deadline) proc.stdin!.end(prompt);
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -574,7 +581,36 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
     }
 
     await Promise.race([Promise.all([procExited, stderrClosed]), forcedDrain]);
+  } catch (error) {
+    lifecycleFailure = error;
+    throw error;
   } finally {
+    if (options.nativeLifecycle) {
+      killProcessGroup(proc, 'SIGKILL');
+      closePipes();
+      armDrain();
+      try {
+        await Promise.race([procExited, forcedDrain]);
+        let hookTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            options.nativeLifecycle.onSettled({ deadline: drainDeadline, exited: exitCode !== undefined && !processError }),
+            new Promise<never>((_, reject) => {
+              hookTimer = setTimeout(() => reject(new Error('native lifecycle settlement deadline exceeded')), Math.max(0, drainDeadline - Date.now()));
+            }),
+          ]);
+        } finally { clearTimeout(hookTimer); }
+      } catch (error) {
+        if (lifecycleFailure) throw new AggregateError([lifecycleFailure, error], 'native lifecycle failed');
+        throw error;
+      } finally {
+        clearTimeout(phaseTimer);
+        clearTimeout(drainTimer);
+        signal?.removeEventListener('abort', onAbort);
+        proc.removeListener('exit', onExit);
+        proc.stderr!.removeListener('data', onStderr);
+      }
+    }
     clearTimeout(phaseTimer);
     clearTimeout(drainTimer);
     signal?.removeEventListener('abort', onAbort);
@@ -605,8 +641,7 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
   const { transcript, resultLine, toolCalls } = parsed;
   const browseErrors: string[] = [];
 
-  // Scan transcript + stderr for browse errors
-  const allText = transcript.map(e => JSON.stringify(e)).join('\n') + '\n' + stderr;
+  const allText = toolCalls.filter(call => call.tool === 'Bash').map(call => call.output).join('\n') + '\n' + stderr;
   for (const pattern of BROWSE_ERROR_PATTERNS) {
     const match = allText.match(pattern);
     if (match) {
@@ -660,7 +695,8 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
   }
 
   // Cost from result line (exact) or estimate from chars
-  const turnsUsed = resultLine?.num_turns || 0;
+  const turnsUsed = resultLine?.num_turns
+    || new Set(transcript.filter(event => event?.type === 'assistant' && !event.parent_tool_use_id).map(event => event.message?.id)).size;
   const estimatedCost = resultLine?.total_cost_usd || 0;
   const inputChars = prompt.length;
   const outputChars = (resultLine?.result || '').length;

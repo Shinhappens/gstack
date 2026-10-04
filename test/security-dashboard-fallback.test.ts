@@ -114,6 +114,7 @@ function run(
       ...process.env,
       PATH: pathEnv,
       GSTACK_DIR: ROOT,
+      GSTACK_HOME: join(tmp, "state"),
       GSTACK_SUPABASE_URL: "https://stub.supabase.test",
       GSTACK_SUPABASE_ANON_KEY: "stub-key",
       STUB_CURL_MODE: opts.mode,

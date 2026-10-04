@@ -16,8 +16,49 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { isBuiltin } from 'node:module';
 import { createHash } from 'node:crypto';
 import { atomicWriteSync } from '../lib/fs-atomic';
+
+/**
+ * Follow literal module imports from `entries` (repo-relative) without
+ * executing them, including installed package bytes and the package.json that
+ * governs each resolved module; root bunfig/tsconfig/jsconfig are included
+ * when present. The root package.json is left to the caller, which hashes its
+ * semantic fields without the release version label.
+ */
+export function sourceDependencyClosure(root: string, entries: string[]): string[] {
+  const seen = new Set<string>();
+  const scan = new Bun.Transpiler({ loader: 'tsx' });
+  const visit = (file: string) => {
+    file = path.resolve(file);
+    const relative = path.relative(root, file).split(path.sep).join('/');
+    if (relative.startsWith('../') || path.isAbsolute(relative)) throw new Error('Dependency outside checkout');
+    if (relative === 'package.json') return;
+    if (seen.has(relative)) return;
+    seen.add(relative);
+    const source = fs.readFileSync(file, 'utf8');
+    if (!/\.[cm]?[jt]sx?$/.test(file)) return;
+    // Entrypoint scripts carry hashbangs, which scanImports does not accept.
+    // Strip only for parsing; buildEvalInputIdentity still hashes the full file.
+    for (const entry of scan.scanImports(source.replace(/^#![^\n]*(?:\n|$)/, '\n'))) {
+      if (isBuiltin(entry.path) || entry.path.startsWith('bun:')) continue;
+      const resolved = Bun.resolveSync(entry.path, path.dirname(file));
+      visit(resolved);
+      // Package export maps/defaults affect resolution independently of code.
+      let directory = path.dirname(resolved);
+      while (directory !== root && directory.startsWith(root + path.sep)) {
+        const manifest = path.join(directory, 'package.json');
+        if (fs.existsSync(manifest)) { visit(manifest); break; }
+        directory = path.dirname(directory);
+      }
+    }
+  };
+  for (const file of entries) visit(path.join(root, file));
+  for (const file of ['bunfig.toml', 'tsconfig.json', 'jsconfig.json'])
+    if (fs.existsSync(path.join(root, file))) visit(path.join(root, file));
+  return [...seen].sort();
+}
 
 export const EVAL_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const EVAL_CACHE_RESULT_MAX_BYTES = 16 * 1024;
@@ -49,7 +90,7 @@ export type EvalInputIdentityResult =
   | { status: 'eligible'; identity: EvalInputIdentity }
   | { status: 'ineligible'; reason: string };
 export interface EvalCachePolicy {
-  purpose: 'gate' | 'periodic' | 'release';
+  purpose: 'gate' | 'periodic' | 'release' | 'marathon';
   fresh?: boolean;
   now?: number;
   maxAgeMs?: number;
@@ -105,7 +146,7 @@ function canonical(value: unknown): string {
 export function buildEvalInputIdentity(input: EvalInputManifest): EvalInputIdentityResult {
   try {
     if (!validScope(input.scope)) throw new Error('A repository and positive PR number are required');
-    if (!object(input.coverage) || ['dependencies', 'prompts', 'environment'].some(key => input.coverage[key] !== 'complete')
+    if (!object(input.coverage) || (['dependencies', 'prompts', 'environment'] as const).some(key => input.coverage[key] !== 'complete')
       || !Array.isArray(input.unknownDependencies) || input.unknownDependencies.length !== 0) {
       throw new Error('Consumed input coverage is incomplete or unknown');
     }
@@ -146,7 +187,7 @@ function validIdentity(value: unknown): value is EvalInputIdentity {
     && canonical(value.caseIds) === canonical(sorted(value.caseIds));
 }
 function bypass(policy: EvalCachePolicy): string | null {
-  if (policy.purpose !== 'gate') return 'Periodic and release validation must execute fresh';
+  if (policy.purpose !== 'gate') return 'Periodic, marathon and release validation must execute fresh';
   if (policy.fresh) return 'Fresh validation requested';
   if (!positive(policy.now ?? Date.now()) || !positive(policy.maxAgeMs ?? EVAL_CACHE_MAX_AGE_MS)) return 'Invalid cache age policy';
   return null;

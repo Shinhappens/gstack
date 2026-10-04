@@ -1,4 +1,6 @@
 import { describe, test, expect } from 'bun:test';
+import { emitActivity } from '../src/activity';
+import { stubRouteContext, callRoute } from './route-test-harness';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -10,6 +12,8 @@ import { stripLoneSurrogates as sanitizeLoneSurrogates } from '../src/sanitize';
 
 const SERVER_PATH = path.resolve(import.meta.dir, '..', 'src', 'server.ts');
 const SERVER_SRC = fs.readFileSync(SERVER_PATH, 'utf-8');
+const ROUTE_SRC = (file: string) => fs.readFileSync(path.resolve(import.meta.dir, '..', 'src', 'routes', file), 'utf-8');
+const LONE = 'bad \uD800 value';
 
 describe('sanitizeLoneSurrogates — unit cases', () => {
   test('passthrough ASCII', () => {
@@ -105,22 +109,27 @@ describe('sanitizeLoneSurrogates — wiring invariants', () => {
     expect(SERVER_SRC).toContain('result: stripLoneSurrogates(cr.result)');
   });
 
-  test('SSE activity feed routes outbound frames through createSseEndpoint', () => {
-    // v1.51 refactor: /activity/stream no longer inlines its own
-    // ReadableStream/sanitizer wiring; it routes through createSseEndpoint
-    // which applies sanitizeReplacer to every JSON.stringify. The grep
-    // pins both halves of the contract: the endpoint uses the helper,
-    // and the helper does the sanitization.
-    const activityBlock = SERVER_SRC.match(
-      /if \(url\.pathname === '\/activity\/stream'\)[\s\S]*?createSseEndpoint\(/,
-    );
-    expect(activityBlock).not.toBeNull();
+  test('SSE activity feed routes outbound frames through createSseEndpoint', async () => {
+    // v1.51 refactor: /activity/stream routes through createSseEndpoint,
+    // which applies sanitizeReplacer to every JSON.stringify. Replaying an
+    // activity entry that carries a lone surrogate must emit U+FFFD, never
+    // the lone code unit or its \uXXXX escape.
+    const entry = emitActivity({ type: 'command_start', command: 'goto', url: `https://example.com/${LONE}` });
+    const resp = await callRoute('GET', `/activity/stream?after=${entry.id - 1}`, stubRouteContext());
+    const reader = resp.body!.getReader();
+    let text = '';
+    while (!text.includes(`"id":${entry.id}`)) text += new TextDecoder().decode((await reader.read()).value);
+    await reader.cancel();
+    expect(text).toContain('bad \uFFFD value');
+    expect(text).not.toMatch(/\\ud800/i);
   });
 
   test('SSE inspector stream routes outbound frames through createSseEndpoint', () => {
-    // Same v1.51 refactor invariant for /inspector/events.
-    const inspectorBlock = SERVER_SRC.match(
-      /if \(url\.pathname === '\/inspector\/events'[\s\S]*?createSseEndpoint\(/,
+    // Same v1.51 invariant for /inspector/events. Inspector state only fills
+    // from a live CDP pick, so this stays a source check, re-pointed to the
+    // route module.
+    const inspectorBlock = ROUTE_SRC('inspector.ts').match(
+      /path: '\/inspector\/events'[\s\S]*?createSseEndpoint\(/,
     );
     expect(inspectorBlock).not.toBeNull();
   });
@@ -152,13 +161,22 @@ describe('sanitizeLoneSurrogates — wiring invariants', () => {
     );
   });
 
-  test('server.ts imports sanitizeReplacer for non-SSE JSON egress and still uses it', () => {
-    // server.ts used to define its own private sanitizeReplacer for the
-    // non-SSE JSON egress paths (/pty-inject-scan, /memory snapshot, etc.).
-    // It now imports the canonical one — and must still pass it at those
-    // JSON.stringify egress sites.
-    expect(SERVER_SRC).toMatch(/import \{[^}]*sanitizeReplacer[^}]*\} from '\.\/sanitize'/);
+  test('non-SSE JSON egress routes use the canonical sanitizeReplacer', async () => {
+    // The non-SSE JSON egress paths (/memory snapshot, /pty-inject-scan)
+    // moved to route modules; they pass the canonical replacer from
+    // sanitize.ts through json(). /memory is exercised end to end with a
+    // page-derived tab title carrying a lone surrogate.
+    const ctx = stubRouteContext({
+      browserManager: { getMemorySnapshot: async () => ({ tabs: [{ title: LONE }] }) } as any,
+    });
+    const text = await (await callRoute('GET', '/memory', ctx)).text();
+    expect(JSON.parse(text).tabs[0].title).toBe('bad \uFFFD value');
+    expect(text).not.toMatch(/\\ud800/i);
+    for (const file of ['core.ts', 'pty.ts']) {
+      const src = ROUTE_SRC(file);
+      expect(src).toMatch(/import \{[^}]*sanitizeReplacer[^}]*\} from '\.\.\/sanitize'/);
+      expect(src).toContain('replacer: sanitizeReplacer');
+    }
     expect(SERVER_SRC).not.toContain('function sanitizeReplacer(');
-    expect(SERVER_SRC).toContain(', sanitizeReplacer)');
   });
 });

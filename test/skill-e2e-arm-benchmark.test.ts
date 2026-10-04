@@ -21,7 +21,7 @@
  * Failure taxonomy (CEO review finding 2):
  *   - zero-diff arm  -> VALID scored cell (LOC 0, judge scores it "none").
  *   - harvest failure -> cell FAILED, harvest: null recorded.
- *   - judge still malformed after armJudge's bounded retries -> judge_error
+ *   - judge output malformed (armJudge never re-asks) -> judge_error
  *     cell: excluded from aggregates, surfaced in the run report, never
  *     silently dropped.
  *
@@ -108,7 +108,7 @@ async function runArmCell(task: ArmTask, arm: Arm): Promise<CellResult> {
     }
     const checks = runChecks(task, dirs.dir);
 
-    // Judge taxonomy: still malformed after armJudge's bounded retries ->
+    // Judge taxonomy: malformed armJudge output (no re-ask) ->
     // judge_error cell (excluded from aggregates, surfaced in the report).
     let judge: ArmJudgeScore | null = null;
     let judgeError: string | null = null;

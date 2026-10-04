@@ -1,68 +1,28 @@
 import { isDeepStrictEqual } from 'node:util';
 import * as path from 'node:path';
 import type { SkillTestResult } from './session-runner';
+import { coverageAuditReadEvidence } from './coverage-audit-evidence';
 
 export interface CoverageFile { path: string; content: string }
 
-function outputText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content.filter(block => block?.type === 'text' && typeof block.text === 'string')
-    .map(block => block.text).join('\n');
-}
-
-/** Require the entire nonce-bearing fixture in successful, owned tool output.
- * Shell spelling is deliberately irrelevant: cat, sed and other readers can
- * display the same bytes. A command, assistant claim or pending call is no proof.
+/** Require both nonce-bearing fixtures in successful, owned native tool output.
+ * coverageAuditReadEvidence is the single owner of what counts as a read: a
+ * native Read of the path, or a closed read-only Bash command whose cat/sed
+ * output holds the complete file at its own position. A command, assistant
+ * claim, pending call or echoed copy is no proof.
  */
 export function requireCoverageFileReads(transcript: any[], cwd: string, files: CoverageFile[]): void {
   // A retained transcript keeps the originating filesystem's path namespace.
   const paths = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(cwd) ? path.win32 : path.posix;
-  const required = ['src/billing.ts', 'test/billing.test.ts'].map(file => paths.join(cwd, file)).sort();
-  if (!isDeepStrictEqual(files.map(file => file.path).sort(), required)
+  const required = ['src/billing.ts', 'test/billing.test.ts'].map(file => paths.join(cwd, file));
+  if (!isDeepStrictEqual(files.map(file => file.path).sort(), [...required].sort())
     || files.some(file => typeof file.content !== 'string' || !file.content.trim())) {
     throw new Error('Coverage audit: source and test expectations are required');
   }
-  const inits = transcript.filter(event => event.type === 'system' && event.subtype === 'init'
-    && event.parent_tool_use_id == null);
-  const sessions = new Set(inits.map(event => event.session_id));
-  if (sessions.size !== 1 || typeof inits[0]?.session_id !== 'string'
-    || !inits.every(event => event.cwd === cwd)) throw new Error('Coverage audit: missing or conflicting native owner');
-  const session = inits[0].session_id;
-  const calls = new Map<string, any>();
-  const results = new Map<string, any>();
-  const read = new Set<string>();
-  for (const event of transcript) {
-    if (event.session_id !== session || event.parent_tool_use_id != null
-      || !Array.isArray(event.message?.content)) continue;
-    for (const block of event.message.content) {
-      if (event.type === 'assistant' && block.type === 'tool_use' && typeof block.id === 'string') {
-        if (calls.has(block.id) && !isDeepStrictEqual(calls.get(block.id), block)) {
-          throw new Error('Coverage audit: conflicting native tool input');
-        }
-        calls.set(block.id, block);
-      }
-      if (event.type !== 'user' || block.type !== 'tool_result') continue;
-      if (results.has(block.tool_use_id) && !isDeepStrictEqual(results.get(block.tool_use_id), block)) {
-        throw new Error('Coverage audit: conflicting native tool result');
-      }
-      results.set(block.tool_use_id, block);
-      if (block.is_error !== undefined && block.is_error !== false) continue;
-      const call = calls.get(block.tool_use_id);
-      if (!call || !['Read', 'Bash'].includes(call.name)) continue;
-      const text = outputText(block.content).replace(/\r\n/g, '\n');
-      // Native Read uses N→; cat -n uses N<TAB>. Preserve every content byte.
-      const numbered = text.split('\n').map(line => line.replace(/^\s*\d+(?:\t|→)/, '')).join('\n');
-      for (const file of files) {
-        if (call.name === 'Read' && (typeof call.input?.file_path !== 'string'
-          || paths.resolve(cwd, call.input.file_path) !== file.path)) continue;
-        if (call.name === 'Bash' && typeof call.input?.command !== 'string') continue;
-        const expected = file.content.replace(/\r\n/g, '\n').trim();
-        if (expected && (text.includes(expected) || numbered.includes(expected))) read.add(file.path);
-      }
-    }
-  }
-  const missing = files.filter(file => !read.has(file.path)).map(file => paths.relative(cwd, file.path));
+  const [source, tests] = required.map(file => files.find(candidate => candidate.path === file)!);
+  const reads = coverageAuditReadEvidence(Array.isArray(transcript) ? transcript : [], { cwd, source: source!, tests: tests! });
+  const missing = [[reads.sourceRead, source!], [reads.testsRead, tests!] as const]
+    .filter(([read]) => !read).map(([, file]) => paths.relative(cwd, (file as CoverageFile).path));
   if (missing.length) throw new Error(`Coverage audit: no successful complete file read: ${missing.join(', ')}`);
 }
 

@@ -1,0 +1,14 @@
+{
+  "_comment": "First-AUQ texts in serializeNativeAuq shape. known_good passes the matrix's format gate (substance is graded separately). known_bad must keep failing it.",
+  "known_good": {
+    "full-format": "Scope\n\nD1 — Which test harness should the plan adopt?\nELI10: The plan needs one test runner.\nStakes if we pick wrong: flaky CI for weeks.\nRecommendation: A because the repo already uses bun test.\nPros / cons:\nNet: reuse vs. migration.\n\nA) bun test (recommended)\n✅ already installed\n❌ fewer plugins\n\nB) vitest\n✅ plugins\n❌ new dependency",
+    "no-emoji-or-net": "Scope\n\nD1 — Which test harness should the plan adopt?\nELI10: The plan needs one test runner.\nRecommendation: A because the repo already uses bun test and adding vitest means a second config.\n\nA) bun test (recommended)\nAlready installed; fewer plugins.\n\nB) vitest\nMore plugins; new dependency.",
+    "bold-recommendation": "Scope\n\n**Recommendation:** B, because the migration is already half done.\n\nA) Stay\nNo churn.\n\nB) Finish migration (recommended)\nOne config."
+  },
+  "known_bad": {
+    "no-recommendation-line": "Scope\n\nD1 — Which test harness?\nELI10: pick one.\n✅ ❌ Net: tradeoff. Pros / cons\n\nA) bun test (recommended)\n\nB) vitest",
+    "two-recommended": "Scope\n\nRecommendation: A because it is installed.\n\nA) bun test (recommended)\n\nB) vitest (recommended)",
+    "no-recommended-option": "Scope\n\nRecommendation: A because it is installed.\n\nA) bun test\n\nB) vitest",
+    "empty-recommendation": "Scope\n\nRecommendation:\n\nA) bun test (recommended)\n\nB) vitest"
+  }
+}

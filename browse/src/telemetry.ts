@@ -20,11 +20,11 @@
 
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { readGstackConfigYamlKey } from './config';
+import { resolveStateRoot } from '../../lib/state-root';
 
 function gstackHome(): string {
-  return process.env.GSTACK_HOME || path.join(os.homedir(), '.gstack');
+  return resolveStateRoot();
 }
 
 function analyticsDir(): string {

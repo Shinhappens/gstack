@@ -25,20 +25,8 @@ const evalCollector = createEvalCollector('e2e-qa-bugs');
 // (fallback). Neither → skip, never fail.
 const describeOutcome = (evalsEnabled && hasApiKey && (asideAvailable() || fs.existsSync(browseBin))) ? describe : describe.skip;
 
-/**
- * The BROWSER SETUP section qa/SKILL.md renders (Aside probe + browse fallback
- * + driving rules). The agent gets just this, not the 1500-line skill, so the
- * driver decision is the skill's own text, not the prompt's.
- */
 function browserSetupSection(): string {
-  const skill = fs.readFileSync(path.join(ROOT, 'qa', 'SKILL.md'), 'utf-8');
-  const start = skill.indexOf('## BROWSER SETUP');
-  // The Aside contract is followed by its own H2, '## Browser fallback: ...' — the
-  // fixture must carry both so a run without Aside can take the $B path.
-  const fallback = skill.indexOf('\n## Browser fallback', start + 3);
-  const end = skill.indexOf('\n## ', (fallback > 0 ? fallback : start) + 3);
-  if (start < 0 || end < 0) throw new Error('qa/SKILL.md: BROWSER SETUP section not found — regenerate with: bun run gen:skill-docs');
-  return skill.slice(start, end);
+  return fs.readFileSync(path.join(ROOT, 'qa', 'sections', 'browser-setup.md'), 'utf-8');
 }
 
 // Wrap describeOutcome with selection — skip if no planted-bug tests are selected

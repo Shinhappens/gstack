@@ -13,7 +13,7 @@ export function installOutsideReviewFixture(rendered: string, host: 'claude' | '
   const head = extractSkillSections(source, ['Step 0: Detect platform and base branch', 'Step 3: Get the diff']);
   const sectionPath = join(source, 'sections', 'adversarial.md');
   const section = existsSync(sectionPath) ? readFileSync(sectionPath, 'utf8')
-    : extractSkillSections(source, ['Step 5.7: Adversarial review (always-on)']).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+    : extractSkillSections(source, ['Step 4.8: Adversarial review (always-on)']).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
   if (!section.includes('Adversarial review (always-on)')) throw new Error(`Missing adversarial workflow: ${source}`);
   // Runtime paths are the only fixture substitution. Provider selection,
   // caller controls, prompt, probes, and execution code stay generated verbatim.

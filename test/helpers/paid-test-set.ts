@@ -11,8 +11,8 @@ import { matchGlob } from './touchfiles';
 
 /** The exact globs package.json's `test:gate` passes to `bun test`. */
 export const PAID_TEST_GLOBS = [
-  // skill-llm-eval* (not just the base file): skill-llm-eval-spec.test.ts
-  // fell outside the exact glob and could never run in any lane.
+  // skill-llm-eval* (not just the base file): a sibling judge file outside
+  // the exact glob could never run in any lane.
   'test/skill-llm-eval*.test.ts',
   'test/skill-e2e-*.test.ts',
   'test/skill-routing-e2e.test.ts',
@@ -22,7 +22,6 @@ export const PAID_TEST_GLOBS = [
   // entered the paid census. The same bug class as the deleted pre-split
   // monolith (see test/paid-shards.test.ts's regression pin).
   'test/codex-e2e*.test.ts',
-  'test/gemini-e2e.test.ts',
   'test/llm-judge-recommendation.test.ts',
   'test/carve-section-loading*.test.ts',
 ] as const;

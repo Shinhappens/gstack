@@ -38,22 +38,20 @@ function sourceOutputs() {
 }
 
 beforeAll(async () => {
-  // Copy current tracked source bytes, not HEAD: the real generator and helper
+  // Copy current nonignored source bytes, not HEAD: the real generator and helper
   // must resolve their own ROOT inside this disposable checkout. This also
   // makes the legacy in-place comparison safe in parallel free-test shards.
   fs.mkdirSync(source);
   fs.mkdirSync(temporaryParent);
-  const files = spawnSync('git', ['ls-files', '-z'], { cwd: ROOT, encoding: 'utf8' });
+  const files = spawnSync('git', ['ls-files', '-co', '--exclude-standard', '-z'], { cwd: ROOT, encoding: 'utf8', timeout: 5000 });
   expect(files.status, files.stderr).toBe(0);
-  for (const relative of files.stdout.split('\0').filter(Boolean)) {
+  for (const relative of new Set(files.stdout.split('\0').filter(Boolean))) {
     const from = path.join(ROOT, relative);
     const to = path.join(source, relative);
     fs.mkdirSync(path.dirname(to), { recursive: true });
     if (fs.lstatSync(from).isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(from), to);
     else fs.copyFileSync(from, to);
   }
-  // The helper can be a new, not-yet-indexed file during a repair.
-  fs.copyFileSync(path.join(ROOT, 'test/helpers/sol-skill-fixture.ts'), path.join(source, 'test/helpers/sol-skill-fixture.ts'));
   fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(source, 'node_modules'), 'dir');
   const legacy = spawnSync(process.execPath, ['scripts/gen-skill-docs.ts', '--host', 'codex', '--model', 'gpt-5.6-sol'], {
     cwd: source, encoding: 'utf8', timeout: 120_000,

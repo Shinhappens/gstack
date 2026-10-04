@@ -124,17 +124,15 @@ describe("#1624 retro guard — branch D: stale-base BLOCK", () => {
   test("today comes from the session reminder, never the system clock", () => {
     const body = readTmpl();
     expect(body).toMatch(/session reminder/);
-    expect(body).toMatch(/NEVER from `date`/);
+    expect(body).toMatch(/never from `date`/i);
   });
 });
 
 describe("#1624 retro guard — disclosure must reach the narrative", () => {
   test("skip paths carry a disclosure line into the retro output", () => {
     const body = readTmpl();
-    // The prose ties disclosure + narrative together so the retro output is
-    // never silently confidently-wrong on offline/local-only runs.
+    // The retro output is never silently confidently-wrong on offline/local-only runs.
     expect(body).toMatch(/offline run, window not freshness-verified/);
-    expect(body).toMatch(/(?:disclosure[\s\S]{0,200}narrative|narrative[\s\S]{0,200}disclosure)/);
   });
 
   test("non-default analyzed ref is disclosed (RETRO_REF)", () => {

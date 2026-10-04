@@ -6,8 +6,6 @@ import { spawnSync } from 'node:child_process';
 import { createAutoplanArtifactRecorder, recordAutoplanArtifact, readPendingAutoplanArtifact,
   autoplanArtifactRecorderStatus, autoplanArtifactApprovalBoundary } from './helpers/autoplan-artifact-recorder';
 import type { NativePublicToolEvent } from './helpers/plan-count-transcript';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
-
 // Synthetic hook envelopes and owned temp paths. The live pending hook envelope
 // was unpublished; these controls do not reconstruct it or provide paid coverage.
 function fixture(approveEdits=false) {
@@ -164,13 +162,6 @@ describe('owned Autoplan pending artifact metadata recorder',()=>{
       expect(f.status()).toEqual({status:'invalid',reason:'stdin_timeout'});
     }finally{clearTimeout(timer);child.stdin.end();if(child.exitCode===null){child.kill('SIGKILL');await child.exited}f.dispose()}
   },7000);
-  test('recorder disposal removes owned state and shared recorder inputs select both paid owners',()=>{
-    const f=fixture();f.write(f.event());f.dispose();expect(fs.existsSync(f.recorder.file)).toBe(false);
-    for(const file of ['test/helpers/autoplan-artifact-recorder.ts','test/autoplan-artifact-recorder.test.ts'])
-      expect(selectTests([file],E2E_TOUCHFILES,[]).selected.sort()).toEqual(['autoplan-chain-pty','plan-eng-finding-count']);
-    for(const file of ['test/autoplan-pending-artifact.test.ts','test/fixtures/autoplan-pending-artifact-ae.json'])
-      expect(selectTests([file],E2E_TOUCHFILES,[]).selected).toEqual(['autoplan-chain-pty']);
-  });
 });
 
 // Real hook subprocesses and the public JSONL reader; no synthetic phase success

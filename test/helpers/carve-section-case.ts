@@ -52,7 +52,7 @@ const PLAN_MD = [
 
 export function registerCarveSectionCase(skill: string): void {
     const guard = CARVE_GUARDS[skill];
-    if (!guard || guard.behavioral === 'external') throw new Error(`No generic carved-skill case for ${skill}`);
+    if (!guard || (guard.behavioral !== 'plan' && guard.behavioral !== 'prompt')) throw new Error(`No generic carved-skill case for ${skill}`);
     // Keep explicit cost-scoped selection; the free census pins every wrapper.
     if (only && only !== guard.skill) return;
 
@@ -108,11 +108,15 @@ export function registerCarveSectionCase(skill: string): void {
             ? '- Proceed directly with the requested engineering review; skip the optional /office-hours prerequisite. You represent the plan author, whose scope and proposed steps are in PLAN.md. At each decision, choose the complete alternative that preserves those requirements and existing contracts; choose the recommended option only among alternatives within that scope. Do not authorize optional scope, extra public input guarantees, arbitrary size limits, or optional proof projects. Decline work explicitly listed out of scope, including creating TODOs for it. Record the decision and its actual authority as the skill requires, then continue without asking a human. A demonstrated incompatibility or missing required proof still requires resolution; do not hide it or claim approval when no offered alternative meets these constraints.'
             : undefined,
           // Both plan reviews persist their required report in the reviewed plan.
-          reportFile: ['plan-devex-review', 'plan-eng-review'].includes(guard.skill) ? 'PLAN.md' : undefined,
+          // design-consultation's final output is DESIGN.md itself; a second
+          // REPORT.md only duplicated the proposal (census 36641820398 timeout).
+          reportFile: ['plan-devex-review', 'plan-eng-review'].includes(guard.skill) ? 'PLAN.md'
+            : guard.skill === 'design-consultation' ? 'DESIGN.md' : undefined,
           // This scenario produces an HTML implementation, whose complete
           // document need not contain any of the prose report keywords.
           reportMarker: guard.skill === 'design-html'
             ? /<!doctype\s+html\s*>\s*<html\b[^>]*>[\s\S]*?<head\b[^>]*>[\s\S]*?<\/head\s*>[\s\S]*?<body\b[^>]*>[\s\S]*?<\/body\s*>\s*<\/html\s*>/i
+            : guard.skill === 'design-consultation' ? /^# gstack: design-md-format=spec$/m
             : /report|review|summary|design doc|handoff/i,
           testName: `${guard.skill} section-loading`,
           runId,
@@ -125,7 +129,7 @@ export function registerCarveSectionCase(skill: string): void {
         });
         // Require the HTML artifact itself; a terminal-only claim is insufficient.
         // captureSectionReads already requires a successful native completion.
-        const reportProduced = completionMarked && (guard.skill !== 'design-html' || reportWritten);
+        const reportProduced = completionMarked && (!['design-html', 'design-consultation'].includes(guard.skill) || reportWritten);
 
         const missing = guard.requiredReads.filter((s) => !readSections.has(s));
         // Named failure output (codex #2): skill + expected + observed.

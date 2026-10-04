@@ -250,10 +250,11 @@ describe('SKILL.md size budget regression (gate, free)', () => {
     // estimate was a moving target: 4177 solo, 8356 and 8041 in two parallel
     // runs. A repo-budget ratchet measures the catalog that ships; CI always
     // checks the PR's committed tree anyway.
-    const trackedPaths = execSync('git ls-files -- "*/SKILL.md"', { cwd: REPO_ROOT, encoding: 'utf-8', timeout: 30_000 })
+    // List paths from HEAD too: a staged-but-uncommitted skill is in the index
+    // but not yet in HEAD, so `git ls-files` + `git show HEAD:` disagree.
+    const trackedPaths = execSync('git ls-tree -r --name-only HEAD', { cwd: REPO_ROOT, encoding: 'utf-8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 })
       .split('\n')
-      .filter(Boolean)
-      .filter((p) => p.split('/').length === 2);
+      .filter((p) => p.endsWith('/SKILL.md') && p.split('/').length === 2);
     let descriptionBytes = 0;
     for (const rel of trackedPaths) {
       const committed = execSync(`git show HEAD:${JSON.stringify(rel)}`, {

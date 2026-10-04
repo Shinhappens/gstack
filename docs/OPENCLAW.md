@@ -142,9 +142,11 @@ the same command line:
 GSTACK_SESSION_KIND=spawned "$_SS" --skill "document-release" ...
 ```
 
-gstack itself uses this: `/ship` Step 18 dispatches the `/document-release`
-subagent with this prefix so its interactive gates auto-choose instead of
-prose-stopping. Deliberately narrow: only `spawned` is honored — `headless`
+gstack itself uses this: `/ship` Step 14.5 dispatches the `/document-release`
+subagent with this prefix before final commit, verification and publication.
+Its ship-owned scope overrides generic spawned auto-choice: risky or uncertain
+documentation changes return as blockers for the parent, without interactive
+questions or automatic approval. Deliberately narrow: only `spawned` is honored — `headless`
 already has `GSTACK_HEADLESS`, and letting an env var force `interactive`
 over CI markers would be a misclassification footgun. Empty or other values
 are reserved and ignored (fall through to ambient detection). Note that hook

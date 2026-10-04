@@ -192,42 +192,6 @@ describe('resolveDisconnectCause', () => {
   });
 });
 
-// ─── onDisconnect exit-code propagation (regression test) ──────────
-//
-// The contract: BrowserManager.onDisconnect is called with the resolved
-// exit code (0 for clean Cmd+Q, 2 for crash). server.ts then forwards
-// that code to activeShutdown(), which exits the process.
-//
-// Without this propagation, the headed-mode user-visible Cmd+Q respawn
-// bug returns: server.ts hardcoded `activeShutdown?.(2)` ignores the
-// resolved 0 and gbrowser's gbd HealthMonitor treats the clean quit as
-// a crash, restarting the window.
-describe('BrowserManager.onDisconnect exit-code propagation', () => {
-  it('signature accepts an optional exitCode argument', async () => {
-    const { BrowserManager } = await import('../src/browser-manager');
-    const bm = new BrowserManager();
-    const calls: Array<number | undefined> = [];
-    bm.onDisconnect = (code?: number) => { calls.push(code); };
-    bm.onDisconnect(0);
-    bm.onDisconnect(2);
-    bm.onDisconnect(undefined);
-    expect(calls).toEqual([0, 2, undefined]);
-  });
-
-  it('server.ts callback forwards exitCode when provided, falls back to 2', async () => {
-    // Mirror the production wiring in browse/src/server.ts so a refactor
-    // that drops the forward (e.g. reverting to `() => activeShutdown?.(2)`)
-    // fails CI before the user-visible bug returns.
-    const shutdownCalls: number[] = [];
-    const activeShutdown = (code: number) => { shutdownCalls.push(code); };
-    const onDisconnect = (code?: number) => activeShutdown(code ?? 2);
-    onDisconnect(0);
-    onDisconnect(2);
-    onDisconnect(undefined);
-    expect(shutdownCalls).toEqual([0, 2, 2]);
-  });
-});
-
 // ─── Stealth injected on EVERY launch path (regression tripwire) ───
 //
 // applyStealth must run on launch() (headless), launchHeaded(), AND

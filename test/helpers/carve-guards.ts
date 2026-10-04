@@ -77,8 +77,9 @@ export interface CarveGuard {
    *  - 'external' → covered by a dedicated bespoke test (complex fixtures, e.g.
    *                 ship's git/VERSION/CHANGELOG state). The data-driven loop
    *                 skips it; E1 asserts `externalTest` exists instead.
+   *  - 'none'     → no behavioral guard; the static invariants still apply.
    */
-  behavioral: 'plan' | 'prompt' | 'external';
+  behavioral: 'plan' | 'prompt' | 'external' | 'none';
   /** Required when behavioral === 'external': path (repo-relative) to the dedicated test. */
   externalTest?: string;
   /** Parity: max bytes for the always-loaded skeleton (asserts the carve shrank it). */
@@ -104,12 +105,14 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       'test-coverage.md',
       'plan-completion.md',
       'review-army.md',
+      'shared-code-reuse.md',
       'greptile.md',
       'adversarial.md',
       'changelog.md',
+      'documentation.md',
       'pr-body.md',
     ],
-    requiredReads: ['review-army.md', 'changelog.md'],
+    requiredReads: ['review-army.md', 'changelog.md', 'documentation.md'],
     scenario:
       'This is a FRESH version-changing ship: the branch has a real code change, VERSION still equals the base version (needs a bump), and CHANGELOG.md needs a new entry. Follow the skill flow for a version-changing ship: run the pre-landing review and prepare the CHANGELOG entry. Produce the ship plan / review report. Do NOT actually commit, push, or open a PR.',
     staticInvariants: {
@@ -130,8 +133,8 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       mustStayInSkeleton: [
         'v$NEW_VERSION',
         'gstack-pr-title-rewrite',
-        'dispatching the /document-release subagent to sync docs',
-        'Continue to mandatory Step 18 (dispatch /document-release)',
+        '## Step 14.5: Documentation audit (every ship)',
+        'No documentation writer runs after push',
         'dispatches the /document-release subagent',
       ],
       // ...while the full create/update procedure stays carved into pr-body.md
@@ -163,7 +166,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // wave's headline capability) grows the union to 1.195x. Deliberate:
     // the section is on-demand (loads only for Apple store targets), so
     // per-invocation cost for non-iOS ships is one manifest line.
-    maxSizeRatio: 1.322, // Shared advisory identity/dedup + critical-severity validation: 248,065 union bytes / 187,706 baseline = 1.3216 (2026-09-17).
+    maxSizeRatio: 1.403, // Shared advisory identity/dedup + critical-severity validation: 248,065 union bytes / 187,706 baseline = 1.3216 (2026-09-17). + test value bar in the lazy Step 7 section (value cards, weak paths, gate table, base control, machine checks; ~13.6KB): measured 1.396 (2026-09-29). + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.401 (2026-09-30). + the shared QA review step's plan-check timing rule (plan checks and their revalidation run on --timeout-ms after smoke expiry); measured 1.4022 (2026-09-30). + the shared TEST_BOOTSTRAP owned-change undo rules (s03 H1-H3, M1) and the value-bar coverage wording (s03 M2/M3); measured 1.4044 (2026-10-02). Lowered to the follow-up wave's measured 1.4023 (2026-10-03).
   },
   'plan-ceo-review': {
     skill: 'plan-ceo-review',
@@ -181,7 +184,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // v1.65 merge: provisional larger-of-both-waves budget; re-measured below.
         // Fork port wave 2 (#703): the repo-doc-preference block in the design
     // check grew every plan-review skeleton ~0.7KB. Measured values noted.
-    maxSkeletonBytes: 80_150, // + depth-specific output and 0H/0I feasibility boundary clarity + the Aside probe's failure reason; measured 80,111.
+    maxSkeletonBytes: 80_850, // + depth-specific output and 0H/0I feasibility boundary clarity + the Aside probe's failure reason; measured 80,111. + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 80,649 (2026-09-30); + the same guard in the CEO spec-review metrics block; measured 80,812 (2026-09-30).
     minUnionBytes: 123_600, // token-reduction Phases 1-2 (v1.69.x branch): preamble bash -> bin/gstack-skill-start, onboarding -> gated emission; measured union 137,346
     mustContain: ['SCOPE EXPANSION', 'SELECTIVE EXPANSION', 'HOLD SCOPE', 'SCOPE REDUCTION'],
     // Default-on Codex outside-voice (codexPreflight block + CODEX_MODE branch
@@ -218,7 +221,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // 1.08 → 1.10: the scope-gate exceptions block (+ its adversarial-review
     // hardening: host-anchored mode signal, precedence, passing-mention
     // guards) and the plan-mode preamble reword land the union at 1.092.
-    maxSizeRatio: 1.151, // + clarity rules for saved decisions/setup gates + the Aside probe's failure reason; measured 1.1504
+    maxSizeRatio: 1.175, // + clarity rules for saved decisions/setup gates + the Aside probe's failure reason; measured 1.1504. + test value bar and Tests to Retire in the lazy Test review section (~2.6KB); measured 1.168 + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.173 (2026-09-30). + v1.91.12.0 merge of #2999 (headless rule: a disallowed question tool never qualifies) with #3002; measured 1.1741 (2026-10-01).
   },
   'plan-design-review': {
     skill: 'plan-design-review',
@@ -352,8 +355,8 @@ do not launch the downstream skill or open a browser.`,
   },
   'document-release': {
     skill: 'document-release',
-    expectedSections: ['release-body.md'],
-    requiredReads: ['release-body.md'],
+    expectedSections: ['audit-scope.md', 'release-body.md'],
+    requiredReads: ['audit-scope.md', 'release-body.md'],
     scenario:
       'A PR has shipped a new CLI flag and touched README.md and CHANGELOG.md. Skip the git pre-flight shell commands (assume the diff adds --new-flag and updates those two docs). Run the documentation workflow: build the coverage map, then audit the docs, apply updates, and polish the CHANGELOG voice. Produce the documentation health summary.',
     staticInvariants: {
@@ -384,7 +387,7 @@ do not launch the downstream skill or open a browser.`,
     expectedSections: ['proposal-and-preview.md'],
     requiredReads: ['proposal-and-preview.md'],
     scenario:
-      'The user gave product context (a B2B analytics dashboard for ops teams) and declined the research phase. Skip browser/design tool setup. Proceed to build the complete design-system proposal, then write DESIGN.md. Produce the proposal and the DESIGN.md content.',
+      'The user gave product context (a B2B analytics dashboard for ops teams), declined the research phase and declined the optional outside design voices. Skip browser/design tool setup. Proceed to build the complete design-system proposal, then write DESIGN.md and its CLAUDE.md guidance.',
     staticInvariants: {
       mustStayInSkeleton: ['## Phase 0: Pre-checks', '## Phase 1: Product Context', '## Phase 2: Research'],
       mustMoveToSection: ['## Phase 3: The Complete Proposal', '## Phase 6: Write DESIGN.md'],
@@ -404,7 +407,14 @@ do not launch the downstream skill or open a browser.`,
     // the cross-session decision-memory nudge) lands this carved skeleton just over
     // the strict 1.05; headroom for the shared preamble additions.
     // v1.64+v1.65 merge sums both waves' preamble growth; measured 1.073.
-    maxSizeRatio: 1.08,
+    // + W1 guarded state-root resolution in the Context Recovery preamble, the
+    // eureka log, the office-hours lookup and the taste-profile read; measured
+    // 1.0834 (2026-09-30). + named design-direction defaults to avoid in the native
+    // subagent prompt (s02 H4a); measured 1.0911 (2026-10-02). Re-measured
+    // 1.0758 (2026-10-03); cap = measured + 0.005 headroom. + v1.91.17.0's
+    // never-overwrite round accounting and printed-path board images; measured
+    // 1.091 (2026-10-03).
+    maxSizeRatio: 1.092,
   },
   cso: {
     skill: 'cso',
@@ -450,7 +460,7 @@ do not launch the downstream skill or open a browser.`,
   // ── Token-reduction Phase 4 wave 1 (v1.69.x branch) ──────────────────────
   review: {
     skill: 'review',
-    expectedSections: ['plan-completion.md', 'review-army.md', 'adversarial.md'],
+    expectedSections: ['plan-completion.md', 'review-army.md', 'shared-code-reuse.md', 'adversarial.md'],
     requiredReads: ['plan-completion.md', 'review-army.md'],
     scenario:
       "The working tree has a real diff against the base branch (assume Step 1's git checks passed; the diff implements the PLAN.md cache layer). Run the /review flow: the scope-drift and plan-completion deep pass against PLAN.md, then the critical pass, then the Review Army specialist dispatch — apply the specialist checklists yourself instead of launching subagents. Produce the review report. Do NOT commit, push, or create a PR.",
@@ -475,10 +485,10 @@ do not launch the downstream skill or open a browser.`,
       gateAfterStop: undefined, // operational multi-STOP skill, like ship
     },
     behavioral: 'plan',
-    maxSkeletonBytes: 74_600, // Shared-code identity/skip/action rules + critical-severity validation; measured 74,493 (2026-09-17).
+    maxSkeletonBytes: 74_881, // Shared-code identity/skip/action rules + critical-severity validation; measured 74,493 (2026-09-17). + v1.91.12.0 merge of #2999 (review clarity repairs: await reads, research alongside dispatch, /review deadline and setup authority, findings sources) with #3002 (guarded state-root lines, plan-check checkpoints); each fit alone; measured 74,881 (2026-10-01).
     minUnionBytes: 89_000, // Phase 4 wave 1; measured union 93,357
     mustContain: ['confidence', 'P1', 'P2', 'Review Army', 'adversarial'],
-    maxSizeRatio: 1.18, // Shared-code feature + critical-severity validation: 128,042 union bytes / 108,523 baseline = 1.1799; preserves content floors.
+    maxSizeRatio: 1.185, // Shared-code feature + critical-severity validation: 128,042 union bytes / 108,523 baseline = 1.1799; preserves content floors. + v1.91.12.0 merge of #2999 (above, plus plan-completion fallback intent and specialist checklist-by-path) with #3002; measured 1.1843 (2026-10-01).
   },
   codex: {
     skill: 'codex',
@@ -530,7 +540,7 @@ do not launch the downstream skill or open a browser.`,
     },
     behavioral: 'prompt',
     maxSkeletonBytes: 74_500, // + Aside browser contract for Step 7 canary ({{ASIDE_SETUP}}); measured 73_523
-    maxSizeRatio: 1.10, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.077
+    maxSizeRatio: 1.100, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.077. + both untrusted-content marker formats in the browser fallback (W7f) + the readiness gate's project test command and live eval-store paths (s06 H6/H7); measured 1.1076 (2026-10-02). Re-measured 1.0943 (2026-10-03); cap = measured + 0.005 headroom.
     minUnionBytes: 91_000, // Phase 4 wave 1; estimated union ~94.9KB
     mustContain: ['readiness', 'merge', 'canary', 'revert', 'staging'],
   },
@@ -563,8 +573,8 @@ do not launch the downstream skill or open a browser.`,
       ],
       gateAfterStop: 'AskUserQuestion options:',
     },
-    behavioral: 'external',
-    externalTest: 'test/skill-e2e-autoplan-chain.test.ts', // phase-complete markers live ONLY in sections — its assertions ARE section-read proof
+    // The retired skill-e2e-autoplan-chain was its only section-read proof.
+    behavioral: 'none',
     maxSkeletonBytes: 70_000, // Phase-specific outside coverage, native fallback, and harness guard.
     minUnionBytes: 85_000, // measured union 86,926
     mustContain: ['6 Decision Principles', 'TASTE DECISION', 'USER CHALLENGE', 'consensus', 'Restore Point'],
@@ -632,19 +642,18 @@ do not launch the downstream skill or open a browser.`,
   // ── Token-reduction Phase 4 wave 3 (v1.69.x branch) ──────────────────────
   qa: {
     skill: 'qa',
-    expectedSections: ['test-bootstrap.md', 'qa-patterns.md'],
-    requiredReads: ['qa-patterns.md'],
+    expectedSections: ['scope.md', 'browser-setup.md', 'exploratory.md', 'system-functional.md', 'browser-verify.md', 'test-bootstrap.md', 'qa-patterns.md'],
+    requiredReads: ['scope.md', 'browser-setup.md', 'exploratory.md', 'qa-patterns.md'],
     scenario:
       'Walk /qa in SIMULATION — do not launch a browser, run any aside command, or execute bash; treat the working tree as clean, the tier as Quick, and the target app as http://localhost:3000 with a small feature-branch diff touching one page. Skip the test-framework bootstrap (assume CLAUDE.md documents the test command). Read each pointed section before doing its step, then produce the QA plan as the report: the mode you selected and why, the Phase 1-6 steps you would run, and a worked health-score computation from the rubric. Do NOT use AskUserQuestion.',
     staticInvariants: {
       mustStayInSkeleton: [
         '## Setup',
-        '## BROWSER SETUP (Aside',
         '## Phases 1-6: QA Baseline',
         '## Phase 7: Triage',
         '## Phase 8: Fix Loop',
         '8e.5. Regression Test',
-        'WTF-LIKELIHOOD',
+        '### 8f. Self-Regulation',
         '## Additional Rules (qa-specific)',
         '## Output Structure',
       ],
@@ -652,6 +661,8 @@ do not launch the downstream skill or open a browser.`,
       mustMoveToSection: [
         '## Test Framework Bootstrap',
         'BOOTSTRAP_DECLINED',
+        '### Select the surface before setup',
+        '## BROWSER SETUP (Aside',
         '## Health Score Rubric',
         '### Diff-aware (automatic when on a feature branch with no URL)',
         'Never refuse to use the browser',
@@ -660,10 +671,27 @@ do not launch the downstream skill or open a browser.`,
     },
     behavioral: 'prompt',
     maxSkeletonBytes: 63_500, // + v2.0 {{ASIDE_SETUP}}/{{BROWSE_FALLBACK}} (replaces the browse setup block); measured 61_253
-    maxSizeRatio: 1.08, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.063
+    maxSizeRatio: 1.107, // + v1.81 Aside contract + gstack-browser fallback block (1.080 on v1.91.7.0) + the shared test value bar at 8a.5 ({{TEST_VALUE_BAR:qa}}); measured 1.094 + W1 guarded state-root resolution (`eval gstack-paths; : "${GSTACK_STATE_ROOT:?…}"`) in the Context Recovery preamble, the eureka log and each state-writing bash block; measured 1.101 (2026-09-30) + v1.91.12.0 merge of #2999 (await scope/method Reads, capture --after checkpoints, browser-only empty evidence list) with #3002; measured 1.1028 (2026-10-01). + both untrusted-content marker formats in the browser fallback (W7f); measured 1.1035 (2026-10-02). Re-measured 1.1038 after the W8 probe-loop renames (2026-10-03); the cap already matches. + the annotate-every-capture and superseded rule before materialize (a ship-exploratory-late-input run published evidence that omitted older-snapshot captures); measured 1.1064 (2026-10-03).
     minUnionBytes: 69_500, // measured union 70,385
     // 'aside repl' pins the Aside contract; '$B goto' pins the fallback block in the always-loaded skeleton.
     mustContain: ['bug', 'aside repl', '$B goto', 'fix', 'Health Score Rubric', 'regression'],
+  },
+  'qa-only': {
+    skill: 'qa-only',
+    expectedSections: ['exploratory.md'],
+    requiredReads: ['exploratory.md'],
+    scenario:
+      'Walk /qa-only for an isolated CLI fixture using its declared native commands. Read installed scope, exploratory and functional resources; never read browser setup or DX instructions. Report contract outcomes and proposed tests without changing product, tests or Git. Do not use AskUserQuestion.',
+    staticInvariants: {
+      mustStayInSkeleton: ['## Request Parameters', 'Never fix bugs or write product tests', '## Output'],
+      mustPrecedeStop: ['## Request Parameters'],
+      mustMoveToSection: ['# Shared exploratory QA'],
+    },
+    behavioral: 'external',
+    externalTest: 'test/skill-e2e-qa-functional.test.ts',
+    maxSkeletonBytes: 45_000,
+    minUnionBytes: 40_000,
+    mustContain: ['contract', 'Never fix bugs', 'edit-then-restore', 'test_stub'],
   },
   browse: {
     skill: 'browse',

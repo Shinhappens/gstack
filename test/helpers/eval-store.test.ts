@@ -14,8 +14,20 @@ import {
   formatComparison,
   generateCommentary,
   judgePassed,
+  CONTRACT_VIOLATIONS_FILE,
+  ContractViolation,
+  TRIAL_ENV,
+  TRIAL_OUTCOME_SCHEMA,
+  expectContract,
+  failureClassOf,
+  formatTrialOutcomes,
+  panelVerdict,
+  parseTrialOutcomes,
+  sanitizeTrialError,
+  trialContextFromEnv,
 } from './eval-store';
-import type { EvalResult, EvalTestEntry, ComparisonResult } from './eval-store';
+import type { EvalResult, EvalTestEntry, ComparisonResult, PanelTrial, TrialOutcomeRecord } from './eval-store';
+import { EVAL_POLICY } from './periodic-exclude-data';
 import { manualReviewFixture } from './manual-judge-review-fixture';
 
 let tmpDir: string;
@@ -955,5 +967,193 @@ describe('generateCommentary', () => {
 
     const notes = generateCommentary(c);
     expect(notes.some(n => n.includes('Stable run'))).toBe(true);
+  });
+});
+
+// --- Trials, panel verdicts and contract vetoes (eval reliability policy) ---
+
+const PANEL = EVAL_POLICY.panel;
+const pass = (trial: number, extra: Partial<PanelTrial> = {}): PanelTrial => ({ trial, outcome: 'passed', ...extra });
+const fail = (trial: number, extra: Partial<PanelTrial> = {}): PanelTrial => ({ trial, outcome: 'failed', ...extra });
+const behavior = (trials: PanelTrial[], quarantined = false) =>
+  panelVerdict({ case: 'case-x', kind: 'behavior', panel: PANEL, trials, quarantined });
+
+describe('panelVerdict', () => {
+  test('policy constants are the approved pre-registration', () => {
+    expect(EVAL_POLICY.panel).toEqual({ n: 3, k: 2 });
+    expect(EVAL_POLICY.quarantine).toEqual({
+      entry: { rate: 0.95, minTrials: 10 },
+      exit: { rate: 0.97, minTrials: 10 },
+      capFraction: 0.1,
+      expiryWeeklyRuns: 8,
+    });
+    expect(EVAL_POLICY.infraRedispatch).toBe(1);
+  });
+
+  test('rule: one trial, any failure fails the lane', () => {
+    const ok = panelVerdict({ case: 'r', kind: 'rule', panel: { n: 1, k: 1 }, trials: [pass(1)] });
+    expect(ok).toMatchObject({ status: 'PASS', split: false, failsLane: false, coverage: true, marks: '✓' });
+    const bad = panelVerdict({ case: 'r', kind: 'rule', panel: { n: 1, k: 1 }, trials: [fail(1)] });
+    expect(bad).toMatchObject({ status: 'FAIL', failsLane: true, coverage: false, redClass: 'VERDICT', marks: '✗' });
+  });
+
+  test('behavior 3/3 is a clean PASS', () => {
+    expect(behavior([pass(1), pass(2), pass(3)])).toMatchObject({ status: 'PASS', split: false, passed: 3, failsLane: false });
+  });
+
+  test('behavior 2/3 is a split PASS that shows its failed trial', () => {
+    const v = behavior([pass(1), fail(2, { exit_reason: 'timeout' }), pass(3)]);
+    expect(v).toMatchObject({ status: 'PASS', split: true, passed: 2, failed: 1, failsLane: false, coverage: true, marks: '✓✗✓', reason: 'PASS 2/3' });
+    expect(v.trials[1].exit_reason).toBe('timeout');
+  });
+
+  test('behavior 1/3 and 0/3 fail the lane', () => {
+    expect(behavior([pass(1), fail(2), fail(3)])).toMatchObject({ status: 'FAIL', failsLane: true, redClass: 'VERDICT' });
+    expect(behavior([fail(1), fail(2), fail(3)])).toMatchObject({ status: 'FAIL', failsLane: true });
+  });
+
+  test('a contract trial fails the panel even at 2/3', () => {
+    const v = behavior([pass(1), pass(2), fail(3, { failure_class: 'contract' })]);
+    expect(v).toMatchObject({ status: 'FAIL', contract: true, failsLane: true, redClass: 'VERDICT', reason: 'contract violation' });
+  });
+
+  test('a missing trial is INCOMPLETE and fails the lane', () => {
+    const v = behavior([pass(1), pass(3)]);
+    expect(v).toMatchObject({ status: 'INCOMPLETE', failsLane: true, coverage: false, redClass: 'INCOMPLETE', marks: '✓·✓' });
+    expect(v.reason).toContain('missing trial t2');
+  });
+
+  test('duplicate or out-of-range trial records are INCOMPLETE, never deduplicated', () => {
+    expect(behavior([pass(1), pass(2), pass(2), fail(3)]).status).toBe('INCOMPLETE');
+    expect(behavior([pass(1), pass(2), pass(3), pass(4)]).reason).toContain('unexpected trial t4');
+    const v = panelVerdict({ case: 'c', kind: 'behavior', panel: { n: 11, k: 6 }, trials: Array.from({ length: 10 }, (_, i) => pass(i + 2)) });
+    expect(v.reason).toContain('missing trial t1');
+  });
+
+  test('timeout and infra trials count as failed, never passing', () => {
+    const v = behavior([pass(1), fail(2, { exit_reason: 'timeout' }), fail(3, { failure_class: 'infra' })]);
+    expect(v).toMatchObject({ status: 'FAIL', passed: 1, failed: 2, failsLane: true, redClass: 'VERDICT' });
+    const infra = behavior([pass(1), fail(2, { failure_class: 'infra' }), fail(3, { failure_class: 'infra' })]);
+    expect(infra).toMatchObject({ status: 'FAIL', redClass: 'INFRA' });
+    expect(failureClassOf({ exit_reason: 'timeout' })).toBe('timeout');
+    expect(failureClassOf({})).toBe('assertion');
+  });
+
+  test('quarantined: 1/3 does not fail the lane, 0/3 and contract do, no coverage credit', () => {
+    expect(behavior([pass(1), fail(2), fail(3)], true)).toMatchObject({ status: 'FAIL', failsLane: false, coverage: false, redClass: null });
+    expect(behavior([fail(1), fail(2), fail(3)], true)).toMatchObject({ status: 'FAIL', failsLane: true });
+    expect(behavior([pass(1), pass(2), fail(3, { failure_class: 'contract' })], true)).toMatchObject({ status: 'FAIL', failsLane: true });
+    expect(behavior([pass(1), pass(2), pass(3)], true)).toMatchObject({ status: 'PASS', coverage: false, failsLane: false });
+    expect(behavior([pass(1), pass(2)], true)).toMatchObject({ status: 'INCOMPLETE', failsLane: true });
+  });
+
+  test('quarantined rule keeps rule meaning (k = n)', () => {
+    const v = panelVerdict({ case: 'r', kind: 'rule', panel: { n: 3, k: 3 }, trials: [pass(1), pass(2), fail(3)], quarantined: true });
+    expect(v).toMatchObject({ status: 'FAIL', failsLane: false });
+  });
+
+  test('all-skipped panel is SKIPPED with no credit; partly skipped is INCOMPLETE', () => {
+    const skip = (trial: number): PanelTrial => ({ trial, outcome: 'skipped' });
+    expect(behavior([skip(1), skip(2), skip(3)])).toMatchObject({ status: 'SKIPPED', coverage: false, failsLane: false });
+    expect(behavior([pass(1), pass(2), skip(3)])).toMatchObject({ status: 'INCOMPLETE', failsLane: true });
+  });
+
+  test('trials of different run attempts are never merged into one verdict', () => {
+    expect(() => behavior([pass(1), pass(2), fail(3, { attempt: 2 })])).toThrow(/run attempts/);
+    expect(behavior([pass(1, { attempt: 2 }), pass(2, { attempt: 2 }), pass(3, { attempt: 2 })]).attempt).toBe(2);
+  });
+
+  test('invalid panels throw', () => {
+    expect(() => panelVerdict({ case: 'c', kind: 'behavior', panel: { n: 3, k: 4 }, trials: [] })).toThrow(/invalid panel/);
+    expect(() => panelVerdict({ case: 'c', kind: 'nope' as any, panel: { n: 1, k: 1 }, trials: [] })).toThrow(/unknown kind/);
+  });
+});
+
+describe('trial context and expectContract', () => {
+  let dir: string;
+  const saved: Record<string, string | undefined> = {};
+  const keys = [...Object.values(TRIAL_ENV), 'GSTACK_EVAL_DIR'];
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-verdict-'));
+    for (const key of keys) saved[key] = process.env[key];
+  });
+  afterEach(() => {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const setTrial = () => Object.assign(process.env, {
+    [TRIAL_ENV.caseId]: 'case-x', [TRIAL_ENV.kind]: 'behavior', [TRIAL_ENV.trial]: '2',
+    [TRIAL_ENV.panelN]: '3', [TRIAL_ENV.panelK]: '2', [TRIAL_ENV.policyVersion]: String(EVAL_POLICY.version),
+    GSTACK_EVAL_DIR: dir,
+  });
+
+  test('trialContextFromEnv: absent, complete, and malformed', () => {
+    for (const key of Object.values(TRIAL_ENV)) delete process.env[key];
+    expect(trialContextFromEnv()).toBeNull();
+    setTrial();
+    expect(trialContextFromEnv()).toEqual({ case_id: 'case-x', kind: 'behavior', trial: 2, panel: { n: 3, k: 2 }, policy_version: EVAL_POLICY.version });
+    process.env[TRIAL_ENV.trial] = '4';
+    expect(() => trialContextFromEnv()).toThrow(/Malformed trial context/);
+  });
+
+  test('passing contract is a no-op', () => {
+    setTrial();
+    expect(() => expectContract(true, 'fine')).not.toThrow();
+    expect(fs.existsSync(path.join(dir, CONTRACT_VIOLATIONS_FILE))).toBe(false);
+  });
+
+  test('failed contract stamps the recorded entry and the sidecar before throwing', () => {
+    setTrial();
+    const collector = new EvalCollector('e2e', dir);
+    collector.addTest({ name: 'case-x', suite: 's', tier: 'e2e', passed: true, duration_ms: 1, cost_usd: 0 });
+    expect(() => expectContract(false, 'handoff missing', { collector, name: 'case-x' })).toThrow(ContractViolation);
+    const partial = JSON.parse(fs.readFileSync(path.join(dir, '_partial-e2e.json'), 'utf-8'));
+    expect(partial.tests[0]).toMatchObject({ passed: false, failure_class: 'contract', case_id: 'case-x', trial: 2, kind: 'behavior', panel: { n: 3, k: 2 } });
+    const sidecar = fs.readFileSync(path.join(dir, CONTRACT_VIOLATIONS_FILE), 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(sidecar).toEqual([expect.objectContaining({ case_id: 'case-x', trial: 2, message: 'handoff missing' })]);
+  });
+
+  test('a contract marked before recording stamps the later record, or becomes its own at finalize', async () => {
+    setTrial();
+    const collector = new EvalCollector('e2e', dir);
+    expect(() => expectContract(0, 'no question asked', { collector, name: 'later' })).toThrow('CONTRACT: no question asked');
+    collector.addTest({ name: 'later', suite: 's', tier: 'e2e', passed: true, duration_ms: 1, cost_usd: 0 });
+    expect(() => expectContract(null, 'never recorded', { collector, name: 'orphan' })).toThrow();
+    const file = await collector.finalize();
+    const tests = JSON.parse(fs.readFileSync(file, 'utf-8')).tests;
+    expect(tests.find((t: any) => t.name === 'later')).toMatchObject({ passed: false, failure_class: 'contract' });
+    expect(tests.find((t: any) => t.name === 'orphan')).toMatchObject({ passed: false, failure_class: 'contract', error: 'never recorded' });
+  });
+});
+
+describe('trial-outcomes JSONL', () => {
+  const record = (extra: Partial<TrialOutcomeRecord> = {}): TrialOutcomeRecord => ({
+    schema: TRIAL_OUTCOME_SCHEMA, case: 'case-x', file: 'test/x.test.ts', tier: 'gate', kind: 'behavior',
+    trial: 1, panel: { n: 3, k: 2 }, attempt: 1, outcome: 'passed', duration_ms: 10, cost_usd: 0.1,
+    policy_version: EVAL_POLICY.version, quarantined: false, execution: 'executed', source: 'shard', ...extra,
+  });
+
+  test('round-trips valid records', () => {
+    const records = [record(), record({ trial: 2, outcome: 'failed', failure_class: 'timeout', exit_reason: 'timeout' })];
+    expect(parseTrialOutcomes(formatTrialOutcomes(records))).toEqual({ records, errors: [] });
+  });
+
+  test('writer fails closed; reader reports bad lines as data errors', () => {
+    expect(() => formatTrialOutcomes([record({ outcome: 'failed' })])).toThrow(/failed without failure_class/);
+    expect(() => formatTrialOutcomes([record({ trial: 4 })])).toThrow(/trial invalid/);
+    const text = `${JSON.stringify(record())}\nnot json\n${JSON.stringify({ ...record(), schema: 'other' })}\n`;
+    const parsed = parseTrialOutcomes(text);
+    expect(parsed.records).toHaveLength(1);
+    expect(parsed.errors).toEqual(['line 2: not JSON', 'line 3: schema other']);
+    expect(parseTrialOutcomes(text, { maxBytes: 10 }).errors[0]).toContain('exceed');
+  });
+
+  test('sanitizeTrialError keeps one capped line without mentions', () => {
+    expect(sanitizeTrialError('\n  expected @garrytan to `see`\nsecond')).toBe("expected @\u200bgarrytan to 'see'");
+    expect(sanitizeTrialError('x'.repeat(1000))!.length).toBe(300);
+    expect(sanitizeTrialError('')).toBeUndefined();
   });
 });

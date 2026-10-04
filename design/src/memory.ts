@@ -1,7 +1,7 @@
 /**
  * Design Memory — extract visual language from approved mockups into DESIGN.md.
  *
- * After a mockup is approved, uses GPT-4o vision to extract:
+ * After a mockup is approved, uses an OpenAI vision model to extract:
  * - Color palette (hex values)
  * - Typography (font families, sizes, weights)
  * - Spacing patterns (padding, margins, gaps)
@@ -15,6 +15,7 @@ import fs from "fs";
 import path from "path";
 import { requireApiKey } from "./auth";
 import { receiptedFetch } from "./receipted-fetch";
+import { modelRejectionHint, visionRequestBody } from "./models";
 import { parseDesignMd, detectFormat, renderDesignMd, spliceSection, specSkeleton, tokensFlat, slug, DesignMdEditRefused } from "../../lib/design-md";
 import { atomicWriteSync } from "../../lib/fs-atomic";
 
@@ -46,18 +47,16 @@ export async function extractDesignLanguage(imagePath: string): Promise<Extracte
         "Authorization": `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{
-          role: "user",
-          content: [
-            {
-              type: "image_url",
-              image_url: { url: `data:image/png;base64,${imageData}` },
-            },
-            {
-              type: "text",
-              text: `Analyze this UI mockup and extract the design language. Return valid JSON only, no markdown:
+      body: visionRequestBody([{
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${imageData}` },
+          },
+          {
+            type: "text",
+            text: `Analyze this UI mockup and extract the design language. Return valid JSON only, no markdown:
 
 {
   "colors": [{"name": "primary", "hex": "#...", "usage": "buttons, links"}, ...],
@@ -68,17 +67,15 @@ export async function extractDesignLanguage(imagePath: string): Promise<Extracte
 }
 
 Extract real values from what you see. Be specific about hex colors and font sizes.`,
-            },
-          ],
-        }],
-        max_tokens: 800,
-        response_format: { type: "json_object" },
-      }),
+          },
+        ],
+      }], 800, { response_format: { type: "json_object" } }),
       signal: controller.signal,
     });
 
     if (!response.ok) {
-      console.error(`Vision extraction failed (${response.status})`);
+      const error = await response.text();
+      console.error(`Vision extraction failed (${response.status}): ${error.slice(0, 200)}${modelRejectionHint(response.status, error, "vision")}`);
       return defaultDesign();
     }
 

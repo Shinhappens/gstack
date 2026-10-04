@@ -158,34 +158,6 @@ describe('handleMemoryCommand', () => {
     expect(result).toContain('Chromium processes: (unavailable — see notes)');
   });
 
-  test('12. text mode renders modificationHistory with evicted-count when > 0', async () => {
-    // formatSnapshotText is what we're really testing here — exercise it
-    // directly with a known snapshot so the live collectStructureStats
-    // doesn't override the fixture values.
-    const mod = await import('../src/memory-command');
-    // formatSnapshotText is private; reach via re-rendering through
-    // --json mode then visually validating the JSON shape. The text-mode
-    // renderer is exercised by test 13 below with live (zero) values.
-    const stats = makeStructureStats();
-    stats.modificationHistory = { current: 200, cap: 200, evicted: 47 };
-    // Synthesize a "would-render" snapshot to assert the eviction note shape.
-    const renderedExpected =
-      'modificationHistory:    200 / 200 entries  (47 evicted since reset)';
-    // Since formatSnapshotText isn't exported, validate the format
-    // contract by re-implementing the line and asserting our expectation
-    // matches the canonical format. This pins the user-visible string
-    // shape — a renderer change to drop the "evicted since reset" suffix
-    // would fail this assertion.
-    const evicted = stats.modificationHistory.evicted;
-    const current = stats.modificationHistory.current;
-    const cap = stats.modificationHistory.cap;
-    const expected =
-      `modificationHistory:    ${current} / ${cap} entries` +
-      (evicted > 0 ? `  (${evicted} evicted since reset)` : '');
-    expect(expected).toBe(renderedExpected);
-    void mod;
-  });
-
   test('13. text mode renders modificationHistory line shape', async () => {
     const { handleMemoryCommand } = await import('../src/memory-command');
     const result = await handleMemoryCommand([], makeFakeBm(makeSnapshot()));

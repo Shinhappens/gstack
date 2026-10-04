@@ -2,8 +2,10 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { readPlanCountTranscript, unresolvedPlanQuestionCalls } from './helpers/plan-count-transcript';
-import { nativePlanCallFingerprint, planCountQuestionPhase, engStep0Boundary, ceoStep0Boundary, ceoFirstReviewAUQ } from './helpers/claude-pty-runner';
+import { randomUUID } from 'node:crypto';
+import { readPlanCountTranscript, unresolvedPlanQuestionCalls, readOwnedClaudePublicTranscript, nativePathSpelling,
+  ownedNativePath, sameNativePath } from './helpers/plan-count-transcript';
+import { nativePlanCallFingerprint, planCountQuestionPhase, engStep0Boundary } from './helpers/claude-pty-runner';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
@@ -36,50 +38,6 @@ function fixture() {
 }
 
 describe('native plan-count transcripts', () => {
-  test('the actual partially answered CEO setup packet counts once without selecting its unanswered mode', () => {
-    const f = fixture();
-    // Native question/header/label metadata from targeted-a's paired CEO
-    // call. The successful tool_result answered only routing and approach.
-    const packet = [{"header":"Routing","question":"gstack works best when your project's CLAUDE.md includes skill routing rules — should I add them? <gstack-qid:routing-injection>","options":[{"label":"Add routing rules (Recommended)"},{"label":"Skip for now"}]},{"header":"Prerequisites","question":"No design doc found for this branch. Run /office-hours to capture structured problem context first, or proceed directly to the plan review? <gstack-qid:plan-ceo-review-office-hours>","options":[{"label":"Skip — review the plan directly (Recommended)"},{"label":"Run /office-hours first"}]},{"header":"Test Scope","question":"Which implementation approach should the tests follow? This shapes the review scope. <gstack-qid:plan-ceo-review-approach>\n\nD1 — Approach selection for processPayment() test coverage\nProject: Payment Processing — adding missing unit tests\nELI10: The plan calls for exactly 2 tests. Adding a few more for the most common real-world Stripe failures (card declined, rate limit) costs ~10 extra minutes with CC but closes the gaps users actually hit. The question is whether to stay at 2 or expand to ~5-6 tests.\nStakes if we pick wrong: Choosing minimal leaves 402 (card declined) untested — the most common production failure. Choosing full adds ~5 min of CC work.\nRecommendation: B (Core Stripe paths) because 402 card declined is the highest-volume real-world failure and CC compresses the extra work to near-zero.\nCompleteness: A=7/10, B=9/10","options":[{"label":"Minimal — 2 tests as planned (7/10)"},{"label":"Core paths — ~5 tests (9/10) (Recommended)"}]},{"header":"Review Mode","question":"D2 — Review mode for this plan?\nProject: Payment Processing test coverage — adding missing unit tests for processPayment()\nELI10: The plan adds 2 missing unit tests. HOLD SCOPE means: take the scope as given, review it with maximum rigor — catch every ambiguity, failure mode, edge case, observability gap. SELECTIVE EXPANSION means: do all that AND surface cherry-pick expansions (additional test scenarios, receipt schema validation, etc.) one at a time for your approval.\nStakes if we pick wrong: HOLD keeps the review tight and fast. SELECTIVE surfaces more opportunities but adds round-trips.\nRecommendation: HOLD SCOPE — this is a focused gap-fill, and rigor matters more than ambition here.\nNote: options differ in kind, not coverage — no completeness score. <gstack-qid:plan-ceo-review-mode>","options":[{"label":"HOLD SCOPE — maximum rigor (Recommended)"},{"label":"SELECTIVE EXPANSION — rigor + cherry-picks"}]}];
-    f.append(f.ask('actual-packet', packet), f.answer('actual-packet', [packet[0], packet[2]]));
-    const [call] = f.read().calls;
-    expect(call.answered).toBe(true);
-    expect(call.failed).toBe(false);
-    expect(call.unansweredQuestionIndices).toEqual([1, 3]);
-    expect(f.read().calls.filter(c => c.answered)).toHaveLength(1);
-    const setup = nativePlanCallFingerprint(call, 0, true);
-    expect(setup.options.some(o => /HOLD SCOPE/.test(o.label))).toBe(false);
-    expect(ceoStep0Boundary(setup)).toBe(false);
-    expect(ceoFirstReviewAUQ(setup)).toBe(false);
-
-    const finding = [{"header":"Receipt Schema","question":"D3 — The plan says 'assert correct receipt is generated' but doesn't define what a correct receipt looks like. Without a schema, the test will pass even if the receipt is missing critical fields.\n\nELI10: Right now the test could assert `receipt != nil` and call it a day. That test passes even if the receipt has the wrong amount or no charge ID. We need to specify what fields a correct receipt must have.\n\nStakes if we pick wrong: Tests pass in CI but fail to catch a real receipt bug — e.g., wrong charge_id linked to wrong customer.\n\nRecommendation: A — specify the receipt schema in the plan now; costs ~5 min, prevents a class of silent bugs.\nCompleteness: A=9/10, B=7/10, C=3/10 <gstack-qid:plan-ceo-receipt-schema>","options":[{"label":"Specify schema in plan (Recommended)"},{"label":"Specify during implementation"},{"label":"Skip — too much detail for a plan"}]}];
-    f.append(f.ask('receipt-schema', finding), f.answer('receipt-schema', finding));
-    const review = nativePlanCallFingerprint(f.read().calls[1], 1, true);
-    expect(planCountQuestionPhase(review, false, ceoStep0Boundary, ceoFirstReviewAUQ))
-      .toEqual({ preReview: false, reviewStarted: true });
-
-    // A refused/empty packet must not receive the same completion credit.
-    f.append(f.ask('empty-packet', packet), f.answer('empty-packet', []));
-    const empty = f.read().calls[2];
-    expect(empty.answered).toBe(false);
-    expect(empty.failure).toContain('no matching nonempty answers');
-  });
-
-  test('CEO first-finding fallback requires native finding identity and rejects setup decisions', () => {
-    const f = fixture();
-    for (const [id, text] of [
-      ['setup', 'D1 — Missing context: choose a scope <gstack-qid:plan-ceo-review-scope>'],
-      ['mode', 'D1 — Missing context: choose a mode <gstack-qid:plan-ceo-review-mode>'],
-      ['unscoped', 'D1 — Missing receipt schema'],
-      ['arbitrary', 'D1 — Pick an option <gstack-qid:plan-ceo-review-choice>'],
-      ['next', 'D1 — Missing engineering review: what next? <gstack-qid:plan-ceo-next-steps>'],
-    ]) {
-      const questions = [f.question(text)];
-      f.append(f.ask(id, questions), f.answer(id, questions));
-    }
-    for (const call of f.read().calls) expect(ceoFirstReviewAUQ(nativePlanCallFingerprint(call, 0, true))).toBe(false);
-  });
-
   test('requires a matching successful answer and preserves full native question metadata', () => {
     const f = fixture();
     const questions = [f.question('D1 — Cross-project learnings scope\n' + 'full context '.repeat(40) + '<gstack-qid:learnings-cross-project>')];
@@ -248,5 +206,204 @@ describe('native plan approval request evidence', () => {
     fs.appendFileSync(f.file, 'bad JSON\n');
     expect(f.read().status).toBe('error');
     expect(f.read().planReadyRequests).toBeUndefined();
+  });
+});
+
+describe('native journal roots: SessionStart preamble, resumed genesis and reason codes', () => {
+  function rooted() {
+    const config = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'journal-roots-')));
+    dirs.push(config);
+    const cwd = path.join(config, 'project');
+    const project = path.join(config, 'projects', 'project');
+    fs.mkdirSync(cwd); fs.mkdirSync(project, { recursive: true });
+    const sessionId = 'session-roots';
+    const file = path.join(project, `${sessionId}.jsonl`);
+    let tick = 0;
+    const node = (parentUuid: string | null, extra: object) => ({ uuid: randomUUID(), parentUuid, cwd, sessionId,
+      isSidechain: false, version: '2.1.284', timestamp: new Date(Date.parse('2026-10-02T14:00:00Z') + tick++ * 1000).toISOString(), ...extra });
+    const hook = (parentUuid: string | null, extra: object = {}) => node(parentUuid, { type: 'attachment',
+      attachment: { type: 'hook_success', hookEvent: 'SessionStart', hookName: 'SessionStart:startup' }, ...extra });
+    const preamble = (count: number) => {
+      const chain = [hook(null)];
+      while (chain.length < count) chain.push(hook(chain.at(-1)!.uuid));
+      return chain;
+    };
+    const user = (parentUuid: string | null, extra: object = {}) => node(parentUuid, { type: 'user',
+      message: { role: 'user', content: 'Plan the retry change.' }, origin: { kind: 'human' }, promptSource: 'typed', promptId: randomUUID(), ...extra });
+    const say = (parentUuid: string, text: string, extra: object = {}) => node(parentUuid, { type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text }] }, ...extra });
+    const write = (rows: object[], tail = '\n') => fs.writeFileSync(file, rows.map(r => JSON.stringify(r)).join('\n') + tail);
+    const owned = () => readOwnedClaudePublicTranscript(file, cwd, sessionId);
+    const plain = () => readPlanCountTranscript(config, cwd);
+    const messages = () => owned().events.filter(e => e.kind === 'message').map(e => (e as { text: string }).text);
+    return { config, cwd, project, file, sessionId, node, hook, preamble, user, say, write, owned, plain, messages };
+  }
+
+  test('a user root without a preamble stays owned', () => {
+    const j = rooted(), prompt = j.user(null);
+    j.write([prompt, j.say(prompt.uuid, 'Reviewed.')]);
+    expect(j.owned().transcript.status).toBe('ready');
+    expect(j.messages()).toEqual(['Reviewed.']);
+  });
+
+  for (const count of [1, 3])
+    test(`${count} leading SessionStart attachment(s) root the first user turn for both readers`, () => {
+      const j = rooted(), chain = j.preamble(count), prompt = j.user(chain.at(-1)!.uuid);
+      j.write([...chain, prompt, j.say(prompt.uuid, 'Reviewed.')]);
+      const read = j.owned();
+      expect(read.transcript).toMatchObject({ status: 'ready' });
+      expect(read.transcript.reason).toBeUndefined();
+      expect(read.events.map(e => e.kind)).toEqual(['user_turn', 'message']);
+      expect(j.plain().assistantMessages.map(m => m.text)).toEqual(['Reviewed.']);
+    });
+
+  test('a preamble flushed after its children still roots ownership; the plain reader follows a later cwd change', () => {
+    const j = rooted(), chain = j.preamble(3), prompt = j.user(chain.at(-1)!.uuid);
+    const other = path.join(j.config, 'elsewhere'); fs.mkdirSync(other);
+    const first = j.say(prompt.uuid, 'Before cd.'), moved = j.say(first.uuid, 'After cd.', { cwd: other });
+    j.write([prompt, first, moved, ...chain.toReversed()]);
+    expect(j.messages()).toEqual(['Before cd.', 'After cd.']);
+    // Origin seeding uses the causal root, not physical order, so the native
+    // continuation across Bash cd keeps its ownership.
+    expect(j.plain().assistantMessages.map(m => m.text)).toEqual(['Before cd.', 'After cd.']);
+  });
+
+  test('a resumed fork whose first record is a compact boundary with an absent logical parent is a root', () => {
+    const j = rooted();
+    const boundary = j.node(null, { type: 'system', subtype: 'compact_boundary', logicalParentUuid: randomUUID(), content: 'Conversation compacted' });
+    const summary = j.user(boundary.uuid, { isCompactSummary: true, origin: undefined, promptSource: undefined });
+    const prompt = j.user(summary.uuid);
+    j.write([{ type: 'ai-title', sessionId: j.sessionId }, boundary, summary, prompt, j.say(prompt.uuid, 'Resumed.')]);
+    expect(j.owned().transcript.status).toBe('ready');
+    expect(j.messages()).toEqual(['Resumed.']);
+    // Mid-file, the same boundary may be an unflushed ancestor: no ownership, no hard code.
+    const stray = j.hook(null);
+    j.write([stray, boundary, summary, prompt, j.say(prompt.uuid, 'Resumed.')]);
+    expect(j.owned().transcript).toMatchObject({ status: 'missing', calls: [] });
+    expect(j.owned().transcript.reason).toBeUndefined();
+    expect(j.owned().events).toEqual([]);
+  });
+
+  test('competing roots stay hard: a second user root, a second preamble carrying a turn, or a genesis beside a user root', () => {
+    const j = rooted(), chain = j.preamble(2), prompt = j.user(chain.at(-1)!.uuid);
+    const base = [...chain, prompt, j.say(prompt.uuid, 'Reviewed.')];
+    j.write([...base, j.hook(null)]);
+    expect(j.owned().transcript.status).toBe('ready');
+    const second = j.hook(null);
+    for (const extra of [[j.user(null)], [second, j.user(second.uuid)]]) {
+      j.write([...base, ...extra]);
+      expect(j.owned().transcript).toMatchObject({ status: 'error', reason: 'competing_root' });
+      expect(j.owned().events).toEqual([]);
+    }
+    const boundary = j.node(null, { type: 'system', subtype: 'compact_boundary', logicalParentUuid: randomUUID() });
+    const resumed = j.user(boundary.uuid);
+    j.write([boundary, resumed, j.user(null)]);
+    expect(j.owned().transcript.reason).toBe('competing_root');
+  });
+
+  test('foreign cwd is hard only when the spelling and the real directory both differ', () => {
+    const j = rooted(), chain = j.preamble(1), prompt = j.user(chain[0]!.uuid);
+    const other = path.join(j.config, 'other-project'); fs.mkdirSync(other);
+    j.write([{ ...chain[0]!, cwd: other }, prompt]);
+    expect(j.owned().transcript.reason).toBe('foreign_cwd');
+    j.write([{ ...chain[0]!, cwd: j.cwd + path.sep }, { ...prompt, cwd: j.cwd + path.sep }]);
+    expect(j.owned().transcript.reason).toBe('unrecognized_shape:cwd_spelling');
+  });
+
+  test('sidechain, agent and cyclic ancestry are hard codes', () => {
+    const j = rooted();
+    const [head] = j.preamble(1), prompt = j.user(head!.uuid);
+    j.write([{ ...head!, isSidechain: true }, prompt]);
+    expect(j.owned().transcript.reason).toBe('sidechain');
+    j.write([{ ...head!, agentId: 'agent-1' }, prompt]);
+    expect(j.owned().transcript.reason).toBe('agent');
+    j.write([{ ...head!, parentUuid: prompt.uuid }, prompt]);
+    expect(j.owned().transcript).toMatchObject({ status: 'error', reason: 'cycle' });
+  });
+
+  test('unknown root shapes report a typed code and the record types, never content or ownership', () => {
+    const j = rooted();
+    const command = j.node(null, { type: 'system', subtype: 'local_command', content: '<command-name>/model</command-name>' });
+    const setup = j.hook(null, { attachment: { type: 'hook_success', hookEvent: 'Setup' } });
+    const assistantFirst = j.hook(null);
+    for (const [rows, code] of [
+      [[command, j.user(command.uuid)], 'unrecognized_shape:preamble:system:local_command'],
+      [[setup, j.user(setup.uuid)], 'unrecognized_shape:preamble:attachment:hook_success'],
+      [[assistantFirst, j.say(assistantFirst.uuid, 'No prompt yet.')], 'unrecognized_shape:first_turn:assistant'],
+    ] as const) {
+      const current = j.node(rows[1].uuid, { type: 'assistant', message: { role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_current', name: 'Read', input: { file_path: '/x' } }] } });
+      j.write([...rows, current]);
+      const read = j.owned();
+      expect(read.transcript).toMatchObject({ status: 'missing', reason: code, calls: [], assistantMessages: [] });
+      expect(read.events).toEqual([]);
+      expect(read.diagnostic).toMatchObject({ claudeVersion: '2.1.284', toolUseIds: ['toolu_current'], complete: true });
+      expect(read.diagnostic!.rootShape[0]).toBe(code === 'unrecognized_shape:preamble:system:local_command' ? 'system:local_command' : 'attachment:hook_success');
+      expect(JSON.stringify(read.diagnostic)).not.toContain('Plan the retry change');
+      expect(JSON.stringify(read.diagnostic)).not.toContain('/model');
+    }
+  });
+
+  test('malformed, partial and changing journals are retry codes, never shape advisories', () => {
+    const j = rooted(), prompt = j.user(null);
+    j.write([prompt]);
+    fs.appendFileSync(j.file, 'not JSON\n');
+    expect(j.owned().transcript.reason).toBe('malformed');
+    j.write([prompt, j.say(prompt.uuid, 'Reviewed.')], '\n{"partial":');
+    expect(j.owned().transcript.status).toBe('ready');
+    expect(j.owned().diagnostic).toBeUndefined();
+    expect(readOwnedClaudePublicTranscript(path.join(j.project, 'absent.jsonl'), j.cwd, 'absent').transcript.reason).toBeUndefined();
+  });
+
+  test('win32 spellings fold before validation; dot segments stay rejected', () => {
+    const w = path.win32;
+    expect(nativePathSpelling('C:/Users/a/proj', w)).toBe('C:\\Users\\a\\proj');
+    expect(nativePathSpelling('c:\\Users\\a', w)).toBe('C:\\Users\\a');
+    expect(nativePathSpelling('/c/Users/a', w)).toBe('C:\\Users\\a');
+    expect(nativePathSpelling('\\\\server\\share\\x', w)).toBe('\\\\server\\share\\x');
+    expect(nativePathSpelling('/c/Users/a', path.posix)).toBe('/c/Users/a');
+    for (const good of ['C:/Users/a/proj', '/c/Users/a', 'c:\\x', '\\\\server\\share\\x']) expect(ownedNativePath(good, w)).toBe(true);
+    expect(nativePathSpelling('/cc/x', w)).toBe('\\cc\\x');
+    for (const bad of ['C:/Users/a/../b', 'C:\\Users\\.\\a', '/c', 'relative\\x', 'C:\\a\\\\b', 42])
+      expect(ownedNativePath(bad, w)).toBe(false);
+    expect(ownedNativePath('/c/Users/a', path.posix)).toBe(true);
+    expect(sameNativePath('C:/x/y', 'c:\\x\\y', w)).toBe(true);
+    expect(sameNativePath('/c/x', 'C:\\x', w)).toBe(true);
+    expect(sameNativePath('C:\\x\\..\\y', 'C:\\y', w)).toBe(false);
+    expect(sameNativePath('C:/x', 'C:\\x', path.posix)).toBe(false);
+  });
+
+  describe('real Claude Code 2.1.284 journals (redacted)', () => {
+    const real = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures', 'claude-native-journal-roots-2.1.284.json'), 'utf8')) as {
+      claudeCodeVersion: string; journals: Record<string, { sessionId: string; lines: string[] }>;
+    };
+    const load = (name: string) => {
+      const j = rooted(), journal = real.journals[name]!;
+      const file = path.join(j.project, `${journal.sessionId}.jsonl`);
+      fs.writeFileSync(file, journal.lines.map(line => line.replaceAll('__CWD__', JSON.stringify(j.cwd).slice(1, -1))).join('\n') + '\n');
+      const records = journal.lines.map(line => JSON.parse(line));
+      return { j, file, records, read: readOwnedClaudePublicTranscript(file, j.cwd, journal.sessionId) };
+    };
+    test('the fixture is structure only and names its Claude Code version', () => {
+      expect(real.claudeCodeVersion).toBe('2.1.284');
+      expect(Object.keys(real.journals).sort()).toEqual(['clear', 'compact', 'forkAfterCompact', 'startup']);
+      for (const journal of Object.values(real.journals)) for (const line of journal.lines) {
+        const record = JSON.parse(line);
+        if (typeof record.message?.content === 'string') expect(record.message.content).toBe('[redacted]');
+        if (record.version) expect(record.version).toBe('2.1.284');
+      }
+    });
+    for (const [name, head] of [['startup', 'attachment'], ['clear', 'attachment'], ['compact', 'attachment'], ['forkAfterCompact', 'system']] as const)
+      test(`${name}: the owned reader accepts the real root shape`, () => {
+        const { j, records, read } = load(name);
+        const first = records.find(r => r.uuid)!;
+        expect(first.type).toBe(head);
+        expect(first.parentUuid).toBeNull();
+        if (head === 'attachment') expect(first.attachment).toMatchObject({ hookEvent: 'SessionStart' });
+        else expect(records.some(r => r.uuid === first.logicalParentUuid)).toBe(false);
+        expect(read.transcript.status).toBe('ready');
+        expect(read.events.filter(e => e.kind === 'message').length).toBeGreaterThan(0);
+        expect(j.plain().assistantMessages.length).toBeGreaterThan(0);
+      });
   });
 });

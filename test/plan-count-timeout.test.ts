@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 const ROOT = path.resolve(import.meta.dir, '..');
-type Event = { event: string; at: number; invocation: number; pid?: number; start?: string; cwd?: string; data?: string; elapsed?: number; outcome?: string; fixtureGone?: boolean };
+type Event = { event: string; at: number; invocation: number; pid?: number; start?: string; cwd?: string; data?: string; elapsed?: number; outcome?: string; summary?: string; fixtureGone?: boolean };
 
 function ownedFake(event: Event, fake: string): boolean {
   if (!event.pid) return false;
@@ -39,7 +39,7 @@ process.stdin.setRawMode(true);
 process.stdin.resume();
 process.stdin.on('data', bytes => log('input', {data:bytes.toString()}));
 process.on('SIGINT', () => log('sigint')); // exercise the owned forced-exit fallback
-process.stdout.write('Counting lifecycle fixture is ready.\n');
+process.stdout.write('COUNT_TIMEOUT_FIXTURE_READY\n');
 setInterval(() => {}, 1000);
 `, { mode: 0o755 });
   fs.writeFileSync(worker, `import {test} from 'bun:test';\nimport * as fs from 'node:fs';\nimport {runPlanSkillCounting} from ${JSON.stringify(helper)};\n` + String.raw`
@@ -52,12 +52,13 @@ test('owned counting timeout', async () => {
   try {
     const observation = await runPlanSkillCounting({skillName:'plan-design-review', slashCommand:'/plan-design-review',
       followUpPrompt:'# Timeout lifecycle fixture\nReview this plan.', isLastStep0AUQ:()=>false,
-      reviewCountCeiling:8, timeoutMs:18000, env:{TIMEOUT_INVOCATION:String(invocation),TIMEOUT_EVENTS:process.env.TIMEOUT_EVENTS}});
+      reviewCountCeiling:8, timeoutMs:8000, startupReadyMarker:'COUNT_TIMEOUT_FIXTURE_READY',
+      env:{TIMEOUT_INVOCATION:String(invocation),TIMEOUT_EVENTS:process.env.TIMEOUT_EVENTS}});
     const ready = fs.readFileSync(process.env.TIMEOUT_EVENTS,'utf8').trim().split('\n').map(line=>JSON.parse(line)).find(e=>e.event==='ready'&&e.invocation===invocation);
-    log('returned', invocation, {elapsed:Date.now()-start,outcome:observation.outcome,fixtureGone:!fs.existsSync(ready.cwd)});
+    log('returned', invocation, {elapsed:Date.now()-start,outcome:observation.outcome,summary:observation.summary,fixtureGone:!fs.existsSync(ready.cwd)});
     throw new Error('HELPER_TIMEOUT_'+invocation);
   } finally { log('finally', invocation); }
-}, 18000);
+}, 8000);
 `);
   let rows: Event[] = [];
   let child: ReturnType<typeof Bun.spawn> | undefined;
@@ -89,7 +90,11 @@ test('owned counting timeout', async () => {
     expect(finished[0]!.at).toBeLessThanOrEqual(starts[1]!.at);
     for (const event of returned) {
       expect(event.outcome).toBe('timeout');
-      expect(event.elapsed).toBeLessThan(18000);
+      // The silent fixture stops writing after its ready marker: the summary names that idle time.
+      const idle = /; idleFor=(\d+)ms$/.exec(event.summary ?? '');
+      expect(idle, event.summary).not.toBeNull();
+      expect(Number(idle![1])).toBeGreaterThanOrEqual(1000);
+      expect(event.elapsed).toBeLessThan(8000);
       expect(event.fixtureGone).toBe(true);
     }
     for (const event of ready) {
@@ -97,7 +102,7 @@ test('owned counting timeout', async () => {
       const body = starts.find(e => e.invocation === event.invocation)!;
       const inputs = rows.filter(e => e.event === 'input' && e.invocation === event.invocation);
       expect(inputs.map(e => e.data).join('')).toBe('/plan-design-review\r');
-      expect(inputs.every(e => e.at - body.at < 13000)).toBe(true);
+      expect(inputs.every(e => e.at - body.at < 3000)).toBe(true);
     }
   } finally {
     if (watchdog) clearTimeout(watchdog);
@@ -126,7 +131,7 @@ test.skipIf(process.platform === 'win32')('deadline boundaries stop boot, late s
   const fake = path.join(dir, 'fake-claude');
   const worker = path.join(dir, 'worker.ts');
   const helper = pathToFileURL(path.join(ROOT, 'test/helpers/claude-pty-runner.ts')).href;
-  const screenModule = pathToFileURL(path.join(ROOT, 'test/helpers/pty-screen.ts')).href;
+  const screenModule = pathToFileURL(path.join(ROOT, 'test/helpers/pty/screen.ts')).href;
   fs.writeFileSync(fake, `#!${process.execPath}\n` + String.raw`
 import * as fs from 'node:fs';
 const log = (event, extra={}) => fs.appendFileSync(process.env.BOUNDARY_EVENTS,JSON.stringify({event,at:Date.now(),invocation:1,...extra})+'\n');
@@ -138,6 +143,7 @@ process.stdin.on('data',data=>{
   process.stdout.write('\x1b[2J\x1b[HWhich remedy should be used?\r\n❯1.First remedy\r\n2.Second remedy\r\n');
 });
 process.on('SIGINT',()=>{log('sigint');process.exit(0)});
+process.stdout.write('COUNT_BOUNDARY_FIXTURE_READY\n');
 setInterval(()=>{},1000);
 `, { mode: 0o755 });
   fs.writeFileSync(worker, `import {mock} from 'bun:test';\nimport * as fs from 'node:fs';\n` +
@@ -148,7 +154,7 @@ const log=(event,extra={})=>fs.appendFileSync(process.env.BOUNDARY_EVENTS,JSON.s
 if(mode==='boot') {
   const sleep=Bun.sleep.bind(Bun);
   Bun.sleep=async ms=>{
-    if(typeof ms==='number' && ms>1000 && ms<8000) {
+    if(typeof ms==='number' && ms>250 && ms<1000) {
       log('early-clipped-wake',{requested:ms});
       return sleep(Math.max(0,ms-250));
     }
@@ -157,17 +163,18 @@ if(mode==='boot') {
 }
 if(mode==='screen') mock.module(screenModule,()=>({createPtyScreen:async(...args)=>{
   const screen=await originalScreen(...args);
-  return {...screen,read:async()=>{reads++; await Bun.sleep(Math.max(0,start+13200-Date.now()));return screen.read();}};
+  return {...screen,read:async()=>{reads++; await Bun.sleep(Math.max(0,start+3200-Date.now()));return screen.read();}};
 }}));
 ` + `const {runPlanSkillCounting}=await import(${JSON.stringify(helper)});\n` + String.raw`
 start=Date.now();log('body');
 const observation=await runPlanSkillCounting({skillName:'plan-design-review',slashCommand:'/plan-design-review',
-  followUpPrompt:'Review the deadline fixture.',isLastStep0AUQ:()=>false,reviewCountCeiling:8,timeoutMs:mode==='boot'?12000:18000,
+  followUpPrompt:'Review the deadline fixture.',isLastStep0AUQ:()=>false,reviewCountCeiling:8,timeoutMs:mode==='boot'?6000:8000,
+  ...(mode==='boot'?{}:{startupReadyMarker:'COUNT_BOUNDARY_FIXTURE_READY'}),
   pickAUQ:(_routing,_active,context)=>{
     const ready=fs.readFileSync(process.env.BOUNDARY_EVENTS,'utf8').trim().split('\n').map(line=>JSON.parse(line)).find(event=>event.event==='ready');
-    if(!Object.isFrozen(context)||context.cwd!==ready.cwd||!Number.isFinite(context.deadlineAt)||context.deadlineAt<=Date.now()||context.deadlineAt>start+18000)
+    if(!Object.isFrozen(context)||context.cwd!==ready.cwd||!Number.isFinite(context.deadlineAt)||context.deadlineAt<=Date.now()||context.deadlineAt>start+8000)
       throw new Error('Picker did not receive its owned fixture and bounded deadline');
-    log('picker');while(Date.now()-start<12800){};return 2;
+    log('picker');while(Date.now()-start<2800){};return 2;
   },
   env:{BOUNDARY_EVENTS:process.env.BOUNDARY_EVENTS}});
 const events=fs.readFileSync(process.env.BOUNDARY_EVENTS,'utf8').trim().split('\n').map(line=>JSON.parse(line));
@@ -188,7 +195,7 @@ log('returned',{outcome:observation.outcome,elapsed:Date.now()-start,reads,fixtu
       const events=fs.readFileSync(eventPath,'utf8').trim().split('\n').map(line=>JSON.parse(line));
       const returned=events.find(e=>e.event==='returned');
       expect(returned.outcome).toBe('timeout'); expect(returned.fixtureGone).toBe(true);
-      expect(returned.elapsed).toBeLessThan(mode==='boot'?12000:18000);
+      expect(returned.elapsed).toBeLessThan(mode==='boot'?6000:8000);
       const input=events.filter(e=>e.event==='input').map(e=>e.data).join('');
       expect(input).toBe(mode==='boot'?'':mode==='screen'?'/plan-design-review\r':'/plan-design-review\r2');
       if(mode==='boot') expect(events.some(e=>e.event==='early-clipped-wake')).toBe(true);

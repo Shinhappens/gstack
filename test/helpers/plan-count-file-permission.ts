@@ -17,8 +17,11 @@ const scoped = (file: unknown, config: string, session: string) => {
   return rel.length === 2 && rel[0] !== '..' && rel[0] !== '.' && rel[1] === `${session}.jsonl`;
 };
 export function createFilePermissionRecorder(cwd: string, config: string, expected: string) {
-  const relative = path.relative(os.tmpdir(), expected);
-  if (!path.isAbsolute(expected) || !relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) return undefined;
+  const inside = (root: string) => {
+    const relative = path.relative(root, expected);
+    return !!relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+  };
+  if (!path.isAbsolute(expected) || !(inside(os.tmpdir()) || inside(fs.realpathSync(os.tmpdir())))) return undefined;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-file-permission-'));
   const file = path.join(dir, 'state.json');
   const command = [process.execPath, import.meta.path, '--record', file, cwd, config, expected].map(quote).join(' ');
@@ -284,7 +287,11 @@ function currentCreatePreview(preview: string, r: any, config: string, cwd: stri
   if(event.name!=='Write'||`${event.sessionId}:${event.toolUseId}`!==r.pendingId||event.input?.file_path!==r.expected||
     Date.parse(event.timestamp)<startedAt||typeof event.input.content!=='string'||
     Buffer.byteLength(event.input.content)>MAX_WRITE_INPUT_BYTES) return false;
-  const source=event.input.content.split(/\r?\n/), rows=preview.split('\n');
+  // A crop can keep the pane's file row and rule above the preview while its
+  // "Create file" title scrolls away. That row must name the owned path.
+  const header=/^ {0,3}(?![1-9]\d*(?:[ \t]|\n))(\S[^\n]*)\n[╌─━]{3,}[ \t]*\n/.exec(preview);
+  if(header && path.resolve(cwd,header[1]!.trim())!==r.expected) return false;
+  const source=event.input.content.split(/\r?\n/), rows=preview.slice(header?.[0].length ?? 0).split('\n');
   const numbered:Array<{line:number;text:string}>=[];
   let leading='';
   for(const row of rows) {

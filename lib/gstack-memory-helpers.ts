@@ -24,7 +24,8 @@ import { appendJsonl } from "./jsonl-store";
 import { gbrainConfigDir, isExecTimeout } from "./gbrain-exec";
 import { dirname, join } from "path";
 import { execFileSync } from "child_process";
-import { homedir, tmpdir } from "os";
+import { tmpdir } from "os";
+import { resolveStateRoot } from "./state-root";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -326,7 +327,7 @@ function redactMatch(s: string): string {
 const ENGINE_CACHE_TTL_MS = 60 * 1000;
 
 function gstackHome(): string {
-  return process.env.GSTACK_HOME || join(homedir(), ".gstack");
+  return resolveStateRoot();
 }
 
 function engineCachePath(): string {
@@ -555,8 +556,8 @@ function extractGbrainBlock(frontmatter: string): GbrainManifest | null {
  *
  * Each sub-key sits one indent level deeper than `filter:`. Surrounding quotes
  * are stripped and template vars ({repo_slug}, now-7d, ...) are left intact for
- * downstream substitution, matching how dispatchList stringifies each value
- * into a `--filter k=v` argument. Returns undefined when there is no `filter:`
+ * downstream substitution; dispatchList maps each key onto a `gbrain list`
+ * flag. Returns undefined when there is no `filter:`
  * block or it is empty.
  */
 function parseFilterMap(body: string): Record<string, string> | undefined {

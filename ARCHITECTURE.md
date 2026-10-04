@@ -67,7 +67,7 @@ Node.js would work. Bun is better here for three reasons:
 
 3. **Native TypeScript.** The server runs as `bun run server.ts` during development. No compilation step, no `ts-node`, no source maps to debug. The compiled binary is for deployment; source files are for development.
 
-4. **Built-in HTTP server.** `Bun.serve()` is fast, simple, and doesn't need Express or Fastify. The server handles ~10 routes total. A framework would be overhead.
+4. **Built-in HTTP server.** `Bun.serve()` is fast, simple, and doesn't need Express or Fastify. The server handles ~30 routes, declared in one route table (`browse/src/routes/table.ts`; its header shows how to add one). A framework would be overhead.
 
 The bottleneck is always Chromium, not the CLI or server. Bun's startup speed (~1ms for the compiled binary vs ~100ms for Node) is nice but not the reason we chose it. The compiled binary and native SQLite are.
 
@@ -199,7 +199,7 @@ Storage reset and authentication verification are independent opt-ins. `--clear-
 
 ### Shell injection prevention
 
-The browser registry (Chrome, Chromium, Brave, Edge, and macOS-only Comet, Arc, Dia) is hardcoded. Database roots come from known platform locations; profile directory input is validated. Keychain access uses `Bun.spawn()` with explicit argument arrays, not shell string interpolation.
+The browser registry (Chrome, Chromium, Brave, Edge, Windows-only Opera and Opera GX, and macOS-only Comet, Arc, Dia) is hardcoded. Database roots come from known platform locations; profile directory input is validated. Keychain access uses `Bun.spawn()` with explicit argument arrays, not shell string interpolation.
 
 ### Egress receipt ledger (v1.63.0.0)
 
@@ -215,14 +215,14 @@ Page content harvested by CDP can contain lone UTF-16 surrogate halves (orphaned
 
 | Egress path | Module | Sanitization point |
 |---|---|---|
-| `POST /command` (HTTP) | `browse/src/server.ts` | `handleCommandInternal` wrapper (sanitizes the result of `handleCommandInternalImpl`) |
-| `POST /command/batch` | `browse/src/server.ts` | Same wrapper — batch consumers inherit it |
-| `GET /activity/stream` (SSE) | `browse/src/server.ts` | `sanitizeReplacer` passed to `JSON.stringify` |
-| `GET /inspector/events` (SSE) | `browse/src/server.ts` | `sanitizeReplacer` passed to `JSON.stringify` |
+| `POST /command` (HTTP) | `browse/src/routes/commands.ts` (wrapper in `browse/src/server.ts`) | `handleCommandInternal` wrapper (sanitizes the result of `handleCommandInternalImpl`) |
+| `POST /batch` | `browse/src/routes/commands.ts` | Same wrapper — batch consumers inherit it |
+| `GET /activity/stream` (SSE) | `browse/src/routes/activity.ts` | `sanitizeReplacer` applied inside `createSseEndpoint` |
+| `GET /inspector/events` (SSE) | `browse/src/routes/inspector.ts` | `sanitizeReplacer` applied inside `createSseEndpoint` |
 
 `sanitizeReplacer` is a `JSON.stringify` replacer function that cleans every string value during encoding. Post-stringify regex doesn't work here — `JSON.stringify` has already converted `\uD800` into the literal escape sequence `"\\ud800"` before the regex could match, so the replacer must run inside the encoding pipeline. The pure-string helper `sanitizeLoneSurrogates` is used directly for `text/plain` responses.
 
-**Architectural invariant.** Every new SSE/WebSocket writer or HTTP response that ships page-content-derived strings MUST go through one of two paths: `JSON.stringify(payload, sanitizeReplacer)` for object payloads, or `sanitizeLoneSurrogates(body)` for text bodies. New surfaces that bypass both will desync the system. Inline comments at both SSE producers in `server.ts` say so; `browse/test/server-sanitize-surrogates.test.ts` pins wiring with bug-repro + invariant tests (`handleCommandInternalImpl` rename, central sanitization line, replacer existence, SSE producers stringify with replacer).
+**Architectural invariant.** Every new SSE/WebSocket writer or HTTP response that ships page-content-derived strings MUST go through one of two paths: `JSON.stringify(payload, sanitizeReplacer)` for object payloads, or `sanitizeLoneSurrogates(body)` for text bodies. New surfaces that bypass both will desync the system. Inline comments at both SSE producers (`routes/activity.ts`, `routes/inspector.ts`) say so; `browse/test/server-sanitize-surrogates.test.ts` pins wiring with bug-repro + invariant tests (`handleCommandInternalImpl` rename, central sanitization line, replacer existence, SSE producers stringify with replacer).
 
 ### Prompt injection defense (sidebar agent)
 
@@ -342,12 +342,15 @@ Templates contain the workflows, tips, and examples that require human judgment.
 | `{{BROWSE_SETUP}}` | `gen-skill-docs.ts` | Binary discovery + setup instructions |
 | `{{BROWSE_FALLBACK}}` | `resolvers/browse.ts` | Aside→`$B` hand-off: binary discovery + the step-by-step equivalence table, rendered right after `{{ASIDE_SETUP}}` in every browsing skill |
 | `{{BASE_BRANCH_DETECT}}` | `gen-skill-docs.ts` | Dynamic base branch detection for PR-targeting skills (ship, review, qa, plan-ceo-review) |
-| `{{QA_METHODOLOGY}}` | `gen-skill-docs.ts` | Shared QA methodology block for /qa and /qa-only |
+| `{{QA_METHODOLOGY}}` | `resolvers/utility.ts` | Browser-only QA methodology, conditionally loaded by /qa and /qa-only |
+| `{{QA_SCOPE}}, {{QA_EXPLORATORY}}, {{QA_FUNCTIONAL}}, {{QA_RESOURCE}}, {{QA_METHOD_READS}}, {{QA_REVIEW}}` | `resolvers/qa.ts` | Surface selection, checkpointed native/exploratory QA, direct conditional method reads, installed-asset references and bounded review/ship callers |
 | `{{DESIGN_METHODOLOGY}}` | `gen-skill-docs.ts` | Shared design audit methodology for /plan-design-review and /design-review |
 | `{{SHARED_LIBS_RUBRIC}}` | `resolvers/shared-libs.ts` | Shared-code criteria for /deslop-shared-libs, /plan-eng-review, and /review: verified callers, existing helpers, compatibility, tests, and total savings |
 | `{{REVIEW_DASHBOARD}}` | `gen-skill-docs.ts` | Review Readiness Dashboard for /ship pre-flight |
-| `{{TEST_BOOTSTRAP}}` | `gen-skill-docs.ts` | Test framework detection, bootstrap, CI/CD setup for /qa, /ship, /design-review |
-| `{{CODEX_PLAN_REVIEW}}` | `resolvers/review.ts` | Optional outside plan review for /plan-ceo-review and /plan-eng-review: Claude Code on Codex, Codex on other supported harnesses, with the caller's native subagent fallback |
+| `{{TEST_VALUE_BAR:<mode>}}` | `resolvers/test-value.ts` | Shared test value bar (authoring gate, value card, X/Y coverage, red-first proof, low-value catalog) for /qa and /qa-only (`qa`) and /test-audit (`audit`); /plan-eng-review and /ship embed it through the coverage audit |
+| `{{TEST_VALUE_MESSAGE:<key>}}` | `resolvers/test-value.ts` | One degraded-mode message (problem, consequence, fix, docs anchor) from the shared constants |
+| `{{TEST_BOOTSTRAP}}` | `resolvers/testing.ts` | Test framework detection, bootstrap, CI/CD setup for /ship and /design-review |
+| `{{CODEX_PLAN_REVIEW}}` | `resolvers/outside-voice-steps.ts` | Optional outside plan review for /plan-ceo-review and /plan-eng-review: Claude Code on Codex, Codex on other supported harnesses, with the caller's native subagent fallback |
 | `{{DESIGN_SETUP}}` | `resolvers/design.ts` | Discovery pattern for `$D` design binary, mirrors `{{BROWSE_SETUP}}` |
 | `{{DESIGN_DETECTOR}}` | `resolvers/design.ts` | Probe block + sentinel reading for the user-installed impeccable engine (`bin/gstack-design-detect.ts`); `:phase0` renders design-review's mechanical scan, `:gate` design-html's bounded slop gate |
 | `{{DESIGN_MD_CHECK}}` | `resolvers/design.ts` | Open DESIGN.md format check through `bin/gstack-design-md.ts`, with the one-time conversion offer persisted in the file; `:calibrate` renders the tokens-as-calibration form for /design-review |
@@ -359,13 +362,17 @@ Templates contain the workflows, tips, and examples that require human judgment.
 | `{{GBRAIN_SAVE_RESULTS}}` | `resolvers/gbrain.ts` | Post-skill brain persistence with entity enrichment, throttle handling, and per-skill save instructions. 8 skill-specific save formats. |
 | `{{FOREGROUND_DISPATCH_NOTE}}` | `resolvers/constants.ts` | Canonical `run_in_background: false` guidance for every synchronous Agent-tool subagent dispatch (subagents run in the background by default since Claude Code v2.1.198). Single source of truth; carriers are pinned per file by `test/run-in-background-guidance.test.ts`. |
 
+`/qa` uses its browser-only `qa/sections/test-bootstrap.md.tmpl`; functional QA never bootstraps.
+
 This is structurally sound — if a command exists in code, it appears in docs. If it doesn't exist, it can't appear.
 
 The generator also owns two files that are not skill docs: `review/design-checklist.md` is rendered from `lib/design-catalog.ts` (through `scripts/resolvers/design-checklist.ts`), and `lib/dom-dump.js` is written from `lib/dom-dump-script.ts`. The checklist `/review` and `/ship` read and the DOM dump `/design-review` runs therefore cannot drift from the catalog and the script the templates describe; `test/design-checklist-sync.test.ts` pins both.
 
-The internal async `runGeneration()` driver inventories skills, Claude sections,
-host metadata, OpenClaw snippets, the index, the agent digest, and auxiliary
-assets. Every artifact goes through one compare-or-write function. Dry runs
+The internal async `runGeneration()` driver inventories skills, Claude sections
+and QA/qa-only sections on every supported host, host metadata, OpenClaw snippets,
+the index, the agent digest, and auxiliary assets. Other skills remain inline on
+non-Claude hosts; QA assets resolve relative to the installed host skill.
+Every artifact goes through one compare-or-write function. Dry runs
 report missing or different artifacts as `STALE` without changing files or
 directories; rendering and filesystem failures report `ERROR` with their cause.
 Either fails the command, including a single-host invocation. Module imports
@@ -525,7 +532,7 @@ See [eval defaults and overrides](CONTRIBUTING.md#testing--evals).
 
 Tier 1 runs on every `bun run test`. Tiers 2+3 are gated behind `EVALS=1`. The idea: catch 95% of issues for free, use LLMs only for judgment calls and integration testing.
 
-Anything that needs Aside itself — `test/skill-e2e-aside.test.ts`, the Aside cases in the qa and design-review E2E files, the live round-trip in `test/aside-render.test.ts` — runs only on a Mac with the Aside app open and self-skips elsewhere (`asideAvailable()` in `test/helpers/aside-available.ts`; `GSTACK_SKIP_ASIDE=1` forces the skip). The render gates are engine-agnostic: make-pdf's `*-gate.test.ts` and `test/skill-e2e-diagram.test.ts` run through whichever engine resolves (`browserAvailable()` in `make-pdf/test/e2e/browser-available.ts` = `asideAvailable() || resolveBrowseBin() !== null`) and skip only when neither exists, so Linux CI builds the browse binary with `bun run build:gates` and runs them live. The fallback engine's own tests (`browse/test/`, the `$B`-driven E2E cases) run on every platform as before: Linux CI proves the fallback path live and the Aside contract statically.
+Anything that needs Aside itself — `test/skill-e2e-aside.test.ts`, the Aside cases in the qa and design-review E2E files, the live round-trip in `test/aside-render.test.ts` — runs only on a Mac with the Aside app open and self-skips elsewhere (`asideAvailable()` in `test/helpers/aside-available.ts`; `GSTACK_SKIP_ASIDE=1` forces the skip). The render gates are engine-agnostic: make-pdf's `*-gate.test.ts` and `test/skill-e2e-diagram.test.ts` run through whichever engine resolves (`browserAvailable()` in `test/helpers/browser-available.ts` = `asideAvailable() || resolveBrowseBin() !== null`) and skip only when neither exists, so Linux CI builds the browse binary with `bun run build:gates` and runs them live. The fallback engine's own tests (`browse/test/`, the `$B`-driven E2E cases) run on every platform as before: Linux CI proves the fallback path live and the Aside contract statically.
 
 ## What's intentionally not here
 

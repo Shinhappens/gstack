@@ -1,4 +1,8 @@
 import type { ResolverFn } from './types';
+import { getHostConfig } from '../../hosts/index';
+
+/** The installed read-only Git helper. Always the trusted global runtime, never a repo-local root. */
+export const generateSafeGitPath: ResolverFn = (ctx) => `~/${getHostConfig(ctx.host).globalRoot}/bin/gstack-safe-git`;
 
 /** Shared criteria only: the caller owns scope, output, and permission to act. */
 export const generateSharedLibsRubric: ResolverFn = () => `### Shared-code evaluation rubric

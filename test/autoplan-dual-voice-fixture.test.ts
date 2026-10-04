@@ -64,7 +64,8 @@ mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/session-runner.ts'))}
         noPriorReview: actualPlan.split('## Review record')[1].trim() === '',
         originalRestore: fs.readFileSync(path.join(opts.env.HOME, 'restore.md'), 'utf8') === fs.readFileSync(plan, 'utf8'),
         currentInput: actualPlan.includes(fs.readFileSync(plan, 'utf8')),
-        hasActualRanges: /ranges: \\[\\{\"offset\":1,\"limit\":/.test(entry)},
+        hasActualRanges: /ranges: \\[\\{\"offset\":1,\"limit\":/.test(entry),
+        blocksAsDelivered: entry.includes('Run each bash block below as\\ndelivered, alone in one Bash call; run any extra diagnostics as separate calls.')},
       timeout: opts.timeout, maxTurns: opts.maxTurns,
       allowedTools: opts.allowedTools, tools: opts.tools,
       appendedPrompt: opts.appendSystemPrompt, model: opts.model,
@@ -255,7 +256,7 @@ await import(${JSON.stringify(path.join(ROOT, 'test/skill-e2e-autoplan-dual-voic
         expect(attempt.initial).toBe(ORIGINAL_PLAN);
         expect(attempt.prompt).toBe(`Read ${JSON.stringify(attempt.entryPath)} and execute the standalone CEO dual-voice review described there.`);
         expect(attempt.entryPath).toBe(path.join(attempt.env.HOME, 'ceo-dual-entry.md'));
-        expect(attempt.entry).toEqual({exactDual: true, exactPreflight: true, scopeDeclared: true, noPriorReview: true, originalRestore: true, currentInput: true, hasActualRanges: true});
+        expect(attempt.entry).toEqual({exactDual: true, exactPreflight: true, scopeDeclared: true, noPriorReview: true, originalRestore: true, currentInput: true, hasActualRanges: true, blocksAsDelivered: true});
         expect(attempt.timeout).toBe(600_000);
         expect(attempt.maxTurns).toBe(40);
         expect(attempt.allowedTools).toEqual(['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob', 'Agent', 'Skill']);

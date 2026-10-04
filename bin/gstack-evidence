@@ -39,6 +39,7 @@ import { mkdirpSync } from "../lib/fs-utils";
 import { join, dirname } from "path";
 import { spawnSync } from "child_process";
 import { appendJsonl, readJsonl } from "../lib/jsonl-store";
+import { resolveStateRoot } from "../lib/state-root";
 import { scan, applyRedactions } from "../lib/redact-engine";
 
 const BIN_DIR = dirname(Bun.fileURLToPath(import.meta.url));
@@ -93,10 +94,10 @@ function currentWtree(): string | undefined {
 }
 
 function ledgerPath(): { dir: string; file: string; logsDir: string } {
-  const home = process.env.GSTACK_HOME || (process.env.HOME ? join(process.env.HOME, ".gstack") : undefined);
-  // No resolvable home: skip bookkeeping (a literal "~" dir in cwd would land
-  // inside the repo and perturb the fingerprint it exists to compute).
-  if (!home) throw new Error("no GSTACK_HOME/HOME — bookkeeping skipped");
+  const home = resolveStateRoot();
+  // No resolvable home: skip bookkeeping (the relative ".gstack" fallback would
+  // land inside the repo and perturb the fingerprint it exists to compute).
+  if (home === ".gstack") throw new Error("no GSTACK_HOME/HOME — bookkeeping skipped");
   // ONE gstack-slug spawn: its output carries both SLUG= and BRANCH= lines
   // (same branch→filename sanitization as reviews.jsonl).
   const slugOut = spawnSync(join(BIN_DIR, "gstack-slug"), { encoding: "utf-8" });

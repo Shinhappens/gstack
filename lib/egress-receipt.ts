@@ -26,7 +26,7 @@
 
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
+import { resolveStateRoot } from './state-root';
 import path from 'node:path';
 
 export const EGRESS_RECEIPT_FAILED = 'EGRESS_RECEIPT_FAILED';
@@ -109,14 +109,9 @@ export interface VerifyResult {
   sizeWarning: string | null;
 }
 
-/**
- * Same resolution order as the rest of gstack (shell sinks, selection code):
- * GSTACK_HOME, legacy GSTACK_STATE_DIR, then $HOME/.gstack.
- */
+/** The shared state root (lib/state-root.ts), made absolute. */
 export function resolveEgressHome(env: Env = process.env): string {
-  const configured = env.GSTACK_HOME || env.GSTACK_STATE_DIR;
-  if (configured) return path.resolve(configured);
-  return path.join(env.HOME || os.homedir(), '.gstack');
+  return path.resolve(resolveStateRoot(env));
 }
 
 export function egressLedgerPath(home: string): string {

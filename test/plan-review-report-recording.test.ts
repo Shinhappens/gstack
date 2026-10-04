@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
-import { recordE2E } from './helpers/e2e-helpers';
+import { isPreTurnInfraFailure, recordE2E } from './helpers/e2e-helpers';
 import { EvalCollector, isFinalizedEvalResultFile, listEvalJsonFiles, type EvalTestEntry } from './helpers/eval-store';
 import { OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt } from './helpers/office-hours-attempt';
 import { isPaidTestFile } from './helpers/paid-test-set';
@@ -212,7 +212,8 @@ test('canonical reports preserve both successful exits, terminal forms, metadata
       timeout: CAPTURE_LONG_MS, runId: 'public-report-free' });
     expect(call.signal).toBeInstanceOf(AbortSignal);
     expect(call.prompt).toContain('Read plan-eng-review/SKILL.md and plan-eng-review/sections/review-sections.md');
-    expect(call.prompt).toContain('"Plan File Review Report" section of plan-eng-review/sections/review-sections.md');
+    expect(call.prompt).toContain('plan.md is the plan file for this review session');
+    expect(call.prompt).not.toMatch(/CRITICAL REQUIREMENT|GSTACK REVIEW REPORT|\bMUST\b/);
     expect(call.prompt).not.toContain('placeholder table with all five review rows (CEO, Codex, Eng, Design, DX)');
     expect(call.main).toBe(fs.readFileSync(path.join(ROOT, 'plan-eng-review/SKILL.md'), 'utf8'));
     expect(call.section).toBe(fs.readFileSync(path.join(ROOT, 'plan-eng-review/sections/review-sections.md'), 'utf8'));
@@ -256,4 +257,41 @@ test('report deadline aborts, records once, cleans up and ignores late completio
 
 test('report recording controls stay outside the paid test filename patterns', () => {
   expect(isPaidTestFile('test/plan-review-report-recording.test.ts')).toBe(false);
+});
+
+// A pre-turn API/transport failure is INFRA; once the model has run, a failure
+// keeps its ordinary class.
+function runnerResult(exitReason: string, turnsUsed = 0, transcript: any[] = [{ type: 'system', subtype: 'init' }]): any {
+  return { exitReason, transcript, toolCalls: [], browseErrors: [], duration: 1, output: '',
+    costEstimate: { inputChars: 1, outputChars: 0, estimatedTokens: 0, estimatedCost: 0, turnsUsed } };
+}
+function recordedClass(result: any, extra?: Partial<EvalTestEntry>) {
+  const evalDir = fs.mkdtempSync(path.join(os.tmpdir(), 'report-recording-class-'));
+  try {
+    const collector = new EvalCollector('e2e', evalDir);
+    recordE2E(collector, 'infra-probe', 'Infra probe', result, extra);
+    return (collector as any).tests.at(-1)?.failure_class;
+  } finally { fs.rmSync(evalDir, { recursive: true, force: true }); }
+}
+
+test.each(['error_api', 'timeout_startup', 'error_output_stream', 'exit_code_1'])(
+  'a %s before the first model turn is recorded as infra', exitReason => {
+    expect(isPreTurnInfraFailure(runnerResult(exitReason))).toBe(true);
+    expect(recordedClass(runnerResult(exitReason))).toBe('infra');
+  });
+
+test.each([
+  ['a timeout after model work', runnerResult('timeout')],
+  ['max turns', runnerResult('error_max_turns', 24)],
+  ['an API error after a turn', runnerResult('error_api', 3)],
+  ['an API error after an assistant message', runnerResult('error_api', 0, [{ type: 'assistant', message: { content: [{ type: 'text', text: 'I cannot help with that.' }] } }])],
+  ['a successful run', runnerResult('success', 2)],
+] as const)('%s is not infra', (_name, result) => {
+  expect(isPreTurnInfraFailure(result)).toBe(false);
+  expect(recordedClass(result)).toBeUndefined();
+});
+
+test('an explicit pass or class from the caller wins', () => {
+  expect(recordedClass(runnerResult('error_api'), { passed: true })).toBeUndefined();
+  expect(recordedClass(runnerResult('error_api'), { failure_class: 'assertion' })).toBe('assertion');
 });

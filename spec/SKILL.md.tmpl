@@ -144,13 +144,12 @@ Ask until you can answer:
 
 Do NOT proceed until scope is locked.
 
-### Phase 3: Technical Interrogation (HARD requirement: read code first)
+### Phase 3: Technical Interrogation (read code first)
 
-**Mandatory:** Before asking ANY Phase 3 question, you MUST read at least one
-piece of evidence from the codebase via Grep, Glob, or Read. This is the magical
-moment for the user: they see you grounded in their actual code, not generic
-checklists. Do NOT skip. Do NOT ask "what file should I look at?" first — find
-it yourself.
+Before asking any Phase 3 question, read at least one piece of evidence from the
+codebase via Grep, Glob, or Read, and cite it. This is the magical moment for the
+user: they see you grounded in their actual code, not generic checklists. Find the
+relevant file yourself rather than asking which one to look at.
 
 Mapping the user's request to evidence:
 
@@ -175,9 +174,6 @@ Then ask about whichever categories apply (skip ones that clearly don't):
 - **UI** — new pages, modified components, state management
 - **Infrastructure** — IaC changes, secrets, cost impact
 - **Testing** — how to test at each layer, regression risk
-
-Don't ask questions you can answer by reading the code. Read first, then ask
-the questions whose answers aren't in the code.
 
 ### Phase 4: Draft Review
 
@@ -334,7 +330,7 @@ this? Even "revert the PR" is worth stating explicitly.
 
 ## Issue Structure Templates
 
-### Standard Issues (default; also used for `--bug`, `--feature`, `--refactor` framings)
+### Standard Issues (default; bug, feature and refactor framings adapt within it)
 
 ```
 ## Context
@@ -482,8 +478,8 @@ Add to the standard template:
   a `/spec` archive (frontmatter `spec_issue_number: <N>`) AND the PR delivers
   the full spec (acceptance criteria checked off per `/ship`'s existing
   plan-completion gate), `/ship` adds `Closes #<N>` to the PR body so merging
-  auto-closes the source issue. Conditional — partial PRs do NOT auto-close
-  (codex F4). Branch-name inference is NOT used (codex F3).
+  auto-closes the source issue. Conditional — partial PRs do not auto-close, and
+  the source issue is never inferred from the branch name.
 
 ---
 

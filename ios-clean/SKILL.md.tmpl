@@ -52,7 +52,9 @@ Each item is reverted only after AskUserQuestion confirmation:
    `DebugBridgeManager.shared.start()`.
 3. Any standalone `// @Snapshotable` generator marker comments on the
    canonical app state class.
-4. Generated `StateAccessor.swift` files anywhere under the app source.
+4. The generated `DebugBridge/` package directory and `DebugBridgeGenerated/`
+   (accessors and `.gstack-version`) that `gstack-ios-qa-regen` wrote under
+   the app source, plus any other generated `StateAccessor.swift` files.
 5. The `gstack-ios-qa.token` file under `NSTemporaryDirectory()` on the
    device (best-effort — only works if device is connected when /ios-clean
    runs).
@@ -67,8 +69,8 @@ Each item is reverted only after AskUserQuestion confirmation:
 
 1. Glob for `import DebugBridge` across the app source.
 2. Glob for `#if DEBUG ... DebugBridgeManager` blocks.
-3. Glob for `// Auto-generated state accessor` headers in
-   `StateAccessor.swift` files.
+3. Grep `StateAccessor.swift` files for the generator header
+   `// AUTO-GENERATED — DO NOT EDIT. Regenerate with /ios-sync.`
 4. Parse `Package.swift` for the DebugBridge dependency entry.
 5. Show the user what's about to be removed (file list + line counts).
    AskUserQuestion: proceed, dry-run, or abort.
@@ -79,9 +81,11 @@ For each item the user approved:
 
 1. Use Edit tool to strip the import + the `#if DEBUG` block (keep the
    surrounding code intact).
-2. Use Edit tool to remove the `.package(url:...DebugBridge...)` entry
-   from `Package.swift` and any `targets` referencing `"DebugBridge"`.
-3. Delete generated `StateAccessor.swift` files.
+2. Use Edit tool to remove the local `.package(path: ...DebugBridge...)`
+   entry from `Package.swift` and every target dependency on a
+   `DebugBridge*` product (`DebugBridgeUI`, `DebugBridgeCore`, `DebugBridgeTouch`).
+3. Delete the generated `DebugBridge/` and `DebugBridgeGenerated/`
+   directories and any other generated `StateAccessor.swift` files.
 4. Run `xcodebuild -scheme <SchemeName> -destination 'platform=iOS,id=<UDID>'
    build install -configuration Release` to verify Release builds without
    the bridge. If it fails on a missing DebugBridge symbol, the removal

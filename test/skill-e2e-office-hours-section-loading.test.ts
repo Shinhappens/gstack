@@ -1,7 +1,12 @@
 /**
- * Full office-hours startup workflow, isolated from the generic carve shard.
+ * Office-hours startup workflow, isolated from the generic carve shard.
  * A fixed interview exercises real opinion/design/review/approval/handoff work.
  * Free completion regressions live in office-hours-completion.test.ts.
+ *
+ * This full start-to-finish workflow (1–3 real spec-review rounds, ~20 min) is
+ * marathon tier. skill-e2e-office-hours-design-draft.test.ts runs the same
+ * interview only through the checkpoint that creates the design (~5 min) in
+ * the periodic lane.
  */
 import { test, expect } from 'bun:test';
 import * as fs from 'node:fs';
@@ -11,7 +16,7 @@ import { setupSkillDir, skillFromWorktree, captureSectionReads } from './helpers
 import { CARVE_GUARDS } from './helpers/carve-guards';
 import { validateOfficeHoursCompletion, validateOfficeHoursReviewerHandoffs, validateOfficeHoursReviewArtifacts, validateOfficeHoursReviewPreservation } from './helpers/office-hours-completion';
 
-const describeE2E = describeE2ETier('periodic');
+const describeMarathon = describeE2ETier('marathon');
 const runId = `office-hours-section-loading-${process.env.EVALS_RUN_ID ?? 'local'}`;
 
 // Full startup diagnosis + outside opinion + up to three spec reviews exceeds
@@ -25,7 +30,7 @@ const runId = `office-hours-section-loading-${process.env.EVALS_RUN_ID ?? 'local
 const OFFICE_HOURS_CAPTURE_MS = 1_200_000;
 const OFFICE_HOURS_TEST_MS = 1_260_000;
 
-describeE2E('/office-hours full section-loading workflow (periodic)', () => {
+describeMarathon('/office-hours full section-loading workflow (marathon)', () => {
   test('a real startup review reads its sections and completes the approved design and handoff', async () => {
     const guard = CARVE_GUARDS['office-hours'];
     const { skillMd, sectionsFrom } = skillFromWorktree(guard.skill);

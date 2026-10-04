@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 
 import { render, sanitizeUntrustedHtml } from "../src/render";
 import { smartypants } from "../src/smartypants";
-import { printCss } from "../src/print-css";
+import { printCss, screenCss } from "../src/print-css";
 
 // ─── smartypants ──────────────────────────────────────────────
 
@@ -589,5 +589,15 @@ describe("render() — no double HTML entity escaping", () => {
       // Never contains a double-encoded entity.
       expect(titleMatch[1]).not.toMatch(/&amp;(amp|lt|gt|quot|#\d+);/);
     }
+  });
+});
+
+describe("screenCss", () => {
+  test("screenCss is media-scoped and readable-width", () => {
+    const css = screenCss();
+    expect(css).toContain("@media screen");
+    // 42em at 12pt ≈ 70-75 chars/line — the readable ceiling (design review).
+    expect(css).toContain("max-width: 42em");
+    expect(css).toContain(".watermark { display: none; }");
   });
 });

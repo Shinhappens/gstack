@@ -152,13 +152,21 @@ export async function submitPlanSeed(session: SeedSession, seed: string, opts: {
   });
   if (Date.now() >= opts.deadlineAt) throw new PlanSeedTimeout('Plan seed submission exhausted the existing case budget');
   session.sendKey('Enter'); // Separate input event after the acknowledged paste.
+  // The transcript can record end_turn before the CLI repaints, so an empty
+  // composer counts only when the same frame survives one more poll.
+  let settled = '';
   await until(async () => {
     const owned = read();
     if (!owned || owned.pendingBytes) return false;
     const rows = owned.rows.slice(before);
     const users = rows.filter(r => r.type === 'user' && content(r).some(c => c.type === 'text'));
     if (!users.length) return false;
-    if (users.length !== 1 || content(users[0]).length !== 1 || content(users[0])[0].text !== seed) throw new Error('Plan seed was fused, duplicated, or changed');
+    const received = content(users[0]);
+    const text = received[0]?.text;
+    const nativePaste = typeof text === 'string'
+      ? /^\n\n<pasted_content id="([0-9a-f]+)">\n([\s\S]*)<\/pasted_content id="\1">\n$/.exec(text)?.[2]
+      : undefined;
+    if (users.length !== 1 || received.length !== 1 || (text !== seed && nativePaste !== seed)) throw new Error('Plan seed was fused, duplicated, or changed');
     const after = rows.slice(rows.indexOf(users[0]) + 1);
     const pending = new Set<string>();
     let complete = false;
@@ -173,13 +181,18 @@ export async function submitPlanSeed(session: SeedSession, seed: string, opts: {
       }
       if (row.type === 'user') for (const c of content(row)) if (c.type === 'tool_result') pending.delete(c.tool_use_id);
     }
-    if (!complete || pending.size || owned.status.waitingFor) return false;
+    const unsettled = () => { settled = ''; return false; };
+    if (!complete || pending.size || owned.status.waitingFor) return unsettled();
     const frame = await session.currentScreen!();
     if (opts.isQuestionOrPermission(frame.text)) throw new Error('Plan seed response requires an answer before skill invocation');
     const input = composer(frame.text);
     if (frame.rawEnd !== session.mark() || !input
-      || input.line.replace(/^❯[ \u00a0]*/, '').trim() !== '') return false;
+      || input.line.replace(/^❯[ \u00a0]*/, '').trim() !== '') return unsettled();
     const fresh = read();
-    return !!fresh && !fresh.pendingBytes && fresh.rows.length === owned.rows.length && !fresh.status.waitingFor;
+    if (!fresh || fresh.pendingBytes || fresh.rows.length !== owned.rows.length || fresh.status.waitingFor) return unsettled();
+    const signature = `${frame.rawEnd}:${fresh.rows.length}:${frame.text}`;
+    if (signature === settled) return true;
+    settled = signature;
+    return false;
   });
 }

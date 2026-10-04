@@ -151,7 +151,7 @@ function splitFrontmatter(raw: string, file: string): { frontmatter: string; bod
  * Standalone generated STOP-Read blocks between horizontal rules replace
  * entire carved steps and end the preceding H2. Nested pointers stay inside it.
  */
-function scanH2Sections(bodyLines: string[]): H2Section[] {
+function scanH2Sections(bodyLines: string[], stopAtH1 = false): H2Section[] {
   const sections: H2Section[] = [];
   let fence: { ch: string; len: number } | null = null;
 
@@ -170,6 +170,7 @@ function scanH2Sections(bodyLines: string[]): H2Section[] {
     }
     if (!fence) {
       const heading = line.startsWith('## ');
+      const title = stopAtH1 && /^ {0,3}#(?:[ \t]|$)/.test(line);
       let carvedStep = /^> \*\*STOP\.\*\* Before .+, Read `[^`]+\/sections\/[^`]+\.md` and execute it$/.test(line)
         && bodyLines[i + 1] === '> in full. Do not work from memory — that section is the source of truth for this step.';
       if (carvedStep) {
@@ -179,7 +180,7 @@ function scanH2Sections(bodyLines: string[]): H2Section[] {
         while (following < bodyLines.length && !bodyLines[following].trim()) following++;
         carvedStep = bodyLines[preceding] === '---' && bodyLines[following] === '---';
       }
-      if (heading || carvedStep) {
+      if (heading || title || carvedStep) {
         const previous = sections.at(-1);
         if (previous) previous.end = Math.min(previous.end, i);
         if (heading) sections.push({ heading: line.slice(3).trim(), start: i, end: bodyLines.length });
@@ -189,7 +190,7 @@ function scanH2Sections(bodyLines: string[]): H2Section[] {
   return sections;
 }
 
-function loadSkill(skillDirOrFile: string): {
+function loadSkill(skillDirOrFile: string, stopAtH1 = false): {
   file: string;
   frontmatter: string;
   bodyLines: string[];
@@ -198,7 +199,7 @@ function loadSkill(skillDirOrFile: string): {
   const file = resolveSkillMd(skillDirOrFile);
   const raw = fs.readFileSync(file, 'utf-8');
   const { frontmatter, bodyLines } = splitFrontmatter(raw, file);
-  return { file, frontmatter, bodyLines, sections: scanH2Sections(bodyLines) };
+  return { file, frontmatter, bodyLines, sections: scanH2Sections(bodyLines, stopAtH1) };
 }
 
 function findSection(sections: H2Section[], name: string, file: string): H2Section {
@@ -240,7 +241,7 @@ export function extractSkillSections(skillDir: string, sections: string[]): stri
  * ~780-line shared generated preamble and nothing else.
  */
 export function extractSkillBody(skillDir: string): string {
-  const { file, frontmatter, bodyLines, sections: all } = loadSkill(skillDir);
+  const { file, frontmatter, bodyLines, sections: all } = loadSkill(skillDir, true);
   const boundary = (names: string[]): H2Section => {
     const matches = all.filter(section => names.includes(section.heading));
     const label = names.map(name => `"## ${name}"`).join(' or ');

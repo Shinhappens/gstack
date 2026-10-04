@@ -44,7 +44,7 @@ import {
   type AskUserQuestionFingerprint,
   type ClaudePtySession,
 } from './helpers/claude-pty-runner';
-import { ceoExpansionPacingChoice, ceoExpansionPacingReady, ceoModeSubmissionInput, hasNativePostAnswerCeoPosture, nextCeoModeNavigation, nextCeoPostureContinuation } from './helpers/ceo-mode-option';
+import { ceoExpansionPacingChoice, ceoExpansionPacingReady, ceoModePacketTabAnswer, ceoModeSubmissionInput, hasNativePostAnswerCeoPosture, holdDeferKeepIndex, nextCeoModeNavigation, nextCeoPostureContinuation } from './helpers/ceo-mode-option';
 import { createPlanCountFixture } from './helpers/plan-count-fixture';
 import { readPlanCountTranscript, type NativePublicToolEvent, type PlanCountTranscript } from './helpers/plan-count-transcript';
 import { readPendingQuestion, pendingQuestionRecorderStatus } from './helpers/plan-count-pending-question';
@@ -61,7 +61,7 @@ interface ModeCase {
 
 const CASES: ModeCase[] = [
   { mode: 'HOLD SCOPE',      postureRe: /\b(rigor|bulletproof|hold\s*scope|maximum\s+rigor)\b/i },
-  { mode: 'SCOPE EXPANSION', postureRe: /\b(expansion|10x|delight|dream|cathedral|opt[\s-]?in)\b/i },
+  { mode: 'SCOPE EXPANSION', postureRe: /\b(expansions?|10x|delight|dream|cathedral|opt[\s-]?in)\b/i },
 ];
 
 // Both cases review the same plan, available before the slash command starts.
@@ -231,6 +231,7 @@ describeE2E('/plan-ceo-review mode routing (gate)', () => {
           let pacingCalls = 0;
           const seenDownstream = new Set<string>();
           const submittedModePackets = new Set<string>();
+          const answeredPacketTabs = new Set<string>();
           while (Date.now() - start < budgetMs) {
             await Bun.sleep(2500);
             if (session.exited()) {
@@ -260,8 +261,15 @@ describeE2E('/plan-ceo-review mode routing (gate)', () => {
             }
             const currentInput = await session.currentScreen();
             capture('awaiting_posture', currentInput, transcript);
-            const modeSubmit = ceoModeSubmissionInput(currentInput, question.nativeCall, c.mode, transcript, submittedModePackets);
+            const modeSubmit = ceoModeSubmissionInput(currentInput, question.nativeCall, c.mode, transcript, submittedModePackets, session.visibleText());
             if (modeSubmit !== null) { session.send(modeSubmit); continue; }
+            const packetTab = ceoModePacketTabAnswer(currentInput, question.nativeCall, transcript, answeredPacketTabs);
+            if (packetTab) {
+              const input = planCountQuestionInput(currentInput, packetTab.question, packetTab.index);
+              if (input.includes('\r')) await selectPtyNumberedOption(session, packetTab.index);
+              else session.send(input);
+              continue;
+            }
             const pendingQuestion = readPendingQuestion(session.pendingQuestionFile, fixture.cwd,
               session.hermeticConfigDir, selectionStartedAt, transcript);
             if (pacingChoice && !ceoExpansionPacingReady(currentInput, transcript, pacingChoice, publicTools)) continue;
@@ -286,10 +294,14 @@ describeE2E('/plan-ceo-review mode routing (gate)', () => {
               else {
                 const pending = transcript.calls.find(call => !call.answered && !call.failed) ?? pendingQuestion;
                 const question = capturePlanCountQuestion(currentInput, new Set(), 0, false, pending)!;
-                if (c.mode === 'HOLD SCOPE' && question.nativeCall)
+                // HOLD's own defer/keep menu (0G) is scope work, not the rigor decision
+                // under assessment: keep the item in scope and assess the next decision.
+                const keep = c.mode === 'HOLD SCOPE' ? holdDeferKeepIndex(question.nativeCall) : null;
+                if (c.mode === 'HOLD SCOPE' && question.nativeCall && keep === null)
                   continuedCallId ??= `${question.nativeCall.sessionId}:${question.nativeCall.toolUseId}`;
-                const input = planCountQuestionInput(currentInput, question, 1);
-                if (input.includes('\r')) await selectPtyNumberedOption(session, 1);
+                const pick = keep ?? 1;
+                const input = planCountQuestionInput(currentInput, question, pick);
+                if (input.includes('\r')) await selectPtyNumberedOption(session, pick);
                 else session.send(input);
               }
               continue;

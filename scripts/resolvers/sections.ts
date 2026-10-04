@@ -5,23 +5,29 @@
  * on demand. The SAME template ships to every host, so these resolvers make the
  * carve host-aware:
  *
- *  - On CLAUDE: {{SECTION:id}} emits a STOP-Read pointer to the generated section
+ *  - On CLAUDE and for QA on every host: {{SECTION:id}} emits a STOP-Read pointer to the generated section
  *    file (the skeleton), and the section .md is generated + installed separately.
- *  - On every OTHER host: {{SECTION:id}} INLINES the section template's content,
+ *  - Other skills on external hosts: {{SECTION:id}} INLINES the section template's content,
  *    so external hosts keep the full monolith ship skill (no section files, no
  *    host-portable-path problem). Inlined content keeps its own {{RESOLVER}}
  *    tokens, which the generator's multi-pass resolve expands.
  *
  * {{SECTION_INDEX:skill}} renders the situation→section table from the PASSIVE
- * manifest on Claude (empty on other hosts — they have no sections). The manifest
+ * manifest for lazy skills (empty for inlined skills). The manifest
  * is the single source of id/file/title/trigger text (CM2; v2_PLAN.md:663).
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { ResolverFn, TemplateContext } from './types';
+import type { Host, ResolverFn, TemplateContext } from './types';
 
 const ROOT = path.resolve(import.meta.dir, '..', '..');
+
+export const QA_ASSET_BLOCKER = 'If missing or unreadable, report a QA setup blocker and its affected probes as blocked; continue other safe probes (independent functional/static checks). Missing/unreadable assets block required QA.';
+
+export function usesLazySections(host: Host, skill: string): boolean {
+  return host === 'claude' || skill === 'qa' || skill === 'qa-only';
+}
 
 interface SectionEntry {
   id: string;
@@ -48,20 +54,35 @@ function findSection(skill: string, id: string): SectionEntry {
   return entry;
 }
 
+export function sectionPath(ctx: TemplateContext, skill: string, id: string): string {
+  const entry = findSection(skill, id);
+  if (skill === 'qa' || skill === 'qa-only') {
+    fs.accessSync(path.join(ROOT, skill, 'sections', `${entry.file}.tmpl`), fs.constants.R_OK);
+    const installedName = ctx.host === 'claude' ? `\`${skill}\`/\`gstack-${skill}\`` : `\`gstack-${skill}\``;
+    return `\`sections/${entry.file}\` relative to the installed ${installedName} SKILL.md directory`;
+  }
+  return `\`${ctx.paths.skillRoot}/${skill}/sections/${entry.file}\``;
+}
+
 /**
- * {{SECTION:id}} — pointer on Claude, inline on other hosts.
- * Claude path uses the stable gstack-root install (`{skillRoot}/{skill}/sections/`),
- * which always exists, instead of a naked relative path (Codex outside-voice #7).
+ * {{SECTION:id}} — installed-file pointer for QA; otherwise Claude pointers
+ * and external inline content retain their existing behavior.
  */
 export const SECTION: ResolverFn = (ctx: TemplateContext, args?: string[]): string => {
   const id = args?.[0];
   if (!id) throw new Error('{{SECTION:id}} requires a section id');
   const entry = findSection(ctx.skillName, id);
 
-  if (ctx.host === 'claude') {
-    const sectionPath = `${ctx.paths.skillRoot}/${ctx.skillName}/sections/${entry.file}`;
+  if (usesLazySections(ctx.host, ctx.skillName)) {
+    if (ctx.skillName === 'qa' || ctx.skillName === 'qa-only') {
+      return [
+        `> **STOP.** Before ${entry.trigger}, Read ${sectionPath(ctx, ctx.skillName, id)} in full and follow it.`,
+        '> Use this host\'s installed path, never the product working directory or another host\'s assets.',
+        `> ${QA_ASSET_BLOCKER}`,
+      ].join('\n');
+    }
     return [
-      `> **STOP.** Before ${entry.trigger}, Read \`${sectionPath}\` and execute it`,
+      `> **STOP.** Before ${entry.trigger}, Read ${sectionPath(ctx, ctx.skillName, id)} and execute it`,
       `> in full. Do not work from memory — that section is the source of truth for this step.`,
     ].join('\n');
   }
@@ -74,23 +95,32 @@ export const SECTION: ResolverFn = (ctx: TemplateContext, args?: string[]): stri
 
 /**
  * {{SECTION_INDEX:skill}} — situation→section table from the passive manifest.
- * Claude only; other hosts inline everything so an index would be noise.
+ * Lazy skills only; an index would be noise for inlined skills.
  */
 export const SECTION_INDEX: ResolverFn = (ctx: TemplateContext, args?: string[]): string => {
-  if (ctx.host !== 'claude') return '';
   const skill = args?.[0] ?? ctx.skillName;
+  if (!usesLazySections(ctx.host, skill)) return '';
   const manifest = loadManifest(skill);
   const lines: string[] = [
     '## Section index — Read each section when its situation applies',
     '',
-    'This skill is a decision-tree skeleton. The steps below point to on-demand',
-    'sections. Read a section in full before doing its step; do not work from memory.',
+    ...(skill === 'qa' || skill === 'qa-only'
+      ? ['Read sections in full when directed; do not work from memory.']
+      : ['This skill is a decision-tree skeleton. The steps below point to on-demand',
+        'sections. Read a section in full before doing its step; do not work from memory.']),
     '',
     '| When | Read this section |',
     '|------|-------------------|',
   ];
   for (const s of manifest.sections) {
-    lines.push(`| ${s.trigger} | \`sections/${s.file}\` |`);
+    const reference = skill === 'qa' || skill === 'qa-only' ? sectionPath(ctx, skill, s.id) : `\`sections/${s.file}\``;
+    if (skill === 'review' && s.id === 'review-army') {
+      lines.push(`| Select surfaces and read QA methods | Inline in [Step 4](#step-4-critical-pass-core-review); setup and probes run in Step 4.7 |`);
+    }
+    lines.push(`| ${s.trigger} | ${reference} |`);
+    if (skill === 'ship' && s.id === 'review-army') {
+      lines.push(`| exploratory QA before Fix-First (Step 9.2.1) | Use the QA Read directive in ${reference} |`);
+    }
   }
   return lines.join('\n');
 };

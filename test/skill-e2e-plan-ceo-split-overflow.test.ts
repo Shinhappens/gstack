@@ -1,5 +1,5 @@
 /**
- * /plan-ceo-review split-overflow regression (periodic, paid, real-PTY).
+ * /plan-ceo-review split-overflow regression (marathon, paid, real-PTY).
  *
  * Catches the original failure mode the user complained about: when the
  * agent has 5+ options for ONE conceptual decision, it must split into N
@@ -14,9 +14,9 @@
  * The fixture seeds 5 independent scope candidates (chat-platform
  * integrations) — each carries an independent include/defer/cut decision.
  * The existing semantic scope validator examines every acknowledged native
- * call, including candidate choices before mode selection. It keeps the
- * N-1 call floor and requires independent offered dispositions for all five
- * candidates. The review-phase counter reports progress, not target coverage.
+ * call, including candidate choices before mode selection. It requires
+ * independent offered dispositions for all five candidates; the call floor
+ * is two, the minimum for five options at four per call. The review-phase counter reports progress, not target coverage.
  * Collection ends once all five native choices are acknowledged; the same
  * semantic validator then decides whether those choices satisfy the metric.
  *
@@ -29,8 +29,11 @@
  *     which is exactly the shape that hits Conductor's 4-option cap and
  *     triggers the new split-vs-drop guidance.
  *
- * Tier: periodic (~25 min, ~$0.30-$5.00/run depending on agent path).
- * Sequential by default.
+ * The fixture supplies the HOLD SCOPE mode the actor always chose, so 0E skips
+ * its mode question. Run 36385945043 acknowledged all five candidates 8m55s
+ * after launch (mode question included); collection stops there.
+ *
+ * Tier: periodic (25 min budget; ~8-9 min expected). Sequential by default.
  */
 
 import { test } from 'bun:test';
@@ -43,21 +46,21 @@ import {
   ceoStep0Boundary,
 } from './helpers/claude-pty-runner';
 import { FORCING_SPLIT_OVERFLOW_CEO } from './fixtures/forcing-finding-seeds';
-import { ceoSplitDecisionFingerprints, isCeoSplitCandidateCall, isCeoSplitCollectionComplete, pickCeoSplitCountQuestion } from './helpers/ceo-split-question-policy';
+import { CEO_SPLIT_CALL_FLOOR, ceoSplitDecisionFingerprints, isCeoSplitCandidateCall, isCeoSplitCollectionComplete, pickCeoSplitCountQuestion } from './helpers/ceo-split-question-policy';
 import { CEO_SCOPE_CANDIDATES } from './helpers/plan-review-cases';
 import { evaluatePlanReviewDecisions } from './helpers/plan-review-decisions';
 
-const describeE2E = describeE2ETier('periodic');
+const describeE2E = describeE2ETier('marathon');
 
 const N = 5;
-const FLOOR = N - 1; // 4 — must fire at least one AUQ per non-dropped option
+const FLOOR = CEO_SPLIT_CALL_FLOOR;
 
 /** Plan-file target baked into the FORCING_SPLIT_OVERFLOW_CEO fixture prompt.
  *  Rewritten per-run to a mkdtemp path so concurrent runs (--retry,
  *  EVALS_JOBS>1, sibling worktrees) never share one /tmp artifact. */
 const FIXTURE_PLAN_PATH = '/tmp/gstack-test-plan-ceo-split-overflow.md';
 
-describeE2E('/plan-ceo-review split-overflow regression (periodic)', () => {
+describeE2E('/plan-ceo-review split-overflow regression (marathon)', () => {
   test(
     `5-option scope decision emits >= ${FLOOR} review-phase AskUserQuestions (no dropping)`,
     async () => {
@@ -98,9 +101,9 @@ describeE2E('/plan-ceo-review split-overflow regression (periodic)', () => {
               `--- evidence (last 3KB) ---\n${obs.evidence}`,
           );
         }
-        // The phase counter is progress, not target coverage. The existing scope
-        // validator keeps FLOOR=4 and requires all five independent candidate
-        // decisions, complete native evidence, and offered Include/Defer/Cut ACKs.
+        // The phase counter is progress, not target coverage. The scope validator
+        // requires all five independent candidate decisions, complete native
+        // evidence, and offered Include/Defer/Cut ACKs; FLOOR only bounds calls.
         await evaluatePlanReviewDecisions({ plan: followUpPrompt, targets: CEO_SCOPE_CANDIDATES,
           fingerprints: ceoSplitDecisionFingerprints(obs.transcript, obs.fingerprints),
           floor: FLOOR, kind: 'scope', deadlineAt });

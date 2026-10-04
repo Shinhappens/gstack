@@ -21,11 +21,15 @@
  *   └─────────────────────────────┘
  *      + per-runner extraAllow (codex: OpenAI vars; gemini: Google vars)
  *      + CLAUDE_CONFIG_DIR=<runRoot>/.claude  GSTACK_HOME=<runRoot>/gstack-home
+ *      + DISABLE_AUTOUPDATER=1 (pinned in both branches; the scrub drops the
+ *        workflow's copy and every PTY screen otherwise shows the updater's
+ *        "no write permission to npm prefix" failure)
  *      + per-test overrides spread LAST
  *
  * Escape hatch: EVALS_HERMETIC=0 restores the legacy contaminated env
- * byte-identically (runners must also gate --strict-mcp-config on
- * isHermeticEnabled() so the escape hatch restores args too).
+ * plus only the DISABLE_AUTOUPDATER pin (runners must also gate
+ * --strict-mcp-config on isHermeticEnabled() so the escape hatch restores
+ * args too).
  *
  * isHermeticEnabled() is evaluated at CALL time, never at module load —
  * ESM hoists imports above any in-file `process.env.EVALS_HERMETIC = '0'`
@@ -100,9 +104,10 @@ export function buildHermeticEnv(
   opts?: HermeticEnvOpts,
 ): Record<string, string> {
   if (!isHermeticEnabled(base)) {
-    // Escape hatch: byte-identical to the legacy spread.
+    // Escape hatch: the legacy spread plus the updater pin.
     const legacy: Record<string, string> = {};
     for (const [k, v] of Object.entries(base)) if (v !== undefined) legacy[k] = v;
+    legacy.DISABLE_AUTOUPDATER = '1';
     for (const [k, v] of Object.entries(overrides ?? {})) if (v !== undefined) legacy[k] = v;
     return legacy;
   }
@@ -127,6 +132,7 @@ export function buildHermeticEnv(
     if (allowed) out[k] = v;
   }
   if (!out.TERM) out.TERM = 'xterm-256color';
+  out.DISABLE_AUTOUPDATER = '1';
   Object.assign(out, hermeticVars);
   for (const [k, v] of Object.entries(overrides ?? {})) if (v !== undefined) out[k] = v;
   return out;

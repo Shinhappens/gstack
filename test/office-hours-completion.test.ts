@@ -3,8 +3,8 @@ import { describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { validateOfficeHoursCompletion, validateOfficeHoursReviewerHandoffs, validateOfficeHoursReviewArtifacts, validateOfficeHoursReviewPreservation, validateOfficeHoursSpecSummary, type OfficeHoursCompletionEvidence } from './helpers/office-hours-completion';
-import { E2E_TOUCHFILES, E2E_TIERS } from './helpers/touchfiles-data';
+import { validateOfficeHoursCompletion, validateOfficeHoursDesignDraft, validateOfficeHoursReviewerHandoffs, validateOfficeHoursReviewArtifacts, validateOfficeHoursReviewPreservation, type OfficeHoursCompletionEvidence } from './helpers/office-hours-completion';
+import { E2E_TOUCHFILES } from './helpers/touchfiles-data';
 import { selectTests } from './helpers/test-selection';
 
 const designPath = '/tmp/office-hours-fixture/docs/designs/roster-check.md';
@@ -70,6 +70,21 @@ describe('office-hours fixture completion', () => {
     expect(instructions).toContain('write the full relationship closing and handoff directly into REPORT.md');
     expect(instructions.indexOf('Delivery throughout this non-interactive run')).toBeLessThan(compose);
     expect(instructions).toContain('A failed command remains a failure');
+  });
+
+  test('the design-draft checkpoint applies the full validator\'s design and opinion checks alone', () => {
+    const draftDesign = design.replace('Status: APPROVED', 'Status: DRAFT').replace(/## Reviewer Concerns[\s\S]*$/, '');
+    const draft = { designPath, designContent: draftDesign, toolCalls: completed().toolCalls.slice(0, 2) };
+    expect(validateOfficeHoursDesignDraft(draft)).toEqual({ designPath, repoPath: 'docs/designs/roster-check.md', firstDesignWrite: 1 });
+    expect(() => validateOfficeHoursDesignDraft({ ...draft, toolCalls: draft.toolCalls.slice(1) }))
+      .toThrow('Office-hours design draft: no independent Agent/Task opinion');
+    expect(() => validateOfficeHoursDesignDraft({ ...draft, toolCalls: [...draft.toolCalls].reverse() }))
+      .toThrow('no independent Agent/Task opinion');
+    expect(() => validateOfficeHoursDesignDraft({ ...draft, designContent: draftDesign.replace(/## Success Criteria\n[^\n]+\n/, '') }))
+      .toThrow('repo design lacks substantive Success Criteria');
+    expect(() => validateOfficeHoursDesignDraft({ ...draft, designContent: null })).toThrow('repo design is missing');
+    expect(() => validateOfficeHoursCompletion({ ...completed(), toolCalls: completed().toolCalls.slice(1) }))
+      .toThrow('Office-hours completion: no independent Agent/Task opinion');
   });
 
   test('accepts a completed approved design with unresolved reviewer concerns', () => {
@@ -398,20 +413,8 @@ describe('office-hours reviewer finding preservation', () => {
       calls++;
       expect(prompt).toContain(JSON.stringify(original));
       expect(prompt).toContain(JSON.stringify(review!.concerns));
-      expect(prompt).toContain('Do not require verbatim wording or judge by issue count alone');
-      expect(prompt).toContain('optional alternative remedies may be omitted');
-      expect(prompt).toContain('only actual defects, never successful mappings');
-      expect(prompt).toContain('Keep reasoning brief');
-      expect(prompt).toContain('Complete EVERY applicable audit even if another already fails');
-      expect(prompt).toContain('a coverage failure cannot skip metrics');
-      expect(prompt).toContain('a metrics failure cannot skip convergence');
-      expect(prompt).toContain('one brief conclusion per applicable audit');
-      expect(prompt).toContain('APPROVED records user approval and is compatible with CONCERNS_RECORDED');
+      // The response schema is the wire contract; the judge's wording is not.
       expect(prompt).toContain('{"reasoning":string,"missing":string[],"unsupported":string[],"complete":boolean}');
-      expect(prompt).toContain('finalize missing and unsupported, and emit complete last');
-      expect(prompt).toContain('at most 150 words total');
-      expect(prompt).toContain('Coverage and the remaining inventory come from the FINAL reviewer verdict only');
-      expect(prompt).toContain('lack of a confirmed prior fix does not invent a missing final-verdict finding');
       return JSON.stringify(accepted);
     });
     expect(calls).toBe(1);
@@ -695,55 +698,8 @@ describe('office-hours completion eval selection', () => {
   test('office-hours source selects its dedicated workflow instead of the generic carve file', () => {
     const { selected } = selectTests(['office-hours/sections/design-and-handoff.md.tmpl'], E2E_TOUCHFILES);
     expect(selected).toContain('office-hours-section-loading');
+    expect(selected).toContain('office-hours-design-draft');
     expect(selected).not.toContain('carve-section-loading');
-  });
-
-  test('completion helper changes select its gate and dedicated periodic workflow', () => {
-    const { selected } = selectTests(['test/helpers/office-hours-completion.ts'], E2E_TOUCHFILES);
-    expect(selected).toEqual(['office-hours-spec-review', 'office-hours-section-loading']);
-    expect(selected.filter(name => E2E_TIERS[name] === 'periodic')).toEqual(['office-hours-section-loading']);
-    expect(E2E_TIERS['office-hours-spec-review']).toBe('gate');
-    expect(E2E_TOUCHFILES['office-hours-section-loading']).toContain('test/skill-e2e-office-hours-section-loading.test.ts');
-  });
-});
-
-describe('office-hours spec-review summary completion', () => {
-  const summary = `The Agent dispatches an independent reviewer across five dimensions:
-Completeness, Consistency, Clarity, Scope, and Feasibility. Maximum 3 iterations.
-Metrics track iterations, issues found, issues fixed, remaining issues, and quality score.`;
-
-  test('accepts a successful written explanation of the loop and metrics', () => {
-    expect(() => validateOfficeHoursSpecSummary('success', summary)).not.toThrow();
-  });
-
-  test.each(['timeout', 'error_max_turns', 'error_api'])('rejects %s even with a complete summary file', reason => {
-    expect(() => validateOfficeHoursSpecSummary(reason, summary)).toThrow(`execution failed: ${reason}`);
-  });
-
-  test('requires the actual summary file', () => {
-    expect(() => validateOfficeHoursSpecSummary('success', null)).toThrow('summary file was not written');
-  });
-
-  test('rejects incomplete dimensions, dispatch, and iteration explanations', () => {
-    expect(() => validateOfficeHoursSpecSummary('success', summary.replace(/five dimensions:[\s\S]*?Feasibility/, 'one dimension: Completeness')))
-      .toThrow('five review dimensions');
-    expect(() => validateOfficeHoursSpecSummary('success', summary.replace('Agent', 'model'))).toThrow('Agent reviewer dispatch');
-    expect(() => validateOfficeHoursSpecSummary('success', summary.replace('Maximum 3 iterations', 'Maximum 4 iterations')))
-      .toThrow('three-iteration limit');
-  });
-
-  test('15 dimensions does not satisfy the five-dimension count', () => {
-    const incorrect = summary.replace(/five dimensions:[\s\S]*?Feasibility/, '15 dimensions');
-    expect(() => validateOfficeHoursSpecSummary('success', incorrect)).toThrow('five review dimensions');
-  });
-
-  test('13 iterations does not satisfy the three-iteration limit', () => {
-    expect(() => validateOfficeHoursSpecSummary('success', summary.replace('Maximum 3 iterations', 'Maximum 13 iterations')))
-      .toThrow('three-iteration limit');
-  });
-
-  test.each(['issues found', 'issues fixed', 'remaining issues', 'quality score'])('requires the %s metric', metric => {
-    expect(() => validateOfficeHoursSpecSummary('success', summary.replace(metric, ''))).toThrow('metric');
   });
 });
 

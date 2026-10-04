@@ -35,9 +35,6 @@ checks, and deploy status commands — then persist everything to CLAUDE.md.
 
 After this runs once, `/land-and-deploy` reads CLAUDE.md and skips detection entirely.
 
-## User-invocable
-When the user types `/setup-deploy`, run this skill.
-
 ## Instructions
 
 ### Step 1: Check existing configuration
@@ -71,7 +68,7 @@ Run the platform detection from the deploy bootstrap:
 
 # GitHub Actions deploy workflows
 for f in $(find .github/workflows -maxdepth 1 \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null); do
-  [ -f "$f" ] && grep -qiE "deploy|release|production|staging|cd" "$f" 2>/dev/null && echo "DEPLOY_WORKFLOW:$f"
+  [ -f "$f" ] && grep -qiE "deploy|release|production|staging" "$f" 2>/dev/null && echo "DEPLOY_WORKFLOW:$f"
 done
 
 # Project type
@@ -93,7 +90,7 @@ If `fly.toml` detected:
 3. If installed, verify: `fly status --app {app} 2>/dev/null`
 4. Infer URL: `https://{app}.fly.dev`
 5. Set deploy status command: `fly status --app {app}`
-6. Set health check: `https://{app}.fly.dev` (or `/health` if the app has one)
+6. Set health check: run `curl -s -o /dev/null -w "%{http_code}" https://{app}.fly.dev/health`; use `https://{app}.fly.dev/health` when it returns 2xx, otherwise `https://{app}.fly.dev`
 
 Ask the user to confirm the production URL. Some Fly apps use custom domains.
 
@@ -108,7 +105,7 @@ If `render.yaml` detected:
 5. Set health check: the inferred URL
 
 Ask the user to confirm. Render uses auto-deploy from the connected git branch — after
-merge to main, Render picks it up automatically. The "deploy wait" in /land-and-deploy
+merge to the default branch, Render picks it up automatically. The "deploy wait" in /land-and-deploy
 should poll the Render URL until it responds with the new version.
 
 #### Vercel
@@ -117,7 +114,7 @@ If vercel.json or .vercel detected:
 
 1. Check for `vercel` CLI: `which vercel 2>/dev/null`
 2. If installed: `vercel ls --prod 2>/dev/null | head -3`
-3. Vercel deploys automatically on push — preview on PR, production on merge to main
+3. Vercel deploys automatically on push — preview on PR, production on merge to the default branch
 4. Set health check: the production URL from vercel project settings
 Ask for the production URL if not available from the CLI, then confirm it before writing.
 
@@ -141,6 +138,7 @@ If deploy workflows detected but no platform config:
 1. Read the workflow file to understand what it does
 2. Extract the deploy target (if mentioned)
 3. Ask the user for the production URL
+4. Set deploy status command: `gh run list --workflow {workflow file name} --limit 1 --json headSha,status,conclusion`
 
 #### Custom / Manual
 
@@ -149,7 +147,7 @@ If nothing detected:
 Use AskUserQuestion to gather the information:
 
 1. **How are deploys triggered?**
-   - A) Automatically on push to main (Fly, Render, Vercel, Netlify, etc.)
+   - A) Automatically on push to the default branch (Fly, Render, Vercel, Netlify, etc.)
    - B) Via GitHub Actions workflow
    - C) Via a deploy script or CLI command (describe it)
    - D) Manually (SSH, dashboard, etc.)
@@ -169,7 +167,7 @@ Use AskUserQuestion to gather the information:
 
 ### Step 4: Write configuration
 
-Before writing, collect fields not already confirmed: merge method (squash/merge/rebase, constrained to methods allowed by repo settings), pre-merge command or none, deploy trigger, and status/health checks. Ask only for missing values, across every platform path. If the project does not deploy, set platform/URL/workflow/status/health/trigger to `none`, retain its CLI/library project type, and skip deploy verification. Show the complete proposed configuration and obtain confirmation.
+Before writing, collect fields not already confirmed: merge method (squash/merge/rebase, offering only the methods `gh repo view --json squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed` reports as allowed), pre-merge command or none, deploy trigger, and status/health checks. Ask only for missing values, across every platform path. If the project does not deploy, set platform/URL/workflow/status/health/trigger to `none`, retain its CLI/library project type, and skip deploy verification. Show the complete proposed configuration and obtain confirmation.
 
 Read CLAUDE.md (or create it). Find and replace the `## Deploy Configuration` section
 if it exists, or append it at the end.
@@ -186,10 +184,12 @@ if it exists, or append it at the end.
 
 ### Custom deploy hooks
 - Pre-merge: {command or "none"}
-- Deploy trigger: {command or "automatic on push to main"}
+- Deploy trigger: {command or "automatic on push to <default branch>"}
 - Deploy status: {command or "poll production URL"}
 - Health check: {URL or command}
 ```
+
+The hooks block repeats the exact commands /land-and-deploy runs: `Deploy status` is the same value as `Deploy status command`, and `Health check` the same as `Post-deploy health check`. Write each value in both places.
 
 ### Step 5: Verify
 
@@ -202,7 +202,9 @@ curl -sf "{health-check-url}" -o /dev/null -w "%{http_code}" 2>/dev/null || echo
 
 2. If a deploy status command was configured, try it:
 ```bash
-{deploy-status-command} 2>/dev/null | head -5 || echo "COMMAND_FAILED"
+_OUT=$({deploy-status-command} 2>&1); _RC=$?
+printf '%s\n' "$_OUT" | head -5
+[ "$_RC" -eq 0 ] || echo "COMMAND_FAILED (exit $_RC)"
 ```
 
 Report results. If anything failed, note it but don't block — the config is still

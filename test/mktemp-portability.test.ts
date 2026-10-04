@@ -13,8 +13,8 @@
  */
 
 import { describe, it, expect } from "bun:test";
-import { execFileSync } from "child_process";
-import { existsSync, readFileSync } from "fs";
+import { execFileSync, spawnSync } from "child_process";
+import { existsSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
 
 const ROOT = join(import.meta.dir, "..");
@@ -55,5 +55,32 @@ describe("mktemp portability (#2091)", () => {
     }).trim();
     expect(created.length).toBeGreaterThan(0);
     execFileSync("rm", ["-f", created], { timeout: 30_000 });
+  });
+
+  // #2881: a failed mktemp left TMPERR empty, so `2>"$TMPERR"` failed before
+  // codex started and read as a Codex error ("no stderr captured").
+  it("every /codex and outside-voice mktemp assignment fails closed", () => {
+    const sources = [
+      ...readdirSync(join(ROOT, "codex/sections")).filter(f => f.endsWith(".md.tmpl")).map(f => `codex/sections/${f}`),
+      "scripts/resolvers/outside-voice.ts",
+      "scripts/resolvers/outside-voice-steps.ts",
+    ];
+    const unguarded: string[] = [];
+    for (const rel of sources) {
+      readFileSync(join(ROOT, rel), "utf-8").split("\n").forEach((line, i) => {
+        if (/=\$\(mktemp\b/.test(line) && !/\)\s*\|\|/.test(line)) unguarded.push(`${rel}:${i + 1}: ${line.trim()}`);
+      });
+    }
+    expect(unguarded).toEqual([]);
+
+    const rendered = readdirSync(join(ROOT, "codex/sections")).filter(f => f.endsWith(".md") && !f.endsWith(".tmpl"))
+      .flatMap(f => readFileSync(join(ROOT, "codex/sections", f), "utf-8").split("\n").filter(line => /^\S.*=\$\(mktemp\b/.test(line)));
+    expect(rendered.length).toBeGreaterThanOrEqual(5);
+    for (const line of rendered) {
+      const r = spawnSync("bash", ["-c", `TMP_ROOT=/nonexistent/gstack-2881\n${line}\necho REACHED`], { encoding: "utf-8", timeout: 30_000 });
+      expect(r.status, line).toBe(1);
+      expect(r.stdout, line).not.toContain("REACHED");
+      expect(r.stderr, line).toContain("mktemp failed");
+    }
   });
 });

@@ -24,7 +24,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { resolvePopplerTool } from "../../src/pdftotext";
-import { browserAvailable, NO_BROWSER_REASON } from "./browser-available";
+import { browserAvailable, NO_BROWSER_REASON } from "../../../test/helpers/browser-available";
 
 const FIXTURE = path.resolve(__dirname, "../fixtures/diagram-gate.md");
 const ROOT = path.resolve(__dirname, "../../..");

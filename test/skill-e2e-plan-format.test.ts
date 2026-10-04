@@ -18,6 +18,7 @@
  * accordingly.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import { CAPTURE_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
 import { runRecordedOfficeHoursAttempt, OFFICE_HOURS_BUN_GRACE_MS } from './helpers/office-hours-attempt';
@@ -32,6 +33,7 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { KIND_NOTE_RE } from './helpers/plan-format-kind-note';
 
 const evalCollector = createEvalCollector('e2e-plan-format');
 
@@ -48,7 +50,6 @@ const evalCollector = createEvalCollector('e2e-plan-format');
 // scripts/resolvers/preamble/generate-ask-user-format.ts. The optional
 // `[A-Z]=` prefix tolerates either shape; both are acceptable spec output.
 const COMPLETENESS_RE = /Completeness:\s*(?:[A-Z]=)?\d{1,2}\/10/;
-const KIND_NOTE_RE = /options differ in kind/i;
 
 // v1.7.0.0 Pros/Cons format tokens. Tests are additive: existing
 // RECOMMENDATION / Completeness / kind-note assertions still hold; new
@@ -128,7 +129,7 @@ describeIfSelected('Plan Format — CEO Mode Selection', ['plan-ceo-review-forma
     const judgeMetadata: Pick<EvalTestEntry, 'judge_scores' | 'judge_reasoning'> = {};
     await runRecordedOfficeHoursAttempt({
       collector: evalCollector, name: '/plan-ceo-review-format-mode', suite: 'Plan Format — CEO Mode Selection',
-      model: 'claude-opus-4-7', budgetMs: CAPTURE_MS,
+      model: resolveEvalModel('capture'), budgetMs: CAPTURE_MS,
       judgeMetadata,
       run: signal => runSkillTest({
         signal,
@@ -146,7 +147,7 @@ After writing the file, stop. Do not continue the review.`,
         timeout: CAPTURE_MS,
         testName: 'plan-ceo-review-format-mode',
         runId,
-        model: 'claude-opus-4-7',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/plan-ceo-review format (mode)', result);
@@ -156,8 +157,9 @@ After writing the file, stop. Do not continue the review.`,
         const captured = fs.readFileSync(outFile, 'utf-8');
         expect(captured.length).toBeGreaterThan(100);
 
-        // Kind-differentiated: Completeness: N/10 must NOT appear, "options differ
-        // in kind" note must appear. Recommendation presence is checked by the judge.
+        // Kind-differentiated: Completeness: N/10 must NOT appear, and the brief
+        // says the options are not comparable on coverage (any wording).
+        // Recommendation presence is checked by the judge.
         expect(captured).not.toMatch(COMPLETENESS_RE);
         expect(captured).toMatch(KIND_NOTE_RE);
 
@@ -195,7 +197,7 @@ describeIfSelected('Plan Format — CEO Approach Menu', ['plan-ceo-review-format
     const judgeMetadata: Pick<EvalTestEntry, 'judge_scores' | 'judge_reasoning'> = {};
     await runRecordedOfficeHoursAttempt({
       collector: evalCollector, name: '/plan-ceo-review-format-approach', suite: 'Plan Format — CEO Approach Menu',
-      model: 'claude-opus-4-7', budgetMs: CAPTURE_MS,
+      model: resolveEvalModel('capture'), budgetMs: CAPTURE_MS,
       judgeMetadata,
       run: signal => runSkillTest({
         signal,
@@ -213,7 +215,7 @@ After writing the file, stop. Do not continue the review.`,
         timeout: CAPTURE_MS,
         testName: 'plan-ceo-review-format-approach',
         runId,
-        model: 'claude-opus-4-7',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/plan-ceo-review format (approach)', result);
@@ -261,7 +263,7 @@ describeIfSelected('Plan Format — Eng Coverage Issue', ['plan-eng-review-forma
     const judgeMetadata: Pick<EvalTestEntry, 'judge_scores' | 'judge_reasoning'> = {};
     await runRecordedOfficeHoursAttempt({
       collector: evalCollector, name: '/plan-eng-review-format-coverage', suite: 'Plan Format — Eng Coverage Issue',
-      model: 'claude-opus-4-7', budgetMs: CAPTURE_MS,
+      model: resolveEvalModel('capture'), budgetMs: CAPTURE_MS,
       judgeMetadata,
       run: signal => runSkillTest({
         signal,
@@ -282,7 +284,7 @@ After writing the file with that ONE question, stop. Do not continue the review.
         timeout: CAPTURE_MS,
         testName: 'plan-eng-review-format-coverage',
         runId,
-        model: 'claude-opus-4-7',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/plan-eng-review format (coverage)', result);
@@ -330,7 +332,7 @@ describeIfSelected('Plan Format — Eng Kind Issue', ['plan-eng-review-format-ki
     const judgeMetadata: Pick<EvalTestEntry, 'judge_scores' | 'judge_reasoning'> = {};
     await runRecordedOfficeHoursAttempt({
       collector: evalCollector, name: '/plan-eng-review-format-kind', suite: 'Plan Format — Eng Kind Issue',
-      model: 'claude-opus-4-7', budgetMs: CAPTURE_MS,
+      model: resolveEvalModel('capture'), budgetMs: CAPTURE_MS,
       judgeMetadata,
       run: signal => runSkillTest({
         signal,
@@ -348,7 +350,7 @@ After writing the file with that ONE question, stop. Do not continue the review.
         timeout: CAPTURE_MS,
         testName: 'plan-eng-review-format-kind',
         runId,
-        model: 'claude-opus-4-7',
+        model: resolveEvalModel('capture'),
       }),
       validate: async (result, signal) => {
         logCost('/plan-eng-review format (kind)', result);
@@ -358,8 +360,9 @@ After writing the file with that ONE question, stop. Do not continue the review.
         const captured = fs.readFileSync(outFile, 'utf-8');
         expect(captured.length).toBeGreaterThan(100);
 
-        // Kind-differentiated: Completeness: N/10 must NOT appear, "options differ
-        // in kind" note must appear. Recommendation presence checked by the judge.
+        // Kind-differentiated: Completeness: N/10 must NOT appear, and the brief
+        // says the options are not comparable on coverage (any wording).
+        // Recommendation presence checked by the judge.
         expect(captured).not.toMatch(COMPLETENESS_RE);
         expect(captured).toMatch(KIND_NOTE_RE);
 

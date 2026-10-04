@@ -91,6 +91,49 @@ function assignmentBody(markdown: string): string {
     || '';
 }
 
+/**
+ * Design-draft phase of the fixed fixture: the repo design carries every
+ * required section and an Assignment, and an independent Agent/Task opinion on
+ * RosterCheck preceded the Write that created it. The full workflow validator
+ * applies these same checks; the focused design-draft capture applies them alone.
+ */
+export function validateOfficeHoursDesignDraft(
+  evidence: Pick<OfficeHoursCompletionEvidence, 'designPath' | 'designContent' | 'toolCalls'>,
+  label = 'Office-hours design draft',
+): { designPath: string; repoPath: string; firstDesignWrite: number } {
+  const fail = (message: string): never => { throw new Error(`${label}: ${message}`); };
+  if (evidence.designContent === null) fail(`repo design is missing: ${evidence.designPath}`);
+  const design = evidence.designContent!;
+  for (const [section, names] of [
+    ['Problem Statement', ['problem statement']],
+    ['Recommended Approach', ['recommended approach']],
+    ['Success Criteria', ['success criteria']],
+    ['What I noticed about how you think', ['what i noticed about how you think']],
+  ] as const) {
+    if (!substantive(sectionBody(design, [...names]))) fail(`repo design lacks substantive ${section}`);
+  }
+  if (!substantive(assignmentBody(design))) fail('repo design lacks a concrete Assignment');
+
+  // A cold-read opinion before the design exists is not the required spec
+  // review. The fixture promises an available Agent, so require an attempt
+  // that names this design even when the review subsequently fails.
+  const designPath = evidence.designPath.replace(/\\/g, '/');
+  const repoPath = designPath.match(/(?:^|\/)(docs\/designs\/[^/]+\.md)$/)?.[1] ?? designPath;
+  const firstDesignWrite = evidence.toolCalls.findIndex(call => {
+    const writtenPath = String(call.input?.file_path ?? '').replace(/\\/g, '/').replace(/^\.\//, '');
+    return call.tool === 'Write' && (writtenPath === designPath || writtenPath === repoPath);
+  });
+  if (firstDesignWrite === -1) fail('no observed Write created the repo design');
+  const opinion = evidence.toolCalls.slice(0, firstDesignWrite).some(call => {
+    if (!['Agent', 'Task'].includes(call.tool)) return false;
+    const prompt = `${String(call.input?.description ?? '')}\n${String(call.input?.prompt ?? '')}`;
+    return /\bRosterCheck\b/i.test(prompt)
+      && /\b(?:review|challenge|opinion|critique|perspective|steelman|advisor)\b|\bcold.read\b/i.test(prompt);
+  });
+  if (!opinion) fail('no independent Agent/Task opinion on RosterCheck preceded the repo design Write');
+  return { designPath, repoPath, firstDesignWrite };
+}
+
 export function validateOfficeHoursCompletion(evidence: OfficeHoursCompletionEvidence): OfficeHoursReviewEvidence | null {
   const fail = (message: string): never => { throw new Error(`Office-hours completion: ${message}`); };
   if (evidence.exitReason !== 'success') fail(`execution failed: ${evidence.exitReason}`);
@@ -111,34 +154,8 @@ export function validateOfficeHoursCompletion(evidence: OfficeHoursCompletionEvi
   if (statuses.length !== 1 || statuses[0].trim().toUpperCase() !== 'APPROVED') {
     fail('repo design is not marked Status: APPROVED');
   }
-  for (const [label, names] of [
-    ['Problem Statement', ['problem statement']],
-    ['Recommended Approach', ['recommended approach']],
-    ['Success Criteria', ['success criteria']],
-    ['What I noticed about how you think', ['what i noticed about how you think']],
-  ] as const) {
-    if (!substantive(sectionBody(design, [...names]))) fail(`repo design lacks substantive ${label}`);
-  }
-  if (!substantive(assignmentBody(design))) fail('repo design lacks a concrete Assignment');
+  const { designPath, repoPath, firstDesignWrite } = validateOfficeHoursDesignDraft(evidence, 'Office-hours completion');
   if (!substantive(assignmentBody(evidence.output))) fail('REPORT.md lacks the Assignment');
-
-  // A cold-read opinion before the design exists is not the required spec
-  // review. The fixture promises an available Agent, so require an attempt
-  // that names this design even when the review subsequently fails.
-  const designPath = evidence.designPath.replace(/\\/g, '/');
-  const repoPath = designPath.match(/(?:^|\/)(docs\/designs\/[^/]+\.md)$/)?.[1] ?? designPath;
-  const firstDesignWrite = evidence.toolCalls.findIndex(call => {
-    const writtenPath = String(call.input?.file_path ?? '').replace(/\\/g, '/').replace(/^\.\//, '');
-    return call.tool === 'Write' && (writtenPath === designPath || writtenPath === repoPath);
-  });
-  if (firstDesignWrite === -1) fail('no observed Write created the repo design');
-  const opinion = evidence.toolCalls.slice(0, firstDesignWrite).some(call => {
-    if (!['Agent', 'Task'].includes(call.tool)) return false;
-    const prompt = `${String(call.input?.description ?? '')}\n${String(call.input?.prompt ?? '')}`;
-    return /\bRosterCheck\b/i.test(prompt)
-      && /\b(?:review|challenge|opinion|critique|perspective|steelman|advisor)\b|\bcold.read\b/i.test(prompt);
-  });
-  if (!opinion) fail('no independent Agent/Task opinion on RosterCheck preceded the repo design Write');
   const reviews = evidence.toolCalls.slice(firstDesignWrite + 1).filter(call => {
     if (!['Agent', 'Task'].includes(call.tool)) return false;
     const prompt = String(call.input?.prompt ?? '').replace(/\\/g, '/');
@@ -435,30 +452,5 @@ ${JSON.stringify({
   }
   if (!result.complete || result.missing.length || result.unsupported.length) {
     throw new Error(`Office-hours review preservation: incomplete; missing=${JSON.stringify(result.missing)}; unsupported=${JSON.stringify(result.unsupported)}; ${result.reasoning}`);
-  }
-}
-
-/** Completion contract for the existing spec-review explanation fixture. */
-export function validateOfficeHoursSpecSummary(exitReason: string, summary: string | null): void {
-  const fail = (message: string): never => { throw new Error(`Office-hours spec summary: ${message}`); };
-  if (exitReason !== 'success') fail(`execution failed: ${exitReason}`);
-  if (summary === null) fail('requested summary file was not written');
-  const text = summary!.replace(/\*\*/g, '').toLowerCase();
-  const dimensions = ['completeness', 'consistency', 'clarity', 'scope', 'feasibility'];
-  if (!/\b(?:5|five)\b.*dimension|dimension.*\b(?:5|five)\b/.test(text)
-      && !dimensions.every(dimension => new RegExp(`\\b${dimension}\\b`).test(text))) {
-    fail('summary lacks the five review dimensions');
-  }
-  if (!/\b(?:agent|subagent)\b/.test(text)) fail('summary lacks the Agent reviewer dispatch');
-  if (!/\b(?:3|three)\b.*iteration|iteration.*\b(?:3|three)\b|maximum.*\b(?:3|three)\b/.test(text)) {
-    fail('summary lacks the three-iteration limit');
-  }
-  for (const [label, pattern] of [
-    ['issues found', /\bfound\b|\bissues_found\b/],
-    ['issues fixed', /\bfixed\b|\bissues_fixed\b/],
-    ['remaining issues', /\b(?:remaining|unresolved)\b/],
-    ['quality score', /\bquality[\s_-]+score\b/],
-  ] as const) {
-    if (!pattern.test(text)) fail(`summary lacks the ${label} metric`);
   }
 }

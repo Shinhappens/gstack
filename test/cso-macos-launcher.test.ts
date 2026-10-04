@@ -2,7 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { identityStartedAtMs, processIdentitySource } from '../lib/cso/process-identity';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const macos = process.platform === 'darwin';
@@ -38,6 +39,23 @@ describe('CSO native macOS build contract', () => {
 });
 
 (macos ? describe : describe.skip)('CSO native macOS startup', () => {
+  test('#2894 the darwin process identity source reads real process start times', async () => {
+    const own = processIdentitySource.read(process.pid), started = identityStartedAtMs(own ?? '');
+    expect(own).toMatch(/^darwin:\d+$/);
+    expect(processIdentitySource.read(process.pid)).toBe(own!);
+    expect(started!).toBeLessThanOrEqual(Date.now());
+    expect(started!).toBeGreaterThan(Date.now() - 3_600_000);
+    await Bun.sleep(20);
+    const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], { stdio: 'ignore' });
+    try {
+      const identity = processIdentitySource.read(child.pid!);
+      expect(identity).toMatch(/^darwin:\d+$/);
+      expect(identity).not.toBe(own!);
+      expect(identityStartedAtMs(identity!)!).toBeGreaterThanOrEqual(started!);
+    } finally { child.kill(); }
+    expect(processIdentitySource.read(2147483647)).toBeUndefined();
+  });
+
   test('the public launcher has a valid hardened-runtime signature', () => {
     const launcher = path.join(ROOT, 'bin', 'gstack-cso-launcher');
     const verified = spawnSync('/usr/bin/codesign', ['--verify', '--strict', launcher], { encoding: 'utf8', timeout: 30_000 });

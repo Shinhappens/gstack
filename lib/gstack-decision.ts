@@ -14,12 +14,12 @@
  */
 
 import { join } from "path";
-import { homedir } from "os";
 import { randomUUID } from "crypto";
 import { existsSync, readFileSync, appendFileSync, statSync, openSync, closeSync, unlinkSync } from "fs";
 import { atomicWriteSync } from "./fs-atomic";
 import { appendJsonl, readJsonl, hasInjection } from "./jsonl-store";
 import { scan } from "./redact-engine";
+import { resolveStateRoot } from "./state-root";
 
 export type DecisionKind = "decide" | "supersede" | "redact";
 export type DecisionScope = "repo" | "branch" | "issue";
@@ -57,7 +57,7 @@ export interface DecisionPaths {
 
 /** Resolve the per-project decision store paths. Bins pass slug + GSTACK_HOME. */
 export function decisionPaths(slug: string, gstackHome?: string): DecisionPaths {
-  const home = gstackHome || process.env.GSTACK_HOME || join(homedir(), ".gstack");
+  const home = gstackHome || resolveStateRoot();
   const dir = join(home, "projects", slug || "unknown");
   return {
     log: join(dir, "decisions.jsonl"),

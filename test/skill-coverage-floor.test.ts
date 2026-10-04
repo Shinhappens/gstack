@@ -8,17 +8,14 @@
  * frontmatter regressions, missing generated header, empty/trivial bodies,
  * and dangling SKILL.md.tmpl-without-SKILL.md mismatches.
  *
- * Pairs with test/skill-coverage-matrix.ts (the registry) and
- * test/parity-suite.test.ts (the content-invariant suite). Together,
- * v1.45.0.0 ships with: floor (this file) + matrix (registry CI gate)
- * + invariants (content per skill family) + size budget. That's the
- * eval-first foundation the v2.0.0.0 sections/ work builds on.
+ * Pairs with test/parity-suite.test.ts (the content-invariant suite).
+ * The floor iterates every authored skill from skillCensus(), so a new
+ * skill is covered without registering it anywhere.
  */
 
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { SKILL_COVERAGE } from './skill-coverage-matrix';
 import { skillCensus } from './helpers/skill-census';
 
 const REPO_ROOT = path.resolve(import.meta.dir, '..');
@@ -32,29 +29,8 @@ function readSkillMd(skill: string): string | null {
   }
 }
 
-// Registry-completeness assertions ("every skill on disk is registered",
-// "every entry has a gate test") live in test/skill-coverage-matrix.test.ts —
-// they were duplicated here with a DIFFERENT hand-rolled directory walk, which
-// is the divergence class test/helpers/skill-census.ts exists to kill. This
-// file owns the per-skill structural compliance checks only.
-
 describe('skill-coverage-floor: every skill passes structural compliance', () => {
   const skills = skillCensus(REPO_ROOT).authoredSkills;
-
-  test('every gate-tier test path referenced in registry exists on disk', () => {
-    const missing: string[] = [];
-    for (const [skill, coverage] of Object.entries(SKILL_COVERAGE)) {
-      for (const testPath of [...coverage.gate, ...coverage.periodic]) {
-        const fullPath = path.join(REPO_ROOT, testPath);
-        if (!fs.existsSync(fullPath)) {
-          missing.push(`${skill} → ${testPath}`);
-        }
-      }
-    }
-    if (missing.length > 0) {
-      throw new Error(`Registry references missing test files:\n  ${missing.join('\n  ')}`);
-    }
-  });
 
   // Per-skill structural compliance (file IO only, no LLM)
   for (const skill of skills) {

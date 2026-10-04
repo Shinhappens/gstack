@@ -13,8 +13,6 @@ import {
   nextCeoPostureContinuation,
   hasNativePostAnswerCeoPosture,
 } from './helpers/ceo-mode-option';
-import { autoplanRoutingSetupInput } from './helpers/autoplan-setup-question';
-
 const designOutsideQuestions = [
   {
     "question": "D3 (Step 0D) — I've rated this plan 5/10 on design completeness. The three biggest gaps are: (1) the 5 identified implementation gaps describe the problem but not the solution, (2) no explicit state coverage table, (3) no user journey emotional arc. I'll skip mockups and review all 7 dimensions as you requested. Any specific areas to prioritize, or cover all 7 equally? <gstack-qid:plan-design-focus>",
@@ -243,44 +241,6 @@ describe('native AUQ accepts one action per displayed question', () => {
     );
     expect(grant).toEqual({ kind: 'permission', input: '1\r' });
   });
-  test('autoplan routing uses the native shortcut with early or delayed metadata, while prose is unchanged', () => {
-    const q = {
-      header: 'Routing rules',
-      question:
-        "gstack works best when your project's CLAUDE.md includes skill routing rules. Add them? <gstack-qid:routing-injection>",
-      options: [
-        { label: 'Add routing rules (Recommended)' },
-        { label: 'Skip — manual invocation' },
-      ],
-    };
-    const native = { ...pending(), questions: [q] };
-    const screen =
-      '☐ Routing rules\n' +
-      q.question +
-      '\n❯1.Add routing rules (Recommended)\n2.Skip — manual invocation\nEnter to select · ↑/↓ to navigate · Esc to cancel\n';
-    expect(autoplanRoutingSetupInput(screen, new Set(), native)).toBe('1');
-    expect(autoplanRoutingSetupInput(screen, new Set())).toBe('1');
-    expect(
-      autoplanRoutingSetupInput(
-        screen.replace(
-          'Enter to select · ↑/↓ to navigate · Esc to cancel\n',
-          '',
-        ),
-        new Set(),
-      ),
-    ).toBe('1\r');
-    expect(
-      autoplanRoutingSetupInput(
-        screen.replace(
-          q.question,
-          'Should the app change its product routing?',
-        ),
-        new Set(),
-        native,
-      ),
-    ).toBeNull();
-  });
-
   test.skipIf(process.platform === 'win32')(
     'real PTY completes two and four tabs once without skipping, overshooting or queuing Enter',
     async () => {
@@ -452,7 +412,13 @@ process.stdout.write('PTY_READY:' + item.record + '\x1b[2J\x1b[H');
       fs.writeFileSync(
         worker,
         `import {runPlanSkillCounting} from ${JSON.stringify(pathToFileURL(path.resolve(import.meta.dir, 'helpers/claude-pty-runner.ts')).href)};
-import {pickDesignCountOutsideVoices} from ${JSON.stringify(pathToFileURL(path.resolve(import.meta.dir, 'helpers/design-count-outside.ts')).href)};
+// Caller policy for the fixture's outside-voices tab; the runner's tab binding is the subject.
+const pickOutsideVoices = (_routing, active) => {
+  const q = active.nativeCall?.questions[active.nativeQuestionIndex ?? 0];
+  if (!/outside(?: design)? voices/i.test(q ? q.header : active.promptSnippet)) return null;
+  const index = (q ? q.options : active.options).findIndex(option => /^No,?\\s+proceed without/i.test(option.label.trim()));
+  return index < 0 ? null : index + 1;
+};
 const cases=${JSON.stringify(cases)};
 const results = await Promise.all(cases.map(async item => ({
   name: item.name,
@@ -464,7 +430,7 @@ const results = await Promise.all(cases.map(async item => ({
     isLastStep0AUQ: () => false,
     isReviewAUQ: () => true,
     firstAUQPick: item.designQuestions ? undefined : () => 2,
-    pickAUQ: item.designQuestions ? pickDesignCountOutsideVoices : undefined,
+    pickAUQ: item.designQuestions ? pickOutsideVoices : undefined,
     reviewCountCeiling: 8,
     timeoutMs: 35000,
     env: { NATIVE_INPUT_CASE: JSON.stringify(item) },

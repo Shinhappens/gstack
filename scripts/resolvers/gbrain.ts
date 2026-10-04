@@ -59,7 +59,7 @@ export function generateGBrainContextLoad(ctx: TemplateContext): string {
 
 Extract 2-4 keywords from the user's request. Search the brain:
 \`gbrain search "<keywords>"\`. Read the top 3 results with
-\`gbrain get_page "<slug>"\`. Use that context to inform your analysis.
+\`gbrain get "<slug>"\`. Use that context to inform your analysis.
 
 If \`gbrain search\` returns no results or any non-zero exit, proceed
 without brain context. Full search/read protocol + examples:
@@ -110,7 +110,8 @@ EOF
 )"
 \`\`\`
 
-Then extract person/org entities and create stub pages for each one.
+Read the saved page back before claiming persistence. Then extract
+person/org entities and create stub pages for each one.
 Throttle errors (exit 1 with "throttle"/"rate limit"/"busy") and any
 other non-zero exit are transient — don't retry inline. Full entity-stub
 template, throttle handling, and backlink protocol:
@@ -178,7 +179,7 @@ present in the loaded context; ground recommendations in what the brain
 prints for this skill.
 
 \`\`\`bash
-eval "$(${binDir}/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG=$(${binDir}/gstack-slug --get SLUG 2>/dev/null) || true
 {
   printf '## Brain Context\\n\\n'
 ${loadLines}
@@ -217,7 +218,7 @@ This is non-blocking — the user doesn't wait. Next invocation benefits
 from the warm cache.`}
 
 \`\`\`bash
-eval "$(${binDir}/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG=$(${binDir}/gstack-slug --get SLUG 2>/dev/null) || true
 (${binDir}/gstack-brain-cache refresh --project "$SLUG" 2>/dev/null &) || true
 \`\`\`
 `;
@@ -266,7 +267,7 @@ source_skill: ${ctx.skillName}
 After write, invalidate affected digests:
 
 \`\`\`bash
-eval "$(${ctx.paths.binDir}/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG=$(${ctx.paths.binDir}/gstack-slug --get SLUG 2>/dev/null) || true
 ${invalidateBash || '  # (no per-skill invalidation targets configured)'}
 \`\`\``;
 }

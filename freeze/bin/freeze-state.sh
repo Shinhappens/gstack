@@ -3,6 +3,10 @@ set -euo pipefail
 
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_here/../../careful/bin/hook-extract.sh"
+if ! command -v gstack_hook_state_root >/dev/null 2>&1; then
+  echo "FREEZE_ERROR: cannot resolve the gstack state root: $_here/../../bin/gstack-state-root.sh is missing. No boundary changed. Fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)." >&2
+  exit 1
+fi
 STATE_DIR="$(gstack_hook_state_root; printf x)"; STATE_DIR="${STATE_DIR%x}"
 mkdir -p "$STATE_DIR"
 STATE_DIR="$(cd "$STATE_DIR" && pwd -P && printf x)"; STATE_DIR="${STATE_DIR%$'\nx'}"

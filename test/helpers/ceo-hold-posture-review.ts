@@ -64,7 +64,8 @@ export function buildCeoHoldPostureReview(input: CeoHoldPostureReviewInput): Pla
   for (const call of [mode, decision]) {
     const context = /Project\/branch\/task:([^\n]*)/i.exec(call.questions[0]!.question)?.[1] ?? '';
     const plans = [...new Set(context.match(/(?<![\w.:/\\-])[\w.:/\\-]+\.md(?![\w.:/\\-])/gi) ?? [])];
-    if (plans.length !== 1 || (plans[0] !== name && plans[0] !== source.path)) fail('native source context differs from original plan');
+    // Naming no plan leaves the owned source Read below as the binding; naming another or several plans does not.
+    if (plans.length > 1 || (plans.length === 1 && plans[0] !== name && plans[0] !== source.path)) fail('native source context differs from original plan');
   }
   const decisionContext = /Project\/branch\/task:([^\n]*)/i.exec(decision.questions[0]!.question)?.[1] ?? '';
   if (!/\bHOLD SCOPE\b/.test(decisionContext) ||

@@ -5,7 +5,6 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createPendingQuestionRecorder, readPendingQuestion, recordPendingQuestion } from './helpers/plan-count-pending-question';
 import { readPlanCountTranscript } from './helpers/plan-count-transcript';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import captured from './fixtures/autoplan-routing-manual-skills-ac.json';
 
 // Exact retained public question; hook envelopes and owned temp paths are
@@ -208,13 +207,6 @@ describe('opt-in pending native AskUserQuestion capture', () => {
       }
     } finally { f.dispose(); }
   });
-
-  test('the helper and new free test select only the two opted-in workflows', () => {
-    for (const file of ['test/helpers/plan-count-pending-question.ts', 'test/autoplan-pending-question.test.ts']) {
-      expect(selectTests([file], E2E_TOUCHFILES, []).selected.sort()).toEqual(['autoplan-chain-pty', 'plan-ceo-mode-routing']);
-    }
-  });
-
   test('a hook whose input never ends closes within its own bound and remains silent', async () => {
     const f = fixture();
     const hook = f.recorder.hooks.PreToolUse[0]!.hooks[0]!;

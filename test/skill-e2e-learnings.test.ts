@@ -40,7 +40,7 @@ describeIfSelected('Learnings E2E', ['learnings-show'], () => {
     // Copy bin scripts needed by /learn
     const binDir = path.join(workDir, 'bin');
     fs.mkdirSync(binDir, { recursive: true });
-    for (const script of ['gstack-learnings-search', 'gstack-learnings-log', 'gstack-slug']) {
+    for (const script of ['gstack-learnings-search', 'gstack-learnings-log', 'gstack-slug', 'gstack-state-root.sh', 'gstack-remote-identity.sh']) {
       fs.copyFileSync(path.join(ROOT, 'bin', script), path.join(binDir, script));
       fs.chmodSync(path.join(binDir, script), 0o755);
     }

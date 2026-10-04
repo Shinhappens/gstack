@@ -36,6 +36,19 @@ export function redactPublicValue(value: unknown, token: string, unsafe = () => 
   return value;
 }
 
+/**
+ * Path 4 remote actor: the prompt directs Step 5a registration (the contract under
+ * test), so the MCP-registration question takes its register/recommended option.
+ * Every other gate (privacy, artifacts repo, per-remote policy) is declined or skipped.
+ */
+export function setupGbrainRemoteAnswer(q: { question: string; header?: string; options: Array<{ label: string }> }): string {
+  if (/typed tool surface|\bregister(?:s|ing)?\b[^?]*\bMCP\b|\bMCP\b[^?]*\bregist/i.test(`${q.header ?? ''}\n${q.question}`)) {
+    const accept = q.options.find(o => /^(?:yes|register)\b/i.test(o.label)) ?? q.options.find(o => /\(recommended\)/i.test(o.label));
+    if (accept) return accept.label;
+  }
+  return (q.options.find(o => /skip|decline|no thanks|local/i.test(o.label)) ?? q.options[q.options.length - 1]!).label;
+}
+
 /** Retain the prior Path 4 public projection; SDK private fields are never read. */
 export function publicEvents(events: readonly unknown[]): unknown[] {
   return events.flatMap((event: any) => {

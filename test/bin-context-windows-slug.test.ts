@@ -9,6 +9,8 @@ import {
   outermostProjectRoot,
   resolveSlug,
   NEEDS_NATIVE_SLUG_ON_WINDOWS,
+  slugCacheFile,
+  readVersionedSlugCache,
 } from "../lib/bin-context";
 
 const ROOT = path.resolve(import.meta.dir, "..");
@@ -90,7 +92,7 @@ describe("native slug fallback mirrors bin/gstack-slug", () => {
     const key = path.join(home, "slug-cache", toMsysPath(cwd).replace(/\//g, "_"));
     expect(fs.existsSync(key)).toBe(true);
     // no trailing newline: gstack-slug writes with printf '%s'
-    expect(fs.readFileSync(key, "utf-8")).toBe(slug);
+    expect(fs.readFileSync(key, "utf-8")).toBe(`v2:${slug}`);
   });
 
   test("never returns the empty string", () => {
@@ -197,7 +199,7 @@ describe("walk-up parity with bin/gstack-slug (outermost project root)", () => {
 
     expect(slugFromEnvironment(nativeHome(), siteSubdir)).toBe("loadout");
     // The cache file itself must have been overwritten (self-healing).
-    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("loadout");
+    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("v2:loadout");
   });
 
   test("sticky cache (#2212): a cached identity that is NOT the old-bug shape survives", () => {
@@ -323,7 +325,7 @@ describe("walk-up parity with bin/gstack-slug (outermost project root)", () => {
 
     expect(slugFromEnvironment(nativeHome(), repo)).toBe("garrytan-gstack");
     // The cache file itself must have been overwritten (self-healing).
-    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("garrytan-gstack");
+    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("v2:garrytan-gstack");
   });
 
   test("package.json wrapper root (no .git): sticky basename slug is PRESERVED — heal is stray-repo-shape only", () => {
@@ -344,7 +346,7 @@ describe("walk-up parity with bin/gstack-slug (outermost project root)", () => {
     fs.writeFileSync(cacheFile, "wrapperproj"); // legit sticky identity
 
     expect(slugFromEnvironment(nativeHome(), inner)).toBe("wrapperproj"); // NOT healed to acme-web
-    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("wrapperproj");
+    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("v2:wrapperproj");
 
     // The bash implementation agrees on the same fixture (own home, seeded cache).
     if (HAS_BASH) {
@@ -370,7 +372,7 @@ describe("walk-up parity with bin/gstack-slug (outermost project root)", () => {
     fs.writeFileSync(cacheFile, "stickyproj"); // pre-origin basename identity
 
     expect(slugFromEnvironment(nativeHome(), repo)).toBe("stickyproj");
-    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("stickyproj");
+    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("v2:stickyproj");
   });
 
   test('hostile origin `url = ..` never becomes a dot slug — basename fallback (dot-only guard)', () => {
@@ -402,6 +404,65 @@ describe("walk-up parity with bin/gstack-slug (outermost project root)", () => {
     // Per-invocation escape hatch, never a durable identity: no cache written.
     const cacheFile = path.join(nativeHome(), "slug-cache", toMsysPath(siteSubdir).replace(/\//g, "_"));
     expect(fs.existsSync(cacheFile)).toBe(false);
+  });
+
+  test("nested-group remotes (#3003): 2/3/4-segment ssh+https agree with bin/gstack-slug and the golden vectors", () => {
+    const vectors: Array<{ url: string; slug: string }> = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dir, "fixtures", "remote-identity-vectors.json"), "utf-8"),
+    );
+    const urls = [
+      "https://github.com/garrytan/gstack.git",
+      "git@github.com:garrytan/gstack.git",
+      "https://gitlab.com/customer-a/product/repo.git",
+      "ssh://git@gitlab.com:2222/customer-a/product/repo.git",
+      "git@gitlab.example.com:group/sub/team/repo.git",
+      "https://gitlab.example.com/group/sub/team/repo",
+    ];
+    for (const url of urls) {
+      const want = vectors.find((v) => v.url === url)!.slug;
+      const repo = fs.mkdtempSync(path.join(tmp, "nested-"));
+      spawnSync("git", ["init", "-q", repo], { timeout: 30_000 });
+      spawnSync("git", ["-C", repo, "remote", "add", "origin", url], { timeout: 30_000 });
+      expectBoth(repo, want);
+    }
+  });
+
+  test("unversioned legacy cache of a 3-segment remote is upgraded once and rewritten as v2 (#3003)", () => {
+    const repo = path.join(tmp, "nested-upgrade");
+    fs.mkdirSync(repo, { recursive: true });
+    spawnSync("git", ["init", "-q", repo], { timeout: 30_000 });
+    spawnSync("git", ["-C", repo, "remote", "add", "origin", "git@gitlab.com:customer-a/product/repo.git"], { timeout: 30_000 });
+    const cacheFile = slugCacheFile(nativeHome(), repo);
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, "product-repo"); // what the pre-#3003 resolver cached
+    expect(slugFromEnvironment(nativeHome(), repo)).toBe("product-repo-5eca1fe041984543");
+    expect(fs.readFileSync(cacheFile, "utf-8")).toBe("v2:product-repo-5eca1fe041984543");
+    expect(readVersionedSlugCache(nativeHome(), repo)).toBe("product-repo-5eca1fe041984543");
+    if (HAS_BASH) {
+      const bashCache = path.join(tmp, "bash-home", ".gstack", "slug-cache", toMsysPath(repo).replace(/\//g, "_"));
+      fs.mkdirSync(path.dirname(bashCache), { recursive: true });
+      fs.writeFileSync(bashCache, "product-repo");
+      expect(bashSlug(repo)).toBe("product-repo-5eca1fe041984543");
+      expect(fs.readFileSync(bashCache, "utf-8")).toBe("v2:product-repo-5eca1fe041984543");
+    }
+  });
+
+  test("readVersionedSlugCache accepts only v2 entries with a usable value", () => {
+    const cwd = path.join(tmp, "cache-reader");
+    fs.mkdirSync(cwd);
+    const file = slugCacheFile(nativeHome(), cwd);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    expect(readVersionedSlugCache(nativeHome(), cwd)).toBeUndefined();
+    for (const [content, want] of [
+      ["legacy-unversioned", undefined],
+      ["v2:", undefined],
+      ["v2:..", undefined],
+      ["v2:a/../b", "a..b"],
+      ["v2:owner-repo", "owner-repo"],
+    ] as const) {
+      fs.writeFileSync(file, content);
+      expect(readVersionedSlugCache(nativeHome(), cwd)).toBe(want);
+    }
   });
 
   test("outermostProjectRoot terminates on hostile path forms (dirname fixed points)", () => {

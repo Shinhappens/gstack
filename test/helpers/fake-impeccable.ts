@@ -18,3 +18,14 @@ export function installFakeImpeccable(prefix = 'gstack-fake-impeccable-'): { dir
   fs.copyFileSync(DETECT_SAMPLE, path.join(dir, 'impeccable-detect-sample.json')); // the shim's documented default output, beside it
   return { dir, bin };
 }
+
+/** Sample rule ids the design checklist never names: a review can carry them only from the detector's rows. */
+export function detectorOnlyRuleIds(checklist: string): string[] {
+  const rules = JSON.parse(fs.readFileSync(DETECT_SAMPLE, 'utf-8')) as Array<{ antipattern: string }>;
+  return [...new Set(rules.map(rule => rule.antipattern))].filter(id => !checklist.includes(id));
+}
+
+export function carriesDetectorRows(review: string, checklist: string): boolean {
+  const text = review.toLowerCase();
+  return detectorOnlyRuleIds(checklist).some(id => new RegExp(`(?<![\\w-])${id}(?![\\w-])`).test(text));
+}

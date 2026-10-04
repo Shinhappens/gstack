@@ -8,6 +8,9 @@ import { assertCanonicalStartPlan, canonicalStartPlan, canonicalTestPlan, certif
 import { assertionWitnessPairHash, witnessObservationHash } from '../lib/cso/witness';
 import { admit, machinePoolRoot, markSupervised, release } from '../lib/cso/admission';
 import { sanitizeHelperForJson } from '../lib/cso/process';
+import { spawnSync } from 'node:child_process';
+import { dispatchCsoCommand } from '../lib/cso/cli';
+import { RUNTIME_CATALOG } from '../lib/cso/runtime-catalog';
 
 const dirs:string[]=[];const tmp=()=>{const p=fs.mkdtempSync(path.join(os.tmpdir(),'cso-contract-'));dirs.push(p);return p;};afterEach(()=>{for(const p of dirs.splice(0))fs.rmSync(p,{recursive:true,force:true});});
 const CREDENTIAL_CANARY=['ghp_','abcdefghijklmnopqrstuvwxyz1234567890'].join('');
@@ -210,3 +213,51 @@ describe('tested repair certificate gate',()=>{
   });
 });
 function tree(root:string){return sha256(JSON.stringify(fs.readdirSync(root).sort().map(p=>{const file=path.join(root,p),stat=fs.statSync(file);return[p,sha256(fs.readFileSync(file)),stat.mode&0o777];})));}
+
+describe('#2894 truthful completion in the report the user receives',()=>{
+  const coverage=(domain:string,status:string,gaps:string[]=[],tool?:any)=>({domain,scope:'all',status,method:'trace',gaps,exclusions:[],evidence:[],...(tool?{tool}:{})});
+  const report=(entries:any[],status='finished'):any=>{const base:any={coverage:entries,gaps:[]};return{...base,schemaVersion:3,runId:'1700000000000-0123456789abcdef',repoId:'x',createdAt:'2026-01-01',deadline:'2026-01-01',status,completeness:completeness(base),policy:{mode:'daily',scope:'all',diff:false,base:'main',offline:true,budgetSeconds:600,maxWorkers:3,maxRepairs:3},source:{root:'/x',snapshotHash:'s',originalHash:'o'},application:{actors:[],assets:[],entrypoints:[],tenantBoundaries:[],sensitiveOperations:[],invariants:[]},findings:[],events:[]};};
+  test('not assessed names what ran, what is missing, why, and the next step, and never reads as clean',()=>{
+    const markdown=renderReport(report([coverage('snapshot-inputs','assessed'),coverage('auth','not_assessed',['Investigation deadline reached']),coverage('secrets','not_assessed',['Assessment has not been submitted'])]));
+    const lines=markdown.split('\n');
+    expect(lines[0]).toStartWith('not assessed — ');
+    expect(lines[1]).toBe('Status: not assessed. No security domain was assessed, so this report is not a clean result.');
+    expect(lines[2]).toBe('Ran: snapshot-inputs (assessed). Missing: auth (not\\_assessed); secrets (not\\_assessed).');
+    expect(lines[3]).toBe('Reason: Investigation deadline reached; Assessment has not been submitted.');
+    expect(lines[4]).toStartWith('Next: start a new /cso audit');
+    expect(markdown).not.toContain('No supported findings in the assessed scope.');
+    expect(markdown).toContain('No findings: nothing was assessed.');
+    const running=renderReport(report([coverage('auth','not_assessed')],'running'));
+    expect(running).toContain('Reason: no assessment evidence was recorded for the missing domains.');
+    expect(running).toContain('Next: resume this run with `gstack-cso resume 1700000000000-0123456789abcdef`');
+  });
+  test('partial and complete keep the exact empty phrase; partial names missing coverage first and optional scanners without results',()=>{
+    const partial=renderReport(report([coverage('auth','assessed'),coverage('secrets','partial',['Scanner timed out']),coverage('scanner:gitleaks','not_assessed',['Scanner catalog unavailable'],{name:'gitleaks',version:'unavailable',freshness:'not reported',outcome:'not_assessed'})]));
+    expect(partial).toStartWith('partial — all\nStatus: partial. Some required coverage is missing;');
+    expect(partial).toContain('Ran: auth (assessed); secrets (partial). Missing: secrets (partial).');
+    expect(partial).toContain('Optional scanners without results: gitleaks (not\\_assessed: Scanner catalog unavailable).');
+    expect(partial).toContain('No supported findings in the assessed scope.');
+    expect(partial.indexOf('Status: partial')).toBeLessThan(partial.indexOf('No supported findings'));
+    const complete=renderReport(report([coverage('auth','assessed')]));
+    expect(complete).toContain('No supported findings in the assessed scope.');
+    expect(complete).not.toContain('Status:');
+  });
+  test('a finished run with no submitted evidence writes a not-assessed report.md',async()=>{
+    const previous=process.env.GSTACK_HOME,base=tmp();process.env.GSTACK_HOME=path.join(base,'state');
+    try{
+      const repo=path.join(base,'repo');fs.mkdirSync(repo);
+      for(const args of [['init','-q'],['config','user.email','fixture@example.test'],['config','user.name','Fixture']])expect(spawnSync('git',args,{cwd:repo,timeout:10_000}).status).toBe(0);
+      fs.writeFileSync(path.join(repo,'app.js'),'console.log("fixture")\n');
+      for(const args of [['add','app.js'],['commit','-qm','fixture']])expect(spawnSync('git',args,{cwd:repo,timeout:10_000}).status).toBe(0);
+      const dependencies={runtimeCatalog:RUNTIME_CATALOG,catalogImageSession:async()=>{throw new Error('unused');},watchdogPath:()=>'/unused'} as any;
+      const started=await dispatchCsoCommand('start',['--repo',repo,'--offline'],dependencies) as any;
+      await dispatchCsoCommand('finish',[started.runId],dependencies);
+      const markdown=fs.readFileSync(path.join(base,'state','security','cso',started.repoId,started.runId,'report.md'),'utf8');
+      expect(markdown).toStartWith('not assessed — ');
+      expect(markdown).toContain('Status: not assessed. No security domain was assessed, so this report is not a clean result.');
+      expect(markdown).toContain('Missing: application-model (not\\_assessed)');
+      expect(markdown).toMatch(/\nReason: [^\n]*Assessment has not been submitted[^\n]*\nNext: start a new \/cso audit/);
+      expect(markdown).not.toContain('No supported findings in the assessed scope.');
+    }finally{if(previous===undefined)delete process.env.GSTACK_HOME;else process.env.GSTACK_HOME=previous;}
+  },30_000);
+});

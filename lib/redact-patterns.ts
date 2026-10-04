@@ -410,6 +410,17 @@ function urlPasswordIsPlaceholder(span: string): boolean {
   return PLACEHOLDER_STRUCTURAL.some((re) => re.test(pw));
 }
 
+/** A value span that is only an environment-variable read expression (#2912). */
+const ENV_READ_SPAN =
+  /^(?:os\.environ\[|os\.environ\.get\(|os\.getenv\(|getenv\(|ENV\[|process\.env\.[A-Za-z_$][\w$]*[;,)]?)$/;
+function isBareEnvRead(span: string, match: RegExpExecArray): boolean {
+  if (!ENV_READ_SPAN.test(span)) return false;
+  const rest = match.input.slice(match.index + match[0].length).split("\n", 1)[0];
+  for (const [, literal] of rest.matchAll(/["']([^\s'"]{8,})["']/g))
+    if (!isPlaceholderSpan(literal) && shannonEntropy(literal) >= 3.0) return false;
+  return true;
+}
+
 export const PATTERNS: RedactPattern[] = [
   // ===== HIGH — genuinely-secret credentials (block) =====
   {
@@ -676,11 +687,17 @@ export const PATTERNS: RedactPattern[] = [
     // so name-shape checking lives in validate, not in a second group.
     regex: /^[ \t]*(?:export[ \t]+)?["']?[A-Za-z0-9_.-]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|DSN|AUTH|COOKIE|SESSION|PRIVATE)["']?[ \t]*[:=][ \t]*["']?([^\s'"]{8,})["']?/i,
     // Only fire on credential-shaped names with high-entropy values — kills
-    // `FOO_KEY=changeme` and `cacheKey: <entropic-id>` FPs.
+    // `FOO_KEY=changeme` and `cacheKey: <entropic-id>` FPs. #2912: a value
+    // that is exactly an environment read (`os.environ["X"]`,
+    // `os.getenv("X")`, `process.env.X`, `ENV["X"]`) names a secret without
+    // holding one, unless the rest of its line carries a high-entropy quoted
+    // literal (`os.getenv("X", "<secret>")`). A literal appended to the read
+    // itself (`process.env.X||"…"`) is not an exact read and still fires.
     validate: (span, match) =>
       isCredentialShapedEnvName(match[0]) &&
       !isPlaceholderSpan(span) &&
       !/^\$\{?[A-Za-z_]/.test(span) &&
+      !isBareEnvRead(span, match) &&
       shannonEntropy(span) >= 3.0,
   },
   {

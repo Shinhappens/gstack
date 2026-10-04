@@ -52,6 +52,27 @@ afterEach(() => {
 });
 
 describe('review start/end binding (#2803)', () => {
+  test('a matching core snapshot preserves incomplete coverage and a saved native tree exposes later untracked edits', () => {
+    const core = log(cli('gstack-review-log', ['--start', 'review']), {
+      status: 'issues_found', completed: false, converged: false,
+    });
+    const native = log(cli('gstack-review-log', ['--start', 'adversarial-review']), {
+      skill: 'adversarial-review', source: 'in-host',
+    });
+    expect(core.review_binding.state).toBe('incomplete');
+    expect(core.wtree).toBeUndefined();
+    expect(native.review_binding.state).toBe('verified');
+    expect(core.review_binding.start_wtree).toBe(native.wtree);
+    expect(core.review_binding.end_wtree).toBe(native.wtree);
+    expect(git('diff', native.wtree, cli('gstack-wtree'))).toBe('');
+    writeFileSync(join(repo, 'new.ts'), 'export const changed = true;\n');
+    expect(git('diff', '--name-only', native.wtree, cli('gstack-wtree'))).toBe('new.ts');
+    const saved = rows()[0];
+    expect(saved.completed).toBe(false);
+    expect(saved.converged).toBe(false);
+    expect(saved.review_freshness.status).toBe('UNVERIFIED');
+  });
+
   test('unchanged completed review is current, including an identical-content commit', () => {
     writeFileSync(join(repo, 'source.ts'), 'export const value = 2;\n');
     writeFileSync(join(repo, 'new.ts'), 'export {};\n');

@@ -8,8 +8,8 @@
  * (office-hours/SKILL.md.tmpl:69); when AskUserQuestion is disallowed at
  * the tool-registry level the model cannot ask and silently picks one mode,
  * breaking the whole interactive premise. This test asserts that question
- * still surfaces — fix must route through mcp__conductor__AskUserQuestion
- * (when present) or plan-file + ExitPlanMode flow.
+ * still surfaces — through mcp__conductor__AskUserQuestion (when present)
+ * or the prose fallback, never a plan-file ## Decisions substitute.
  *
  * Filename keeps `auto-mode` for branch-history continuity. Auto-mode (the
  * AUTO_DECIDE preamble path when QUESTION_TUNING=true) is a related but
@@ -20,12 +20,15 @@ import { test, expect } from 'bun:test';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { describeE2ETier } from './helpers/e2e-gate';
 import { runPlanSkillObservation, planFileHasDecisionsSection } from './helpers/claude-pty-runner';
+import { assertNoPlanFileDecisions } from './helpers/plan-mode-evidence';
 
 const describeE2E = describeE2ETier('gate');
 
 describeE2E('office-hours AskUserQuestion-blocked smoke (gate)', () => {
-  // Pass envelope is ['asked', 'plan_ready']; failure signals are
-  // 'auto_decided' + silent_write/exited/timeout.
+  // With AskUserQuestion blocked the mode question must still be asked (the
+  // prose fallback, observed as 'asked'); a plan-file ## Decisions section is
+  // not a substitute. Failure signals also include 'auto_decided' +
+  // silent_write/exited/timeout.
   test('AskUserQuestion surfaces when --disallowedTools AskUserQuestion is set', async () => {
     const obs = await runPlanSkillObservation({
       skillName: 'office-hours',
@@ -47,14 +50,12 @@ describeE2E('office-hours AskUserQuestion-blocked smoke (gate)', () => {
           `--- evidence (last 2KB visible) ---\n${obs.evidence}`,
       );
     }
-    if (obs.outcome === 'plan_ready') {
-      if (!obs.planFile || !planFileHasDecisionsSection(obs.planFile)) {
-        throw new Error(
-          `office-hours AskUserQuestion-blocked regression: plan_ready without a "## Decisions" section in ${obs.planFile ?? '<no plan file detected>'} — startup-vs-builder mode question was silently skipped.\n` +
-            `--- evidence (last 2KB visible) ---\n${obs.evidence}`,
-        );
-      }
+    assertNoPlanFileDecisions(obs, planFileHasDecisionsSection);
+    if (obs.outcome !== 'asked') {
+      throw new Error(
+        `office-hours AskUserQuestion-blocked regression: outcome=${obs.outcome} — the startup-vs-builder mode question reached ${obs.planFile ?? 'plan_ready'} without being asked.\n` +
+          `--- evidence (last 2KB visible) ---\n${obs.evidence}`,
+      );
     }
-    expect(['asked', 'plan_ready']).toContain(obs.outcome);
   }, CAPTURE_LONG_MS);
 });

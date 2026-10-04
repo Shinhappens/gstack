@@ -7,7 +7,7 @@
  * salience block (Layer 1). Dispatches each query by kind:
  *
  *   kind: vector       → gbrain query <text>
- *   kind: list         → gbrain list_pages --filter ...
+ *   kind: list         → gbrain list --type/--tag/--updated-after/--sort ...
  *   kind: filesystem   → local glob
  *
  * Each MCP/CLI call has a 500ms hard timeout per Section 1C. On timeout or
@@ -38,6 +38,8 @@ import { existsSync, readFileSync, statSync, readdirSync, accessSync, constants 
 import { join, dirname, basename, resolve, delimiter } from "path";
 import { spawnSync } from "child_process";
 import { homedir } from "os";
+import { resolveStateRoot } from "../lib/state-root";
+import { gbrainConfigDir } from "../lib/gbrain-exec";
 
 import { parseSkillManifest, type GbrainManifest, type GbrainManifestQuery, withErrorContext } from "../lib/gstack-memory-helpers";
 
@@ -62,12 +64,14 @@ interface QueryResult {
   bytes: number;
   duration_ms: number;
   reason?: string;
+  /** A gbrain call or unsupported manifest field failed (not an empty result). */
+  failed?: boolean;
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const HOME = homedir();
-const GSTACK_HOME = process.env.GSTACK_HOME || join(HOME, ".gstack");
+const GSTACK_HOME = resolveStateRoot();
 // 500ms hard cap per Section 1C; overridable for slow/loaded environments
 // (test harnesses under CI load, cold CLI starts).
 const MCP_TIMEOUT_MS = Math.max(1, parseInt(process.env.GSTACK_BRAIN_TIMEOUT_MS || "", 10) || 500);
@@ -234,52 +238,99 @@ function dispatchVector(q: GbrainManifestQuery, args: CliArgs): QueryResult {
   }
 
   const limit = q.limit ?? args.limit;
-  const result = spawnSync("gbrain", ["query", query, "--limit", String(limit), "--format", "compact"], {
+  const result = spawnSync("gbrain", ["query", query, "--limit", String(limit)], {
     encoding: "utf-8",
     timeout: MCP_TIMEOUT_MS,
   });
 
-  if (result.status !== 0 || !result.stdout) {
+  if (result.status !== 0) {
+    const stderrLine = (result.stderr || "").trim().split("\n").pop()?.trim();
     return {
       query: q,
       ok: false,
+      failed: true,
       rendered: "",
       bytes: 0,
       duration_ms: Date.now() - t0,
-      reason: result.error?.message || `gbrain query exited ${result.status}`,
+      reason: result.error?.message || `gbrain query exited ${result.status}${stderrLine ? `: ${stderrLine}` : ""}`,
     };
+  }
+  if (!result.stdout.trim() || /^No results\./.test(result.stdout.trim())) {
+    return { query: q, ok: false, rendered: "", bytes: 0, duration_ms: Date.now() - t0, reason: "no matches" };
   }
 
   const rendered = wrapDatamarked(q.render_as, capBody(result.stdout));
   return { query: q, ok: true, rendered, bytes: rendered.length, duration_ms: Date.now() - t0 };
 }
 
+// `gbrain list` (the CLI verb behind the list_pages MCP tool) has no generic
+// --filter flag and rejects unknown flags (gbrain >= 0.42.76). Manifest filter
+// keys map onto its real flags; `content_contains` has no list flag, so it is
+// matched against the returned slug/type/title rows here.
+const LIST_FILTER_FLAGS: Record<string, string> = {
+  type: "--type",
+  tags_contains: "--tag",
+  updated_after: "--updated-after",
+};
+const LIST_SORTS: Record<string, string> = {
+  updated_at_desc: "updated_desc",
+  updated_at_asc: "updated_asc",
+  created_at_desc: "created_desc",
+  updated_desc: "updated_desc",
+  updated_asc: "updated_asc",
+  created_desc: "created_desc",
+  slug: "slug",
+};
+
+function listFilterValue(key: string, value: string): string {
+  if (key !== "updated_after") return value;
+  const relative = /^now-(\d+)d$/.exec(value);
+  if (!relative) return value;
+  return new Date(Date.now() - Number(relative[1]) * 86_400_000).toISOString().slice(0, 10);
+}
+
 function dispatchList(q: GbrainManifestQuery, args: CliArgs): QueryResult {
   const t0 = Date.now();
+  const fail = (reason: string): QueryResult =>
+    ({ query: q, ok: false, failed: true, rendered: "", bytes: 0, duration_ms: Date.now() - t0, reason });
   if (!gbrainAvailable()) {
     return { query: q, ok: false, rendered: "", bytes: 0, duration_ms: Date.now() - t0, reason: "gbrain CLI missing" };
   }
   const limit = q.limit ?? args.limit;
-  const cliArgs: string[] = ["list_pages", "--limit", String(limit)];
-  if (q.sort) cliArgs.push("--sort", q.sort);
-  if (q.filter) {
-    for (const [k, v] of Object.entries(q.filter)) {
-      const { resolved: rv } = substituteTemplateVars(String(v), args);
-      cliArgs.push("--filter", `${k}=${rv}`);
+  const cliArgs: string[] = ["list"];
+  let contentContains: string | undefined;
+  for (const [k, v] of Object.entries(q.filter ?? {})) {
+    const { resolved, unresolved } = substituteTemplateVars(String(v), args);
+    if (unresolved.length > 0) {
+      return { query: q, ok: false, rendered: "", bytes: 0, duration_ms: Date.now() - t0,
+        reason: `template vars unresolved: ${unresolved.join(",")}` };
     }
+    if (k === "content_contains") {
+      contentContains = resolved.toLowerCase();
+      continue;
+    }
+    const flag = LIST_FILTER_FLAGS[k];
+    if (!flag) return fail(`unsupported list filter: ${k}`);
+    cliArgs.push(flag, listFilterValue(k, resolved));
   }
+  if (q.sort) {
+    const sort = LIST_SORTS[q.sort];
+    if (!sort) return fail(`unsupported list sort: ${q.sort}`);
+    cliArgs.push("--sort", sort);
+  }
+  cliArgs.push("--limit", String(contentContains === undefined ? limit : Math.min(Math.max(limit * 10, 50), 200)));
   const result = spawnSync("gbrain", cliArgs, { encoding: "utf-8", timeout: MCP_TIMEOUT_MS });
-  if (result.status !== 0 || !result.stdout) {
-    return {
-      query: q,
-      ok: false,
-      rendered: "",
-      bytes: 0,
-      duration_ms: Date.now() - t0,
-      reason: result.error?.message || `gbrain list_pages exited ${result.status}`,
-    };
+  if (result.status !== 0) {
+    const stderrLine = (result.stderr || "").trim().split("\n").pop()?.trim();
+    return fail(result.error?.message || `gbrain list exited ${result.status}${stderrLine ? `: ${stderrLine}` : ""}`);
   }
-  const rendered = wrapDatamarked(q.render_as, capBody(result.stdout));
+  let rows = (result.stdout || "").split("\n").filter((line) => line.includes("\t"));
+  if (contentContains !== undefined) rows = rows.filter((line) => line.toLowerCase().includes(contentContains!));
+  rows = rows.slice(0, limit);
+  if (rows.length === 0) {
+    return { query: q, ok: false, rendered: "", bytes: 0, duration_ms: Date.now() - t0, reason: "no matches" };
+  }
+  const rendered = wrapDatamarked(q.render_as, capBody(rows.join("\n") + "\n"));
   return { query: q, ok: true, rendered, bytes: rendered.length, duration_ms: Date.now() - t0 };
 }
 
@@ -486,6 +537,12 @@ async function main(): Promise<void> {
 
   if (!args.quiet && rendered.length > 0) {
     console.log(rendered);
+  }
+
+  const failures = results.filter((r) => r.failed);
+  if (!args.quiet && failures.length > 0 && gbrainAvailable() && existsSync(join(gbrainConfigDir(), "config.json"))) {
+    const reasons = [...new Set(failures.map((r) => r.reason))].join("; ");
+    console.error(`brain context: ${failures.length}/${results.length} queries failed (${reasons})`);
   }
 
   if (args.explain) {

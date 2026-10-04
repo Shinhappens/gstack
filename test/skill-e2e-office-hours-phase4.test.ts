@@ -45,8 +45,8 @@ const evalCollector = createEvalCollector('e2e-office-hours-phase4');
 const BECAUSE_RE = /\bbecause\b/i;
 // At least 2 numbered/lettered options (A/B or 1/2). Office-hours Phase 4 says
 // "2-3 distinct alternatives," so 2+ is the minimum bar.
-function hasTwoAlternatives(text: string): boolean {
-  const options: Array<{ indent: number; label: string }> = [];
+function outerOptions(text: string): Array<{ label: string; text: string }> {
+  const options: Array<{ indent: number; label: string; text: string }> = [];
   let fence: { char: string; length: number } | undefined;
   for (const line of text.split('\n')) {
     const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
@@ -55,13 +55,16 @@ function hasTwoAlternatives(text: string): boolean {
       continue;
     }
     if (marker) { fence = { char: marker[1]![0]!, length: marker[1]!.length }; continue; }
-    const option = /^( {0,3})([A-Z]|[1-9]\d*)\)\s+\S/.exec(line);
-    if (option) options.push({ indent: option[1]!.length, label: option[2]! });
+    const option = /^( {0,3})([A-Z]|[1-9]\d*)\)\s+(\S.*)$/.exec(line);
+    if (option) options.push({ indent: option[1]!.length, label: option[2]!, text: option[3]! });
   }
   // Only the outer option list counts; numbered steps inside one option and
   // Markdown source/quoted blocks do not supply another alternative.
   const outerIndent = Math.min(...options.map(option => option.indent));
-  const labels = options.filter(option => option.indent === outerIndent).map(option => option.label);
+  return options.filter(option => option.indent === outerIndent);
+}
+function hasTwoAlternatives(text: string): boolean {
+  const labels = outerOptions(text).map(option => option.label);
   return new Set(labels.filter(label => /^[A-Z]$/.test(label))).size >= 2 ||
     new Set(labels.filter(label => /^\d+$/.test(label))).size >= 2;
 }
@@ -69,6 +72,12 @@ function hasTwoAlternatives(text: string): boolean {
 // question. Without this, a captured AskUserQuestion from an earlier phase
 // would false-pass.
 const PHASE4_VOCAB_RE = /approach|alternative|architectur(?:e|al)|implementation/i;
+// A question whose outer options are two of the seeded Phase 4 shapes is the
+// Phase 4 fork even when its prose names none of those words.
+function offersSeededAlternatives(text: string): boolean {
+  const shapes = outerOptions(text).map(option => /^\**(Server-side|Client-side|Hybrid)\b/i.exec(option.text)?.[1]?.toLowerCase());
+  return new Set(shapes.filter(Boolean)).size >= 2;
+}
 
 function setupOfficeHoursDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-office-hours-phase4-'));
@@ -181,7 +190,7 @@ After writing the file with that ONE Phase 4 question, stop. Do not continue to 
       expect(captured).toMatch(BECAUSE_RE);
       expect(hasTwoAlternatives(captured)).toBe(true);
       // Phase-4 specificity: prevents a stray earlier-phase AUQ from false-passing.
-      expect(captured).toMatch(PHASE4_VOCAB_RE);
+      expect(PHASE4_VOCAB_RE.test(captured) || offersSeededAlternatives(captured), 'captured question is not the Phase 4 fork').toBe(true);
 
       // Recommendation-quality judge: same threshold as plan-format tests.
       await assertRecommendationQuality({

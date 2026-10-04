@@ -124,20 +124,22 @@ process.stdout.write('native-summary-complete-after-heading-scrolled');`);
   test('missing installed headless source fails explicitly before the CLI can spawn', () => {
     const f = fixture();
     try {
+      // The viewport module resolves xterm beside itself; a copy placed in the
+      // fixture resolves the fixture's source-less xterm and replaces the real
+      // module for the launcher (mock.module), so the real launch path runs.
+      const screenModule = path.join(ROOT, 'test/helpers/pty/screen.ts');
       const copied = path.join(f.dir, 'missing-headless.ts');
-      fs.copyFileSync(path.join(ROOT, 'test/helpers/pty-screen.ts'), copied);
+      fs.writeFileSync(copied, fs.readFileSync(screenModule, 'utf8')
+        .replace(/from (['"])(\.\.?\/[^'"]+)\1/g, (_match, _quote, relative) =>
+          'from ' + JSON.stringify(pathToFileURL(path.resolve(path.dirname(screenModule), relative + '.ts')).href)));
       const packageDir = path.join(f.dir, 'node_modules/xterm');
       fs.mkdirSync(packageDir, { recursive: true });
       fs.writeFileSync(path.join(packageDir, 'package.json'), '{"name":"xterm","version":"fixture"}');
-      const clone = path.join(f.dir, 'launch-with-missing-screen.ts');
-      const source = fs.readFileSync(path.join(ROOT, 'test/helpers/claude-pty-runner.ts'), 'utf8')
-        .replace(/from (['"])(\.\.?\/[^'"]+)\1/g, (_match, _quote, relative) => {
-          const target = relative === './pty-screen' ? copied : path.resolve(ROOT, 'test/helpers', relative + '.ts');
-          return 'from ' + JSON.stringify(pathToFileURL(target).href);
-        });
-      fs.writeFileSync(clone, source);
       const result = run(f.dir, f.fake, `
-const {launchClaudePty}=await import(${JSON.stringify(pathToFileURL(clone).href)});
+import {mock} from 'bun:test';
+const missing=await import(${JSON.stringify(pathToFileURL(copied).href)});
+mock.module(${JSON.stringify(screenModule)},()=>missing);
+const {launchClaudePty}=await import(${JSON.stringify(runner)});
 try {const unexpected=await launchClaudePty({cwd:${JSON.stringify(f.dir)},observeScreen:true});await unexpected.close();throw new Error('launch unexpectedly succeeded');}
 catch(error){if(!String(error).includes('PTY screen unavailable') || !String(error.cause).includes('headless source is missing'))throw error;process.stdout.write('failed-before-CLI-spawn');}
 `);

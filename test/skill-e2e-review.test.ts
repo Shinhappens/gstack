@@ -8,11 +8,12 @@ import {
   createEvalCollector, finalizeEvalCollector,
 } from './helpers/e2e-helpers';
 import { extractSkillSections, REVIEW_E2E_SECTIONS } from './helpers/skill-fixture';
+import { expectContract } from './helpers/eval-store';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { installFakeImpeccable } from './helpers/fake-impeccable';
+import { carriesDetectorRows, DETECT_SAMPLE, installFakeImpeccable } from './helpers/fake-impeccable';
 
 const evalCollector = createEvalCollector('e2e-review');
 // Capture cleanup and recording must finish before Bun starts its retry.
@@ -76,12 +77,12 @@ Write your review findings to ${reviewDir}/review-output.md`,
     });
 
     logCost('/review', result);
-    recordE2E(evalCollector, '/review SQL injection', 'Review skill E2E', result);
-    expect(result.exitReason).toBe('success');
-
-    // Verify the review output mentions SQL injection-related findings
-    const reviewOutputPath = path.join(reviewDir, 'review-output.md');
-    if (fs.existsSync(reviewOutputPath)) {
+    let passed = false;
+    try {
+      expect(result.exitReason).toBe('success');
+      expect(result.browseErrors).toEqual([]);
+      const reviewOutputPath = path.join(reviewDir, 'review-output.md');
+      expect(fs.existsSync(reviewOutputPath)).toBe(true);
       const reviewContent = fs.readFileSync(reviewOutputPath, 'utf-8').toLowerCase();
       const hasSqlContent =
         reviewContent.includes('sql') ||
@@ -92,6 +93,9 @@ Write your review findings to ${reviewDir}/review-output.md`,
         reviewContent.includes('user_input') ||
         reviewContent.includes('unsanitized');
       expect(hasSqlContent).toBe(true);
+      passed = true;
+    } finally {
+      recordE2E(evalCollector, '/review SQL injection', 'Review skill E2E', result, { passed });
     }
   }, CAPTURE_MS + REVIEW_FINALIZE_MS);
 });
@@ -139,19 +143,22 @@ describeIfSelected('Review enum completeness E2E', ['review-enum-completeness'],
   });
 
   testConcurrentIfSelected('review-enum-completeness', async () => {
+    const attempt = ++enumCaptureSequence;
+    for (const f of fs.readdirSync(enumDir)) if (/^review-output.*\.md$/.test(f)) fs.rmSync(path.join(enumDir, f));
+    const reviewPath = path.join(enumDir, `review-output-${attempt}.md`);
     const result = await runSkillTest({
-      prompt: `You are in a git repo on branch feature/add-returned-status with changes against main.
-Read review-SKILL.md for the review workflow instructions.
-Also read review-checklist.md and apply it — pay special attention to the Enum & Value Completeness section.
-Run /review on the current diff (git diff main...HEAD).
-Write your review findings to ${enumDir}/review-output.md
+      prompt: `You are in a git repo on branch feature/add-returned-status with changes against main. This is a focused, read-only core review: run only the checklist's static Enum & Value Completeness check on this diff. Do not run the full /review lifecycle, QA or exploratory probes (for example Step 4.7), Greptile, hosting/PR/review-log setup, or any command that is not a git read or a file read.
+This fixture provides only static Ruby source with no configured runnable application, dependencies or runtime/test harness; base main is local and there is no remote or PR. Do not fetch, install, run, or probe an app or dependencies, and any tools that happen to be installed on the host do not expand this scope.
+Read review-SKILL.md for the review workflow instructions, then read review-checklist.md and apply its Enum & Value Completeness section.
+Statically inspect the change: read git diff main...HEAD, then grep the sibling status values through the actual authored source and read every match in full, including unchanged consumers, checking whether each handles the new value.
+Write your review findings once to ${reviewPath} and then stop with a brief final response. Do not re-run the review, reuse a prior report, or invent runtime checks.
 
 The diff adds a new "returned" status to the Order model. Your job is to check if all consumers handle it.`,
       workingDirectory: enumDir,
       maxTurns: 15,
       timeout: JUDGE_MS,
       testName: 'review-enum-completeness',
-      runId: `${process.env.EVALS_RUN_ID ?? runId}-review-enum-${process.pid}-${++enumCaptureSequence}`,
+      runId: `${process.env.EVALS_RUN_ID ?? runId}-review-enum-${process.pid}-${attempt}`,
       publicStreamDiagnostics: true,
     });
 
@@ -161,16 +168,13 @@ The diff adds a new "returned" status to the Order model. Your job is to check i
       expect(result.exitReason).toBe('success');
 
       // Verify the review caught the missing enum handlers
-      const reviewPath = path.join(enumDir, 'review-output.md');
-      if (fs.existsSync(reviewPath)) {
-        const review = fs.readFileSync(reviewPath, 'utf-8');
-        // Should mention the missing "returned" handling in at least one of the methods
-        const mentionsReturned = review.toLowerCase().includes('returned');
-        const mentionsEnum = review.toLowerCase().includes('enum') || review.toLowerCase().includes('status');
-        const mentionsCritical = review.toLowerCase().includes('critical');
-        expect(mentionsReturned).toBe(true);
-        expect(mentionsEnum || mentionsCritical).toBe(true);
-      }
+      expect(fs.existsSync(reviewPath)).toBe(true);
+      const review = fs.readFileSync(reviewPath, 'utf-8');
+      const mentionsReturned = review.toLowerCase().includes('returned');
+      const mentionsEnum = review.toLowerCase().includes('enum') || review.toLowerCase().includes('status');
+      const mentionsCritical = review.toLowerCase().includes('critical');
+      expect(mentionsReturned).toBe(true);
+      expect(mentionsEnum || mentionsCritical).toBe(true);
       passed = result.browseErrors.length === 0;
     } finally {
       recordE2E(evalCollector, '/review enum completeness', 'Review enum completeness E2E', result, { passed });
@@ -227,6 +231,17 @@ describeIfSelected('Review design lite E2E', ['review-design-lite'], () => {
     fs.copyFileSync(path.join(ROOT, 'review', 'greptile-triage.md'), path.join(designDir, 'review-greptile-triage.md'));
     // Fake impeccable engine OUTSIDE the repo (the wrapper ignores an in-repo IMPECCABLE_BIN).
     fakeEngineDir = installFakeImpeccable('skill-e2e-fake-impeccable-').dir;
+    // Point the sample's rows at this diff's files so the review does not spend
+    // turns mapping a foreign fixture path; rule ids and snippets are unchanged.
+    const lineOf = (file: string, needle: string) => fs.readFileSync(path.join(designDir, file), 'utf-8').split('\n').findIndex(line => line.includes(needle)) + 1;
+    const locations: Array<[string, string, string]> = [['#8b5cf6', 'styles.css', 'linear-gradient'], ['#6366f1', 'styles.css', 'background: #6366f1'],
+      ['#1e1b4b', 'styles.css', 'background: #1e1b4b'], ['<h3>', 'landing.html', '<h3>'], ['Purple', 'styles.css', 'linear-gradient'], ['streamline', 'landing.html', 'streamline']];
+    const rows = JSON.parse(fs.readFileSync(DETECT_SAMPLE, 'utf-8')).map((row: { snippet: string }) => {
+      const [, file, needle] = locations.find(([key]) => row.snippet.includes(key))!;
+      return { ...row, file, line: lineOf(file, needle) };
+    });
+    if (rows.some((row: { line: number }) => row.line < 1)) throw new Error('review-design-lite: a detector row did not map to the diff');
+    fs.writeFileSync(path.join(fakeEngineDir, 'landing-detect.json'), JSON.stringify(rows, null, 2));
   });
 
   afterAll(() => {
@@ -255,7 +270,7 @@ Important: The design checklist should catch issues like blacklisted fonts, smal
       runId,
       env: {
         IMPECCABLE_BIN: path.join(fakeEngineDir, 'impeccable'),
-        IMPECCABLE_FAKE_OUTPUT: path.join(ROOT, 'test', 'fixtures', 'impeccable-detect-sample.json'),
+        IMPECCABLE_FAKE_OUTPUT: path.join(fakeEngineDir, 'landing-detect.json'),
       },
     });
 
@@ -283,12 +298,14 @@ Important: The design checklist should catch issues like blacklisted fonts, smal
       if (review.includes('welcome to') || review.includes('all-in-one') || review.includes('generic') || review.includes('hero copy') || review.includes('ai slop')) detected++;
       // Issue 7: 3-column feature grid — LOW
       if (review.includes('3-column') || review.includes('three-column') || review.includes('feature grid') || review.includes('icon') || review.includes('circle')) detected++;
-      // Signal 8: the mechanical pass (fake impeccable engine via IMPECCABLE_BIN) surfaced a detector row
-      const detectorSeen = review.includes('detector') || review.includes('[ai-color-palette]') || review.includes('[low-contrast]') || review.includes('impeccable');
+      // Signal 8: the mechanical pass (fake impeccable engine via IMPECCABLE_BIN) surfaced a detector row.
+      // Only rule ids the checklist never names count; claiming the detector is absent is not a row.
+      const detectorSeen = carriesDetectorRows(review, fs.readFileSync(path.join(designDir, 'review-design-checklist.md'), 'utf-8'));
 
       console.log(`Design review detected ${detected}/7 planted checklist signals; detector rows surfaced: ${detectorSeen}`);
       expect(detected).toBeGreaterThanOrEqual(4); // the LLM-checklist bar, unchanged by the detector
-      expect(detectorSeen).toBe(true); // the fake engine's rows are deterministic; the review must carry them
+      // The fake engine's rows are deterministic; carrying them is the contract.
+      expectContract(detectorSeen, 'review-design-lite: the review omitted the mechanical detector rows', { collector: evalCollector, name: '/review design lite' });
     }
   }, CAPTURE_MS + REVIEW_FINALIZE_MS);
 });

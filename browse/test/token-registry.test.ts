@@ -233,13 +233,17 @@ describe('token-registry', () => {
 
     it('rejects expired setup key', () => {
       const setup = createSetupKey({});
-      // Manually expire it
-      const info = validateToken(setup.token);
-      if (info) {
-        (info as any).expiresAt = new Date(Date.now() - 1000).toISOString();
-      }
+      // Manually expire it (createSetupKey returns the registry's own record)
+      setup.expiresAt = new Date(Date.now() - 1000).toISOString();
       const session = exchangeSetupKey(setup.token);
       expect(session).toBeNull();
+    });
+
+    it('does not accept an unexchanged setup key as a bearer token', () => {
+      const setup = createSetupKey({ scopes: ['read', 'write'] });
+      expect(validateToken(setup.token)).toBeNull();
+      const session = exchangeSetupKey(setup.token);
+      expect(validateToken(session!.token)).not.toBeNull();
     });
 
     it('rejects unknown setup key', () => {

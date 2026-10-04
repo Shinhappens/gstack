@@ -2,8 +2,6 @@ import { expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
-import { E2E_TOUCHFILES } from './helpers/touchfiles';
-
 const source = fs.readFileSync(path.join(import.meta.dir, 'skill-e2e-office-hours-phase4.test.ts'), 'utf8');
 const question = (word = 'architectural', options = 'A) Put retrieval on the server\nB) Put retrieval on the client') =>
   `Where should retrieval live?\nThis ${word} choice decides which component owns the retrieval algorithm and the cross-host API contract.\n${options}\nRecommendation: A because all hosts need a consistent algorithm with one owner.\n`;
@@ -99,6 +97,15 @@ test('Phase4 caller fixture retains fork validation under either path convention
   }
 });
 
-test('Phase4 caller controls select only the existing Phase4 paid owner', () => {
-  expect(Object.entries(E2E_TOUCHFILES).filter(([,paths])=>paths.includes('test/office-hours-phase4-caller.test.ts')).map(([name])=>name)).toEqual(['office-hours-phase4-fork']);
+test('Phase4 caller accepts a fork whose outer options are the seeded shapes, without Phase 4 vocabulary', async () => {
+  // Census 36776104571 trials 1-2: a complete Phase 4 fork naming the three seeded shapes as its options.
+  const seeded = (options: string) => `Where should the cross-skill retrieval smarts live?\nThe choice locks in who owns the ranking logic.\n${options}\nRecommendation: C because we can tune the salience signal before freezing a contract.\n`;
+  for (const options of ['A) Server-side — new MCP tools in gbrain\nB) Client-side — a gstack helper\nC) Hybrid — V1 client-side, V1.5 in gbrain',
+    'A) **Server-side** gbrain tools\nB) **Hybrid** promotion later']) {
+    const x = await runCaller(seeded(options)); expect(x.thrown).toBeUndefined(); expect(x.judged).toBe(1); expect(x.rows[0].passed).toBe(true);
+  }
+  for (const options of ['A) Server-side — new MCP tools\nB) Put retrieval on the client', 'A) Server-side\n    1) Client-side\n    2) Hybrid',
+    'A) Use a queue\n```text\nB) Server-side\nC) Client-side\n```', 'A) Ask customers first\nB) Ask later\nServer-side and Client-side are both options.']) {
+    const x = await runCaller(seeded(options)); expect(x.thrown).toBeDefined(); expect(x.judged).toBe(0); expect(x.rows[0].passed).toBe(false);
+  }
 });

@@ -3,25 +3,39 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { DEFAULT_SHARD_TIMEOUT_MS } from '../scripts/test-paid-shards';
+import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
 
 const casePath = path.join(import.meta.dir, 'skill-e2e-office-hours-section-loading.test.ts');
 
-// Evaluate the real case registration with inert test/describe functions.
-// Imports are removed, and the captured paid callback is never invoked.
-function registeredOptions(): { timeout: number; retry: number } {
-  const source = new Bun.Transpiler({ loader: 'ts' }).transformSync(fs.readFileSync(casePath, 'utf8'))
+// Evaluate the real case registrations with inert test/describe functions.
+// Imports are removed, and the captured paid callbacks are never invoked.
+function registrations(file = casePath): Array<{ tier: string; options: unknown }> {
+  const source = new Bun.Transpiler({ loader: 'ts' }).transformSync(fs.readFileSync(file, 'utf8'))
     .replace(/^import\b[^;]*;\s*$/gm, '');
-  const registrations: unknown[] = [];
-  new Function('test', 'describeE2ETier', source)(
-    (_name: string, _callback: unknown, options: unknown) => registrations.push(options),
-    () => (_name: string, register: () => void) => register(),
+  const found: Array<{ tier: string; options: unknown }> = [];
+  new Function('test', 'describeE2ETier', 'CAPTURE_LONG_MS', source)(
+    (_name: string, _callback: unknown, options: unknown) => found.at(-1)!.options = options,
+    (tier: string) => (_name: string, register: () => void) => { found.push({ tier, options: undefined }); register(); },
+    CAPTURE_LONG_MS,
   );
-  expect(registrations).toHaveLength(1);
-  return registrations[0] as { timeout: number; retry: number };
+  return found;
 }
 
+test('the full office-hours workflow is one marathon-tier registration', () => {
+  expect(registrations()).toEqual([{ tier: 'marathon', options: { timeout: 1_260_000, retry: 0 } }]);
+});
+
+test('the design-draft checkpoint is one periodic case inside the ordinary long capture budget', () => {
+  const draft = path.join(import.meta.dir, 'skill-e2e-office-hours-design-draft.test.ts');
+  expect(registrations(draft)).toEqual([{ tier: 'periodic', options: CAPTURE_LONG_MS }]);
+  const source = fs.readFileSync(draft, 'utf8');
+  expect(source).toContain('timeout: LONG_SECTION_CAPTURE_MS');
+  expect(source).toContain('stop after the Write that saves the complete design');
+  expect(source).toContain('Do not run the spec review, approval, relationship closing or handoff');
+});
+
 test('office-hours has one bounded attempt even under the paid runner CLI retry default', () => {
-  const options = registeredOptions();
+  const options = registrations()[0]!.options as { timeout: number; retry: number };
   expect(options).toEqual({ timeout: 1_260_000, retry: 0 });
   expect(options.timeout + 120_000).toBeLessThanOrEqual(DEFAULT_SHARD_TIMEOUT_MS);
 

@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
-import { E2E_TOUCHFILES } from './helpers/touchfiles';
 import { OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt } from './helpers/office-hours-attempt';
 
 const source = fs.readFileSync(path.join(import.meta.dir, 'skill-e2e-office-hours.test.ts'), 'utf8');
@@ -27,7 +27,7 @@ async function exercise(owner: Owner, scenarios: Scenario[]) {
   } };
   const args: Record<string, any> = {
     expect, beforeAll: (fn: () => void) => setups.push(fn), afterAll: (fn: () => void) => finalizers.push(fn),
-    CAPTURE_MS, CAPTURE_LONG_MS, OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt,
+    CAPTURE_MS, CAPTURE_LONG_MS, OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt, resolveEvalModel,
     ROOT: '/source', runId: 'synthetic-posture-run', evalsEnabled: true,
     describeIfSelected: (_title: string, _names: string[], fn: () => void) => fn(),
     testConcurrentIfSelected: (name: string, fn: () => Promise<void>, timeout: number) => { expect(timeout).toBe(CAPTURE_LONG_MS + OFFICE_HOURS_BUN_GRACE_MS); callbacks.set(name, fn); },
@@ -45,7 +45,7 @@ async function exercise(owner: Owner, scenarios: Scenario[]) {
     runSkillTest: async (opts: any) => {
       index++; current = scenarios[index]!; expect(current).toBeDefined(); calls.push(opts);
       expect(opts.testName).toBe(owner); expect(opts.maxTurns).toBe(8); expect(opts.timeout).toBe(CAPTURE_MS);
-      expect(opts.model).toBe('claude-sonnet-4-6'); expect(opts.runId).toBe('synthetic-posture-run');
+      expect(opts.model).toBe(resolveEvalModel('capture')); expect(opts.runId).toBe('synthetic-posture-run');
       expect(opts.signal).toBeInstanceOf(AbortSignal);
       expect(opts.prompt).toContain('Skip any AskUserQuestion');
       const file = path.join(opts.workingDirectory, owner === owners[0] ? 'q3.md' : 'unlocks.md');
@@ -113,8 +113,4 @@ test('posture consecutive failed and passing callbacks retain separate final ver
     expect(x.records.map(r => r.passed)).toEqual([false, true]); expect(x.records.map(r => r.attempt)).toEqual([0, 1]);
     expect(x.records[0].judge_scores).toEqual({ axis_a: 4, axis_b: 3 }); expect(x.records[1].judge_scores).toEqual({ axis_a: 4, axis_b: 4 });
   }
-});
-
-test('posture recorder controls select exactly the two existing paid owners', () => {
-  expect(Object.entries(E2E_TOUCHFILES).filter(([, paths]) => paths.includes('test/office-posture-recording.test.ts')).map(([name]) => name)).toEqual([...owners]);
 });

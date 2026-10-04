@@ -2,6 +2,174 @@
 
 ## NEXT PRIORITY
 
+### P1: paid-eval follow-ups from the v1.91.12.0 proof censuses (filed 2026-09-29)
+
+- **Thin budgets on slow API days** — on Claude Code 2.1.284, review-army-perf
+  (274 of 300 s) and the ship-docsync fault cases (250-263 of 285 s) sit at
+  88-93% of their budgets; a slow-API census can time them out on either CLI
+  version. Make those skills faster rather than raising budgets. Effort M.
+- **Recurring reds to repair, not rerun** — `plan-design-review-plan-mode`
+  (one ~250 s thinking block before its single write; times out at 300 s on
+  2.1.251 in every recent run) and the HOLD SCOPE
+  routing case when its next brief happens not to name the mode (see the
+  handoff item below). Effort M each.
+- **`/plan-ceo-review` skips its Step 0E mode handoff** — 0 of 15 answered
+  samples sent the required `Mode: <mode>; approved decisions: …` chat after
+  the mode answer, across four wording repairs (none shipped). The model writes
+  the handoff in its reasoning and later says it was "sent above". A prose fix
+  won't reach it; this needs a mechanism outside the prompt (a hook or a
+  tool-result gate). The HOLD SCOPE routing case fails whenever the handoff is
+  skipped and nothing else names the posture in time. Effort M.
+- **Pre-push hook tests hang behind some shard neighbors** — on the free-suite
+  plan for dfe5e733, `test/redact-prepush-hook.test.ts` timed out 6 of 28 tests
+  at 30 s in shard 12 on two attempts (the hook process was still running and
+  killed as dangling); it passes alone in 9 s and in the next plan's shard 12.
+  One of the 29 files that ran before it only in the failing plan (browse CDP/
+  stealth/tab tests, pty-workspace-trust, heredoc-pipe-deadlock among them)
+  leaves state the hook's blocking path waits on. Reproduce with that shard's
+  plan under xvfb and GSTACK_EXPECT_BINARIES=1. Effort S.
+- **Let pass-rate history decide the rest** — every census on this branch had
+  a different handful of single-trial reds. Once `eval:pass-rates` has 10 weekly
+  trials per case, apply the CASE_QUARANTINE entry rule instead of chasing one
+  run at a time. Effort S.
+
+### P2/P3: mvanhorn fix-wave deferrals (filed 2026-10-03, from the autoplan review of the wave)
+
+- **E6 (P2): behavior E2E for design round accounting** — stub `$D` so a
+  generating step reports `saved` shorter than `requested` (and exit 2 for zero
+  saved), run /plan-design-review or /design-shotgun against it, and assert the
+  skill tells the user how many paid images were saved, names the failures and
+  builds no board on zero saved. `test/design-printed-paths.test.ts` only pins
+  the marker order; whether the model reports the count is behavior. Context:
+  #1529. Effort M.
+- **E7 (P3): prune or archive unapproved design rounds** — never-overwrite plus
+  `--retry` attempts and iterate outputs grow
+  `$GSTACK_STATE_ROOT/projects/$SLUG/designs/` without bound. Add a prune or
+  archive command for unapproved rounds and attempts (keep anything an
+  `approved.json` names) and show the design directory size in `$D gallery`.
+  Context: #1529, eng review. Effort S.
+- **E5 (P3): restore verifies assumed items read-only** — `/context-restore`
+  could check `(path assumed)` and `(code read)` items itself with read-only
+  commands (file exists, flag is defined, table has a unique key) and report
+  what it found before offering option A. Context: #3004. Effort M.
+- **E4 (P3): real-desktop Windows console smoke for spawn changes** — #1784 was
+  confirmed fixed on a real Windows 11 desktop by its reporter (v1.91.15.0); CI
+  can only check that spawns pass `windowsHide`. A smoke that starts browse from
+  a console-less parent and watches for new visible windows would catch a
+  regression the static sweep can't. Effort M.
+
+### P2/P3: parallel fix-wave follow-ups (filed 2026-10-02, from the approved fix-wave plan)
+
+- **Agent Skills distribution (#113)** — publish gstack in the Agent Skills
+  format so hosts that read it can install without `./setup`. Do it after the
+  host contract (tiers, capabilities, conformance kit in
+  `docs/ADDING_A_HOST.md`) has settled, so the package carries each host's tier
+  and safety caveat. **Effort:** M. **Priority:** P2.
+- **Telemetry-based severity ranking** — rank open issues and fix-wave
+  candidates by how many installs hit the failing skill or helper
+  (`skill_end` outcomes, refusal counts), not by report volume alone.
+  **Effort:** M. **Priority:** P3.
+- **Periodic paid smoke for the default design model pairing** — run
+  `design/scripts/live-model-check.ts` (one low-quality `gpt-5.5` +
+  `gpt-image-2` image call and one vision call) in the periodic lane so a model
+  retirement or entitlement change shows up before users hit it.
+  `gpt-image-1` retires 2026-10-23; the defaults are only live-checked once,
+  on one account. **Effort:** S. **Priority:** P2.
+- **Bug template that asks for `./setup --status`** — add
+  `.github/ISSUE_TEMPLATE/bug.yml` asking for `./setup --status` output (install
+  rows, render column, tiers) and the host + version, so install reports arrive
+  with the registry state. **Effort:** S. **Priority:** P3.
+- **Decide whether bare `./setup` defaults to `--host auto`** — today bare
+  `./setup` installs Claude only and `--host auto` is opt-in. Decide with the
+  install registry in place: auto would install every detected host, which
+  changes first-run behavior for multi-host users. Product decision.
+  **Effort:** S once decided. **Priority:** P3.
+- **Automate host `full` certification** — the "Certify your host" row in
+  `docs/ADDING_A_HOST.md` is written by hand after the host's periodic cases
+  pass. Generate it from a green periodic run (Codex first: `codex-review`,
+  `codex-discover-skill` on the pinned CLI) and flip `tier` in
+  `hosts/<host>.ts`, `bin/gstack-install-registry.sh`, `./setup --help` and the
+  README matrix in one step. Codex stays `experimental` until then.
+  **Effort:** M. **Priority:** P2.
+- **Prune stale per-install render dirs** — an install deleted by hand leaves
+  its `$GSTACK_STATE_ROOT/render/installs/<host>-<key>/` (and `.root` alias)
+  behind; `gstack_install_registry_reconcile` drops only the registry row.
+  Remove renders with no registry row during reconcile. **Effort:** S.
+  **Priority:** P3.
+- **Remaining worktree-refused skill-specific shapes (#2763 residual)** — the
+  start line, context recovery and every `gstack-slug`/`gstack-paths` eval now
+  run in worktree-isolated Claude Code sessions, but these skill-specific forms
+  are still refused there: `git` inside complex constructs (`$(git … | tr …)`,
+  `--arg x "$(git …)"`, a `$(git …)` assignment followed by other commands);
+  `$B` / `$D` variable command names (browse, design); `eval "$SCOPE_RESULT"`
+  (land-and-deploy); and sourced helpers (`. "$_EG"` egress lib in the Aside
+  blocks, `source …/gstack-codex-probe`). Move each into a helper or a plain
+  literal command, and extend `test/worktree-isolated-shapes.test.ts` to cover
+  it. **Effort:** M. **Priority:** P2.
+- **`gstack-config gbrain-refresh` for non-default installs** — it re-renders
+  only the default global install (`render/claude`). A renamed, vendored or
+  `CLAUDE_CONFIG_DIR` install (per-install render) gets brain-aware blocks only
+  by re-running `./setup` from it. Iterate the registry's render column
+  instead. **Effort:** S. **Priority:** P3.
+
+- **Judge actionability sits exactly at the 4.0 gate** (P2, from the PR #3014 eval
+  census) — all 24 workflow judges score actionability at 4.0 in nearly every run, so one
+  low sample of three fails the case (qa-only 9/78, qa 6/78, plan-ceo modes 5/78, plan-eng
+  sections 4/78, review 4/70 over 09-27..10-02). The repair is clearer skill text per case
+  (as done for qa in v1.91.14.0), not a lower threshold. Effort M.
+- **`--case` cannot select loop-registered paid cases** (P3) — coverage audits, TPA and
+  plan-mode-no-op register their cases in a loop, so `test-paid-shards.ts --case <id>` runs
+  nothing; teach `fileCaseRegistration` the loop pattern. Effort S.
+- **Mid-response `API Error:` in PTY sessions waits out the whole budget** (P3, policy call) —
+  a dropped connection after the first model turn returns the CLI to an idle prompt and the
+  harness waits 300 s. Decide whether the harness should fail fast and classify it. Effort S.
+### P2/P3: Opus 5.5 prompt-cleanup deferrals (filed 2026-10-03)
+
+Each item was deferred with a reason during the `/claude-api prompt-audit` cleanup.
+
+- **Safety rules held: their evals do not discriminate** — the
+  safety-ship-stale-evidence, safety-pair-agent-block, safety-codex-consult-embed
+  and safety-ios-demo-ui-only evals passed 10/10 with the current wording, but
+  their rule-removed arms showed 0/5 violations (2026-10-03, claude-fable-5-1,
+  Claude Code 2.1.284), so they cannot show a rewording is safe. The wording stays
+  until a fixture makes the rule's absence observable. The rules are listed in
+  `test/helpers/safety-rules.ts`. Priority P3. Effort M per fixture.
+- **design-review risk-stop rewording held (R8)** — safety-design-risk-stop
+  discriminates (current wording 10/10, rule removed 1/5 violated), but R8 needs a
+  clean run of the reworded rule on every render that carries it. The copilot,
+  cursor, factory, gbrain, hermes, kiro, openclaw, opencode and slate renders run
+  other models with no runner, and the `.agents` render has no Codex runner for
+  this eval. Narrow the rewording to the design-review render, or add per-host
+  runners. Priority P2. Effort M.
+- **Judge prose and rubric cleanup (W2 deferral)** — the arm, qa health-rubric,
+  qa anti-refusal, cross-skill and voice judges, and the default workflow judge,
+  now send a JSON schema; their prompt-audit s11 M1-M7 prose cleanup is still
+  open, as is the qa anti-refusal rubric's "always … regardless" wording. Two
+  prose steps were triggered and not run: the qa workflow judge (its schema
+  comparison held: 4/24 new flips vs 2/24 old, one new false pass on a06, zero
+  format errors, so it stays on today's request) and the default workflow judge
+  (landed, but one provider refusal on corpus item f03 under the new prompt,
+  matched by one under the old prompt). Reuse `test/fixtures/judge-calibration`
+  and `scripts/judge-calibration.ts`. Priority P3. Effort M.
+- **Uncalibrated workflow-judge configurations** — build corpora and calibrate
+  schema transport for the frontier configuration (review/SKILL.md workflow) and
+  the cookie configuration (setup-browser-cookies/SKILL.md workflow); both stay on
+  today's request. After any transport change, re-run the review and cookie
+  workflow judges. Priority P3. Effort M.
+- **Claude model auto-detection for the skill overlay** — when no
+  `claude_overlay_model` is set, detect the Claude Code model (`ANTHROPIC_MODEL`,
+  user and managed settings `model`) in `./setup` and render its pinned overlay.
+  `./setup --claude-model` is opt-in, so users who never pass it keep the generic
+  overlay. A `/model` switch would leave a stale render, and the pinned overlays
+  are not yet measured against `claude` on their own models.
+  `bin/gstack-render-claude.sh`, its activation record and the change-only banner
+  are in place; detection would record `source=detected`. Depends on: task-result
+  evidence that a pinned overlay beats `claude` on its model. Priority P3.
+- **Per-session overlay selection (E6)** — a runtime hook that follows `/model`
+  switches and serves the matching overlay per session. `./setup --claude-model`
+  is install-wide, so a mid-session switch keeps the installed overlay. Builds on
+  the `--claude-model` render and activation record. Priority P3.
+
 ### P2/P3: impeccable interop deferrals (filed 2026-09-08, from the CEO + eng reviews of docs/designs/IMPECCABLE_INTEROP.md)
 
 Each item was weighed during the review and deferred with a reason; none blocks
@@ -85,11 +253,6 @@ reviews deliberately deferred, each with rationale:
   VERSION bumps without a CHANGELOG entry are a workflow the suite must
   tolerate (`/ship` writes both in one step, so probably not). Effort S
   (human ~2h / CC ~10min). Priority P3. Depends on: none.
-- **Config-key reader tripwire** — `transcript_ingest_mode=off` sat unread for
-  months while setup-gbrain advertised it. A free test that asserts every key
-  in bin/gstack-config's default table is read by at least one binary (or is
-  explicitly listed as prose-only) makes a dead consent switch a red test.
-  Effort S. Priority P2. Depends on: Wave E1 landing the reader.
 - **"Pre-existing" failure vocabulary** — scripts/resolvers/preamble/
   generate-test-failure-triage.ts classifies from `git diff --name-only` and
   never asks for a base-branch run. Rewrite T1 to verified/unverified with the
@@ -144,9 +307,10 @@ wave"). Each was explicitly deferred with rationale, not dropped:
 - **#2443 AskUserQuestion numbering redesign** — real mismatch (brief letters
   vs host-rendered numbers), but a prompt-behavior redesign that shifts eval
   baselines; needs its own PR with baseline refresh. Effort S.
-- **#2447 typecheck infra** — tsconfig + repo-wide typecheck script + latent
-  type fixes. High-value, repo-wide blast radius, own PR with bake time.
-  Effort M. Re-derive on current main (several of its fixes landed since).
+- ~~**#2447 typecheck infra**~~ — superseded: the audit fix wave (v1.91.12.0)
+  added `tsconfig.json`, `bun run typecheck` (zero product errors) and the
+  `typecheck:test` ratchet inside the required `free-tests` check, reusing
+  #2447's fixes where they still applied.
 - **#2492 per-project Chromium profile** — needs an on-disk migration story
   for the machine-wide profile default and SingletonLock scoping. Effort M.
 - **#2286 `triggers:` frontmatter** — the Claude Code router never reads the
@@ -502,33 +666,23 @@ touchfiles and re-offer pending ones on the next interactive run.
 false) permanently misses the artifacts-rename migration unless they paste the
 manual command. **Effort:** M. **Priority:** P2.
 
-### P2: periodic tier — TWO documented-red tests need structural repair (was three)
+### ✅ DONE (2026-10-02, parallel-waves fix wave): #1882 — portable skill-install prefix (non-`gstack` install dirs break silently)
 
-**2026-08-29 update (test-infra overhaul):** (1) the sidebar E2E trio is
-ALREADY DELETED — no file in the tree POSTs to /sidebar-command or
-/sidebar-chat; only tombstone tests remain (browse/test/sidebar-tabs.test.ts
-asserts the endpoints STAY deleted), so part (1) closes as already-done.
-(2) skill-e2e-ship-idempotency and (3) skill-e2e-brain-privacy-gate are now
-EXCLUDED from the weekly lane with tracking
-(test/helpers/periodic-exclude-data.ts) — removing their entries re-activates
-them; the structural investigations below are the re-entry condition.
+**Resolved:** setup now renders any Claude install whose root is not
+`~/.claude/skills/gstack` (renamed checkout, project-vendored copy,
+`CLAUDE_CONFIG_DIR`) and any global Codex root other than `~/.codex/skills/gstack`
+(`CODEX_HOME`) into its own per-install render under
+`$GSTACK_STATE_ROOT/render/installs/<host>-<key>/`, links from it, and records
+it in the install registry; `gstack-relink` keeps serving that render. A root
+with spaces is named through a space-free alias symlink, because
+worktree-isolated Claude Code sessions refuse any command path with a space.
+Guarded by `test/host-conformance.test.ts` "renamed, vendored and
+space-in-path installs start skills from their own root (#1882)" and
+"CLAUDE_CONFIG_DIR and CODEX_HOME installs name their own roots". Follow-ups
+are filed under "Parallel fix-wave follow-ups" (gbrain-refresh for non-default
+installs, pruning stale render dirs). Original filing below.
 
-**What:** (1) The sidebar E2E trio (navigate, url-accuracy, css-interaction)
-POSTs to /sidebar-command and /sidebar-chat — endpoints removed on every tree
-when the PTY terminal replaced the chat queue (server.ts tombstone ~2671);
-rewrite them against the PTY surface or delete them. (2)
-skill-e2e-ship-idempotency: the PTY child sits at the Claude Code welcome
-screen in plan mode for the full budget — the typed /ship never lands
-(readiness/typing race vs CLI v2.1.233's welcome screen); never green since
-it was born in v1.63. (3) skill-e2e-brain-privacy-gate: never green anywhere;
-the artifacts-sync stop-gate preconditions don't survive the hermetic env
-even with per-test HOME/GSTACK_HOME injection — needs a transcript-level
-debug of what the child's preamble actually echoes.
-
-**Why:** every red periodic run costs triage time; two of these have burned
-three triage passes across two releases. **Effort:** M. **Priority:** P2.
-
-### P1: #1882 — portable skill-install prefix (non-`gstack` install dirs break silently)
+#### Original filing (closed)
 
 **What:** Every generated SKILL.md hardcodes the literal `~/.claude/skills/gstack/...`
 for its `bin/`/asset calls (the per-invocation telemetry/config preamble plus ~9
@@ -667,41 +821,32 @@ identity-based answer.
 
 **Effort:** S. **Priority:** P3. **Depends on:** none.
 
-### P3: one state-root rule for the bridge's four stores
+### P3: next refactor wave (from the 2026-09 refactor wave survey)
 
-**What:** The hook, `bin/gstack-config` and `bin/gstack-memorable` resolve
-their root as `GSTACK_STATE_ROOT` > `GSTACK_HOME` > `GSTACK_STATE_DIR`; the
-egress ledger (`lib/egress-receipt.ts`) honors `GSTACK_HOME` >
-`GSTACK_STATE_DIR`; the trust-policy store (`lib/gbrain-repo-policy-client.ts`)
-only `GSTACK_HOME`; `bin/gstack-uninstall` deletes only
-`${GSTACK_STATE_DIR:-$HOME/.gstack}`. Extract one shared rule (a
-`lib/state-root.ts` plus its bash twin) and use it everywhere.
+**What:** Hotspots the 1.91.11.0 wave surveyed but did not refactor, plus
+bugs it found and left alone because fixing them changes behavior:
+- `bin/gstack-memory-ingest.ts` (2,674 lines; `ingestPass` is ~600 lines).
+- `scripts/resolvers/design.ts` `generateDesignMethodology` (503 lines).
+- `browse/src/browser-manager.ts` (2,143 lines) and `browse/src/cli.ts` (2,018 lines).
+- `lib/cso/*` dense one-line style.
+- Browse root-token denials disagree: some routes answer 401 `Unauthorized`,
+  others 403 `Root token required`. The route table's per-kind denial map
+  (`browse/src/routes/table.ts`) pins today's split.
+- The sidebar's inspector live updates never arrive: `/inspector/events` is
+  `root-bearer` (it sat behind the old blanket root check), but
+  `extension/sidepanel.js` opens it with a cookie-only EventSource, and it
+  listens for `inspectResult` while the server emits `state` / `inspector`.
+  Fix both together, then flip the cookie rows in
+  `browse/test/server-route-auth-blackbox.test.ts`.
+- Claude Code plugin-mode state (a pointer from `~/.gstack` to
+  `CLAUDE_PLUGIN_DATA`, plus merge, `--explain` and uninstall participation),
+  deferred by the W1 evidence gate: no official plugin distribution exists.
+- The CSO native launchers (`lib/cso/launcher*.c`) pass only `HOME`,
+  `GSTACK_HOME` and `CLAUDE_PLUGIN_*` to the core, so `/cso` ignores an
+  exported `GSTACK_STATE_ROOT` / `GSTACK_STATE_DIR`. Needs a native rebuild.
+- TODOS.md itself (4,500+ lines) needs restructuring.
 
-**Why:** With `GSTACK_STATE_ROOT` set, the gate lives under one directory and
-the receipts under another; the tests pin all three variables to one temp dir,
-so the drift is invisible to them. Found by the /ship red team.
-
-**Context:** Uninstall already flips `memorable_recall` off whenever it reads
-`on`, kept state or not (through gstack-config's own resolution), so no config
-can say `on` after the hook is gone; the remaining drift is observability, not
-consent.
-
-**Effort:** S (human ~3 h / CC+gstack ~20 min). **Priority:** P3.
-**Depends on:** none.
-
-### P3: shared hook logging helper
-
-**What:** `stateRoot()` and the `hook-errors.log` appender now exist in five
-hooks (`question-log`, `question-preference`, `auq-error-fallback`,
-`timeline-stop`, `memorable-user-prompt`), with drifting env-var precedence.
-Extract `hosts/claude/hooks/hook-log.ts` (root resolution, 0600 append, the
-rate limiter the memorable hook added) and migrate the five.
-
-**Why:** One place to fix precedence and file modes; the memorable hook's
-rate limiter belongs to every hook that can fail on every prompt.
-
-**Effort:** S (human ~2 h / CC+gstack ~15 min). **Priority:** P3.
-**Depends on:** the state-root rule above.
+**Effort:** M per item. **Priority:** P3.
 
 ## Aside integration follow-ups (filed via /plan-ceo-review + /plan-eng-review on the third-party-actions Aside plan)
 
@@ -774,7 +919,179 @@ audit trail lives in Aside.
 **Priority:** P3
 **Depends on:** None.
 
+## Browser cookie import follow-ups (filed via /autoplan on the Windows Opera fix wave, #2980/#2957)
+
+### P2: Preserve receipts when key acquisition fails in a mixed batch
+
+**What:** `importCookies` derives the key for the whole batch before the row loop, so one v10 row plus a DPAPI/Keychain failure throws a typed key error and loses plaintext and App-Bound counts for the other rows.
+
+**Why:** A mixed plaintext + v20 + v10 batch with an unavailable key reports only the key error; recoverable plaintext cookies and the unsupported-encryption count disappear.
+
+**Context:** Raised by the outside Eng voice. Deferred because turning a thrown typed key error into partial receipts changes a cross-platform contract, including macOS Keychain "click Allow and retry" prompts. Start at `getDerivedKeys` call in `browse/src/cookie-import-browser.ts` `importCookies`.
+
+**Effort:** M (human ~1 day / CC+gstack ~30 min). **Priority:** P2.
+**Depends on:** a decision on how retry-able key errors surface in a receipt.
+
+### P3: Use the SHA-256(host_key) check on the macOS/Linux CBC path
+
+**What:** The CBC branch of `decryptCookieValue` always drops 32 bytes; databases older than Chromium meta version 24 have no prefix, so their values lose 32 real bytes.
+
+**Why:** Same correctness rule the Windows GCM branch now uses (strip only when the first 32 bytes equal SHA-256(host_key)).
+
+**Context:** Found during the Opera wave's Eng review; affects only old profiles. yt-dlp keys this on `meta.version >= 24`.
+
+**Effort:** S (human ~2 h / CC+gstack ~10 min). **Priority:** P3.
+**Depends on:** nothing.
+
+### P3: macOS and Linux Opera / Opera GX cookie import
+
+**What:** Register Opera on macOS (`~/Library/Application Support/com.operasoftware.Opera`, GX `com.operasoftware.OperaGX`) and Linux (`~/.config/opera`).
+
+**Why:** Opera users off Windows get "available on Windows only".
+
+**Context:** Paths from yt-dlp's `cookies.py`; Keychain service and libsecret application names are unverified. Needs a person on each OS.
+
+**Effort:** M (human ~1 day / CC+gstack ~30 min plus hardware verification). **Priority:** P3.
+**Depends on:** a tester on macOS and Linux.
+
+### P3: Opera Beta/Developer and Opera GX channel directories
+
+**What:** Detect `Opera Next`/`Opera Developer`/GX beta user-data directories.
+
+**Why:** Channel users are currently "not found".
+
+**Context:** Directory names are unverified; add registry rows once confirmed on hardware.
+
+**Effort:** S. **Priority:** P3. **Depends on:** confirmed directory names.
+
+### P3: Opera side profiles (`_side_profiles/<id>/`)
+
+**What:** Opera GX stores extra profiles under `<root>\_side_profiles\<id>\`, which `listProfiles`, `validateProfile` and the native profile regex do not accept.
+
+**Why:** Side-profile users only see their main profile.
+
+**Context:** Needs a profile-naming rule beyond `Default`/`Profile N` and an account-selection safety review.
+
+**Effort:** M. **Priority:** P3. **Depends on:** a real side-profile layout sample.
+
+### P3: Legacy root-level Opera layouts
+
+**What:** Older Opera stored cookies at `<root>\Network\Cookies` with no `Default\`.
+
+**Why:** Old installs report "not found".
+
+**Context:** Cut from the wave by both CEO voices: a stale root DB can be imported as the wrong account when side profiles or a migrated `Default\` exist. Sources: yt-dlp, forensics guides. Build only on a real report, with stale-root/side-profile coexistence tests.
+
+**Effort:** S-M. **Priority:** P3. **Depends on:** a user report with this layout.
+
+### P3: User-supplied Chromium user-data path option
+
+**What:** A yt-dlp-style `chrome:PATH` option for portable or relocated installs and unlisted forks.
+
+**Why:** Each new fork currently needs a registry change and a release.
+
+**Context:** `ARCHITECTURE.md` prefers a hardcoded registry for safety; needs a threat review (arbitrary paths, key sources) before building.
+
+**Effort:** M. **Priority:** P3. **Depends on:** threat review.
+
 ## Test infrastructure
+
+### Automatic exclusion policy for chronically red periodic files (P3)
+
+**What:** A weekly periodic file that stays red for several consecutive runs keeps burning slice minutes
+until someone triages it by hand (the five finding-count evals were red eight runs straight before the
+2026-09 audit retired them). Add a report step that, after N consecutive reds, opens a PR adding the file
+to `PERIODIC_CI_EXCLUDE` with its failing run links, a tracking entry and a re-entry condition.
+
+**Re-entry / done when:** the periodic report proposes the exclusion automatically and a human approves it.
+
+### P3: Collapse the native-completion negative table
+
+**What:** After the 2026-09 audit the 14-mutation "native completion and menu ownership" table survives
+only in `test/eng-first-review.test.ts` (14 per-incident copies), `test/plan-count-completion.test.ts`
+and `test/dx-selected-navigation-ap.test.ts`. One shared table run once against a canonical call is sound
+only after `engFirstReviewAUQ` checks native completion once at entry; today each branch gates it
+separately, so the change alters a paid verdict and needs its own paid run.
+
+### P3: Re-pin the five remaining claude-opus-4-7 paid files
+
+**What:** The 2026-09 audit moved seven paid evals to the default capture model (`resolveEvalModel('capture')`).
+`skill-e2e-design`, `skill-e2e-office-hours-phase4`, `skill-e2e-plan-prosons` and `skill-e2e-plan` keep
+`claude-opus-4-7` because six cases failed on the default model in one run (plan-design-review-plan-mode timeout,
+office-hours-phase4-fork format, plan-review-prosons-neutral-neg missing output, plan-ceo-review-selective and
+plan-eng-review 600 s timeouts, plan-ceo-review-expansion-energy posture score 3). `skill-e2e-qa-bugs` returned
+to `claude-opus-4-7` after `qa-b6-static` timed out on the default model in two of three runs (census 36597762183
+and a targeted local rerun): each time the stream stopped mid-message, with no pending tool, right after the model
+found the disabled submit button, and emitted nothing until the 300 s case deadline. They measure an old model.
+
+**Re-entry:** fix the prompt, budget or rubric so each case passes on the default model in one run, then drop the pin.
+
+### P3: Retire the unused CEO payment seeder
+
+**What:** `seedCeoPaymentProject` and `pickSuppliedCeoPlanStart` in `test/helpers/ceo-finding-fixture.ts`
+and `test/fixtures/ceo-existing-payment/` lost their only paid consumer when the CEO finding-count eval
+was retired; the fixture tests in `test/ceo-finding-fixture.test.ts` still exercise them. Delete the
+seeder, its fixture and those tests together.
+
+### P3: No paid eval runs the full /autoplan chain
+
+**What:** `skill-e2e-autoplan-chain` was retired (it never reached a product
+verdict: launch failures, then 85-minute budget overruns). Phase order is still
+enforced by `autoplan/bin/phase-publication-hook.ts` and pinned by the free
+`test/autoplan-publication-guard.test.ts`, and `skill-e2e-autoplan-dual-voice`
+covers CEO Phase 1 dispatch. Nothing proves a live model completes
+CEO → Design → DX → Eng or reads the required phase sections
+(`CARVE_GUARDS.autoplan` is `behavioral: 'none'`).
+
+**Re-entry:** a chain eval that fits the ordinary PTY tiers, for example one that
+runs the no-UI, no-DX path (CEO then Eng) and asserts the section reads.
+
+### P3: CI-unrunnable paid evals
+
+**Codex part DONE (2026-10-02, parallel-waves fix wave):** the CI image now
+installs a pinned Codex CLI off PATH (`GSTACK_CI_CODEX_BIN_DIR`), paid lanes log
+it in under a CI-only home, and `scopeCodexAccess()` in `scripts/lib/paid-cases.ts`
+exposes it only to the Codex files (`codex-e2e`, `codex-e2e-sol-scope`,
+`codex-e2e-shared-libs`, `codex-e2e-recommendation-substance`,
+`skill-e2e-outside-voice`, `skill-e2e-outside-plan-disabled`) and the
+`codex-review` case. Those five excluded files left `PERIODIC_CI_EXCLUDE`;
+`test/codex-ci-access.test.ts` pins the scoping.
+
+**What (remaining):** Two paid files cannot execute in the CI image (no
+macOS/Aside, no physical iPhone), so the weekly periodic lane scheduled them as
+green shards that verified nothing. They stay in `PERIODIC_CI_EXCLUDE`
+(`test/helpers/periodic-exclude-data.ts`): `skill-e2e-aside`,
+`skill-e2e-ios-device`. One case
+inside a case-sharded file is excluded the same way through `CASE_CI_EXCLUDE`:
+`test/skill-e2e-design.test.ts#design-review-fix` (needs Aside). They still
+run locally on a machine that has the CLI or device.
+
+**Re-entry:** the device or Aside is available to a CI runner. Remove each
+file's exclude entry when its prerequisite exists.
+
+**Review by:** 2026-12-28. **Effort:** S per file. **Priority:** P3.
+
+### ✅ DONE (2026-10-02, parallel-waves fix wave): Install the Codex CLI in the CI image
+
+**Resolved:** `.github/docker/Dockerfile.ci` pins `@openai/codex` off PATH; the
+paid workflows run `codex login --with-api-key` from the `OPENAI_API_KEY` secret
+into `$HOME/.gstack-ci-codex` (exported only as `GSTACK_CI_CODEX_HOME`), and only
+Codex shards see it. Guarded by `test/ci-image-cli-pin.test.ts` and
+`test/codex-ci-access.test.ts`. Recorded durations for the re-entered files are
+still ~0, so the periodic planner learns them from the first runs.
+
+#### Original filing (closed)
+
+**What:** Add `@openai/codex` to `.github/docker/Dockerfile.ci` and provide a
+Codex `auth.json` as a CI secret so the four `codex-e2e*` files and
+`skill-e2e-outside-voice` can leave `PERIODIC_CI_EXCLUDE`.
+
+**Cost estimate:** image build +1 npm global install (~30 s per image build);
+weekly model spend on the order of the repo's periodic rule of thumb, ~$1 per
+file per run, so ~$5/week for the five files, billed to the Codex account
+behind the secret. **Risk:** a long-lived credential in CI.
+
+**Effort:** S. **Priority:** P3.
 
 ### P1: skillify gate test red — HOME-override sessions never discover project skills (pre-existing)
 
@@ -885,11 +1202,12 @@ coverage fill. Remaining, in rough priority order:
   CLI reads a local `eval <file>` itself and sends the code as `js` (
   semantics-preserving; keep the daemon path for remote callers), plus a
   namespace hint appended to read-commands.ts:313's error. Effort S.
-- **P2 — PTY boot-readiness wait.** The PTY tests' Bun.sleep(8000) preludes
-  and invokeAndObserve's 6s boot_grace_ms are blind waits; a real readiness
-  waitFor needs empirical CLI 2.1.x ready-marker probing in a working
-  terminal environment (this sandbox's PTY probe wedged). Effort S, needs a
-  dev machine.
+- **P2 — PTY boot-readiness wait (paid runner).** Free fake-CLI tests now pass
+  `startupReadyMarker` (plan-count-history since the 2026-09 audit). The paid
+  runner's real-CLI path (`runPlanSkillCounting` without a marker) and
+  `test/pty-screen-session.test.ts` still pay the blind 8 s wait; a real
+  readiness waitFor needs empirical CLI 2.1.x ready-marker probing in a working
+  terminal environment. Effort S, needs a dev machine.
 - **P2 — single typed test registry.** Paid globs, tiers, touchfiles keys,
   and exclusions are still separate literal authorities synced by tripwires;
   derive them from one registry and the drift class dies structurally
@@ -905,9 +1223,8 @@ coverage fill. Remaining, in rough priority order:
 - **P3 — eval-list should exclude _partial runs** (pinned as current
   behavior in test/eval-cli-family.test.ts with an improvement note).
   Effort S.
-- **P3 — codex-e2e-plan-format's testIfSelected names have no map keys**
-  (run-all only today) + 15 E2E / 2 judge PHANTOM touchfiles keys select
-  tests that exist nowhere — add keys or delete, one sweep. Effort S.
+- **P3 — 15 E2E / 2 judge PHANTOM touchfiles keys** select tests that exist
+  nowhere — add keys or delete, one sweep. Effort S.
 - **P3 — first-execution rot from the sliced lane's first live runs: 2 of 3
   FIXED** (PR #2721): (a) ✅ skillify family — root cause was HOME==cwd
   making claude treat <cwd>/.claude/skills as the PERSONAL dir (project
@@ -1495,7 +1812,10 @@ free suite in one tree; CLAUDE.md's "Deploying to the active skill" flow
 (Claude adversarial M4, Codex adversarial P2, red team C-70).
 **Priority:** P2. **Effort:** S (human ~half day / CC ~20min).
 
-### P3: Codex periodic CI shards never execute (no codex CLI in Dockerfile.ci)
+### ✅ DONE (2026-10-02, parallel-waves fix wave): Codex periodic CI shards never execute (no codex CLI in Dockerfile.ci)
+
+Resolved by "Install the Codex CLI in the CI image" (Test infrastructure).
+
 
 **What:** `evals-periodic.yml` carries `e2e-codex`, and now `e2e-codex-sol-scope`,
 but the CI image installs only claude-code, so both shards boot, skip everything,
@@ -1893,6 +2213,13 @@ plus a TTL so abandoned PTYs eventually exit.
 
 **Priority:** P2.
 **Effort:** S (CC: ~30 min once fixture exists). Captured from v1.21.1.0 plan-eng-review D2.
+
+**Status (2026-09):** The four `skill-e2e-plan-*-finding-count` evals were retired
+after eight red weekly runs whose failures were harness and budget, not skill
+behavior. The `*-finding-floor` evals assert at least one AskUserQuestion, not one
+per finding, so this contract has no paid coverage today. Re-entry test: a
+qid-keyed per-finding count on a multi-finding fixture with `QUESTION_TUNING: true`
+(the `<gstack-qid:…>` markers only appear with tuning on).
 
 ---
 
@@ -3079,7 +3406,7 @@ files have no `evals.yml` matrix row, so CI never runs them
 (`KNOWN_MATRIX_GAPS` in the test enumerates them — notably the plan-mode and
 finding-floor smokes and the AUQ format-compliance gate). (2) Four matrix rows
 point at whole-file tier-gated files but set no row `tier:` property, so with
-`EVALS_TIER` unexported those suites self-skip: `codex-e2e`/`gemini-e2e` run
+`EVALS_TIER` unexported those suites self-skip: `codex-e2e` runs
 ZERO tests and report green on every PR (vestigial rows; the periodic cron
 lane owns them — consider deleting the rows), and `e2e-pty-plan-smoke` spends
 ~7 min on setup then skips every describe (hollow-green since the files
@@ -3757,7 +4084,7 @@ the browse files with no "Ran N tests" summary. Receipts:
 ### Pre-existing test failures surfaced during v1.12.0.0 ship — RESOLVED
 
 - `test/brain-sync.test.ts` GSTACK_HOME isolation fixed on main in v1.13.0.0.
-- `test/model-overlay-opus-4-7.test.ts` updated on main to match the new overlay content (the v1.10.1.0 removal of "Fan out explicitly" was correct — measured −60pp fanout vs baseline).
+- The Opus 4.7 overlay test (now a block in `test/model-overlays.test.ts`) updated on main to match the new overlay content (the v1.10.1.0 removal of "Fan out explicitly" was correct — measured −60pp fanout vs baseline).
 
 **Completed:** v1.13.0.0 (2026-04-25, on main)
 
@@ -3776,7 +4103,7 @@ the browse files with no "Ran N tests" summary. Receipts:
 
 - **Fixed the `bearer-token-json` regression in `bin/gstack-brain-sync`** — the value charset `[A-Za-z0-9_./+=-]{16,}` didn't permit spaces, so auth headers with the standard `Bearer <token>` form (literal space after the scheme name) slipped past the scanner. Added an optional `(Bearer |Basic |Token )?` prefix to the pattern. Validated against 5 positive cases (including the regression fixture) + 3 negative cases (short tokens, non-secret keys, random JSON). The 7-pattern secret scanner now passes all fixtures including bearer-json.
 - **Added `test/gstack-brain-init-gh-mock.test.ts`** — 8 tests exercising the `gh` CLI auto-create path that previously had zero coverage. Stubs `gh` on PATH to record every call, asserts `gh repo create --private --description "..." --source <GSTACK_HOME>` fires with the computed `gstack-brain-<user>` default name. Covers: happy path, fall-through-to-`gh repo view` when create hits already-exists, user-provided-URL-bypasses-gh, gh-not-on-path prompts for URL, gh-not-authed prompts for URL, idempotent `--remote` re-runs, conflicting-remote rejection.
-- **Added `test/skill-e2e-brain-privacy-gate.test.ts`** — periodic-tier E2E (~$0.30-$0.50/run). Stages a fake `gbrain` on PATH + `gbrain_sync_mode_prompted=false` in config, runs a real skill via `runAgentSdkTest`, intercepts tool-use via `canUseTool`, and asserts the preamble fires the 3-option privacy AskUserQuestion with canonical prose ("publish session memory" / "artifact" / "decline"). Second test asserts the gate is silent when `prompted=true` (idempotency-within-session).
+- **Added the brain privacy-gate E2E** (retired as never green in the 2026-09 test audit; `test/gstack-skill-start.test.ts` now pins consent before egress) — periodic-tier E2E (~$0.30-$0.50/run). Stages a fake `gbrain` on PATH + `gbrain_sync_mode_prompted=false` in config, runs a real skill via `runAgentSdkTest`, intercepts tool-use via `canUseTool`, and asserts the preamble fires the 3-option privacy AskUserQuestion with canonical prose ("publish session memory" / "artifact" / "decline"). Second test asserts the gate is silent when `prompted=true` (idempotency-within-session).
 - **Registered `brain-privacy-gate` in `test/helpers/touchfiles.ts`** (periodic tier) with dependency tracking on `scripts/resolvers/preamble/generate-brain-sync-block.ts`, `bin/gstack-brain-sync`, `bin/gstack-brain-init`, `bin/gstack-config`, and the Agent SDK runner. Diff-based selection will re-run the E2E whenever any of those change.
 
 **Completed:** v1.12.0.0 (2026-04-24)
@@ -4027,9 +4354,9 @@ makes live agents start skipping a section. The canary is the only
 mechanism that catches that, from real usage.
 
 **Context:** Deferred from the carve-guard-hardening plan (D5→T2, codex
-outside-voice #7). `test/helpers/transcript-section-logger.ts` exists but
-is built for deterministic test transcripts + ship action fingerprints,
-NOT real-session drift — it needs rework before it can back this. Ship
+outside-voice #7). The deterministic `test/helpers/transcript-section-logger.ts`
+was deleted in the 2026-09 test audit (no paid or production caller; see
+docs/test-audit-2026-09.md); a real-session logger starts from scratch. Ship
 the deterministic guards first; add this once they've proven useful. The
 carved-skill set + each skill's `requiredReads` are already declared in
 `test/helpers/carve-guards.ts`, so the canary reads its expectations
@@ -4037,7 +4364,7 @@ from there.
 
 **Effort:** M (human ~2d, CC ~4h).
 
-**Depends on:** `transcript-section-logger.ts` real-session-drift rework.
+**Depends on:** a real-session section-read logger (none exists today).
 
 ### P2: Harden behavioral section-loading test hermeticity
 

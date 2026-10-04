@@ -1,4 +1,4 @@
-import { generateAdversarialStep } from '../scripts/resolvers/review';
+import { generateAdversarialStep } from '../scripts/resolvers/outside-voice-steps';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 /**
  * Static guard for cross-model synthesis recommendation emit instructions.
@@ -51,14 +51,14 @@ describe('cross-model synthesis emit instructions', () => {
     expect(tmpl).toMatch(/Recommendation:\s*<action>\s*because/);
   });
 
-  test('scripts/resolvers/review.ts Claude adversarial subagent prompt requires Recommendation', () => {
+  test('scripts/resolvers/outside-voice-steps.ts Claude adversarial subagent prompt requires Recommendation', () => {
     const resolver = generateAdversarialStep({ host: 'claude', paths: HOST_PATHS.claude, skillName: 'review', tmplPath: 'review/SKILL.md.tmpl' });
     // The Claude subagent prompt must instruct the model to emit a final
     // canonical Recommendation line.
     expect(resolver).toMatch(/Claude adversarial subagent[\s\S]+?Recommendation:\s*<action>\s*because/);
   });
 
-  test('scripts/resolvers/review.ts Codex adversarial command requires Recommendation', () => {
+  test('scripts/resolvers/outside-voice-steps.ts Codex adversarial command requires Recommendation', () => {
     const resolver = generateAdversarialStep({ host: 'claude', paths: HOST_PATHS.claude, skillName: 'review', tmplPath: 'review/SKILL.md.tmpl' });
     // The codex exec command's prompt string must include the emit
     // instruction. Match within the codex adversarial section.

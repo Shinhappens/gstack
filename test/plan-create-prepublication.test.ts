@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import {createHash} from 'node:crypto';
 import {createFilePermissionRecorder,recordFilePermission,currentFilePermissionEpoch,readPendingWriteInput} from './helpers/plan-count-file-permission';
 import {readPlanCountTranscript} from './helpers/plan-count-transcript';
-import {createPlanCountPermissionGuard} from './helpers/claude-pty-runner';
+import {createPlanCountPermissionGuard,countingCapture,type CountingRun} from './helpers/claude-pty-runner';
 import {createPlanCountSnapshotWriter} from './helpers/plan-count-artifacts';
 import captured from './fixtures/plan-create-prepublication-491.json';
 
@@ -137,29 +137,31 @@ test('legacy published Write metadata remains sufficient without a sidecar',()=>
 });
 
 // Execute only the actual count capture assembly with its real reader/writer.
-// This is not a full counting-loop execution; existing count throw/timeout tests
+// This calls the counting runner's capture step directly, not a full loop; existing count throw/timeout tests
 // separately prove that the lifecycle invokes capture before fixture disposal.
 test('count capture assembly retains exact prepublication input through refresh, throw and fixture cleanup',()=>{
  const f=fixture(),evalDir=fs.mkdtempSync(path.join(os.tmpdir(),'count-write-retention-'));
  try {
   f.hook();const expected=readPendingWriteInput(f.recorder.file,f.expected,f.cwd,f.config,f.startedAt);
   expect(expected).toBeDefined();
-  const source=fs.readFileSync(path.join(import.meta.dir,'helpers/claude-pty-runner.ts'),'utf8');
-  const start=source.indexOf('  const capture = (observation: object) => saveSnapshot({',source.indexOf('export async function runPlanSkillCounting('));
-  const end=source.indexOf('\n  });',start);
-  expect(start).toBeGreaterThan(0);expect(end).toBeGreaterThan(start);
-  const code=new Bun.Transpiler({loader:'ts'}).transformSync(source.slice(start,end+6)+'\nreturn capture;');
-  const capture=new Function('saveSnapshot','opts','ownedFilePermissions','readPendingWriteInput','fixture','session','startedAt','viewport',code)(
-   createPlanCountSnapshotWriter({EVALS_RUN_ID:'count-prepublication-free',GSTACK_EVAL_DIR:evalDir}),
-   {skillName:'plan-eng-review'},[{file:f.recorder.file,expected:f.expected}],readPendingWriteInput,
-   {cwd:f.cwd},{hermeticConfigDir:f.config,rawOutput:()=>f.screen,visibleText:()=>f.screen},f.startedAt,f.screen);
+  // The runner's own capture step, called with the state it builds for an attempt.
+  const run={opts:{skillName:'plan-eng-review'},fixture:{cwd:f.cwd},startedAt:f.startedAt,viewport:f.screen,
+   ownedFilePermissions:[{file:f.recorder.file,expected:f.expected}],
+   saveSnapshot:createPlanCountSnapshotWriter({EVALS_RUN_ID:'count-prepublication-free',GSTACK_EVAL_DIR:evalDir})} as unknown as CountingRun;
+  const capture=(observation:object)=>countingCapture(run,{hermeticConfigDir:f.config,rawOutput:()=>f.screen,visibleText:()=>f.screen},observation);
   const progress=capture({state:'in_progress'});
+  expect(progress.artifactError).toBeUndefined();expect(progress.artifactDir).toBeDefined();
+  const initial=JSON.parse(fs.readFileSync(path.join(progress.artifactDir,'observation.json'),'utf8'));
+  expect(initial.state).toBe('in_progress');expect(initial.pendingWriteInputs).toEqual([expected]);expect(initial.publicTools).toEqual([]);
+  const published=f.native('assistant',[f.block()]);f.write([...f.base,published]);
   const thrown=capture({state:'threw',error:'controlled caller interruption'});
   expect(thrown.artifactDir).toBe(progress.artifactDir);expect(thrown.artifactError).toBeUndefined();
   f.close();
   const saved=JSON.parse(fs.readFileSync(path.join(thrown.artifactDir,'observation.json'),'utf8'));
   expect(saved.state).toBe('threw');expect(saved.error).toBe('controlled caller interruption');
   expect(saved.pendingWriteInputs).toEqual([expected]);expect(fs.existsSync(f.recorder.file)).toBe(false);
+  expect(saved.publicTools).toEqual([{sessionId:f.sid,timestamp:published.timestamp,toolUseId:f.id,kind:'use',name:'Write',input:f.input}]);
+  expect(fs.existsSync(f.sidecar)).toBe(false);expect(fs.existsSync(f.journal)).toBe(false);
   expect(fs.readFileSync(path.join(thrown.artifactDir,'terminal.screen.log'),'utf8')).toBe(f.screen);
   expect(fs.statSync(path.join(thrown.artifactDir,'observation.json')).mode&0o777).toBe(0o600);
  }finally{f.close();fs.rmSync(evalDir,{recursive:true,force:true});}

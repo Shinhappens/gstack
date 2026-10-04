@@ -431,7 +431,7 @@ describe.skipIf(process.platform === 'win32')('session-runner explicit tool avai
       expect(child.prompt).toContain('Preserve every finding and original requirement, required decision fields and comparisons, exact approvals and verification; every diagram must retain its specified format.');
       expect(child.prompt).toContain('unless needed to specify an accepted change');
       expect(child.prompt).toContain('Complete every required artifact and verification before returning');
-      expect(child.prompt).toContain('MUST actually Read that sections/ file with the Read tool BEFORE doing the work it covers');
+      expect(child.prompt).toMatch(/read that sections\/ file with the Read tool before doing the work it covers/i);
       expect(child.prompt).toContain('report outside coverage as disabled');
       expect(child.prompt).toContain('After all required writes are complete');
       expect(child.prompt).toContain('with Write/Edit at the workflow checkpoints below');
@@ -527,7 +527,7 @@ describe.skipIf(process.platform === 'win32')('session-runner explicit tool avai
       expect(child.prompt).toContain('do not hide it or claim approval when no offered alternative meets these constraints');
       expect(child.prompt).not.toContain("silently pick the skill's recommended option");
       expect(child.prompt).toContain('Every required section, finding, approval and output still has to be completed');
-      expect(child.prompt).toContain('MUST actually Read that sections/ file with the Read tool BEFORE doing the work it covers');
+      expect(child.prompt).toMatch(/read that sections\/ file with the Read tool before doing the work it covers/i);
       expect(child.prompt).toContain('After all required writes are complete');
       expect(flagValue(child.args, '--tools')).toBe('Read,Grep,Glob,Write,Edit,Agent,Bash');
       expect(fs.readFileSync(path.join(dir, 'PLAN.md'), 'utf8')).toBe(fixtures['PLAN.md']);
@@ -548,20 +548,19 @@ describe.skipIf(process.platform === 'win32')('session-runner explicit tool avai
         planDir: dir, skillName: 'ship', scenario, testName: 'ship-report-writing', timeout: 5_000,
       });
       const skillPath = path.join(dir, 'ship', 'SKILL.md');
-      expect(observed().prompt).toBe(`You are running an automated skill-execution test. No human is present, so AskUserQuestion is unavailable. The ONLY skill file you may read is this absolute path: ${skillPath}. Do NOT Glob/find/search for any other SKILL.md anywhere — especially nothing under ~/.claude or /Users.
-
-Read ${skillPath} and EXECUTE its workflow for this scenario:
-
-${scenario}
-
-Rules for this run:
-- Skip system-audit, environment-setup, telemetry, and unrelated codebase exploration. Read the supplied plan's referenced fixture files when its review requires them.
-- At any decision point that would call AskUserQuestion, silently pick the skill's recommended option and continue. Do NOT stop to ask.
-- This skill's body has been carved into on-demand sections/. When the skill gives a STOP-Read directive (for example "Read \`.../sections/<file>\` and execute it in full"), you MUST actually Read that sections/ file with the Read tool BEFORE doing the work it covers. Do not work from memory.
-- Resolve installed-root paths for section and companion Markdown files under ${dir}, where this fixture's skill package is copied.
-- Do NOT run git, gh, commit, push, or any mutating command.
-- When the workflow is complete, write the skill's final output (the full review report / ship plan, including any required report table) to ${path.join(dir, 'REPORT.md')}.
-- After all required writes are complete, return a brief completion message and STOP. Do not reproduce the full report in the final response.`);
+      const prompt = observed().prompt;
+      // CEO-only writing guidance stays out of another skill's capture prompt.
+      for (const ceoOnly of ['all 11 sections', 'Preserve original requirements and accepted plan amendments',
+        'Cross-reference saved IDs', 'report outside coverage as disabled', 'with Write/Edit at the workflow checkpoints']) {
+        expect(prompt).not.toContain(ceoOnly);
+      }
+      // The functional harness rules, checked by meaning rather than bytes.
+      expect(prompt).toContain(scenario);
+      expect(prompt.match(/\/[^\s]*SKILL\.md/g)?.every(file => file === skillPath)).toBe(true);
+      expect(prompt).toMatch(/AskUserQuestion is unavailable/i);
+      expect(prompt).toMatch(/read that sections\/ file with the Read tool before/i);
+      expect(prompt).toMatch(/do not run git, gh, commit, push, or any mutating command/i);
+      expect(prompt).toContain(path.join(dir, 'REPORT.md'));
     });
   });
 

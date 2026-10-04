@@ -21,8 +21,6 @@ const GSTACK_DEV_DIR = path.join(os.homedir(), '.gstack-dev');
 // getProjectEvalDir() (or GSTACK_EVAL_DIR), so watching the legacy global
 // path missed it whenever slug detection succeeded — i.e. the normal case.
 const HEARTBEAT_PATH = path.join(GSTACK_DEV_DIR, 'e2e-live.json');
-const EVAL_DIR = process.env.GSTACK_EVAL_DIR || getProjectEvalDir();
-const PARTIAL_PATH = path.join(EVAL_DIR, '_partial-e2e*.json');
 const STALE_THRESHOLD_SEC = 600; // 10 minutes
 
 export interface HeartbeatData {
@@ -54,7 +52,7 @@ function readJSON<T>(filePath: string): T | null {
 }
 
 /** Read the legacy collector and suite collectors in this shard, never finals. */
-export function readPartialResults(evalDir = EVAL_DIR): PartialData | null {
+export function readPartialResults(evalDir = process.env.GSTACK_EVAL_DIR || getProjectEvalDir()): PartialData | null {
   let names: string[];
   try { names = fs.readdirSync(evalDir).sort(); } catch { return null; }
   const partials = names.filter(name => /^_partial-e2e(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?\.json$/.test(name))
@@ -98,7 +96,7 @@ export function renderDashboard(heartbeat: HeartbeatData | null, partial: Partia
     lines.push('E2E Watch — No active run detected');
     lines.push('');
     lines.push(`Heartbeat: ${HEARTBEAT_PATH} (not found)`);
-    lines.push(`Partial:   ${PARTIAL_PATH} (not found)`);
+    lines.push(`Partial:   ${path.join(process.env.GSTACK_EVAL_DIR || getProjectEvalDir(), '_partial-e2e*.json')} (not found)`);
     lines.push('');
     lines.push('Start a run with: EVALS=1 bun test test/skill-e2e-*.test.ts');
     return lines.join('\n');

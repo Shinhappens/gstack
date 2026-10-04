@@ -100,11 +100,15 @@ describe('seeded PTY update-check isolation', () => {
       const state = path.join(home, 'explicit-state');
       fs.mkdirSync(state);
       fs.writeFileSync(path.join(state, 'config.yaml'), 'update_check: true\nartifacts_sync_mode_prompted: true\n');
+      // gstack-update-check reads its cache from the same state root GSTACK_HOME selects (docs/state-root.md).
+      const stateCache = path.join(state, 'last-update-check');
+      fs.writeFileSync(stateCache, UPGRADE);
       const output = runPreamble(home, { ...env, GSTACK_HOME: state });
       expect(output).toContain(UPGRADE.trim());
       expect(output).toContain('GSTACK_INSTRUCTION_BEGIN: upgrade-flow');
       expect(output).toContain('UPDATE_CHECK: true');
       expect(fs.readFileSync(cache, 'utf8')).toBe(UPGRADE);
+      expect(fs.readFileSync(stateCache, 'utf8')).toBe(UPGRADE);
       expect(fs.existsSync(networkLog)).toBe(false);
     });
   });

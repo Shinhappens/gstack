@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { submitPlanSeed, PlanSeedTimeout } from './helpers/plan-seed-submission';
-import { PtyCurrentScreen } from './helpers/pty-current-screen';
+import { createPtyScreen } from './helpers/pty-screen';
 import { launchClaudePty, runPlanSkillObservation, isProseAUQVisible, isNumberedOptionListVisible, isPermissionDialogVisible } from './helpers/claude-pty-runner';
 
 // A real PTY process consumes the actual paste/Enter/slash bytes and publishes
@@ -11,12 +11,14 @@ import { launchClaudePty, runPlanSkillObservation, isProseAUQVisible, isNumbered
 const CLI = fs.readFileSync(path.join(import.meta.dir, 'fixtures', 'plan-seed-cli.ts'), 'utf8');
 
 for (const scenario of ['success', 'completed-tool', 'status-updating', 'history-empty-box',
+  'native-paste', 'native-paste-block', 'native-paste-changed', 'native-paste-fused',
+  'native-paste-mismatched', 'native-paste-duplicate', 'native-paste-appended', 'native-paste-multiple-blocks',
   'startup-placeholder', 'startup-placeholder-cursor', 'startup-placeholder-unicode',
   'startup-typed-hint', 'startup-partial-dim', 'startup-prior-conversation', 'startup-missing-styles',
   'startup-waiting', 'startup-prose-question', 'startup-permission', 'startup-fresh-waiting',
   'no-ack', 'fused', 'duplicate', 'session-switch', 'foreign-cwd',
   'pending-tool', 'question', 'prose-question', 'permission', 'no-end-turn', 'partial', 'wrong-pid',
-  'typed-current', 'multiline-current', 'history-box-typed-current', 'history-box-multiline-current',
+  'typed-current', 'late-repaint-typed-current', 'multiline-current', 'history-box-typed-current', 'history-box-multiline-current',
   'missing-current-top', 'missing-current-bottom', 'mismatched-current-rules', 'unframed-current',
   'history-no-current', 'history-missing-current-top', 'history-missing-current-bottom',
   'stray-prompt-after-current', 'stale-response-frame',
@@ -25,12 +27,12 @@ for (const scenario of ['success', 'completed-tool', 'status-updating', 'history
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'plan-seed-')));
     const config = path.join(dir, '.claude'); fs.mkdirSync(config);
     const script = path.join(dir, 'cli.ts'); fs.writeFileSync(script, CLI);
-    const decoder = new PtyCurrentScreen({ cols: 120, rows: 40 });
+    const decoder = await createPtyScreen(120, 40);
     let raw = '', exited = false;
     const launchedAt = Date.now();
     const proc = Bun.spawn([process.execPath, script], {
       cwd: dir, env: { ...process.env, CLAUDE_CONFIG_DIR: config, SEED_CASE: scenario },
-      terminal: { cols: 120, rows: 40, data(_terminal, data) { const s = Buffer.from(data).toString(); raw += s; decoder.feed(s); } },
+      terminal: { cols: 120, rows: 40, data(_terminal, data) { const s = Buffer.from(data).toString(); raw += s; decoder.write(s); } },
       onExit() { exited = true; },
     });
     const sent: string[] = [];
@@ -39,7 +41,7 @@ for (const scenario of ['success', 'completed-tool', 'status-updating', 'history
       send(s: string) { sent.push(s); proc.terminal!.write(s); },
       sendKey(key: string) { expect(key).toBe('Enter'); sent.push('\r'); proc.terminal!.write('\r'); },
       mark: () => raw.length,
-      currentScreen: async () => { const mark = raw.length; const frame = await decoder.snapshot();
+      currentScreen: async () => { const mark = raw.length; const frame = await decoder.readFrame();
         if (scenario === 'startup-fresh-waiting') {
           const statusFile = path.join(config, 'sessions', `${proc.pid}.json`);
           const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
@@ -55,7 +57,7 @@ for (const scenario of ['success', 'completed-tool', 'status-updating', 'history
       try { await submitPlanSeed(session, seed, { cwd: dir, launchedAt, deadlineAt,
         isQuestionOrPermission: text => isProseAUQVisible(text) || isNumberedOptionListVisible(text) || isPermissionDialogVisible(text) }); }
       catch (error) { failure = error; }
-      if (['success', 'completed-tool', 'status-updating', 'history-empty-box', 'startup-placeholder', 'startup-placeholder-cursor', 'startup-placeholder-unicode'].includes(scenario)) {
+      if (['success', 'completed-tool', 'status-updating', 'history-empty-box', 'native-paste', 'native-paste-block', 'startup-placeholder', 'startup-placeholder-cursor', 'startup-placeholder-unicode'].includes(scenario)) {
         expect(failure).toBeUndefined();
         session.send('/plan-eng-review\r');
         await Bun.sleep(50);
@@ -69,7 +71,7 @@ for (const scenario of ['success', 'completed-tool', 'status-updating', 'history
           'session-switch': 'native session changed', 'foreign-cwd': 'Foreign cwd',
           question: 'requires an answer', 'prose-question': 'requires an answer', 'wrong-pid': 'does not match this launch',
           'wrong-start': 'native process identity changed', 'wrong-domain': 'native process identity changed' } as Record<string, string>)[scenario]
-          ?? 'existing case budget';
+          ?? (scenario.startsWith('native-paste') ? 'fused, duplicated, or changed' : 'existing case budget');
         expect((failure as Error).message).toContain(expected);
         expect(sent.some(s => s === '/plan-eng-review\r')).toBe(false);
         expect(sent.filter(s => s === '\r').length).toBeLessThanOrEqual(1);
@@ -79,13 +81,19 @@ for (const scenario of ['success', 'completed-tool', 'status-updating', 'history
     } finally {
       if (!exited) proc.kill();
       await proc.exited;
-      proc.terminal?.close(); decoder.dispose();
+      proc.terminal?.close(); await decoder.dispose();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 6000);
 }
 
-for (const inheritedTerm of ['dumb', '', 'xterm-256color']) test.skipIf(process.platform === 'win32')(`actual PTY launcher carries placeholder styling into owned seed submission: ${inheritedTerm || 'empty TERM'}`, async () => {
+for (const entry of [
+  ...['dumb', '', 'xterm-256color'].map(TERM => ({ name: TERM || 'empty TERM', env: { TERM } })),
+  { name: 'CI', env: { CI: '1' } },
+  { name: 'CI with explicit disabled color', env: { CI: '1', FORCE_COLOR: '0' } },
+  { name: 'CI with explicit NO_COLOR', env: { CI: '1', NO_COLOR: '1' } },
+  { name: 'CI with all explicit conflicting terminal knobs', env: { CI: '1', TERM: 'dumb', COLORTERM: '', FORCE_COLOR: '0', NO_COLOR: '1' } },
+]) test.skipIf(process.platform === 'win32')(`actual PTY launcher carries placeholder styling into owned seed submission: ${entry.name}`, async () => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'plan-seed-launcher-')));
   const config = path.join(dir, '.claude'); fs.mkdirSync(config);
   const script = path.join(dir, 'cli.ts'); fs.writeFileSync(script, `#!${process.execPath}\n${CLI}`, { mode: 0o700 });
@@ -93,7 +101,7 @@ for (const inheritedTerm of ['dumb', '', 'xterm-256color']) test.skipIf(process.
   const launchedAt = Date.now(); let session: Awaited<ReturnType<typeof launchClaudePty>> | undefined;
   try {
     session = await launchClaudePty({ cwd: dir, observeScreen: true, permissionMode: 'plan', timeoutMs: 4000, model: 'fixture',
-      env: { CLAUDE_CONFIG_DIR: config, SEED_CASE: 'startup-terminal-placeholder-cursor', TERM: inheritedTerm } });
+      env: { CLAUDE_CONFIG_DIR: config, SEED_CASE: 'startup-terminal-placeholder-cursor', ...entry.env } });
     const seed = '# Real launcher seed\nKeep this exact plan.';
     await submitPlanSeed({...session, currentScreen: session.currentScreenFrame}, seed, { cwd: dir, launchedAt, deadlineAt: launchedAt + 2500,
       isQuestionOrPermission: text => isProseAUQVisible(text) || isNumberedOptionListVisible(text) || isPermissionDialogVisible(text) });
@@ -101,6 +109,37 @@ for (const inheritedTerm of ['dumb', '', 'xterm-256color']) test.skipIf(process.
     const events = fs.readFileSync(path.join(config, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(events.map(e => e.kind)).toEqual(['paste', 'enter', 'end_turn', 'slash']);
     expect(events.slice(0, 3).every(e => e.value === seed)).toBe(true);
+    const launch = JSON.parse(fs.readFileSync(path.join(config, 'launch.json'), 'utf8'));
+    expect(launch.terminalEnv.TERM).toBe('xterm-256color');
+    expect(launch.terminalEnv.FORCE_COLOR).toBe('1');
+    for (const key of ['CI', 'COLORTERM', 'NO_COLOR']) {
+      if (key in entry.env) expect(launch.terminalEnv[key]).toBe(entry.env[key]);
+    }
+  } finally {
+    try { await session?.close(); }
+    finally {
+      if (old === undefined) delete process.env.BROWSE_TERMINAL_BINARY; else process.env.BROWSE_TERMINAL_BINARY = old;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+}, 6000);
+
+for (const terminalEnv of [
+  { CI: '1', TERM: 'dumb', COLORTERM: '', FORCE_COLOR: '0', NO_COLOR: '1' },
+  { CI: '1', TERM: 'xterm-256color', COLORTERM: 'truecolor', FORCE_COLOR: '3', NO_COLOR: '' },
+]) test.skipIf(process.platform === 'win32')(`unobserved PTY preserves explicit terminal environment: ${terminalEnv.FORCE_COLOR}`, async () => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'plan-seed-unobserved-')));
+  const config = path.join(dir, '.claude'); fs.mkdirSync(config);
+  const script = path.join(dir, 'cli.ts'); fs.writeFileSync(script, `#!${process.execPath}\n${CLI}`, { mode: 0o700 });
+  const old = process.env.BROWSE_TERMINAL_BINARY; process.env.BROWSE_TERMINAL_BINARY = script;
+  let session: Awaited<ReturnType<typeof launchClaudePty>> | undefined;
+  try {
+    session = await launchClaudePty({ cwd: dir, timeoutMs: 4000, model: 'fixture',
+      env: { CLAUDE_CONFIG_DIR: config, SEED_CASE: 'startup-terminal-placeholder-cursor', ...terminalEnv } });
+    await session.waitFor('❯', { timeoutMs: 2000 });
+    const launch = JSON.parse(fs.readFileSync(path.join(config, 'launch.json'), 'utf8'));
+    expect(launch.terminalEnv).toEqual(terminalEnv);
+    expect(fs.existsSync(path.join(config, 'events.jsonl'))).toBe(false);
   } finally {
     try { await session?.close(); }
     finally {

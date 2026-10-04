@@ -50,7 +50,7 @@ Rules:
 - P1 blocks ship; P2 should land same branch; P3 is a follow-up TODO.
 - If a finding produced no actionable task, do not invent one.
 - If a section had zero findings, emit \`_No new tasks from <section>._\`
-- ${conditionalWrites ? 'Show human-team and CC+gstack effort estimates. Default task-type ratios (human ÷ CC time): scaffolding ~100x, tests ~50x, features ~30x, bug fix with regression ~20x, architecture ~5x, research ~3x. Adjust to the actual work and state the assumption.' : 'Effort uses the AI-compression table from CLAUDE.md.'}
+- Show human-team and CC+gstack effort estimates. Default task-type ratios (human ÷ CC time): scaffolding ~100x, tests ~50x, features ~30x, bug fix with regression ~20x, architecture ~5x, research ~3x. Adjust to the actual work and state the assumption.
 
 ### JSONL artifact (${conditionalWrites ? 'write when permitted, including zero tasks' : 'always write, even if zero tasks'})
 
@@ -59,8 +59,10 @@ Rules:
 backslashes serialize cleanly — never use hand-rolled \`echo\` / \`printf\`.
 
 \`\`\`bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
-TASKS_DIR="\${HOME}/.gstack/projects/\${SLUG:-unknown}"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "\${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+BRANCH=$(~/.claude/skills/gstack/bin/gstack-slug --get BRANCH 2>/dev/null)
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+TASKS_DIR="$GSTACK_STATE_ROOT/projects/\${SLUG:-unknown}"
 mkdir -p "$TASKS_DIR"
 TASKS_FILE="$TASKS_DIR/tasks-${phase}-$(date +%Y%m%d-%H%M%S).jsonl"
 COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
@@ -105,8 +107,10 @@ Before rendering the Final Approval Gate output block below, aggregate the
 per-phase task lists each review skill wrote.
 
 \`\`\`bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
-TASKS_DIR="\${HOME}/.gstack/projects/\${SLUG:-unknown}"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "\${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+BRANCH=$(~/.claude/skills/gstack/bin/gstack-slug --get BRANCH 2>/dev/null)
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+TASKS_DIR="$GSTACK_STATE_ROOT/projects/\${SLUG:-unknown}"
 BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
 # Commit window: last 5 commits on this branch. Drops stale standalone reviews.
 COMMITS_RECENT=$(git log --format=%H -n 5 2>/dev/null | tr '\\n' '|' | sed 's/|$//')
@@ -129,7 +133,7 @@ if command -v jq >/dev/null 2>&1; then
       # .commit must be bound BEFORE piping to the split commit array: a
       # pipe rebinds jq's context, so a bare .commit after it indexes the
       # ARRAY with a string, every line errors into 2>/dev/null, and the
-      # aggregate is empty forever — the #2018 zero-tasks bug.
+      # aggregate is empty forever.
       jq -c --arg branch "$BRANCH" --arg commits "$COMMITS_RECENT" \\
         '.commit as $c | select(.branch == $branch and ($commits | split("|") | index($c) != null))' \\
         "$f" 2>/dev/null >> "$ALL_JSONL" || true

@@ -54,6 +54,9 @@ export interface PlanReviewDecisionJudgment {
   engReview?: EngReviewJudgment;
 }
 export type PlanReviewJudge = (prompt: string, model?: string, opts?: Pick<CallJudgeOptions, 'signal' | 'max_tokens' | 'jsonSchema'>) => Promise<unknown>;
+// Structured outputs cannot enforce maxLength, so the reason bound the local
+// validator applies is stated on the field the model writes.
+const REASON_FIELD = { type: 'string', description: '1-1000 characters: under 120 words.' } as const;
 // Only response structure is constrained. Identity, exact quotes, enum casing,
 // uncertainty, target coverage, independence and count checks remain local.
 function planReviewDecisionSchema(withPeerComparison: boolean, withEngReview = false): NonNullable<CallJudgeOptions['jsonSchema']> {
@@ -68,7 +71,7 @@ function planReviewDecisionSchema(withPeerComparison: boolean, withEngReview = f
           toolUseId: { type: 'string' }, questionIndex: { type: 'integer' },
           kind: { type: 'string', enum: ['finding', 'scope', 'workflow', 'backlog', 'uncertain'] },
           targetIds: { type: 'array', items: { type: 'string' } },
-          independentDecisions: { type: 'integer' }, reason: { type: 'string' },
+          independentDecisions: { type: 'integer' }, reason: REASON_FIELD,
           evidence: { type: 'array', items: {
             type: 'object', additionalProperties: false, required: ['field', 'optionIndex', 'quote'],
             properties: {
@@ -86,7 +89,7 @@ function planReviewDecisionSchema(withPeerComparison: boolean, withEngReview = f
         type: 'object', additionalProperties: false,
         required: ['status', 'regression', 'approvals', 'navigation', 'reason'],
         properties: {
-          status: { type: 'string', enum: ['complete', 'missing', 'uncertain'] }, reason: { type: 'string' },
+          status: { type: 'string', enum: ['complete', 'missing', 'uncertain'] }, reason: REASON_FIELD,
           regression: { type: 'array', items: { type: 'object', additionalProperties: false,
             required: ['role', 'source', 'quote'], properties: {
               role: { type: 'string', enum: ['critical', 'baseline', 'replay', 'assertions', 'approved-differences'] },
@@ -112,7 +115,7 @@ function planReviewDecisionSchema(withPeerComparison: boolean, withEngReview = f
             properties: { name: { type: 'string' }, quote: { type: 'string' } },
           } },
           productQuote: { type: 'string' }, groundingQuote: { type: 'string' },
-          implicationQuote: { type: 'string' }, reason: { type: 'string' },
+          implicationQuote: { type: 'string' }, reason: REASON_FIELD,
         },
       } } : {}),
     },

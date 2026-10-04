@@ -800,6 +800,7 @@ describe("fetchGitClaimed — unfetched live claims (G2: ls-remote advertises SH
         .split("\n")
         .filter((l) => l.startsWith("fetch "));
       expect(fetches.length).toBe(1);
+      expect(fetches[0]).toContain("--no-auto-maintenance");
       for (const v of ["0-1-70-0", "0-1-71-0", "0-1-72-0"]) {
         expect(fetches[0]).toContain(`refs/heads/late-${v}`);
       }

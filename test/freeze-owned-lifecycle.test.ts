@@ -50,7 +50,7 @@ beforeEach(() => {
   env = { ...process.env, HOME: join(root, 'home'), GSTACK_HOME: join(root, 'state'), CLAUDE_PLUGIN_DATA: '', CLAUDE_PLUGIN_ROOT: '' };
   mkdirSync(env.GSTACK_HOME!);
   state = join(env.GSTACK_HOME!, 'freeze-dir.txt');
-  for (const file of ['freeze/bin/check-freeze.sh', 'freeze/bin/freeze-state.sh', 'careful/bin/hook-extract.sh', 'bin/gstack-paths']) {
+  for (const file of ['freeze/bin/check-freeze.sh', 'freeze/bin/freeze-state.sh', 'careful/bin/hook-extract.sh', 'bin/gstack-paths', 'bin/gstack-state-root.sh']) {
     if (!existsSync(join(ROOT, file))) continue;
     const dest = join(env.HOME!, '.claude/skills/gstack', file);
     mkdirSync(dirname(dest), { recursive: true });

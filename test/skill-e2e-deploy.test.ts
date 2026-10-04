@@ -52,19 +52,12 @@ The skill is carved: on-demand step bodies live in land-and-deploy/sections/ in 
 working directory — when a STOP-Read pointer names a ~/.claude/skills/gstack/... path,
 read the matching file under land-and-deploy/sections/ here instead.
 
-You are on branch feat/add-deploy with changes against main. This repo has a fly.toml
-with app = "test-app", indicating a Fly.io deployment.
+You are on branch feat/add-deploy with changes against main.
 
-IMPORTANT: There is NO remote and NO GitHub PR — you cannot run gh commands.
-Instead, simulate the workflow:
-1. Detect the deploy platform from fly.toml (should find Fly.io, app = test-app)
-2. Infer the production URL (https://test-app.fly.dev)
-3. Note the merge method would be squash
-4. Write the deploy configuration to CLAUDE.md
-5. Write a deploy report skeleton to .gstack/deploy-reports/report.md showing the
-   expected report structure (PR number: simulated, timing: simulated, verdict: simulated)
-
-Do NOT use AskUserQuestion. Do NOT run gh or fly commands.`,
+This run is non-interactive and the repo has no remote, so there is no PR and the gh
+and fly CLIs are unavailable. Run the parts of the workflow that work without them,
+mark the PR, merge and deploy results as simulated, and save the report you would
+show under .gstack/deploy-reports/.`,
       workingDirectory: landDir,
       maxTurns: 20,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob'],
@@ -77,15 +70,16 @@ Do NOT use AskUserQuestion. Do NOT run gh or fly commands.`,
     recordE2E(evalCollector, '/land-and-deploy workflow', 'Land-and-Deploy skill E2E', result);
     expect(result.exitReason).toBe('success');
 
-    const claudeMd = path.join(landDir, 'CLAUDE.md');
-    if (fs.existsSync(claudeMd)) {
-      const content = fs.readFileSync(claudeMd, 'utf-8');
-      const hasFly = content.toLowerCase().includes('fly') || content.toLowerCase().includes('test-app');
-      expect(hasFly).toBe(true);
-    }
-
+    // The prompt names neither the platform nor the app: the skill detects them from fly.toml.
     const reportDir = path.join(landDir, '.gstack', 'deploy-reports');
     expect(fs.existsSync(reportDir)).toBe(true);
+    const claudeMd = path.join(landDir, 'CLAUDE.md');
+    const artifacts = [
+      ...fs.readdirSync(reportDir).filter(f => f.endsWith('.md')).map(f => fs.readFileSync(path.join(reportDir, f), 'utf-8')),
+      fs.existsSync(claudeMd) ? fs.readFileSync(claudeMd, 'utf-8') : '',
+    ].join('\n');
+    expect(artifacts, 'deploy artifacts name the detected platform').toMatch(/fly/i);
+    expect(artifacts, 'deploy artifacts name the detected app').toContain('test-app');
   }, CAPTURE_LONG_MS);
 });
 
@@ -130,22 +124,9 @@ in THIS working directory — read it from there (the STOP-Read pointer's
 You are on branch feat/first-deploy. This is the FIRST TIME running /land-and-deploy
 for this project — there is NO land-deploy-confirmed file.
 
-This repo has a fly.toml with app = "first-run-app", indicating a Fly.io deployment.
-
-IMPORTANT: There is NO remote and NO GitHub PR — you cannot run gh commands.
-Instead, simulate the Step 1.5 first-run dry-run validation:
-1. Detect that this is a FIRST_RUN (no land-deploy-confirmed file)
-2. Detect the deploy platform from fly.toml (Fly.io, app = first-run-app)
-3. Infer the production URL (https://first-run-app.fly.dev)
-4. Build the DEPLOY INFRASTRUCTURE VALIDATION table showing:
-   - Platform detected
-   - Command validation results (simulated as all passing)
-   - Staging detection results (none expected)
-   - What will happen steps
-5. Write the dry-run report to .gstack/deploy-reports/dry-run-validation.md
-
-Do NOT use AskUserQuestion. Do NOT run gh or fly commands.
-Just demonstrate the first-run dry-run output.`,
+This run is non-interactive and the repo has no remote, so there is no PR and the gh
+and fly CLIs are unavailable; treat their command checks as passing. Run the first-run
+dry-run validation and save its report under .gstack/deploy-reports/.`,
       workingDirectory: firstRunDir,
       maxTurns: 20,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob'],
@@ -210,20 +191,12 @@ The Step 3.5 readiness gate is carved into land-and-deploy/sections/readiness-ga
 in THIS working directory — read it from there (the STOP-Read pointer's
 ~/.claude/skills/gstack/... path does not exist here).
 
-Focus on Step 3.5a and Step 3.5a-bis (the review staleness check and inline review offer).
+Focus on Step 3.5a and Step 3.5a-bis.
 
-This repo has 6 commits since the initial commit. There are NO review logs
-(gstack-review-read would return NO_REVIEWS).
-
-Simulate what the readiness gate would show:
-1. Run gstack-review-read equivalent (simulate NO_REVIEWS output)
-2. Determine review staleness: Eng Review should be "NOT RUN"
-3. Note that Step 3.5a-bis would offer an inline review
-4. Write a simulated readiness report to .gstack/deploy-reports/readiness-report.md
-   showing the review status as NOT RUN with the inline review offer text
-
-Do NOT use AskUserQuestion. Do NOT run gh commands.
-Show what the readiness gate output would look like.`,
+gstack-review-read is not installed here; it would print NO_REVIEWS for this repo.
+This run is non-interactive and the repo has no remote, so there is no PR and gh is
+unavailable. Run the readiness gate and save its readiness report under
+.gstack/deploy-reports/.`,
       workingDirectory: reviewDir,
       maxTurns: 15,
       allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob'],
@@ -243,10 +216,10 @@ Show what the readiness gate output would look like.`,
     const reportFiles = fs.readdirSync(reportDir);
     expect(reportFiles.length).toBeGreaterThan(0);
     const reportContent = fs.readFileSync(path.join(reportDir, reportFiles[0]), 'utf-8');
-    // Should mention review status
-    const hasReviewMention = reportContent.toLowerCase().includes('review') ||
-                              reportContent.toLowerCase().includes('not run');
-    expect(hasReviewMention).toBe(true);
+    // The prompt no longer supplies the verdict: the gate must record the
+    // missing review itself.
+    expect(reportContent).toMatch(/review/i);
+    expect(reportContent, 'readiness report records the missing review').toMatch(/not run|no reviews?\b|never run|missing/i);
   }, CAPTURE_LONG_MS);
 });
 

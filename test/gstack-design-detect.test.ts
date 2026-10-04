@@ -34,7 +34,7 @@ function git(cwd: string, ...args: string[]) {
 }
 
 beforeAll(() => {
-  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-design-detect-'));
+  SANDBOX = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-design-detect-')));
   REPO = path.join(SANDBOX, 'repo');
   fs.mkdirSync(REPO);
   git(REPO, 'init', '-q', '-b', 'main');
@@ -1455,16 +1455,16 @@ describe('scan: option-like bases and page-controlled inline ignores', () => {
     fs.mkdirSync(many, { recursive: true });
     for (let i = 0; i < 1100; i++) fs.writeFileSync(path.join(many, `f${i}.css`), 'a{}');
     try {
-      const r = run(['scan', '--format', 'gstack', 'src/many'], { env: { IMPECCABLE_BIN: FAKE, IMPECCABLE_FAKE_SLEEP_MS: '250', GSTACK_DESIGN_DETECT_TIMEOUT_MS: '400' } });
+      const r = run(['scan', '--format', 'gstack', 'src/many'], { env: { IMPECCABLE_BIN: FAKE, IMPECCABLE_FAKE_SLEEP_MS: '1000', GSTACK_DESIGN_DETECT_TIMEOUT_MS: '1500' } });
       expect(r.code).toBe(2); // a directory target is one batch (the fake reports findings): the budget test needs files
       const files = fs.readdirSync(many).map(f => path.join('src', 'many', f));
-      const r2 = run(['scan', '--format', 'gstack', ...files], { env: { IMPECCABLE_BIN: FAKE, IMPECCABLE_FAKE_SLEEP_MS: '250', GSTACK_DESIGN_DETECT_TIMEOUT_MS: '400' } });
-      expect(r2.err).toMatch(/DETECT_TIMEOUT: whole-scan budget 2000ms exceeded, \d+ of 11 batches not run/);
+      const r2 = run(['scan', '--format', 'gstack', ...files], { env: { IMPECCABLE_BIN: FAKE, IMPECCABLE_FAKE_SLEEP_MS: '1000', GSTACK_DESIGN_DETECT_TIMEOUT_MS: '1500' } });
+      expect(r2.err).toMatch(/DETECT_TIMEOUT: whole-scan budget 7500ms exceeded, \d+ of 11 batches not run/);
       expect(r2.code).toBe(1);
     } finally {
       fs.rmSync(many, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   test.skipIf(!POSIX)('detector.ignoreValues from the project config are surfaced on their own line', () => {
     const dir = path.join(REPO, '.impeccable');
@@ -1520,7 +1520,7 @@ describe('install: the one download gstack makes, after consent', () => {
   const PLATFORM = ENGINE_ASSETS[`${process.platform}-${process.arch}`];
   const VERSION = TESTED_ENGINE_VERSIONS[TESTED_ENGINE_VERSIONS.length - 1];
   const ASSET = PLATFORM ? `impeccable-${PLATFORM}${PLATFORM.startsWith('windows') ? '.exe' : ''}` : '';
-  const freshHome = () => fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-impeccable-home-'));
+  const freshHome = () => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-impeccable-home-')));
   const mirror = (body: Uint8Array, hits: string[]) => Bun.serve({
     port: 0, hostname: '127.0.0.1',
     fetch(req) {

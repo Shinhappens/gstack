@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
+import { identityStartedAtMs, processIdentitySource } from '../lib/cso/process-identity';
 import { createPrecisionLossCandidate } from './helpers/cso-ntfs-fixture';
 
 const ROOT = path.resolve(import.meta.dir, '..');
@@ -92,6 +93,34 @@ function expectSuccessfulProcess(result: ReturnType<typeof spawnSync>, label: st
   })}`);
 }
 
+// Diagnostic snapshot of every lease artifact under a CSO state root. A failed
+// native lease command embeds it in the assertion and keeps a copy outside the
+// fixture so the exact owner/decision records survive cleanup.
+function leaseRecords(root: string): string {
+  const records: unknown[] = [];
+  for (const leases of filesNamed(root, '.mutation-lock').map(lock => path.join(path.dirname(lock), '.mutation-lock-leases'))) {
+    let names: string[] = [];
+    try { names = fs.readdirSync(leases).sort(); } catch { continue; }
+    for (const name of names) {
+      const file = path.join(leases, name);
+      try {
+        const stat = fs.lstatSync(file, { bigint: true }), text = stat.size <= 4096n ? fs.readFileSync(file, 'utf8') : '';
+        let pidAlive: boolean | undefined;
+        try { const value = JSON.parse(text), pid = value.ownerPid ?? value.pid; if (Number.isInteger(pid)) { try { process.kill(pid, 0); pidAlive = true; } catch (error: any) { pidAlive = error?.code === 'EPERM'; } } } catch {}
+        records.push({ file: path.relative(root, file), dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink), size: String(stat.size), text, pidAlive });
+      } catch (error: any) { records.push({ file: path.relative(root, file), error: error?.code ?? String(error) }); }
+    }
+  }
+  const serialized = JSON.stringify(records), keep = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'cso-lease-diagnostics');
+  try { fs.mkdirSync(keep, { recursive: true }); fs.writeFileSync(path.join(keep, `${Date.now()}-${process.pid}.json`), serialized); } catch {}
+  return serialized.slice(0, 16_384);
+}
+
+function expectLeaseCommand(result: ReturnType<typeof spawnSync>, label: string, root: string) {
+  try { expectSuccessfulProcess(result, label); }
+  catch (error: any) { throw new Error(`${error.message}\nlease records: ${leaseRecords(root)}`); }
+}
+
 function filesNamed(root: string, name: string): string[] {
   const found: string[] = [];
   const walk = (directory: string) => {
@@ -135,7 +164,7 @@ describe('CSO native Windows build contract', () => {
     expect(msvc).toContain('GSTACK_CSO_GIT_PATH');
     expect(msvc).toContain('/FI$binding');
     expect(msvc).toContain('if ($LASTEXITCODE -ne 0)');
-    const processSource=fs.readFileSync(path.join(ROOT,'lib','cso','process.ts'),'utf8');
+    const processSource=fs.readFileSync(path.join(ROOT,'lib','cso','process.ts'),'utf8').replace(/\s+/g,'');
     expect(processSource).toContain("includeNullPath=process.platform==='win32'?'/dev/null':nullPath");
     const launcherSource = fs.readFileSync(path.join(ROOT, 'lib/cso/launcher-windows.c'), 'utf8');
     expect(launcherSource).toContain('.gstack-cso-generation.lock');
@@ -367,6 +396,69 @@ describe('CSO native Windows build contract', () => {
       const next=command(['start','--repo',repository,'--offline']);expectSuccessfulProcess(next,'gstack-cso start after legacy state');
       expect(JSON.parse(next.stdout).runId).not.toBe(run.runId);
     }
+  }, 180_000);
+
+  test('#2894 the win32 process identity source reads real process start times', async () => {
+    const own = processIdentitySource.read(process.pid), started = identityStartedAtMs(own ?? '');
+    expect(own).toMatch(/^win32:\d+$/);
+    expect(processIdentitySource.read(process.pid)).toBe(own!);
+    expect(started!).toBeLessThanOrEqual(Date.now());
+    expect(started!).toBeGreaterThan(Date.now() - 3_600_000);
+    await Bun.sleep(20);
+    const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], { stdio: 'ignore' });
+    try {
+      const identity = processIdentitySource.read(child.pid!);
+      expect(identity).toMatch(/^win32:\d+$/);
+      expect(identity).not.toBe(own!);
+      expect(identityStartedAtMs(identity!)!).toBeGreaterThanOrEqual(started!);
+    } finally { child.kill(); }
+    expect(processIdentitySource.read(2147483647)).toBeUndefined();
+  });
+
+  test('#2894 lease sequence: repeated commands, a legacy record elsewhere, and recycled or dead owners never brick start', async () => {
+    const repository=path.join(temporary,'issue 2894 repository'),other=path.join(temporary,'issue 2894 other repository'),profile=path.join(temporary,'issue 2894 profile');
+    for(const directory of [repository,other,profile])fs.mkdirSync(directory);
+    const git='C:\\Program Files\\Git\\cmd\\git.exe',gitEnv={...process.env,HOME:profile};
+    for(const repo of [repository,other]){
+      for(const args of [['init','-q'],['config','user.email','fixture@example.test'],['config','user.name','Fixture']] as string[][]){const result=spawnSync(git,args,{cwd:repo,encoding:'utf8',env:gitEnv,timeout:10_000});expect(result.status).toBe(0);}
+      fs.writeFileSync(path.join(repo,'app.js'),'console.log("fixture")\n');fs.writeFileSync(path.join(repo,'other.js'),'console.log("other")\n');
+      for(const args of [['add','app.js','other.js'],['commit','-qm','fixture']] as string[][]){const result=spawnSync(git,args,{cwd:repo,encoding:'utf8',env:gitEnv,timeout:10_000});expect(result.status).toBe(0);}
+    }
+    const actual=path.join(ROOT,'bin','gstack-cso-launcher.exe'),env={...process.env,HOME:'',GSTACK_HOME:'',CLAUDE_PLUGIN_ROOT:'',CLAUDE_PLUGIN_DATA:'',USERPROFILE:profile,PATH:temporary},state=path.join(profile,'.gstack','security','cso');
+    const command=(args:string[],cwd=repository)=>spawnSync(actual,args,{cwd,encoding:'utf8',env,timeout:30_000});
+    const step=(args:string[],label:string,cwd=repository)=>{const result=command(args,cwd);expectLeaseCommand(result,label,state);return result;};
+    const started=JSON.parse(step(['start','--repo',repository,'--offline'],'start').stdout),dir=path.join(state,started.repoId,started.runId),leases=path.join(dir,'.mutation-lock-leases');
+    for(const [args,label] of [[['resume',started.runId],'resume'],[['inspect',started.runId],'inspect'],[['read',started.runId,'app.js'],'read app.js'],[['read',started.runId,'other.js'],'read other.js'],[['history',started.runId],'history'],[['inspect',started.runId],'inspect again']] as [string[],string][])step(args,label);
+    expect(fs.readdirSync(leases)).toEqual([]);
+    // A record left by gstack <= 1.88.0 in another repository's run (lossy NTFS file ID) stays
+    // blocked for that run, but start for any repository still succeeds.
+    const otherRun=JSON.parse(step(['start','--repo',other,'--offline'],'start other',other).stdout),otherLeases=path.join(state,otherRun.repoId,otherRun.runId,'.mutation-lock-leases');
+    step(['resume',otherRun.runId],'resume other',other);
+    const legacy='d'.repeat(32),legacyCandidate=path.join(otherLeases,`${legacy}.json`),legacyDecision=path.join(otherLeases,`${legacy}.decision`);
+    createPrecisionLossCandidate(legacyCandidate,JSON.stringify({pid:2147483647,token:legacy,createdAt:1})+'\n');
+    const legacyStat=fs.lstatSync(legacyCandidate,{bigint:true});
+    fs.writeFileSync(legacyDecision,JSON.stringify({schemaVersion:1,token:legacy,kind:'ticket',ticket:'0000000000000001',candidateDev:String(legacyStat.dev),candidateIno:String(Number(legacyStat.ino)),ownerPid:2147483647,ownerCreatedAt:1,publisherPid:2147483647,createdAt:1})+'\n');
+    const next=JSON.parse(step(['start','--repo',repository,'--offline'],'start with a legacy record in another repository').stdout);
+    expect(next.runId).not.toBe(started.runId);
+    const blocked=command(['resume',otherRun.runId],other);expect(blocked.status).not.toBe(0);expect(blocked.stderr).toContain('UNSAFE_PATH');
+    expect(fs.existsSync(legacyCandidate)).toBe(true);expect(fs.existsSync(legacyDecision)).toBe(true);
+    // A recycled PID: the recorded owner is gone and an unrelated process that started after the
+    // lease was written now holds that PID. A plain dead PID is reclaimed the same way.
+    const nextLeases=path.join(state,next.repoId,next.runId,'.mutation-lock-leases');
+    step(['resume',next.runId],'resume next');
+    const createdAt=Date.now();await Bun.sleep(2_500);
+    const holder=spawn(process.execPath,['-e','setTimeout(()=>{},60000)'],{stdio:'ignore'});
+    try{
+      for(const [token,pid] of [['e'.repeat(32),holder.pid!],['f'.repeat(32),2147483647]] as [string,number][]){
+        const candidate=path.join(nextLeases,`${token}.json`),decision=path.join(nextLeases,`${token}.decision`);
+        fs.writeFileSync(candidate,JSON.stringify({pid,token,createdAt})+'\n');
+        const stat=fs.lstatSync(candidate,{bigint:true});
+        fs.writeFileSync(decision,JSON.stringify({schemaVersion:1,token,kind:'ticket',ticket:'0000000000000001',candidateDev:String(stat.dev),candidateIno:String(stat.ino),ownerPid:pid,ownerCreatedAt:createdAt,publisherPid:pid,createdAt})+'\n');
+        step(['inspect',next.runId],`inspect after ${pid===2147483647?'dead':'recycled'} owner`);
+        expect(fs.existsSync(candidate)).toBe(false);expect(fs.existsSync(decision)).toBe(false);
+      }
+      expect(fs.readdirSync(nextLeases)).toEqual([]);
+    }finally{holder.kill();}
   }, 180_000);
 
   test('the actual helper rejects source mutation during snapshot capture without certifying a report', async () => {

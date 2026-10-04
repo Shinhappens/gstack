@@ -20,25 +20,46 @@ gstack setup — install gstack skills + build browse binary
 Usage: ./setup [options]
 
 Options:
-  --host <name>     Install for a specific host (claude, codex, kiro, factory,
-                    opencode, openclaw, hermes, gbrain, auto). Default: claude.
-  --model <id>      Codex model profile override. Otherwise reads Codex config.
-  --global          Register Codex globally even from a project-vendored source.
+  --host <name>     Install for one host. Default: claude. Hosts by tier:
+                      full:             claude
+                      experimental:     codex, kiro, factory, opencode, cursor, copilot
+                      instruction-only: slate, openclaw, hermes, gbrain
+                      auto:             every installed agent that setup detects
+                    An explicit --host never changes another host's install.
+  --global          Allow this checkout to replace an existing global install
+                    (or register Codex globally from a project-vendored source).
   --prefix          Install skills with the gstack- prefix (e.g. /gstack-review).
   --no-prefix       Install skills with short names (e.g. /review). Default.
   --team            Switch to team mode (per-repo gstack with auto-update).
   --no-team         Force solo install even if a team-mode repo is detected.
+  --status          Print one row per gstack install (read-only) and exit.
+  --refresh-registered
+                    Refresh every install registered for this checkout (what
+                    /gstack-upgrade runs), then print one row per install.
   -q, --quiet       Suppress progress output.
   -h, --help        Show this help and exit.
 
+Model selection:
+  --model <id>      Codex model profile override. Otherwise reads Codex config.
+  --claude-model <id>
+                    Claude skill overlay for a Claude model ID (for example
+                    claude-opus-4-8). Saved as claude_overlay_model and used by
+                    every later setup, upgrade and gbrain-refresh. Without it
+                    the generic claude overlay is used; --claude-model claude
+                    returns to it.
+
 Examples:
   ./setup                          # solo install for Claude Code
-  ./setup --host codex             # install for OpenAI Codex CLI
+  ./setup --host codex             # install for OpenAI Codex CLI only
+  ./setup --host auto              # install for every detected agent
   ./setup --host codex --model gpt-5.6-sol
+  ./setup --claude-model claude-opus-4-8   # Opus 4.8 overlay for Claude skills
+  ./setup --status                 # what is installed, where, at which version
   ./setup --team                   # team mode for a shared repo
   ./setup --no-prefix              # use short slash-command names
 
-Docs: https://github.com/garrytan/gstack
+Docs: https://github.com/garrytan/gstack#other-ai-agents
+      docs/ADDING_A_HOST.md (install ownership rules, host tiers)
 EOF
 }
 
@@ -47,6 +68,19 @@ EOF
 for _arg in "$@"; do
   case "$_arg" in
     -h|--help) usage; exit 0 ;;
+  esac
+done
+# --status is read-only: no bun, no build, no writes (docs/ADDING_A_HOST.md).
+for _arg in "$@"; do
+  case "$_arg" in
+    --status)
+      _STATUS_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+      . "$_STATUS_DIR/bin/gstack-state-root.sh" && . "$_STATUS_DIR/bin/gstack-install-registry.sh" \
+        && . "$_STATUS_DIR/bin/gstack-render-claude.sh" || exit 1
+      gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
+      gstack_install_status
+      gstack_claude_overlay_status
+      exit 0 ;;
   esac
 done
 
@@ -65,12 +99,43 @@ PLAN_TUNE_HOOKS_MODE=""   # "" = resolve from env/config/prompt; "yes"/"no" = ex
 TIMELINE_STOP_HOOK_MODE=""  # "" = resolve from env/config; "yes"/"no" = explicit (#2677)
 MODEL_OVERRIDE=""
 MODEL_OVERRIDE_SET=0
+CLAUDE_MODEL_ARG=""
+CLAUDE_MODEL_SET=0
+REFRESH_REGISTERED=0
+HOST_FLAG_SET=0
+# Reject unknown options before anything is written, with the closest flag.
+_setup_unknown_option() {
+  local bad="$1" next="${2:-}" best="" best_d=99 flag d value=""
+  for flag in --host --model --claude-model --global --local --prefix --no-prefix --team --no-team \
+    --plan-tune-hooks --no-plan-tune-hooks --timeline-stop-hook --no-timeline-stop-hook \
+    --refresh-registered --status --quiet --help; do
+    d="$(awk -v a="${bad%%=*}" -v b="$flag" 'BEGIN {
+      n = length(a); m = length(b)
+      for (i = 0; i <= n; i++) d[i, 0] = i
+      for (j = 0; j <= m; j++) d[0, j] = j
+      for (i = 1; i <= n; i++) for (j = 1; j <= m; j++) {
+        c = (substr(a, i, 1) == substr(b, j, 1)) ? 0 : 1
+        v = d[i-1, j] + 1; if (d[i, j-1] + 1 < v) v = d[i, j-1] + 1; if (d[i-1, j-1] + c < v) v = d[i-1, j-1] + c
+        d[i, j] = v
+      }
+      print d[n, m] }')"
+    if [ "$d" -lt "$best_d" ]; then best_d="$d"; best="$flag"; fi
+  done
+  echo "Unknown option: $bad — nothing was installed or changed." >&2
+  case "$best" in --host|--model|--claude-model) case "$next" in ''|-*) ;; *) value=" $next" ;; esac ;; esac
+  if [ "$best_d" -le 3 ]; then
+    echo "Did you mean: ./setup $best$value" >&2
+  fi
+  echo "Run ./setup --help for every option." >&2
+}
 while [ $# -gt 0 ]; do
   case "$1" in
-    --host) [ -z "$2" ] && echo "Missing value for --host (expected claude, codex, kiro, factory, opencode, cursor, slate, openclaw, hermes, gbrain, or auto)" >&2 && exit 1; HOST="$2"; shift 2 ;;
-    --host=*) HOST="${1#--host=}"; shift ;;
+    --host) [ -z "$2" ] && echo "Missing value for --host (expected claude, codex, kiro, factory, opencode, cursor, copilot, slate, openclaw, hermes, gbrain, or auto)" >&2 && exit 1; HOST="$2"; HOST_FLAG_SET=1; shift 2 ;;
+    --host=*) HOST="${1#--host=}"; HOST_FLAG_SET=1; shift ;;
     --model) [ -z "$2" ] && echo "Missing value for --model" >&2 && exit 1; MODEL_OVERRIDE="$2"; MODEL_OVERRIDE_SET=1; shift 2 ;;
     --model=*) MODEL_OVERRIDE="${1#--model=}"; MODEL_OVERRIDE_SET=1; shift ;;
+    --claude-model) [ -z "$2" ] && echo "Missing value for --claude-model (a Claude model ID such as claude-opus-4-8, or claude)" >&2 && exit 1; CLAUDE_MODEL_ARG="$2"; CLAUDE_MODEL_SET=1; shift 2 ;;
+    --claude-model=*) CLAUDE_MODEL_ARG="${1#--claude-model=}"; [ -z "$CLAUDE_MODEL_ARG" ] && echo "Missing value for --claude-model (a Claude model ID such as claude-opus-4-8, or claude)" >&2 && exit 1; CLAUDE_MODEL_SET=1; shift ;;
     --local) LOCAL_INSTALL=1; shift ;;
     --global) GLOBAL_INSTALL=1; shift ;;
     --prefix)    SKILL_PREFIX=1; SKILL_PREFIX_FLAG=1; shift ;;
@@ -83,8 +148,9 @@ while [ $# -gt 0 ]; do
     --timeline-stop-hook)    TIMELINE_STOP_HOOK_MODE="yes"; shift ;;
     --no-timeline-stop-hook) TIMELINE_STOP_HOOK_MODE="no"; shift ;;
     --timeline-stop-hook=*)  TIMELINE_STOP_HOOK_MODE="${1#--timeline-stop-hook=}"; shift ;;
+    --refresh-registered) REFRESH_REGISTERED=1; shift ;;
     -q|--quiet) QUIET=1; shift ;;
-    *) shift ;;
+    *) _setup_unknown_option "$@"; exit 2 ;;
   esac
 done
 
@@ -106,7 +172,7 @@ print_instruction_tier() {
 }
 
 case "$HOST" in
-  claude|codex|kiro|factory|opencode|cursor|auto) ;;
+  claude|codex|kiro|factory|opencode|cursor|copilot|auto) ;;
   slate)
     echo ""
     echo "Slate is not yet a first-class install target (docs/designs/SLATE_HOST.md —"
@@ -131,12 +197,14 @@ case "$HOST" in
     exit 0 ;;
   hermes)
     echo ""
-    echo "Hermes integration uses the same model as OpenClaw — Hermes spawns"
-    echo "Claude Code sessions, and gstack provides methodology artifacts."
+    echo "Hermes is an instruction-only gstack host: setup installs nothing for"
+    echo "Hermes and changed nothing on this machine."
     echo ""
-    echo "To integrate gstack with Hermes:"
-    echo "  1. Tell your Hermes agent: 'install gstack for hermes'"
-    echo "  2. Or generate artifacts: bun run gen:skill-docs --host hermes"
+    echo "To use gstack with Hermes:"
+    echo "  1. Copy the rules digest below into a file Hermes reads, or"
+    echo "  2. Render Hermes-flavoured skills yourself (not certified; #2826):"
+    echo "       bun run gen:skill-docs --host hermes"
+    echo "     then point a Hermes profile's skills.external_dirs at .hermes/skills."
     print_instruction_tier
     exit 0 ;;
   gbrain)
@@ -151,7 +219,8 @@ case "$HOST" in
     echo "GBrain setup and brain skills ship from the GBrain repo."
     echo ""
     exit 0 ;;
-  *) echo "Unknown --host value: $HOST (expected claude, codex, kiro, factory, opencode, cursor, slate, openclaw, hermes, gbrain, or auto)" >&2; exit 1 ;;
+  *)
+    echo "Unknown --host value: $HOST — nothing was installed or changed. Expected one of: claude (default), codex, kiro, factory, opencode, cursor, copilot, slate, openclaw, hermes, gbrain, or auto. Tiers: ./setup --help" >&2; exit 1 ;;
 esac
 
 if ! command -v bun >/dev/null 2>&1; then
@@ -167,6 +236,158 @@ fi
 
 INSTALL_GSTACK_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_GSTACK_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+# One state root for everything setup writes (bin/gstack-state-root.sh, docs/state-root.md).
+. "$SOURCE_GSTACK_DIR/bin/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $SOURCE_GSTACK_DIR/bin/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
+. "$SOURCE_GSTACK_DIR/bin/gstack-install-registry.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-install-registry.sh is missing. fix: reinstall from a fresh clone (docs/ADDING_A_HOST.md)" >&2; exit 1; }
+. "$SOURCE_GSTACK_DIR/bin/gstack-render-claude.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-render-claude.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
+SETUP_VERSION="$(cat "$SOURCE_GSTACK_DIR/VERSION" 2>/dev/null || echo unknown)"
+
+# --claude-model is validated before anything is written, and persisted once
+# Claude is known to be selected (below, and in the --refresh-registered parent).
+if [ "$CLAUDE_MODEL_SET" -eq 1 ]; then
+  if ! _CLAUDE_MODEL_RESOLVED="$(cd "$SOURCE_GSTACK_DIR" && bun run scripts/models.ts claude-overlay "$CLAUDE_MODEL_ARG" 2>&1)"; then
+    printf 'Error: --claude-model %s\n' "$_CLAUDE_MODEL_RESOLVED" | sed '2,$s/^/  /' >&2
+    echo "  Nothing was installed or changed." >&2
+    exit 1
+  fi
+fi
+# _persist_claude_model — save the validated --claude-model value as given.
+_persist_claude_model() {
+  local overlay generic
+  [ "$CLAUDE_MODEL_SET" -eq 1 ] || return 0
+  if ! "$SOURCE_GSTACK_DIR/bin/gstack-config" set claude_overlay_model "$CLAUDE_MODEL_ARG" >/dev/null; then
+    echo "Error: could not save claude_overlay_model. Nothing was installed or changed." >&2
+    exit 1
+  fi
+  overlay="$(printf '%s' "$_CLAUDE_MODEL_RESOLVED" | tail -1 | cut -f1)"
+  generic="$(printf '%s' "$_CLAUDE_MODEL_RESOLVED" | tail -1 | cut -f2)"
+  if [ "$generic" = 1 ]; then
+    log "Claude overlay: $CLAUDE_MODEL_ARG has no overlay of its own, so it uses the generic claude overlay (saved as claude_overlay_model)."
+  else
+    log "Claude overlay: $CLAUDE_MODEL_ARG uses the $overlay overlay (saved as claude_overlay_model; ./setup --claude-model claude returns to the generic overlay)."
+  fi
+}
+
+# ─── Quiet mode helper ────────────────────────────────────────
+log() { [ "$QUIET" -eq 0 ] && echo "$@" || true; }
+
+# ─── --refresh-registered: refresh exactly the registered installs (#1925) ───
+# What /gstack-upgrade and the team-mode auto-update run. Each install this
+# checkout registered is refreshed by running setup for that one host, in its
+# own process; installs owned by another checkout, and project installs of
+# another project, are listed with the command that refreshes them there and
+# are never repointed. Pre-registry installs that resolve to this checkout are
+# discovered and registered; with nothing registered or discovered, the
+# selected host (default claude) is installed as before.
+if [ "$REFRESH_REGISTERED" -eq 1 ] && [ -z "${GSTACK_SETUP_REFRESH_CHILD:-}" ]; then
+  gstack_install_registry_reconcile || true
+  _RF_HERE="$(pwd -P)"
+  _RF_TARGETS=""
+  _RF_SKIPPED=""
+  _rf_add() {
+    case "
+$_RF_TARGETS" in *"
+$1	$2	$3
+"*) return 0 ;; esac
+    _RF_TARGETS="$_RF_TARGETS$1	$2	$3
+"
+  }
+  while IFS='	' read -r _rf_host _rf_scope _rf_project _rf_dest _rf_root _rf_src _rf_ver _rf_rest; do
+    [ -n "$_rf_host" ] || continue
+    if [ "$_rf_src" != "$SOURCE_GSTACK_DIR" ]; then
+      _RF_SKIPPED="$_RF_SKIPPED$_rf_host	$_rf_scope	$_rf_src	$_rf_dest	$_rf_ver	$(cat "$_rf_src/VERSION" 2>/dev/null || echo -)	skipped	owned by another checkout; refresh it there: cd $_rf_src && ./setup --refresh-registered
+"
+      continue
+    fi
+    if [ "$_rf_scope" = project ]; then
+      case "$_RF_HERE/" in
+        "$(cd "$_rf_project" 2>/dev/null && pwd -P)/"*) ;;
+        *) _RF_SKIPPED="$_RF_SKIPPED$_rf_host	$_rf_scope	$_rf_src	$_rf_dest	$_rf_ver	$SETUP_VERSION	skipped	project install of $_rf_project; refresh it from inside that project: cd $_rf_project && $_rf_root/setup --refresh-registered
+"
+           continue ;;
+      esac
+    fi
+    _rf_add "$_rf_host" "$_rf_scope" "$_rf_root"
+  done <<EOF
+$(gstack_install_registry_rows)
+EOF
+  _RF_REGISTERED_ROOTS="|$(gstack_install_registry_rows | awk -F '\t' '{ printf "%s|", $5 }')"
+  while IFS='	' read -r _rf_host _rf_scope _rf_dest _rf_root; do
+      [ -n "$_rf_host" ] || continue
+      { [ -e "$_rf_root" ] || [ -L "$_rf_root" ]; } || continue
+      case "$_RF_REGISTERED_ROOTS" in *"|$_rf_root|"*) continue ;; esac
+      _rf_src="$(_gstack_install_source "$_rf_root")"
+      [ -n "$_rf_src" ] || continue
+      if [ "$_rf_src" = "$SOURCE_GSTACK_DIR" ]; then
+        _rf_add "$_rf_host" "$_rf_scope" "$_rf_root"
+      elif [ "$_rf_scope" = global ]; then
+        _RF_SKIPPED="$_RF_SKIPPED$_rf_host	$_rf_scope	$_rf_src	$_rf_dest	-	$(cat "$_rf_src/VERSION" 2>/dev/null || echo -)	skipped	pre-registry install owned by another checkout; choose: refresh it there (cd $_rf_src && ./setup --host $_rf_host) or move it to this checkout (./setup --host $_rf_host --global)
+"
+      fi
+  done <<EOF
+$(gstack_install_known_roots)
+EOF
+  case "
+$_RF_TARGETS" in
+    *"
+$HOST	"*) ;;
+    *) if [ "$HOST_FLAG_SET" -eq 1 ] || [ -z "$_RF_TARGETS" ]; then _rf_add "$HOST" global -; fi ;;
+  esac
+  # The children read claude_overlay_model, so the parent saves it first.
+  if [ "$CLAUDE_MODEL_SET" -eq 1 ]; then
+    case "
+$_RF_TARGETS" in
+      *"
+claude	"*) _persist_claude_model ;;
+      *) echo "Error: --claude-model applies to Claude installs, and no Claude install is registered for this checkout. Nothing was installed or changed. Install Claude first: ./setup --claude-model $CLAUDE_MODEL_ARG" >&2
+         exit 1 ;;
+    esac
+  fi
+  _RF_SUMMARY="$(mktemp "${TMPDIR:-/tmp}/gstack-refresh.XXXXXX")"
+  printf '%s' "$_RF_SKIPPED" > "$_RF_SUMMARY"
+  _RF_FAILED=0
+  log "Refreshing registered gstack installs from source: $SOURCE_GSTACK_DIR (v$SETUP_VERSION)"
+  while IFS='	' read -r _rf_host _rf_scope _rf_root; do
+    [ -n "$_rf_host" ] || continue
+    _rf_setup="$SOURCE_GSTACK_DIR/setup"
+    for _rf_try in "$_rf_root" "$(dirname "$(dirname "$(dirname "$_rf_root")")")/.claude/skills/gstack"; do
+      if [ -f "$_rf_try/setup" ] && [ "$(cd "$_rf_try" && pwd -P)" = "$SOURCE_GSTACK_DIR" ]; then
+        _rf_setup="$_rf_try/setup"; break
+      fi
+    done
+    _rf_args=(--host "$_rf_host")
+    if [ "$_rf_host" = codex ] && [ "$_rf_scope" = global ]; then _rf_args+=(--global); fi
+    if [ "$QUIET" -eq 1 ]; then _rf_args+=(-q); fi
+    log ""
+    log "── $_rf_host ($_rf_scope) ← $_rf_setup"
+    _rf_before="$(wc -l < "$_RF_SUMMARY" | tr -d ' ')"
+    if ! GSTACK_SETUP_REFRESH_CHILD=1 GSTACK_SETUP_SUMMARY_FILE="$_RF_SUMMARY" bash "$_rf_setup" "${_rf_args[@]}" </dev/null; then
+      _RF_FAILED=1
+      if [ "$(wc -l < "$_RF_SUMMARY" | tr -d ' ')" = "$_rf_before" ]; then
+        printf '%s	%s	%s	%s	-	%s	failed	setup exited non-zero before installing; its previous install was left in place. Retry: cd %s && ./setup --host %s
+' \
+          "$_rf_host" "$_rf_scope" "$SOURCE_GSTACK_DIR" "${_rf_root:--}" "$SETUP_VERSION" "$SOURCE_GSTACK_DIR" "$_rf_host" >> "$_RF_SUMMARY"
+      fi
+    fi
+  done <<EOF
+$_RF_TARGETS
+EOF
+  grep -q '	failed	' "$_RF_SUMMARY" && _RF_FAILED=1
+  echo ""
+  if [ "$_RF_FAILED" -eq 1 ]; then
+    echo "Upgrade summary (NOT every install was refreshed; see failed rows):"
+  else
+    echo "Upgrade summary:"
+  fi
+  gstack_install_registry_render < "$_RF_SUMMARY"
+  _rf_disabled="$(gstack_disabled_normalize "$("$SOURCE_GSTACK_DIR/bin/gstack-config" get disabled_skills 2>/dev/null || true)")"
+  if [ "$_rf_disabled" != " " ]; then
+    echo "  disabled skills (not registered on any host):$_rf_disabled"
+  fi
+  rm -f "$_RF_SUMMARY"
+  exit "$_RF_FAILED"
+fi
 INSTALL_SKILLS_DIR="$(dirname "$INSTALL_GSTACK_DIR")"
 BROWSE_BIN="$SOURCE_GSTACK_DIR/browse/dist/browse"
 CODEX_SKILLS="${CODEX_HOME:-$HOME/.codex}/skills"
@@ -178,6 +399,8 @@ OPENCODE_GSTACK="$OPENCODE_SKILLS/gstack"
 CURSOR_SKILLS="$HOME/.cursor/skills"
 CURSOR_GSTACK="$CURSOR_SKILLS/gstack"
 KIRO_SKILLS="$HOME/.kiro/skills"
+COPILOT_SKILLS="$HOME/.copilot/skills"
+COPILOT_GSTACK="$COPILOT_SKILLS/gstack"
 
 SKILLS_BASENAME="$(basename "$INSTALL_SKILLS_DIR")"
 SKILLS_PARENT_BASENAME="$(basename "$(dirname "$INSTALL_SKILLS_DIR")")"
@@ -277,11 +500,25 @@ fi
 # INVARIANT: every symlink in this script MUST route through this helper.
 # A raw ln call here will be caught by test/setup-windows-fallback.test.ts
 # (the static-invariant assertion D7).
+#
+# Windows copies are staged: the new copy is built beside the destination and
+# swapped in only when complete, so a failed or interrupted refresh keeps the
+# last working copy. Interruption recovery: a destination that is missing
+# while "$dst.gstack-old.*" exists (killed between the two renames) is
+# restored from it on the next run; stale "$dst.gstack-new.*" partial copies
+# are discarded.
 _link_or_copy() {
   local src="$1"
   local dst="$2"
+  local new old leftover
   if [ "$IS_WINDOWS" -eq 1 ]; then
-    rm -rf "$dst"
+    for leftover in "$dst".gstack-old.*; do
+      [ -e "$leftover" ] || continue
+      if [ ! -e "$dst" ]; then mv "$leftover" "$dst"; else rm -rf "$leftover"; fi
+    done
+    for leftover in "$dst".gstack-new.*; do
+      [ -e "$leftover" ] && rm -rf "$leftover"
+    done
     # Unix `ln -snf` accepts a name-only or relative-path source even when the
     # target doesn't resolve from CWD (e.g. the connect-chrome alias points at
     # the sibling-relative "gstack/open-gstack-browser"). On Windows the
@@ -290,11 +527,22 @@ _link_or_copy() {
     if [ ! -e "$src" ]; then
       return 0
     fi
+    new="$dst.gstack-new.$$"
+    old="$dst.gstack-old.$$"
     if [ -d "$src" ]; then
-      cp -R "$src" "$dst"
+      cp -R "$src" "$new" || { rm -rf "$new"; return 1; }
     else
-      cp -f "$src" "$dst"
+      cp -f "$src" "$new" || { rm -f "$new"; return 1; }
     fi
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+      mv "$dst" "$old" || { rm -rf "$new"; return 1; }
+    fi
+    if ! mv "$new" "$dst"; then
+      [ -e "$old" ] && mv "$old" "$dst"
+      rm -rf "$new"
+      return 1
+    fi
+    rm -rf "$old"
   else
     ln -snf "$src" "$dst"
   fi
@@ -308,7 +556,7 @@ _link_or_copy() {
 # marker) means we created the entry and may delete or refresh it whole; WEAK
 # (byte-identity with our source, or the two-line generated banner on a real
 # file) covers only that SKILL.md — never the directory — and a differing
-# weakly-proven file is moved to ${GSTACK_HOME:-~/.gstack}/backups/skills/<ts>/
+# weakly-proven file is moved to $GSTACK_STATE_ROOT/backups/skills/<ts>/
 # before we install over it. An entry is OURS
 # when: it is a symlink resolving into the gstack payload / render dir (or any
 # path with a `gstack` segment, the convention cleanup and gstack-uninstall
@@ -332,7 +580,7 @@ _gstack_target_is_ours() {
   # $1 = absolute target path, $2 = gstack payload dir
   local t="$1" g="$2" g_real render render_real
   g_real="$(cd "$g" 2>/dev/null && pwd -P || printf '%s' "$g")"
-  render="${GSTACK_USER_RENDER_DIR:-${GSTACK_HOME:-$HOME/.gstack}/render/claude}"
+  render="${GSTACK_USER_RENDER_DIR:-$GSTACK_STATE_ROOT/render/claude}"
   render_real="$(cd "$render" 2>/dev/null && pwd -P || printf '%s' "$render")"
   case "$t" in
     "$g"/*|"$g_real"/*|"$render"/*|"$render_real"/*|gstack/*|*/gstack/*|*/.gstack/render/claude/*) return 0 ;;
@@ -363,7 +611,7 @@ _claude_entry_is_ours() {
     # A gbrain install serves the RENDERED file (link_claude_skill_dirs prefers
     # it), so an exact copy of that render is ours too.
     if [ -n "$src_md" ]; then
-      render_md="${GSTACK_USER_RENDER_DIR:-${GSTACK_HOME:-$HOME/.gstack}/render/claude}/$(basename "$(dirname "$src_md")")/SKILL.md"
+      render_md="${GSTACK_USER_RENDER_DIR:-$GSTACK_STATE_ROOT/render/claude}/$(basename "$(dirname "$src_md")")/SKILL.md"
       [ -f "$render_md" ] && cmp -s "$entry/SKILL.md" "$render_md" && return 0
     fi
     _gstack_generated_header "$entry/SKILL.md" && return 0
@@ -389,7 +637,7 @@ _claude_entry_owned_strongly() {
 }
 # Weakly-proven real files we would otherwise overwrite are moved here (mv, so
 # the path is free for the link); the final summary prints one line.
-_SKILL_BACKUP_ROOT="${GSTACK_HOME:-$HOME/.gstack}/backups/skills/$(date +%Y%m%dT%H%M%S)"
+_SKILL_BACKUP_ROOT="$GSTACK_STATE_ROOT/backups/skills/$(date +%Y%m%dT%H%M%S)"
 _BACKED_UP_SKILL_MDS=()
 _backup_skill_md() {
   # Returns non-zero when the file could NOT be moved: the caller must then
@@ -585,6 +833,83 @@ _swap_in_render() {
   rm -rf "$render_old"
 }
 
+# ─── Per-install render (install-context render contract, #1882) ────────────
+# Committed skills call the host's default install (~/.claude/skills/gstack,
+# ~/.codex/skills/gstack). An install anywhere else (a renamed checkout, a
+# project-vendored Claude copy, CLAUDE_CONFIG_DIR, CODEX_HOME) serves skills
+# rendered for ITS root, out of tree in $GSTACK_STATE_ROOT/render/installs/
+# <host>-<id>/, so each skill's literal paths call this install and two
+# installs never overwrite each other. Built in a temp dir, validated, swapped
+# in; callers link to it only after success (a failed render keeps the previous
+# one). Worktree-isolated Claude Code refuses a command path containing
+# whitespace or shell metacharacters in any quoting, so such a root is named
+# through a plain alias symlink beside the render.
+# _render_install HOST ROOT — sets _INSTALL_RENDER (empty = committed render).
+_INSTALL_RENDER=""
+_render_install() {
+  local host="$1" root="$2" default render named tmp out rc want got
+  _INSTALL_RENDER=""
+  case "$host" in
+    claude) default="$HOME/.claude/skills/gstack" ;;
+    codex) default="$HOME/.codex/skills/gstack" ;;
+    *) return 0 ;;
+  esac
+  [ "$root" = "$default" ] && return 0
+  # The default reached through another spelling (a symlinked parent) is the default.
+  got="$(cd "$(dirname "$root")" 2>/dev/null && pwd -P)" || got=""
+  [ -n "$got" ] && [ "$(basename "$root")" = gstack ] \
+    && [ "$got" = "$(cd "$(dirname "$default")" 2>/dev/null && pwd -P)" ] && return 0
+  render="$(gstack_install_render_dir "$host" "$root")"
+  named="$root"
+  if ! printf '%s' "$named" | grep -Eq '^/[A-Za-z0-9_.@+/-]*$'; then
+    named="$render.root"
+    if [ "$IS_WINDOWS" -eq 1 ] || ! printf '%s' "$named" | grep -Eq '^/[A-Za-z0-9_.@+/-]*$'; then
+      echo "  warning: the $host install root ($root) is not a plain path and no plain alias is available here (state root: $GSTACK_STATE_ROOT); its skills keep the default-install paths" >&2
+      return 1
+    fi
+    mkdir -p "$(dirname "$named")" && _link_or_copy "$root" "$named" || return 1
+  fi
+  tmp="$render.tmp.$$"
+  rm -rf "$tmp"
+  rc=0
+  if [ "$host" = claude ]; then
+    out="$(cd "$SOURCE_GSTACK_DIR" && bun_cmd run gen:skill-docs:user --host claude --out-dir "$tmp" --link-root "$render" --install-root "$named" --model "$_GSTACK_OVERLAY" 2>&1)" || rc=$?
+    want="$(find "$SOURCE_GSTACK_DIR" -mindepth 2 -maxdepth 2 -name SKILL.md | wc -l)"
+    got="$(find "$tmp" -mindepth 2 -maxdepth 2 -name SKILL.md 2>/dev/null | wc -l)"
+    [ "$rc" -ne 0 ] || { [ "$want" -eq "$got" ] && grep -qF "$named/bin/gstack-skill-start --skill" "$tmp/SKILL.md" 2>/dev/null; } \
+      || { rc=1; out="render incomplete: $got of $want skills, or a start line that does not name $named"; }
+    [ "$rc" -ne 0 ] || "$SOURCE_GSTACK_DIR/bin/gstack-patch-names" "$tmp" "$SKILL_PREFIX" >/dev/null || rc=$?
+  else
+    out="$(cd "$SOURCE_GSTACK_DIR" && bun_cmd run gen:skill-docs --host codex --model "$CODEX_GENERATION_MODEL" --install-root "$named" --out-dir "$tmp" --link-root "$render" 2>&1)" || rc=$?
+    want="$(find "$SOURCE_GSTACK_DIR/.agents/skills" -mindepth 2 -maxdepth 2 -name SKILL.md 2>/dev/null | wc -l)"
+    got="$(find "$tmp/.agents/skills" -mindepth 2 -maxdepth 2 -name SKILL.md 2>/dev/null | wc -l)"
+    [ "$rc" -ne 0 ] || { [ "$got" -gt 0 ] && { [ "$want" -eq 0 ] || [ "$want" -eq "$got" ]; } && grep -qF "GSTACK_ROOT=\"$named\"" "$tmp/.agents/skills/gstack-review/SKILL.md" 2>/dev/null; } \
+      || { rc=1; out="render incomplete: $got of $want skills, or a runtime root that does not name $named"; }
+  fi
+  if [ "$rc" -ne 0 ]; then
+    rm -rf "$tmp"
+    echo "  warning: could not render $host skills for the install at $root (exit $rc); $( [ -d "$render" ] && echo 'the previous render stays in use' || echo 'they keep the default-install paths')" >&2
+    printf '%s\n' "$out" | tail -3 | sed 's/^/    /' >&2
+    [ -d "$render" ] || return 1
+  else
+    gstack_render_lock "$render"
+    _swap_in_render "$render" "$tmp"
+    gstack_render_unlock "$render"
+    [ "$host" != claude ] || gstack_claude_render_settle "$SOURCE_GSTACK_DIR" "$render" "${_GBRAIN_RENDER_STATE:-unknown}" rendered 0
+  fi
+  _INSTALL_RENDER="$render"
+}
+# Claude: the arm serves the render through GSTACK_USER_RENDER_DIR, which
+# linking, relink and the ownership checks read.
+_CLAUDE_INSTALL_RENDER=""
+_render_claude_install() {
+  _CLAUDE_INSTALL_RENDER=""
+  _render_install claude "$1" || return 1
+  [ -n "$_INSTALL_RENDER" ] || return 0
+  _CLAUDE_INSTALL_RENDER="$_INSTALL_RENDER"
+  export GSTACK_USER_RENDER_DIR="$_INSTALL_RENDER"
+}
+
 _WINDOWS_COPY_NOTE_PRINTED=0
 _print_windows_copy_note_once() {
   if [ "$IS_WINDOWS" -eq 1 ] && [ "$_WINDOWS_COPY_NOTE_PRINTED" -eq 0 ]; then
@@ -593,8 +918,71 @@ _print_windows_copy_note_once() {
   fi
 }
 
-# ─── Quiet mode helper ────────────────────────────────────────
-log() { [ "$QUIET" -eq 0 ] && echo "$@" || true; }
+
+# ─── Install rows: registry publication + one summary row per install ───────
+# Rows publish to the registry only after a host arm finished activating
+# (bin/gstack-install-registry.sh). The summary uses the same renderer as
+# ./setup --status and /gstack-upgrade. A setup that dies inside a host arm
+# reports that host as failed (its previous install is left in place) with the
+# exact retry command, from the EXIT trap.
+_SETUP_ROWS=""
+_SETUP_ARM=""
+_SETUP_SUMMARY_DONE=0
+_setup_row() {
+  _SETUP_ROWS="$_SETUP_ROWS$1	$2	$SOURCE_GSTACK_DIR	$3	$4	$5	$6	${7:-}
+"
+}
+_setup_retry_command() {
+  printf 'cd %s && ./setup --host %s' "$SOURCE_GSTACK_DIR" "$1"
+}
+_setup_arm_begin() { _SETUP_ARM="$1	$2	$3"; }
+_setup_arm_publish() {
+  local host="$1" scope="$2" project="$3" dest="$4" root="$5" prefix="$6" render="${7:-committed}" old
+  old="$(gstack_install_registry_rows | awk -F '\t' -v h="$host" -v d="$dest" '$1 == h && $4 == d { v = $7 } END { print v }')"
+  _SETUP_ARM=""
+  if ! gstack_install_registry_upsert "$host" "$scope" "$project" "$dest" "$root" "$SOURCE_GSTACK_DIR" "$SETUP_VERSION" "$prefix" "$render"; then
+    _setup_row "$host" "$scope" "$dest" "${old:--}" "$SETUP_VERSION" failed "installed, but the registry write failed, so upgrades will not refresh it; retry: $(_setup_retry_command "$host")"
+    return 0
+  fi
+  if [ -z "$old" ]; then
+    _setup_row "$host" "$scope" "$dest" - "$SETUP_VERSION" installed
+  elif [ "$old" = "$SETUP_VERSION" ]; then
+    _setup_row "$host" "$scope" "$dest" "$old" "$SETUP_VERSION" unchanged
+  else
+    _setup_row "$host" "$scope" "$dest" "$old" "$SETUP_VERSION" updated
+  fi
+}
+_setup_print_summary() {
+  [ "$_SETUP_SUMMARY_DONE" -eq 0 ] || return 0
+  _SETUP_SUMMARY_DONE=1
+  [ -n "$_SETUP_ROWS" ] || return 0
+  if [ -n "${GSTACK_SETUP_SUMMARY_FILE:-}" ]; then
+    printf '%s' "$_SETUP_ROWS" >> "$GSTACK_SETUP_SUMMARY_FILE"
+    return 0
+  fi
+  if [ "$QUIET" -eq 1 ]; then
+    case "$_SETUP_ROWS" in *"	failed	"*) ;; *) return 0 ;; esac
+  fi
+  echo ""
+  echo "Install summary:"
+  printf '%s' "$_SETUP_ROWS" | gstack_install_registry_render
+  if [ "$_DISABLED_SKILLS" != " " ] && [ -n "${_DISABLED_SKILLS:-}" ]; then
+    echo "  disabled skills (not registered on any host):$_DISABLED_SKILLS"
+    echo "    re-enable: gstack-config set disabled_skills \"\""
+  fi
+}
+_setup_exit_summary() {
+  local rc="$1" host scope dest
+  [ "$_SETUP_SUMMARY_DONE" -eq 0 ] || return 0
+  if [ "$rc" -ne 0 ] && [ -n "$_SETUP_ARM" ]; then
+    IFS='	' read -r host scope dest <<EOF
+$_SETUP_ARM
+EOF
+    _setup_row "$host" "$scope" "$dest" - "$SETUP_VERSION" failed "setup stopped (exit $rc) while installing $host; its previous install was left in place. Retry: $(_setup_retry_command "$host")"
+  fi
+  [ "$rc" -ne 0 ] || [ -n "$_SETUP_ROWS" ] || return 0
+  _setup_print_summary >&2
+}
 
 # Aside (aside.com, macOS 15+) is the primary browser; the compiled browse
 # binary is the fallback. Best-effort hint only — no probe of a running app.
@@ -671,12 +1059,30 @@ else
   "$GSTACK_CONFIG" set skill_prefix "$([ "$SKILL_PREFIX" -eq 1 ] && echo true || echo false)" 2>/dev/null || true
 fi
 
+# ─── disabled_skills (gstack-config set disabled_skills a,b) ─────────────────
+# A disabled skill gets no discovery entry on any host (an existing gstack-owned
+# entry is removed); its runtime files in the checkout stay, so skills that call
+# it keep working. Missing or empty = every skill enabled (#1206). Linkers test
+# membership inline with "${_DISABLED_SKILLS:- }", so a linker extracted on its
+# own (tests) behaves as "nothing disabled".
+_DISABLED_SKILLS="$(gstack_disabled_normalize "$("$GSTACK_CONFIG" get disabled_skills 2>/dev/null || true)")"
+# _remove_disabled_host_entry ENTRY — drop a non-Claude host's gstack-owned
+# entry for a disabled skill (a link, or a generated copy); anything else stays.
+_remove_disabled_host_entry() {
+  { [ -e "$1" ] || [ -L "$1" ]; } || return 0
+  if [ -L "$1" ] || { [ -d "$1" ] && _owned_for_windows_refresh "$1"; }; then
+    rm -rf "$1"
+  else
+    echo "  kept $1: disabled in gstack config, but not gstack-managed" >&2
+  fi
+}
+
 # --local: install to .claude/skills/ in the current working directory (deprecated)
 if [ "$LOCAL_INSTALL" -eq 1 ]; then
   echo "Warning: --local is deprecated. Use global install + --team instead." >&2
   echo "  See: https://github.com/garrytan/gstack#team-mode" >&2
-  if [ "$HOST" = "codex" ]; then
-    echo "Error: --local is only supported for Claude Code (not Codex)." >&2
+  if [ "$HOST" = "codex" ] || [ "$HOST" = "copilot" ]; then
+    echo "Error: --local is only supported for Claude Code (not $HOST)." >&2
     exit 1
   fi
   INSTALL_SKILLS_DIR="$(pwd)/.claude/skills"
@@ -692,6 +1098,7 @@ INSTALL_KIRO=0
 INSTALL_FACTORY=0
 INSTALL_OPENCODE=0
 INSTALL_CURSOR=0
+INSTALL_COPILOT=0
 if [ "$HOST" = "auto" ]; then
   command -v claude >/dev/null 2>&1 && INSTALL_CLAUDE=1
   command -v codex >/dev/null 2>&1 && INSTALL_CODEX=1
@@ -702,8 +1109,9 @@ if [ "$HOST" = "auto" ]; then
   # reliable footprint of an installed Cursor IDE.
   command -v cursor >/dev/null 2>&1 && INSTALL_CURSOR=1
   [ -d "$HOME/.cursor" ] && INSTALL_CURSOR=1
+  command -v copilot >/dev/null 2>&1 && INSTALL_COPILOT=1
   # If none found, default to claude
-  if [ "$INSTALL_CLAUDE" -eq 0 ] && [ "$INSTALL_CODEX" -eq 0 ] && [ "$INSTALL_KIRO" -eq 0 ] && [ "$INSTALL_FACTORY" -eq 0 ] && [ "$INSTALL_OPENCODE" -eq 0 ] && [ "$INSTALL_CURSOR" -eq 0 ]; then
+  if [ "$INSTALL_CLAUDE" -eq 0 ] && [ "$INSTALL_CODEX" -eq 0 ] && [ "$INSTALL_KIRO" -eq 0 ] && [ "$INSTALL_FACTORY" -eq 0 ] && [ "$INSTALL_OPENCODE" -eq 0 ] && [ "$INSTALL_CURSOR" -eq 0 ] && [ "$INSTALL_COPILOT" -eq 0 ]; then
     INSTALL_CLAUDE=1
   fi
 elif [ "$HOST" = "claude" ]; then
@@ -718,20 +1126,35 @@ elif [ "$HOST" = "opencode" ]; then
   INSTALL_OPENCODE=1
 elif [ "$HOST" = "cursor" ]; then
   INSTALL_CURSOR=1
+elif [ "$HOST" = "copilot" ]; then
+  INSTALL_COPILOT=1
 fi
 
 # A host that passes --host validation but sets no INSTALL_* flag would
 # silently configure nothing and exit 0 (the #2361 slate failure class).
 # Fail loudly if a future host lands in the accept-list without a dispatch arm.
-if [ "$HOST" != "auto" ] && [ "$INSTALL_CLAUDE" -eq 0 ] && [ "$INSTALL_CODEX" -eq 0 ] && [ "$INSTALL_KIRO" -eq 0 ] && [ "$INSTALL_FACTORY" -eq 0 ] && [ "$INSTALL_OPENCODE" -eq 0 ] && [ "$INSTALL_CURSOR" -eq 0 ]; then
-  echo "Error: no install arm exists for host '$HOST' — it passed --host validation but sets no INSTALL_* flag, so setup would configure nothing and exit 0. This is a setup bug. Valid install targets: claude, codex, kiro, factory, opencode, cursor (informational: slate, openclaw, hermes, gbrain)." >&2
+if [ "$HOST" != "auto" ] && [ "$INSTALL_CLAUDE" -eq 0 ] && [ "$INSTALL_CODEX" -eq 0 ] && [ "$INSTALL_KIRO" -eq 0 ] && [ "$INSTALL_FACTORY" -eq 0 ] && [ "$INSTALL_OPENCODE" -eq 0 ] && [ "$INSTALL_CURSOR" -eq 0 ] && [ "$INSTALL_COPILOT" -eq 0 ]; then
+  echo "Error: no install arm exists for host '$HOST' — it passed --host validation but sets no INSTALL_* flag, so setup would configure nothing and exit 0. This is a setup bug. Valid install targets: claude, codex, kiro, factory, opencode, cursor, copilot (informational: slate, openclaw, hermes, gbrain)." >&2
+  exit 1
+fi
+
+# Copilot reads personal skills from $COPILOT_HOME/skills when it is set, but
+# rendered skills use literal ~/.copilot paths. Refuse rather than install
+# skills Copilot will never discover.
+if [ "$INSTALL_COPILOT" -eq 1 ] && [ -n "${COPILOT_HOME:-}" ] && [ "${COPILOT_HOME%/}" != "$HOME/.copilot" ]; then
+  echo "Error: COPILOT_HOME=$COPILOT_HOME is not supported yet — nothing was installed or changed. gstack installs Copilot skills to ~/.copilot/skills. Unset COPILOT_HOME for setup and Copilot sessions, or use ./setup --host claude." >&2
   exit 1
 fi
 
 if [ "$MODEL_OVERRIDE_SET" -eq 1 ] && [ "$INSTALL_CODEX" -eq 0 ]; then
-  echo "Error: --model is supported only when Codex is selected (--host codex or --host auto with Codex installed)." >&2
+  echo "Error: --model is supported only when Codex is selected (--host codex or --host auto with Codex installed). For the Claude overlay, use --claude-model <id>." >&2
   exit 1
 fi
+if [ "$CLAUDE_MODEL_SET" -eq 1 ] && [ "$INSTALL_CLAUDE" -eq 0 ]; then
+  echo "Error: --claude-model is supported only when Claude is selected (the default host, --host claude, or --host auto with Claude Code installed). Nothing was installed or changed." >&2
+  exit 1
+fi
+_persist_claude_model
 
 migrate_direct_codex_install() {
   local gstack_dir="$1"
@@ -959,9 +1382,11 @@ bun_cmd() {
 }
 
 cleanup_copied_bun() {
+  local rc=$?
   if [ "${BUN_CMD_WAS_COPIED:-0}" -eq 1 ]; then
     rm -rf "$SOURCE_GSTACK_DIR/.tmp-bun-bin"
   fi
+  _setup_exit_summary "$rc"
 }
 
 prepare_bun_for_windows_compile
@@ -980,6 +1405,10 @@ probe_cso_build_prerequisites() {
   local _help _flag _platform _compiler _tmp _ps_script _repo_root _git_path
   CSO_BUILD_AVAILABLE=1
   CSO_FAIL_REASON=""
+  if [ "${GSTACK_SETUP_SKIP_CSO_BUILD:-0}" = "1" ]; then
+    _cso_unavailable "skipped-by-request"
+    return 0
+  fi
 
   _help="$(bun_cmd build --help 2>&1 || true)"
   for _flag in --no-compile-autoload-dotenv --no-compile-autoload-bunfig --no-compile-autoload-tsconfig --no-compile-autoload-package-json; do
@@ -1065,6 +1494,10 @@ if [ "$INSTALL_CODEX" -eq 1 ] || [ "$CODEX_GENERATION_MODEL" != "gpt-6-astra" ];
   log "Codex skill profile: $CODEX_GENERATION_MODEL"
   log "Source: $CODEX_GENERATION_MODEL_SOURCE"
 fi
+# Claude skill overlay: claude_overlay_model when present (only ./setup
+# --claude-model writes it), else the generic claude overlay
+# (bin/gstack-render-claude.sh).
+gstack_claude_overlay "$SOURCE_GSTACK_DIR" "$SOURCE_GSTACK_DIR/bin/gstack-config"
 
 # Migrate existing wrappers BEFORE build can regenerate/prune shared host trees.
 # This also repairs existing Codex/Kiro installs during a Claude-only setup.
@@ -1277,6 +1710,16 @@ if [ "$INSTALL_CURSOR" -eq 1 ] && [ "$NEEDS_BUILD" -eq 0 ]; then
     cd "$SOURCE_GSTACK_DIR"
     bun_cmd install --frozen-lockfile 2>/dev/null || bun_cmd install
     bun_cmd run gen:skill-docs --host cursor
+  )
+fi
+
+# 1f. Generate .copilot/ GitHub Copilot skill docs
+if [ "$INSTALL_COPILOT" -eq 1 ] && [ "$NEEDS_BUILD" -eq 0 ]; then
+  log "Generating .copilot/ skill docs..."
+  (
+    cd "$SOURCE_GSTACK_DIR"
+    bun_cmd install --frozen-lockfile 2>/dev/null || bun_cmd install
+    bun_cmd run gen:skill-docs --host copilot
   )
 fi
 
@@ -1540,7 +1983,12 @@ _link_skill_runtime_assets() {
 # and any pre-existing SKILL.md it moved to the backup root.
 _run_relink_quiet() {
   local out line name
-  out="$(GSTACK_SKILLS_DIR="$INSTALL_SKILLS_DIR" GSTACK_INSTALL_DIR="$SOURCE_GSTACK_DIR" "$GSTACK_RELINK" 2>&1 || true)"
+  local rc=0
+  out="$(GSTACK_SKILLS_DIR="$INSTALL_SKILLS_DIR" GSTACK_INSTALL_DIR="$SOURCE_GSTACK_DIR" "$GSTACK_RELINK" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "  warning: gstack-relink failed (exit $rc) for $INSTALL_SKILLS_DIR; skill names may not match skill_prefix. Output:" >&2
+    printf '%s\n' "$out" | tail -5 | sed 's/^/    /' >&2
+  fi
   while IFS= read -r line; do
     case "$line" in
       '  skipped '*)
@@ -1568,6 +2016,7 @@ link_claude_skill_dirs() {
       # Use frontmatter name: if present (e.g., run-tests/ with name: test → symlink as "test")
       skill_name=$(grep -m1 '^name:' "$skill_dir/SKILL.md" 2>/dev/null | sed 's/^name:[[:space:]]*//' | tr -d '[:space:]')
       [ -z "$skill_name" ] && skill_name="$dir_name"
+      case "${_DISABLED_SKILLS:- }" in *" $skill_name "*|*" $dir_name "*) continue ;; esac
       # Apply gstack- prefix unless --no-prefix or already prefixed
       if [ "$SKILL_PREFIX" -eq 1 ]; then
         case "$skill_name" in
@@ -1620,7 +2069,7 @@ link_claude_skill_dirs() {
       # file's section-base paths point into the render dir, so section reads
       # resolve there too.
       _skill_md_src="$gstack_dir/$dir_name/SKILL.md"
-      _render_dir="${GSTACK_USER_RENDER_DIR:-${GSTACK_HOME:-$HOME/.gstack}/render/claude}"
+      _render_dir="${GSTACK_USER_RENDER_DIR:-$GSTACK_STATE_ROOT/render/claude}"
       if [ -f "$_render_dir/$dir_name/SKILL.md" ]; then
         _skill_md_src="$_render_dir/$dir_name/SKILL.md"
       fi
@@ -1670,6 +2119,7 @@ link_claude_skill_dirs() {
 # list in bin/gstack-uninstall — keep the two sites in sync when adding or
 # renaming an alias, or uninstall will refuse to delete the new alias dir.
 _install_alias_skill_md() {
+  case "${_DISABLED_SKILLS:- }" in *" $(basename "$(dirname "$1")") "*) return 0 ;; esac
   local src_skill_md="$1"
   local dst_dir="$2"
   local alias_name="$3"
@@ -1864,6 +2314,7 @@ link_codex_skill_dirs() {
   for skill_dir in "$agents_dir"/gstack*/; do
     if [ -f "$skill_dir/SKILL.md" ]; then
       skill_name="$(basename "$skill_dir")"
+      case "${_DISABLED_SKILLS:- }" in *" ${skill_name#gstack-} "*) _remove_disabled_host_entry "$skills_dir/$skill_name"; continue ;; esac
       # Skip the sidecar directory — it contains runtime asset symlinks (bin/,
       # browse/), not a skill. Linking it would overwrite the root gstack
       # symlink that Step 5 already pointed at the repo root.
@@ -1943,6 +2394,40 @@ create_agents_sidecar() {
   fi
 }
 
+# ─── Helper: staged activation of a host runtime root (G0a) ──────────────────
+# _activate_runtime_root CREATE_FN SOURCE ROOT — build the runtime root beside
+# the live one ("$ROOT.gstack-new.<pid>") with errexit on, and swap it in only
+# when the build succeeded. A failed refresh leaves the previous runtime root,
+# and so the host's last working install, in place. The swap is two renames;
+# a run killed between them leaves "$ROOT.gstack-old.<pid>", which the next
+# run restores when ROOT is missing.
+_activate_runtime_root() {
+  local fn="$1" src="$2" root="$3" new="$3.gstack-new.$$" old="$3.gstack-old.$$" rc leftover
+  for leftover in "$root".gstack-old.*; do
+    [ -e "$leftover" ] || [ -L "$leftover" ] || continue
+    if [ ! -e "$root" ] && [ ! -L "$root" ]; then mv "$leftover" "$root"; else rm -rf "$leftover"; fi
+  done
+  rm -rf "$root".gstack-new.* 2>/dev/null || true
+  set +e
+  ( set -e; "$fn" "$src" "$new" )
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    rm -rf "$new"
+    echo "  error: could not build the new runtime root for $root (exit $rc); the previous one is unchanged" >&2
+    return "$rc"
+  fi
+  if [ -e "$root" ] || [ -L "$root" ]; then
+    mv "$root" "$old" || { rm -rf "$new"; return 1; }
+  fi
+  if ! mv "$new" "$root"; then
+    { [ -e "$old" ] || [ -L "$old" ]; } && mv "$old" "$root"
+    rm -rf "$new"
+    return 1
+  fi
+  rm -rf "$old"
+}
+
 # ─── Helper: create a minimal ~/.codex/skills/gstack runtime root ───────────
 # Codex scans ~/.codex/skills recursively. Exposing the whole repo here causes
 # duplicate skills because source SKILL.md files and generated Codex skills are
@@ -1950,7 +2435,7 @@ create_agents_sidecar() {
 create_codex_runtime_root() {
   local gstack_dir="$1"
   local codex_gstack="$2"
-  local agents_dir="$gstack_dir/.agents/skills"
+  local agents_dir="${_CODEX_RENDER_ROOT:-$gstack_dir}/.agents/skills"
 
   if [ -L "$codex_gstack" ]; then
     rm -f "$codex_gstack"
@@ -2144,6 +2629,7 @@ link_factory_skill_dirs() {
   for skill_dir in "$factory_dir"/gstack*/; do
     if [ -f "$skill_dir/SKILL.md" ]; then
       skill_name="$(basename "$skill_dir")"
+      case "${_DISABLED_SKILLS:- }" in *" ${skill_name#gstack-} "*) _remove_disabled_host_entry "$skills_dir/$skill_name"; continue ;; esac
       [ "$skill_name" = "gstack" ] && continue
       target="$skills_dir/$skill_name"
       # #2444: on Windows the installed target is a REAL directory copy, so
@@ -2186,6 +2672,7 @@ link_opencode_skill_dirs() {
   for skill_dir in "$opencode_dir"/gstack*/; do
     if [ -f "$skill_dir/SKILL.md" ]; then
       skill_name="$(basename "$skill_dir")"
+      case "${_DISABLED_SKILLS:- }" in *" ${skill_name#gstack-} "*) _remove_disabled_host_entry "$skills_dir/$skill_name"; continue ;; esac
       [ "$skill_name" = "gstack" ] && continue
       target="$skills_dir/$skill_name"
       # #2444: on Windows the installed target is a REAL directory copy, so
@@ -2343,6 +2830,7 @@ link_cursor_skill_dirs() {
   for skill_dir in "$cursor_dir"/gstack*/; do
     if [ -f "$skill_dir/SKILL.md" ]; then
       skill_name="$(basename "$skill_dir")"
+      case "${_DISABLED_SKILLS:- }" in *" ${skill_name#gstack-} "*) _remove_disabled_host_entry "$skills_dir/$skill_name"; continue ;; esac
       [ "$skill_name" = "gstack" ] && continue
       target="$skills_dir/$skill_name"
       # #2444: IS_WINDOWS bypass — real-dir copies never match -L, so re-runs
@@ -2364,9 +2852,132 @@ link_cursor_skill_dirs() {
   fi
 }
 
+# ─── Helper: OpenCode slash commands for gstack skills (#2629) ───────────────
+# Without a command file OpenCode's /<skill> routes to the `plan` primary agent
+# and fails ("Task cancelled"). One managed command per skill runs it on the
+# `build` agent in the current session. A command file without the managed
+# marker is the user's and is never touched; managed files whose skill is gone
+# or disabled are removed.
+write_opencode_commands() {
+  local skills_dir="$1/.opencode/skills" cmd_dir="$2" d name file desc marker
+  marker='<!-- gstack-managed command (./setup --host opencode): edits are overwritten -->'
+  mkdir -p "$cmd_dir"
+  for d in "$skills_dir"/gstack-*/; do
+    [ -f "$d/SKILL.md" ] || continue
+    name="$(basename "$d")"
+    file="$cmd_dir/$name.md"
+    if [ -e "$file" ] && ! grep -qF "$marker" "$file" 2>/dev/null; then
+      echo "  kept $file: an OpenCode command you own already uses this name" >&2
+      continue
+    fi
+    case "${_DISABLED_SKILLS:- }" in *" ${name#gstack-} "*) rm -f "$file"; continue ;; esac
+    desc="$(awk '/^description:/ { f = 1; next } f && /^[^ ]/ { exit } f && NF { sub(/^ +/, ""); print; exit }' "$d/SKILL.md" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    printf -- '---\ndescription: "%s"\nagent: build\nsubtask: false\n---\n%s\nLoad the `%s` skill with the skill tool and follow its instructions.\n\n$ARGUMENTS\n' \
+      "${desc:-gstack $name}" "$marker" "$name" > "$file.tmp.$$" && mv -f "$file.tmp.$$" "$file"
+  done
+  for file in "$cmd_dir"/gstack-*.md; do
+    [ -f "$file" ] && grep -qF "$marker" "$file" 2>/dev/null || continue
+    [ -f "$skills_dir/$(basename "$file" .md)/SKILL.md" ] || rm -f "$file"
+  done
+}
+
+# ─── Helper: create a minimal ~/.copilot/skills/gstack runtime root ─────────
+# Copilot scans ~/.copilot/skills recursively. Same shape as the Cursor root:
+# root SKILL.md from the generated tree + runtime assets only, plus
+# .source-path so /gstack-upgrade can find the source checkout (upgrade-path
+# idea from @andrey-esipov, PR #2323). Built through _activate_runtime_root.
+create_copilot_runtime_root() {
+  local gstack_dir="$1"
+  local copilot_gstack="$2"
+  local copilot_dir="$gstack_dir/.copilot/skills"
+  local asset f
+
+  mkdir -p "$copilot_gstack" "$copilot_gstack/browse" "$copilot_gstack/gstack-upgrade" "$copilot_gstack/review"
+  printf '%s\n' "$gstack_dir" > "$copilot_gstack/.source-path"
+  if [ -f "$copilot_dir/gstack/SKILL.md" ]; then
+    _link_or_copy "$copilot_dir/gstack/SKILL.md" "$copilot_gstack/SKILL.md"
+  fi
+  for asset in bin lib browse/dist browse/bin; do
+    if [ -d "$gstack_dir/$asset" ]; then
+      _link_or_copy "$gstack_dir/$asset" "$copilot_gstack/$asset"
+    fi
+  done
+  if [ -f "$copilot_dir/gstack-upgrade/SKILL.md" ]; then
+    _link_or_copy "$copilot_dir/gstack-upgrade/SKILL.md" "$copilot_gstack/gstack-upgrade/SKILL.md"
+  fi
+  if [ -f "$copilot_dir/gstack-office-hours/SKILL.md" ]; then
+    mkdir -p "$copilot_gstack/office-hours"
+    _link_or_copy "$copilot_dir/gstack-office-hours/SKILL.md" "$copilot_gstack/office-hours/SKILL.md"
+  fi
+  for f in checklist.md design-checklist.md greptile-triage.md TODOS-format.md; do
+    if [ -f "$gstack_dir/review/$f" ]; then
+      _link_or_copy "$gstack_dir/review/$f" "$copilot_gstack/review/$f"
+    fi
+  done
+  if [ -f "$gstack_dir/ETHOS.md" ]; then
+    _link_or_copy "$gstack_dir/ETHOS.md" "$copilot_gstack/ETHOS.md"
+  fi
+  if [ -f "$gstack_dir/supabase/config.sh" ]; then
+    mkdir -p "$copilot_gstack/supabase"
+    _link_or_copy "$gstack_dir/supabase/config.sh" "$copilot_gstack/supabase/config.sh"
+  fi
+}
+
+# Copilot invokes skills by frontmatter name, and /review is a built-in
+# Copilot command, so names get the gstack- prefix to match their dirs.
+link_copilot_skill_dirs() {
+  local gstack_dir="$1"
+  local skills_dir="$2"
+  local copilot_dir="$gstack_dir/.copilot/skills"
+  local linked=()
+
+  if [ ! -d "$copilot_dir" ]; then
+    echo "  Generating .copilot/ skill docs..."
+    ( cd "$gstack_dir" && bun_cmd run gen:skill-docs --host copilot )
+  fi
+  if [ ! -d "$copilot_dir" ]; then
+    echo "  warning: .copilot/skills/ generation failed — run 'bun run gen:skill-docs --host copilot' manually" >&2
+    return 1
+  fi
+  "$gstack_dir/bin/gstack-patch-names" "$copilot_dir" 1
+
+  for skill_dir in "$copilot_dir"/gstack*/; do
+    if [ -f "$skill_dir/SKILL.md" ]; then
+      skill_name="$(basename "$skill_dir")"
+      [ "$skill_name" = "gstack" ] && continue
+      case "${_DISABLED_SKILLS:- }" in *" ${skill_name#gstack-} "*) _remove_disabled_host_entry "$skills_dir/$skill_name"; continue ;; esac
+      target="$skills_dir/$skill_name"
+      if [ "$IS_WINDOWS" -eq 1 ] || [ -L "$target" ] || [ ! -e "$target" ]; then
+        if _owned_for_windows_refresh "$target"; then
+          _link_or_copy "$skill_dir" "$target"
+          linked+=("$skill_name")
+        else
+          echo "  left in place (existing dir not gstack-managed — no generated banner): $target" >&2
+        fi
+      fi
+    fi
+  done
+  if [ ${#linked[@]} -gt 0 ]; then
+    echo "  linked skills: ${linked[*]}"
+  fi
+}
+
 # 4. Install for Claude (default)
+# _claude_scope SKILLS_DIR — "global" for the user's Claude skills dir, else
+# "project <root>".
+_claude_scope() {
+  case "$1" in
+    "$HOME/.claude/skills"|"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills") echo "global -" ;;
+    *) echo "project $(dirname "$(dirname "$1")")" ;;
+  esac
+}
+_claude_prefix_setting() { [ "$SKILL_PREFIX" -eq 1 ] && echo true || echo false; }
 if [ "$INSTALL_CLAUDE" -eq 1 ]; then
   if [ "$SKILLS_BASENAME" = "skills" ]; then
+    read -r _CL_SCOPE _CL_PROJECT <<EOF
+$(_claude_scope "$INSTALL_SKILLS_DIR")
+EOF
+    _setup_arm_begin claude "$_CL_SCOPE" "$INSTALL_SKILLS_DIR"
     # Clean up stale symlinks from the opposite prefix mode
     if [ "$SKILL_PREFIX" -eq 1 ]; then
       cleanup_old_claude_symlinks "$SOURCE_GSTACK_DIR" "$INSTALL_SKILLS_DIR"
@@ -2376,6 +2987,7 @@ if [ "$INSTALL_CLAUDE" -eq 1 ]; then
     # Patch name: fields BEFORE creating symlinks so link_claude_skill_dirs
     # reads the correct (patched) name: values for symlink naming
     "$SOURCE_GSTACK_DIR/bin/gstack-patch-names" "$SOURCE_GSTACK_DIR" "$SKILL_PREFIX"
+    _render_claude_install "$INSTALL_GSTACK_DIR" || true
     link_claude_skill_dirs "$SOURCE_GSTACK_DIR" "$INSTALL_SKILLS_DIR"
     link_claude_root_skill_alias "$SOURCE_GSTACK_DIR" "$INSTALL_SKILLS_DIR"
     _CLAUDE_SKILLS_LINKED=1
@@ -2397,6 +3009,7 @@ if [ "$INSTALL_CLAUDE" -eq 1 ]; then
       _OGB_ALIAS_NAME="gstack-connect-chrome"
     fi
     _install_alias_skill_md "$SOURCE_GSTACK_DIR/open-gstack-browser/SKILL.md" "$_OGB_LINK" "$_OGB_ALIAS_NAME"
+    _setup_arm_publish claude "$_CL_SCOPE" "$_CL_PROJECT" "$INSTALL_SKILLS_DIR" "$INSTALL_GSTACK_DIR" "$(_claude_prefix_setting)" "${_CLAUDE_INSTALL_RENDER:-committed}"
     if [ "$LOCAL_INSTALL" -eq 1 ]; then
       log "gstack ready (project-local)."
       log "  skills: $INSTALL_SKILLS_DIR"
@@ -2425,6 +3038,16 @@ if [ "$INSTALL_CLAUDE" -eq 1 ]; then
         _SKIP_CLAUDE_REGISTER=1
       fi
     fi
+    # Ownership rule 1 (docs/ADDING_A_HOST.md): a global install that links to
+    # a different, still-present gstack checkout is never silently repointed.
+    _CLAUDE_REPOINT_REFUSED=0
+    if [ -L "$CLAUDE_GSTACK_LINK" ] && [ "$GLOBAL_INSTALL" -eq 0 ]; then
+      _EXISTING_REAL=$(cd "$CLAUDE_GSTACK_LINK" 2>/dev/null && pwd -P || echo "")
+      if [ -n "$_EXISTING_REAL" ] && [ "$_EXISTING_REAL" != "$SOURCE_GSTACK_DIR" ] \
+         && [ -f "$_EXISTING_REAL/setup" ] && [ -f "$_EXISTING_REAL/VERSION" ]; then
+        _CLAUDE_REPOINT_REFUSED=1
+      fi
+    fi
 
     if [ "$_SKIP_CLAUDE_REGISTER" -eq 1 ]; then
       log ""
@@ -2441,7 +3064,19 @@ if [ "$INSTALL_CLAUDE" -eq 1 ]; then
       log "gstack built (claude registration skipped)."
       log "  browse: $BROWSE_BIN"
       _browser_hint
+      _setup_row claude global "$CLAUDE_SKILLS_DIR" - "$SETUP_VERSION" skipped "left alone: $CLAUDE_GSTACK_LINK is a separate global install (rule: setup never replaces a global install it does not own)"
+    elif [ "$_CLAUDE_REPOINT_REFUSED" -eq 1 ]; then
+      echo "" >&2
+      echo "Left alone: $CLAUDE_GSTACK_LINK, the global Claude install, which links to another gstack checkout:" >&2
+      echo "  $_EXISTING_REAL (v$(cat "$_EXISTING_REAL/VERSION" 2>/dev/null || echo unknown))" >&2
+      echo "  Rule: setup never silently replaces a global install from a different checkout." >&2
+      echo "  To make this checkout ($SOURCE_GSTACK_DIR) the global install: ./setup --global" >&2
+      echo "  To refresh the existing one instead: cd $_EXISTING_REAL && ./setup" >&2
+      echo "  Docs: docs/ADDING_A_HOST.md#install-ownership-rules" >&2
+      log "gstack built (claude registration skipped)."
+      _setup_row claude global "$CLAUDE_SKILLS_DIR" - "$SETUP_VERSION" skipped "left alone: links to $_EXISTING_REAL; to replace it run ./setup --global from this checkout"
     else
+      _setup_arm_begin claude global "$CLAUDE_SKILLS_DIR"
       mkdir -p "$CLAUDE_SKILLS_DIR"
       _link_or_copy "$SOURCE_GSTACK_DIR" "$CLAUDE_GSTACK_LINK"
       log "  symlinked $CLAUDE_GSTACK_LINK -> $SOURCE_GSTACK_DIR"
@@ -2472,6 +3107,7 @@ if [ "$INSTALL_CLAUDE" -eq 1 ]; then
         _OGB_ALIAS_NAME="gstack-connect-chrome"
       fi
       _install_alias_skill_md "$SOURCE_GSTACK_DIR/open-gstack-browser/SKILL.md" "$_OGB_LINK" "$_OGB_ALIAS_NAME"
+      _setup_arm_publish claude global - "$INSTALL_SKILLS_DIR" "$INSTALL_GSTACK_DIR" "$(_claude_prefix_setting)"
       log "gstack ready (claude)."
       log "  browse: $BROWSE_BIN"
       _browser_hint
@@ -2481,6 +3117,15 @@ fi
 
 # 5. Install for Codex
 if [ "$INSTALL_CODEX" -eq 1 ]; then
+  if [ "$CODEX_REPO_LOCAL" -eq 1 ]; then _CX_SCOPE=project; _CX_PROJECT="$_codex_project"; else _CX_SCOPE=global; _CX_PROJECT=-; fi
+  _setup_arm_begin codex "$_CX_SCOPE" "$CODEX_SKILLS"
+  if [ "$INSTALL_CLAUDE" -eq 0 ]; then
+    case "$INSTALL_SKILLS_DIR" in
+      "$HOME/.claude/skills"|"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills")
+        echo "  note: this checkout lives in Claude Code's skills directory ($INSTALL_GSTACK_DIR), so Claude Code" >&2
+        echo "  still discovers it as a skill. For a Codex-only install, move it: mv $INSTALL_GSTACK_DIR ~/gstack && cd ~/gstack && ./setup --host codex" >&2 ;;
+    esac
+  fi
   mkdir -p "$CODEX_SKILLS"
 
   CODEX_RUNTIME_IN_PLACE=0
@@ -2491,16 +3136,24 @@ if [ "$INSTALL_CODEX" -eq 1 ]; then
       CODEX_RUNTIME_IN_PLACE=1
     fi
   fi
+  # CODEX_HOME (a global root other than ~/.codex/skills/gstack): serve a
+  # per-install render whose runtime root names this install. Repo-local
+  # installs resolve their root at run time and keep the committed render.
+  _CODEX_RENDER_ROOT=""
+  if [ "$CODEX_REPO_LOCAL" -eq 0 ] && _render_install codex "$CODEX_GSTACK" && [ -n "$_INSTALL_RENDER" ]; then
+    _CODEX_RENDER_ROOT="$_INSTALL_RENDER"
+  fi
   if [ "$CODEX_RUNTIME_IN_PLACE" -eq 0 ]; then
     if [ "$CODEX_REPO_LOCAL" -eq 1 ] && _sidecar_root_user_owned "$CODEX_GSTACK"; then
       echo "  left in place (existing dir not gstack-managed — no generated banner): $CODEX_GSTACK" >&2
     else
-      create_codex_runtime_root "$SOURCE_GSTACK_DIR" "$CODEX_GSTACK"
+      _activate_runtime_root create_codex_runtime_root "$SOURCE_GSTACK_DIR" "$CODEX_GSTACK"
     fi
   fi
   # Install generated Codex-format skills (not Claude source dirs)
-  _prune_stale_generated "$SOURCE_GSTACK_DIR" "$SOURCE_GSTACK_DIR/.agents/skills" "$CODEX_SKILLS"
-  link_codex_skill_dirs "$SOURCE_GSTACK_DIR" "$CODEX_SKILLS"
+  _prune_stale_generated "$SOURCE_GSTACK_DIR" "${_CODEX_RENDER_ROOT:-$SOURCE_GSTACK_DIR}/.agents/skills" "$CODEX_SKILLS"
+  link_codex_skill_dirs "${_CODEX_RENDER_ROOT:-$SOURCE_GSTACK_DIR}" "$CODEX_SKILLS"
+  _SETUP_ARM=""
 
   log "gstack ready (codex)."
   log "  browse: $BROWSE_BIN"
@@ -2524,7 +3177,9 @@ if [ "$INSTALL_KIRO" -eq 1 ]; then
   mkdir -p "$KIRO_SKILLS"
   if _sidecar_root_user_owned "$KIRO_GSTACK"; then
     echo "  left in place (existing Kiro runtime root is not gstack-managed): $KIRO_GSTACK" >&2
+    _setup_row kiro global "$KIRO_SKILLS" - "$SETUP_VERSION" skipped "left alone: $KIRO_GSTACK is not gstack-managed (no generated banner)"
   else
+    _setup_arm_begin kiro global "$KIRO_SKILLS"
     [ -L "$KIRO_GSTACK" ] && rm -f "$KIRO_GSTACK"
     mkdir -p "$KIRO_GSTACK" "$KIRO_GSTACK/browse" "$KIRO_GSTACK/gstack-upgrade" "$KIRO_GSTACK/review"
     _link_or_copy "$SOURCE_GSTACK_DIR/bin" "$KIRO_GSTACK/bin"
@@ -2554,6 +3209,7 @@ if [ "$INSTALL_KIRO" -eq 1 ]; then
       skill_name="$(basename "$skill_dir")"
       [ "$skill_name" = "gstack" ] && continue
       target_dir="$KIRO_SKILLS/$skill_name"
+      case "${_DISABLED_SKILLS:- }" in *" ${skill_name#gstack-} "*) _remove_disabled_host_entry "$target_dir"; continue ;; esac
       if { [ -e "$target_dir" ] || [ -L "$target_dir" ]; } && ! _claude_entry_is_ours "$target_dir" "$skill_dir/SKILL.md" "$SOURCE_GSTACK_DIR"; then
         echo "  skipped $skill_name: existing entry is not gstack-managed — left untouched" >&2
         continue
@@ -2595,8 +3251,35 @@ if [ "$INSTALL_KIRO" -eq 1 ]; then
           _link_or_copy "$section_file" "$section_dest"
         done
       fi
+      if [ "$skill_name" = "gstack-qa" ] && [ -f "$skill_dir/templates/functional-report-template.md" ]; then
+        if [ -L "$target_dir/templates" ]; then
+          template_target="$(_gstack_link_target_abs "$target_dir/templates")"
+          if ! _gstack_target_is_ours "$template_target" "$SOURCE_GSTACK_DIR"; then
+            echo "  kept $skill_name/templates: directory link is not gstack-managed" >&2
+            continue
+          fi
+          rm -f "$target_dir/templates"
+        elif [ -e "$target_dir/templates" ] && [ ! -d "$target_dir/templates" ]; then
+          echo "  kept $skill_name/templates: existing entry is not a directory" >&2
+          continue
+        fi
+        mkdir -p "$target_dir/templates"
+        template_dest="$target_dir/templates/functional-report-template.md"
+        if [ -L "$template_dest" ]; then
+          template_target="$(_gstack_link_target_abs "$template_dest")"
+          if ! _gstack_target_is_ours "$template_target" "$SOURCE_GSTACK_DIR"; then
+            echo "  kept $skill_name/templates/functional-report-template.md: file link is not gstack-managed" >&2
+            continue
+          fi
+        elif [ -e "$template_dest" ] && ! _gstack_generated_header "$template_dest"; then
+          echo "  kept $skill_name/templates/functional-report-template.md: existing file is not gstack-managed" >&2
+          continue
+        fi
+        _link_or_copy "$skill_dir/templates/functional-report-template.md" "$template_dest"
+      fi
     done
     _prune_stale_generated "$SOURCE_GSTACK_DIR" "$KIRO_DIR" "$KIRO_SKILLS"
+    _setup_arm_publish kiro global - "$KIRO_SKILLS" "$KIRO_GSTACK" -
     echo "gstack ready (kiro)."
     echo "  browse: $BROWSE_BIN"
     _browser_hint
@@ -2606,10 +3289,12 @@ fi
 
 # 6b. Install for Factory Droid
 if [ "$INSTALL_FACTORY" -eq 1 ]; then
+  _setup_arm_begin factory global "$FACTORY_SKILLS"
   mkdir -p "$FACTORY_SKILLS"
-  create_factory_runtime_root "$SOURCE_GSTACK_DIR" "$FACTORY_GSTACK"
+  _activate_runtime_root create_factory_runtime_root "$SOURCE_GSTACK_DIR" "$FACTORY_GSTACK"
   _prune_stale_generated "$SOURCE_GSTACK_DIR" "$SOURCE_GSTACK_DIR/.factory/skills" "$FACTORY_SKILLS"
   link_factory_skill_dirs "$SOURCE_GSTACK_DIR" "$FACTORY_SKILLS"
+  _setup_arm_publish factory global - "$FACTORY_SKILLS" "$FACTORY_GSTACK" -
   echo "gstack ready (factory)."
   echo "  browse: $BROWSE_BIN"
   _browser_hint
@@ -2618,10 +3303,13 @@ fi
 
 # 6c. Install for OpenCode
 if [ "$INSTALL_OPENCODE" -eq 1 ]; then
+  _setup_arm_begin opencode global "$OPENCODE_SKILLS"
   mkdir -p "$OPENCODE_SKILLS"
-  create_opencode_runtime_root "$SOURCE_GSTACK_DIR" "$OPENCODE_GSTACK"
+  _activate_runtime_root create_opencode_runtime_root "$SOURCE_GSTACK_DIR" "$OPENCODE_GSTACK"
   _prune_stale_generated "$SOURCE_GSTACK_DIR" "$SOURCE_GSTACK_DIR/.opencode/skills" "$OPENCODE_SKILLS"
   link_opencode_skill_dirs "$SOURCE_GSTACK_DIR" "$OPENCODE_SKILLS"
+  write_opencode_commands "$SOURCE_GSTACK_DIR" "$HOME/.config/opencode/commands"
+  _setup_arm_publish opencode global - "$OPENCODE_SKILLS" "$OPENCODE_GSTACK" -
   echo "gstack ready (opencode)."
   echo "  browse: $BROWSE_BIN"
   _browser_hint
@@ -2630,55 +3318,101 @@ fi
 
 # 6d. Install for Cursor
 if [ "$INSTALL_CURSOR" -eq 1 ]; then
+  _setup_arm_begin cursor global "$CURSOR_SKILLS"
   mkdir -p "$CURSOR_SKILLS"
-  create_cursor_runtime_root "$SOURCE_GSTACK_DIR" "$CURSOR_GSTACK"
+  _activate_runtime_root create_cursor_runtime_root "$SOURCE_GSTACK_DIR" "$CURSOR_GSTACK"
   # Link before sidecar. Sidecar mkdir -p creates .cursor/skills/gstack, which
   # would make link_cursor_skill_dirs' "[ ! -d generated ]" gen fallback a no-op.
   _prune_stale_generated "$SOURCE_GSTACK_DIR" "$SOURCE_GSTACK_DIR/.cursor/skills" "$CURSOR_SKILLS"
   link_cursor_skill_dirs "$SOURCE_GSTACK_DIR" "$CURSOR_SKILLS"
   create_cursor_sidecar "$SOURCE_GSTACK_DIR"
+  _setup_arm_publish cursor global - "$CURSOR_SKILLS" "$CURSOR_GSTACK" -
   echo "gstack ready (cursor)."
   echo "  browse: $BROWSE_BIN"
   _browser_hint
   echo "  cursor skills: $CURSOR_SKILLS"
 fi
 
+# 6e. Install for GitHub Copilot CLI (the Copilot app reads the same skills)
+if [ "$INSTALL_COPILOT" -eq 1 ]; then
+  if _sidecar_root_user_owned "$COPILOT_GSTACK"; then
+    echo "  left in place (existing dir not gstack-managed — no generated banner): $COPILOT_GSTACK" >&2
+    _setup_row copilot global "$COPILOT_SKILLS" - "$SETUP_VERSION" skipped "left alone: $COPILOT_GSTACK is not gstack-managed (no generated banner)"
+  else
+    _setup_arm_begin copilot global "$COPILOT_SKILLS"
+    mkdir -p "$COPILOT_SKILLS"
+    _prune_stale_generated "$SOURCE_GSTACK_DIR" "$SOURCE_GSTACK_DIR/.copilot/skills" "$COPILOT_SKILLS"
+    link_copilot_skill_dirs "$SOURCE_GSTACK_DIR" "$COPILOT_SKILLS"
+    _activate_runtime_root create_copilot_runtime_root "$SOURCE_GSTACK_DIR" "$COPILOT_GSTACK"
+    _setup_arm_publish copilot global - "$COPILOT_SKILLS" "$COPILOT_GSTACK" -
+    echo "gstack ready (copilot)."
+    echo "  browse: $BROWSE_BIN"
+    _browser_hint
+    echo "  copilot skills: $COPILOT_SKILLS (invoke as /gstack-<skill>)"
+  fi
+fi
+
 # 7. Create .agents/ sidecar symlinks for the real Codex skill target.
 # The root Codex skill ends up pointing at $SOURCE_GSTACK_DIR/.agents/skills/gstack,
 # so the runtime assets must live there for both global and repo-local installs.
 if [ "$INSTALL_CODEX" -eq 1 ]; then
+  _setup_arm_begin codex "$_CX_SCOPE" "$CODEX_SKILLS"
   create_agents_sidecar "$SOURCE_GSTACK_DIR"
+  _setup_arm_publish codex "$_CX_SCOPE" "$_CX_PROJECT" "$CODEX_SKILLS" "$CODEX_GSTACK" - "${_CODEX_RENDER_ROOT:-committed}"
 fi
 
 # 8. Run pending version migrations
 # Migrations handle state fixes that ./setup alone can't cover (stale config,
 # orphaned files, directory structure changes). Each migration is idempotent.
+# They are STATE-ROOT migrations: their completion marker lives in the state
+# root they repaired ($GSTACK_STATE_ROOT/.last-setup-version), not in a global
+# marker, and it only advances past a migration that succeeded. A failed
+# migration is reported as a failed row and is retried by the next ./setup.
+# Install/host migrations are tracked per install by the registry row version.
 MIGRATIONS_DIR="$SOURCE_GSTACK_DIR/gstack-upgrade/migrations"
-CURRENT_VERSION=$(cat "$SOURCE_GSTACK_DIR/VERSION" 2>/dev/null || echo "unknown")
-LAST_SETUP_VERSION=$(cat "$HOME/.gstack/.last-setup-version" 2>/dev/null || echo "0.0.0.0")
-if [ -d "$MIGRATIONS_DIR" ] && [ "$CURRENT_VERSION" != "unknown" ] && [ "$LAST_SETUP_VERSION" != "$CURRENT_VERSION" ]; then
-  # Fresh install (no marker file) — skip migrations, just write marker
-  if [ ! -f "$HOME/.gstack/.last-setup-version" ]; then
-    : # fall through to marker write below
-  else
-    find "$MIGRATIONS_DIR" -maxdepth 1 -name 'v*.sh' -type f 2>/dev/null | sort -V | while IFS= read -r migration; do
-      m_ver="$(basename "$migration" .sh | sed 's/^v//')"
-      # Run if migration is newer than last setup version AND not newer than current version
-      if [ "$(printf '%s\n%s' "$LAST_SETUP_VERSION" "$m_ver" | sort -V | head -1)" = "$LAST_SETUP_VERSION" ] && [ "$LAST_SETUP_VERSION" != "$m_ver" ] \
-         && [ "$(printf '%s\n%s' "$m_ver" "$CURRENT_VERSION" | sort -V | tail -1)" = "$CURRENT_VERSION" ]; then
-        echo "  running migration $m_ver..."
-        # GSTACK_INSTALL_DIR: migrations that clean the INSTALL (not just
-        # ~/.gstack state) default to ~/.claude/skills/gstack when unset —
-        # a repo-local ./setup would silently no-op them against the wrong
-        # tree without this.
-        CODEX_HOME="$(dirname "$CODEX_SKILLS")" GSTACK_INSTALL_DIR="$SOURCE_GSTACK_DIR" bash "$migration" || echo "  warning: migration $m_ver had errors (non-fatal)"
-      fi
-    done
-  fi
+CURRENT_VERSION="$SETUP_VERSION"
+MIGRATION_MARKER="$GSTACK_STATE_ROOT/.last-setup-version"
+_LEGACY_MARKER="$HOME/.gstack/.last-setup-version"
+if [ -f "$MIGRATION_MARKER" ]; then
+  LAST_SETUP_VERSION="$(cat "$MIGRATION_MARKER" 2>/dev/null || echo 0.0.0.0)"
+elif [ -f "$_LEGACY_MARKER" ]; then
+  LAST_SETUP_VERSION="$(cat "$_LEGACY_MARKER" 2>/dev/null || echo 0.0.0.0)"
+else
+  LAST_SETUP_VERSION=""
 fi
-mkdir -p "$HOME/.gstack"
-if [ "$CURRENT_VERSION" != "unknown" ]; then
-  echo "$CURRENT_VERSION" > "$HOME/.gstack/.last-setup-version"
+_MIGRATED_TO="$LAST_SETUP_VERSION"
+_MIGRATION_FAILED=""
+if [ -d "$MIGRATIONS_DIR" ] && [ "$CURRENT_VERSION" != "unknown" ] && [ -n "$LAST_SETUP_VERSION" ] && [ "$LAST_SETUP_VERSION" != "$CURRENT_VERSION" ]; then
+  while IFS= read -r migration; do
+    [ -n "$migration" ] || continue
+    m_ver="$(basename "$migration" .sh | sed 's/^v//')"
+    # Run if migration is newer than last setup version AND not newer than current version
+    if [ "$(printf '%s\n%s' "$LAST_SETUP_VERSION" "$m_ver" | sort -V | head -1)" = "$LAST_SETUP_VERSION" ] && [ "$LAST_SETUP_VERSION" != "$m_ver" ] \
+       && [ "$(printf '%s\n%s' "$m_ver" "$CURRENT_VERSION" | sort -V | tail -1)" = "$CURRENT_VERSION" ]; then
+      echo "  running migration $m_ver..."
+      # GSTACK_INSTALL_DIR: migrations that clean the INSTALL (not just
+      # ~/.gstack state) default to ~/.claude/skills/gstack when unset —
+      # a repo-local ./setup would silently no-op them against the wrong
+      # tree without this.
+      if CODEX_HOME="$(dirname "$CODEX_SKILLS")" GSTACK_INSTALL_DIR="$SOURCE_GSTACK_DIR" GSTACK_STATE_ROOT="$GSTACK_STATE_ROOT" bash "$migration"; then
+        _MIGRATED_TO="$m_ver"
+      else
+        _MIGRATION_FAILED="$m_ver"
+        break
+      fi
+    fi
+  done <<EOF
+$(find "$MIGRATIONS_DIR" -maxdepth 1 -name 'v*.sh' -type f 2>/dev/null | sort -V)
+EOF
+fi
+mkdir -p "$GSTACK_STATE_ROOT"
+if [ -n "$_MIGRATION_FAILED" ]; then
+  [ -n "$_MIGRATED_TO" ] && printf '%s\n' "$_MIGRATED_TO" > "$MIGRATION_MARKER"
+  echo "  warning: migration $_MIGRATION_FAILED failed; the state root stays marked at ${_MIGRATED_TO:-its previous version}, so the next ./setup retries it" >&2
+  _SETUP_ROWS="$_SETUP_ROWS""state	global	$SOURCE_GSTACK_DIR	$GSTACK_STATE_ROOT	${_MIGRATED_TO:--}	$CURRENT_VERSION	failed	migration $_MIGRATION_FAILED failed; installs are active, the migration is retried by: cd $SOURCE_GSTACK_DIR && ./setup
+"
+elif [ "$CURRENT_VERSION" != "unknown" ]; then
+  echo "$CURRENT_VERSION" > "$MIGRATION_MARKER"
 fi
 
 # 9. First-time welcome + legacy cleanup
@@ -2699,6 +3433,11 @@ rm -f /tmp/gstack-latest-version
 
 # 10. Team mode: register/unregister SessionStart hook
 SETTINGS_HOOK="$SOURCE_GSTACK_DIR/bin/gstack-settings-hook"
+# Claude Code hooks belong to the Claude install. A setup that did not select
+# Claude (--host codex, kiro, …) never heals, registers or removes them (#2347).
+if [ "$INSTALL_CLAUDE" -ne 1 ]; then
+  SETTINGS_HOOK=""
+fi
 
 # ─── Canonical hook paths + self-heal (phantom-hooks fix) ─────────────────────
 # Hook commands written to GLOBAL settings.json must survive deletion of the
@@ -2839,15 +3578,22 @@ fi
 # as-is (zero token overhead) and any stale render dir is removed so it
 # can't shadow canonical files on the next relink.
 #
+# A pinned Claude overlay (claude_overlay_model, set by ./setup
+# --claude-model) is rendered into the same dir whatever detection says; a
+# missing or failed detector counts as "no brain blocks"
+# (bin/gstack-render-claude.sh).
+#
 # Users who install gbrain after running ./setup should re-run setup OR
 # call `gstack-config gbrain-refresh`.
 DETECT_BIN="$SOURCE_GSTACK_DIR/bin/gstack-gbrain-detect"
-GBRAIN_STATE_DIR="${GSTACK_HOME:-$HOME/.gstack}"
+GBRAIN_STATE_DIR="$GSTACK_STATE_ROOT"
 DETECTION_FILE="$GBRAIN_STATE_DIR/gbrain-detection.json"
 _GSTACK_RENDER_DIR="${GSTACK_USER_RENDER_DIR:-$GBRAIN_STATE_DIR/render/claude}"
 # PID-unique tmp so concurrent setups (parallel Conductor workspaces) can't
 # clobber each other's in-flight detection write.
 DETECTION_TMP="$DETECTION_FILE.$$.tmp"
+# ok | absent | unknown (detector missing or failed).
+_GBRAIN_RENDER_STATE=unknown
 mkdir -p "$GBRAIN_STATE_DIR"
 if [ -x "$DETECT_BIN" ]; then
   if "$DETECT_BIN" > "$DETECTION_TMP" 2>/dev/null; then
@@ -2855,13 +3601,24 @@ if [ -x "$DETECT_BIN" ]; then
     # Single source of truth for "is gbrain usable" — `--is-ok` runs live
     # detection (exit 0 iff ok), so setup, bin/dev-setup, and gstack-config
     # all gate on the same check instead of re-grepping the JSON.
-    if "$DETECT_BIN" --is-ok 2>/dev/null; then
+    if [ -n "$_CLAUDE_INSTALL_RENDER" ] && [ "$INSTALL_CLAUDE" -eq 1 ]; then
+      # This install serves its own per-install render (:user, so gbrain
+      # detection decides the brain-aware blocks); refresh it with the
+      # detection just written.
+      _GBRAIN_RENDER_STATE=detected
+      if _render_claude_install "$INSTALL_GSTACK_DIR" && [ "${_CLAUDE_SKILLS_LINKED:-0}" -eq 1 ]; then
+        link_claude_skill_dirs "$SOURCE_GSTACK_DIR" "$INSTALL_SKILLS_DIR" >/dev/null
+      fi
+    elif "$DETECT_BIN" --is-ok 2>/dev/null; then
+      _GBRAIN_RENDER_STATE=ok
       if [ -n "${GSTACK_SKIP_GBRAIN_REGEN:-}" ]; then
         # Dev/source tree (set by bin/dev-setup): detection is persisted
         # above; the dev workspace renders the :user variant into its own
         # untracked dir (.claude/gstack-rendered), and other projects get
         # blocks via `gstack-config gbrain-refresh`.
         log "gbrain detected — GSTACK_SKIP_GBRAIN_REGEN set: leaving tracked SKILL.md canonical (dev/source tree)."
+      elif [ "$INSTALL_CLAUDE" -ne 1 ]; then
+        log "gbrain detected — the Claude render is left as is: Claude is not selected for this setup (rule: an explicit --host never changes another host)."
       else
         log "gbrain detected — rendering brain-aware Claude SKILL.md into $_GSTACK_RENDER_DIR (~250 token overhead per planning skill; source checkout stays clean)..."
         # Render into a tmp dir and swap it in only on SUCCESS. Installed
@@ -2876,29 +3633,36 @@ if [ -x "$DETECT_BIN" ]; then
           # No pipe before the || guard: `cmd | tail -3` reports TAIL's exit
           # status, so a generator crash read as success (same masking the
           # main gen:skill-docs site had). Capture, show the tail, propagate.
-          _GEN_USER_OUT=$(bun_cmd run gen:skill-docs:user --host claude --out-dir "$_GSTACK_RENDER_TMP" --link-root "$_GSTACK_RENDER_DIR" 2>&1)
+          _GEN_USER_OUT=$(bun_cmd run gen:skill-docs:user --host claude --out-dir "$_GSTACK_RENDER_TMP" --link-root "$_GSTACK_RENDER_DIR" --model "$_GSTACK_OVERLAY" 2>&1)
           _GEN_USER_RC=$?
           printf '%s\n' "$_GEN_USER_OUT" | tail -3
           exit "$_GEN_USER_RC"
         ); then
+          gstack_render_lock "$_GSTACK_RENDER_DIR"
           _swap_in_render "$_GSTACK_RENDER_DIR" "$_GSTACK_RENDER_TMP"
-          # Repoint the installed skills at the fresh render — the installer
-          # prefers rendered files when present (#2569).
-          if [ "${_CLAUDE_SKILLS_LINKED:-0}" -eq 1 ]; then
-            link_claude_skill_dirs "$SOURCE_GSTACK_DIR" "$INSTALL_SKILLS_DIR" >/dev/null
-          fi
+          gstack_render_unlock "$_GSTACK_RENDER_DIR"
+          gstack_claude_render_settle "$SOURCE_GSTACK_DIR" "$_GSTACK_RENDER_DIR" ok rendered
         else
           rm -rf "$_GSTACK_RENDER_TMP"
           log "  warning: gen:skill-docs:user failed — previous render (if any) left in place, links stay valid. Run 'bun run gen:skill-docs:user --host claude --out-dir $_GSTACK_RENDER_DIR' manually if you want fresh brain-aware blocks"
+          gstack_claude_render_settle "$SOURCE_GSTACK_DIR" "$_GSTACK_RENDER_DIR" ok failed
+        fi
+        # Repoint the installed skills at the fresh render — the installer
+        # prefers rendered files when present (#2569).
+        if [ "${_CLAUDE_SKILLS_LINKED:-0}" -eq 1 ]; then
+          link_claude_skill_dirs "$SOURCE_GSTACK_DIR" "$INSTALL_SKILLS_DIR" >/dev/null
         fi
       fi
     else
+      _GBRAIN_RENDER_STATE=absent
       log "gbrain not detected — brain-aware blocks suppressed in planning-skill SKILL.md files (zero token overhead)."
       log "  To enable: install gbrain via /setup-gbrain, then re-run ./setup or 'gstack-config gbrain-refresh'."
       # A render from a previous gbrain install would shadow canonical files
-      # on the next link/relink — drop it and restore canonical links.
-      if [ -d "$_GSTACK_RENDER_DIR" ] && [ -z "${GSTACK_SKIP_GBRAIN_REGEN:-}" ]; then
+      # on the next link/relink — drop it and restore canonical links. A
+      # pinned overlay re-renders it without brain blocks instead (below).
+      if [ -d "$_GSTACK_RENDER_DIR" ] && [ -z "${GSTACK_SKIP_GBRAIN_REGEN:-}" ] && [ "$INSTALL_CLAUDE" -eq 1 ] && [ "$_GSTACK_OVERLAY" = claude ]; then
         rm -rf "$_GSTACK_RENDER_DIR"
+        gstack_claude_render_settle "$SOURCE_GSTACK_DIR" "$_GSTACK_RENDER_DIR" absent removed
         if [ "${_CLAUDE_SKILLS_LINKED:-0}" -eq 1 ]; then
           link_claude_skill_dirs "$SOURCE_GSTACK_DIR" "$INSTALL_SKILLS_DIR" >/dev/null
         fi
@@ -2907,6 +3671,32 @@ if [ -x "$DETECT_BIN" ]; then
   else
     rm -f "$DETECTION_TMP"
     log "  warning: gstack-gbrain-detect failed — brain-aware blocks will stay suppressed"
+  fi
+fi
+# Default install without brain blocks: render a pinned overlay, or (detector
+# missing or failed) drop a previous pinned render after a switch back to claude.
+if [ "$INSTALL_CLAUDE" -eq 1 ] && [ -z "$_CLAUDE_INSTALL_RENDER" ] && [ -z "${GSTACK_SKIP_GBRAIN_REGEN:-}" ] \
+  && { [ "$_GBRAIN_RENDER_STATE" = absent ] || [ "$_GBRAIN_RENDER_STATE" = unknown ]; }; then
+  gstack_claude_render_action "$_GSTACK_RENDER_DIR" "$_GBRAIN_RENDER_STATE"
+  case "$_GSTACK_RENDER_ACTION" in
+    plain)
+      if gstack_claude_render_plain "$SOURCE_GSTACK_DIR" "$_GSTACK_RENDER_DIR"; then
+        gstack_claude_render_settle "$SOURCE_GSTACK_DIR" "$_GSTACK_RENDER_DIR" "$_GBRAIN_RENDER_STATE" rendered
+      else
+        gstack_claude_render_settle "$SOURCE_GSTACK_DIR" "$_GSTACK_RENDER_DIR" "$_GBRAIN_RENDER_STATE" failed
+      fi
+      ;;
+    remove)
+      if [ "$_GBRAIN_RENDER_STATE" = unknown ]; then
+        rm -rf "$_GSTACK_RENDER_DIR"
+        gstack_claude_render_settle "$SOURCE_GSTACK_DIR" "$_GSTACK_RENDER_DIR" unknown removed
+      else
+        _GSTACK_RENDER_ACTION=keep
+      fi
+      ;;
+  esac
+  if [ "$_GSTACK_RENDER_ACTION" != keep ] && [ "${_CLAUDE_SKILLS_LINKED:-0}" -eq 1 ]; then
+    link_claude_skill_dirs "$SOURCE_GSTACK_DIR" "$INSTALL_SKILLS_DIR" >/dev/null
   fi
 fi
 
@@ -3264,8 +4054,10 @@ fi
 # posture). An explicit answer is persisted and never re-asked; an explicit
 # "false" is a recorded decline (adversarial review finding 11).
 # `gstack-config get` defaults absent keys to "false", which is
-# indistinguishable from a decline — test key presence in the config file.
-_GSTACK_CFG_FILE="${GSTACK_HOME:-$HOME/.gstack}/config.yaml"
+# indistinguishable from a decline — test key presence in the config file
+# of the resolved state root (the twin beside gstack-config).
+. "$(dirname "$GSTACK_CONFIG")/gstack-state-root.sh" 2>/dev/null && gstack_state_root_select
+_GSTACK_CFG_FILE="${_gstack_sr_root:-$GSTACK_STATE_ROOT}/config.yaml"
 if ! grep -q '^redact_prepush_hook:' "$_GSTACK_CFG_FILE" 2>/dev/null; then
   if [ "$QUIET" -ne 1 ] && [ -t 0 ] && [ -t 1 ]; then
     _REDACT_PROMPT_TIMEOUT=10
@@ -3298,6 +4090,8 @@ if ! grep -q '^redact_prepush_hook:' "$_GSTACK_CFG_FILE" 2>/dev/null; then
   fi
 fi
 
+_setup_print_summary
+
 # ─── CSO native-helper summary ────────────────────────────────────────────────
 if [ "$CSO_BUILD_AVAILABLE" -eq 0 ]; then
   case "$CSO_FAIL_REASON" in
@@ -3309,6 +4103,7 @@ if [ "$CSO_BUILD_AVAILABLE" -eq 0 ]; then
     windows-msvc-toolchain) _CSO_PREREQ="install Visual Studio 2022 Build Tools with Desktop development with C++" ;;
     windows-git) _CSO_PREREQ="install Git for Windows and run setup from its Git Bash" ;;
     unsupported-platform) _CSO_PREREQ="use a supported macOS, Linux, or Windows host" ;;
+    skipped-by-request) _CSO_PREREQ="re-run without GSTACK_SETUP_SKIP_CSO_BUILD=1" ;;
     *) _CSO_PREREQ="install the native CSO build prerequisites" ;;
   esac
   log ""

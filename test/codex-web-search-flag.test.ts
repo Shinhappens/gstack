@@ -91,17 +91,37 @@ describe('deprecated codex web-search flag is gone (#2525)', () => {
 });
 
 describe('codex frontier model flag is present', () => {
-  test('the model flag defaults to gpt-6-astra while allowing GSTACK_CODEX_MODEL', () => {
-    expect(CODEX_MODEL_CONFIG_FLAG).toBe('-c "model=\\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\\""');
+  // #2914: the flag carries the runtime selection, never a hard-coded default.
+  const flagArgv = (flag: string, select: string, env: Record<string, string>, config?: string) => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-flag-model-'));
+    try {
+      if (config !== undefined) fs.writeFileSync(path.join(codexHome, 'config.toml'), config);
+      return execFileSync('bash', ['-c', `source "${path.join(ROOT, 'bin', 'gstack-codex-probe')}" && ${select} 2>/dev/null && printf '%s\\n' ${flag}`], {
+        env: { ...process.env, GSTACK_CODEX_MODEL: '', CODEX_HOME: codexHome, ...env }, encoding: 'utf8', timeout: 10000,
+      }).trim().split('\n');
+    } finally {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  };
+
+  test('the model flag passes the selected model: GSTACK_CODEX_MODEL, then config.toml, then gpt-6-astra', () => {
+    const select = '_gstack_codex_select_model exec';
+    const isolation = ['-c', 'skills.include_instructions=false'];
+    expect(flagArgv(CODEX_MODEL_CONFIG_FLAG, select, {})).toEqual(['-c', 'model="gpt-6-astra"', ...isolation]);
+    expect(flagArgv(CODEX_MODEL_CONFIG_FLAG, select, {}, 'model = "gpt-5.6-terra"\n')).toEqual(['-c', 'model="gpt-5.6-terra"', ...isolation]);
+    expect(flagArgv(CODEX_MODEL_CONFIG_FLAG, select, { GSTACK_CODEX_MODEL: 'custom-codex' }, 'model = "gpt-5.6-terra"\n')).toEqual(['-c', 'model="custom-codex"', ...isolation]);
+    // Without a selection in the same shell the command stops instead of guessing.
+    expect(() => execFileSync('bash', ['-c', `printf '%s\\n' ${CODEX_MODEL_CONFIG_FLAG}`], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' })).toThrow();
   });
 
   test('native review overrides both model settings with the same selection', () => {
-    for (const override of ['', 'custom-codex']) {
-      const argv = execFileSync('bash', ['-c', `printf '%s\\n' ${CODEX_REVIEW_MODEL_CONFIG_FLAG}`], {
-        env: { ...process.env, GSTACK_CODEX_MODEL: override }, encoding: 'utf8', timeout: 5000,
-      }).trim().split('\n');
-      const expected = override || 'gpt-6-astra';
-      expect(argv).toEqual(['-c', `model="${expected}"`, '-c', `review_model="${expected}"`]);
+    for (const [env, config, expected] of [
+      [{}, undefined, 'gpt-6-astra'],
+      [{ GSTACK_CODEX_MODEL: 'custom-codex' }, 'review_model = "gpt-5.6-luna"\n', 'custom-codex'],
+      [{}, 'model = "gpt-5.6-terra"\nreview_model = "gpt-5.6-luna"\n', 'gpt-5.6-luna'],
+    ] as const) {
+      const argv = flagArgv(CODEX_REVIEW_MODEL_CONFIG_FLAG, '_gstack_codex_select_model review', { ...env }, config);
+      expect(argv).toEqual(['-c', `review_model="${expected}"`, '-c', `model="${expected}"`, '-c', 'skills.include_instructions=false']);
     }
     for (const file of ['codex/sections/review-mode.md', 'review/sections/adversarial.md', 'ship/sections/adversarial.md']) {
       const rendered = fs.readFileSync(path.join(ROOT, file), 'utf8');

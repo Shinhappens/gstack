@@ -1,114 +1,106 @@
 <!-- AUTO-GENERATED from qa-patterns.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
+# Browser QA methodology
+
+Run only for selected browser surfaces. Map diffs with source before probes; discovery stays black-box, diagnosis caller-owned.
+
+The shared exploratory loop owns execution order, not these technique phases. Its
+checkpoint rule covers every probe after the baseline, including orientation, links,
+exact replay and additional evidence. Never batch across checkpoints.
+
 ## Modes
+
+For /qa and /qa-only, choose Full, Quick or Regression. Resolve conflicting depth flags
+by asking before probes. /review and /ship keep their caller's smoke and plan bounds.
+Diff-aware selects scope, not another pass. Time caps include checkpoints and evidence.
+At exhaustion, stop probing and report unfinished coverage, never skip checkpoints.
 
 ### Diff-aware (automatic when on a feature branch with no URL)
 
-This is the **primary mode** for developers verifying their work. When the user says `/qa` without a URL and the repo is on a feature branch, automatically:
+Substitute the detected base for `main`:
 
-1. **Analyze the branch diff** to understand what changed:
-   ```bash
-   git diff main...HEAD --name-only
-   git log main..HEAD --oneline
-   ```
+```bash
+git diff main...HEAD --name-only
+git log main..HEAD --oneline
+```
 
-2. **Identify affected pages/routes** from the changed files:
-   - Controller/route files → which URL paths they serve
-   - View/template/component files → which pages render them
-   - Model/service files → which pages use those models (check controllers that reference them)
-   - CSS/style files → which pages include those stylesheets
-   - API endpoints → call them with the session's own cookies from one `aside repl` script:
-     ```bash
-     aside repl '
-     const pg = await openTab("<base-url>");
-     const r = await fetch("<base-url>/api/...", { method: "GET" });
-     console.log("API_STATUS=" + r.status);
-     console.log("API_BODY_START"); console.log((await r.text()).slice(0, 4000)); console.log("API_BODY_END");
-     await closeTab(pg); console.log("GSTACK_STEP_OK");
-     '
-     ```
-   - Static pages (markdown, HTML) → navigate to them directly
+Map changed controllers/routes/views/components/models/services/styles to pages. Check commits/PR intent; add related TODO bugs to the test plan. Open static pages directly. For browser-surface API probes:
 
-   **If no obvious pages/routes are identified from the diff:** Do not skip browser testing. The user invoked /qa because they want browser-based verification. Fall back to Quick mode — navigate to the homepage, follow the top 5 navigation targets, check console for errors, and test any interactive elements found. Backend, config, and infrastructure changes affect app behavior — always verify the app still works.
+```bash
+aside repl '
+const pg = await openTab("<base-url>");
+const r = await fetch("<base-url>/api/...", { method: "GET" });
+console.log("API_STATUS=" + r.status);
+console.log("API_BODY_START"); console.log((await r.text()).slice(0, 4000)); console.log("API_BODY_END");
+await closeTab(pg); console.log("GSTACK_STEP_OK");
+'
+```
 
-3. **Detect the running app** — probe common local dev ports (no browser needed to find a port):
-   ```bash
-   for p in 3000 4000 8080; do curl -sI --max-time 3 "http://localhost:$p" >/dev/null 2>&1 && echo "Found app on :$p"; done
-   ```
-   Open the first URL that answers in Aside. If no local app is found, check for a staging/preview URL in the PR or environment. If nothing works, ask the user for the URL.
+After selecting and isolating a browser surface, find a local app if its URL is missing:
 
-4. **Test each affected page/route:**
-   - Navigate to the page (the Read-a-page script in Phase 3)
-   - Take a screenshot
-   - Check console for errors (the `CONSOLE_ERRORS=` line)
-   - If the change was interactive (forms, buttons, flows), test the interaction end-to-end
-   - Snapshot before acting and print the diff after (the Drive-a-flow script in Phase 5) to verify the change had the expected effect
+```bash
+for p in 3000 4000 8080; do curl -sI --max-time 3 "http://localhost:$p" >/dev/null 2>&1 && echo "Found app on :$p"; done
+```
 
-5. **Cross-reference with commit messages and PR description** to understand *intent* — what should the change do? Verify it actually does that.
+Use the supplied URL or first responder/staging/preview; ask if none. Test changed/adjacent pages and flows. Flag new bugs absent from TODOS.md in the Phase 6 report.
 
-6. **Check TODOS.md** (if it exists) for known bugs or issues related to the changed files. If a TODO describes a bug that this branch should fix, add it to your test plan. If you find a new bug during QA that isn't in TODOS.md, note it in the report.
+**No identifiable pages:** use Quick plus discovered interactions, even for backend/config/infrastructure changes.
 
-7. **Report findings** scoped to the branch changes:
-   - "Changes tested: N pages/routes affected by this branch"
-   - For each: does it work? Screenshot evidence.
-   - Any regressions on adjacent pages?
-
-**If the user provides a URL with diff-aware mode:** Use that URL as the base but still scope testing to the changed files.
-
-### Full (default when URL is provided)
-Systematic exploration. Visit every reachable page. Document 5-10 well-evidenced issues. Produce health score. Takes 5-15 minutes depending on app size.
+### Full (default with a URL)
+Visit every reachable page (5-15 minutes). Score health; document 5-10 evidenced issues, never invent any.
 
 ### Quick (`--quick`)
-30-second smoke test. Visit homepage + top 5 navigation targets. Check: page loads? Console errors? Broken links? Produce health score. No detailed issue documentation.
+30 seconds: homepage + top 5 navigation targets. Check loads/console/broken links; score per Health Score Rubric; skip detailed issues/checklist, never the shared loop's gates.
 
 ### Regression (`--regression <baseline>`)
-Run full mode, then load `baseline.json` from a previous run. Diff: which issues are fixed? Which are new? What's the score delta? Append regression section to report.
-
----
+Run Full; append fixed/new issues and score delta. Preserve the supplied prior baseline.
+A missing or unreadable baseline is a missing prerequisite: it blocks the comparison, not the Full run.
 
 ## Workflow
 
 ### Phase 1: Initialize
 
-1. Confirm Aside is READY (see BROWSER SETUP above). For any non-READY result, the Browser fallback section applies: find `$B` there and translate every `aside repl` script below through its table.
-2. Create output directories
-3. Copy report template from `qa/templates/qa-report-template.md` to output dir
-4. Start timer for duration tracking
+Reuse the caller's BROWSER SETUP and owned artifact paths: Aside READY, otherwise `$B`
+(`NEEDS_ASIDE`/`ASIDE_NOT_RUNNING`). Complete only missing setup within caller
+authority. Clamp the shared loop's deadline guard to the caller's running deadline.
 
 ### Phase 2: Authenticate (if needed)
 
-Aside is the user's real browser, so the session is already signed in wherever the user is signed in. You never authenticate — the user does. In the fallback browser there is no session to inherit: import one with /setup-browser-cookies, or `$B handoff` for a human sign-in and `$B resume` when they're done.
-
-**If a sign-in wall appears:** stop and tell the user: "Sign in to <origin> in Aside yourself (open it in a new Aside tab), then tell me you're done." Then re-run the step — the browser's cookies now apply. Never type passwords, one-time codes, or payment details, and never read or print cookies, tokens, or localStorage.
-
-**If 2FA/OTP is required:** The user completes it in the Aside window, then tells you to continue.
-
-**If CAPTCHA blocks you:** Tell the user: "Please complete the CAPTCHA in Aside, then tell me to continue."
+Follow BROWSER SETUP's **Browser access decision** for /setup-browser-cookies or `$B handoff`/`$B resume`. Rerun after user sign-in/2FA/OTP/CAPTCHA. Never handle credentials or expose cookies/tokens/localStorage.
 
 ### Phase 3: Orient
 
-Get a map of the application. One script reads the landing page — console errors from load, the interactive snapshot tree, the visible text, and a screenshot:
+Establish the successful baseline before challenges. Observe the page or interaction's
+expected result/state, not merely a successful load.
+
+**Read/flow:** set `flow = true` and replace action/wait for interactions. Keep ONE script; tabs close at its end.
 
 ```bash
 aside repl '
+const flow = false;
 const HOOK = `(() => { window.__gstackErrs = window.__gstackErrs || []; const oe = console.error; console.error = (...a) => { window.__gstackErrs.push(a.map(String).join(" ")); oe.apply(console, a); }; window.addEventListener("error", e => window.__gstackErrs.push("uncaught: " + e.message)); window.addEventListener("unhandledrejection", e => window.__gstackErrs.push("unhandledrejection: " + (e.reason && e.reason.message || e.reason))); })()`;
 const pg = await openTab("about:blank");
 await pg._sendToTarget("Page.addScriptToEvaluateOnNewDocument", { source: HOOK });
 await pg.goto("<target-url>");
-const s = await snapshot(pg, { interactive: true });
-console.log(s.tree);
+console.log((await snapshot(pg, { interactive: true })).tree);
+await pg.screenshot({ path: flow ? "issue-001-step-1.jpg" : "initial.jpg", type: "jpeg", quality: 60, fullPage: !flow });
+if (flow) {
+  await pg.locator("e12").click();
+  await sleep(500);
+  console.log("DIFF_START"); console.log((await snapshot(pg)).diff); console.log("DIFF_END");
+  await pg.screenshot({ path: "issue-001-result.jpg", type: "jpeg", quality: 60 });
+}
+console.log("URL=" + pg.url());
 console.log("CONSOLE_ERRORS=" + JSON.stringify(await pg.evaluate(() => window.__gstackErrs)));
 console.log("TEXT_START"); console.log((await pg.evaluate(() => document.body.innerText)).slice(0, 20000)); console.log("TEXT_END");
-await pg.screenshot({ path: "initial.jpg", type: "jpeg", quality: 60, fullPage: true });
 console.log("ASIDE_DIR=" + pwd);
-await closeTab(pg);
-console.log("GSTACK_STEP_OK");
+await closeTab(pg); console.log("GSTACK_STEP_OK");
 '
 ```
 
-Then copy the screenshot out of the printed directory and show it: `cp "<ASIDE_DIR>/initial.jpg" "$REPORT_DIR/screenshots/initial.jpg"`, then Read it.
+EVERY screenshot: `cp "<ASIDE_DIR>/initial.jpg" "$REPORT_DIR/screenshots/initial.jpg"` (substitute names), then Read it. Never delete reports/screenshots.
 
-Map the navigation structure with the links script (same-origin; HEAD status checks only on a LOCAL target — on a real site the user's cookies would ride every request, so links print as `LINK ?` unfetched):
+**Links:** same-origin safe paths; HEAD only locally (requests carry cookies).
 
 ```bash
 aside repl '
@@ -120,83 +112,35 @@ await closeTab(pg); console.log("GSTACK_STEP_OK");
 '
 ```
 
-Every `LINK` line with a 4xx/5xx or `ERR` status is a broken link for the Links score; `LINK ?` lines were not fetched (non-local target) and count as unverified, not broken.
+`LINK` 4xx/5xx or `ERR` is broken; `LINK ?` is unverified. Snapshot SPA buttons/menus missing from links.
 
-**Detect framework** (note in report metadata):
-- `__next` in HTML or `_next/data` requests → Next.js
-- `csrf-token` meta tag → Rails
-- `wp-content` in URLs → WordPress
-- Client-side routing with no page reloads → SPA
-
-**For SPAs:** The links script may return few results because navigation is client-side. Use `snapshot(pg, { interactive: true })` to find nav elements (buttons, menu items) instead.
+Framework: `__next`/`_next/data` = Next.js; `csrf-token` = Rails; `wp-content` = WordPress; no-reload navigation = SPA.
 
 ### Phase 4: Explore
 
-Visit pages systematically. At each page, run the Read-a-page script from Phase 3 against the page URL with `page-<name>.jpg` as the screenshot path, copy it into `$REPORT_DIR/screenshots/`, and Read it.
-
-Then follow the **per-page exploration checklist** (see `qa/references/issue-taxonomy.md`):
-
-1. **Visual scan** — Look at the screenshot for layout issues (use the annotated-screenshot script when you need ref labels on the page)
-2. **Interactive elements** — Click buttons, links, controls. Do they work?
-3. **Forms** — Fill and submit. Test empty, invalid, edge cases
-4. **Navigation** — Check all paths in and out
-5. **States** — Empty state, loading, error, overflow
-6. **Console** — Any new JS errors after interactions? Print `CONSOLE_ERRORS=` after every action
-7. **Responsiveness** — Check the mobile viewport if relevant:
-   ```bash
-   aside repl '
-   const pg = await openTab("<page-url>");
-   await pg._sendToTarget("Emulation.setDeviceMetricsOverride", { width: 375, height: 812, deviceScaleFactor: 2, mobile: true });
-   await sleep(300);
-   await pg.screenshot({ path: "page-mobile.jpg", type: "jpeg", quality: 60, fullPage: true });
-   await pg._sendToTarget("Emulation.clearDeviceMetricsOverride", {});
-   console.log("ASIDE_DIR=" + pwd); await closeTab(pg); console.log("GSTACK_STEP_OK");
-   '
-   ```
-
-**Depth judgment:** Spend more time on core features (homepage, dashboard, checkout, search) and less on secondary pages (about, terms, privacy).
-
-**Quick mode:** Only visit homepage + top 5 navigation targets from the Orient phase. Skip the per-page checklist — just check: loads? Console errors? Broken links visible?
-
-### Phase 5: Document
-
-Document each issue **immediately when found** — don't batch them.
-
-**Two evidence tiers:**
-
-**Interactive bugs** (broken flows, dead buttons, form failures) — one script per flow, because tabs close when the script ends:
-1. Take a screenshot before the action
-2. Perform the action
-3. Take a screenshot showing the result
-4. Print the snapshot diff to show what changed
-5. Write repro steps referencing screenshots
+Select the next candidate from the preceding result. For each page, use the read script with `page-<name>.jpg`. Check layout, controls, empty/invalid/edge-case forms, navigation and empty/loading/error/overflow states per `qa/references/issue-taxonomy.md`. Prioritize core flows over secondary pages; Quick skips this checklist. For mobile:
 
 ```bash
 aside repl '
-const HOOK = `(() => { window.__gstackErrs = window.__gstackErrs || []; const oe = console.error; console.error = (...a) => { window.__gstackErrs.push(a.map(String).join(" ")); oe.apply(console, a); }; window.addEventListener("error", e => window.__gstackErrs.push("uncaught: " + e.message)); })()`;
-const pg = await openTab("about:blank");
-await pg._sendToTarget("Page.addScriptToEvaluateOnNewDocument", { source: HOOK });
-await pg.goto("<page-url>");
-await snapshot(pg, { interactive: true });                            // baseline for .diff; refs like e12 name the elements
-await pg.screenshot({ path: "issue-001-step-1.jpg", type: "jpeg", quality: 60 });
-await pg.locator("e12").click();                                       // or pg.fill("#email", "qa@example.com"), pg.getByRole("button", { name: "Save" }).click()
-await sleep(500);                                                      // or await pg.waitForSelector("#done"); await pg.waitForURL(/dashboard/)
-const s = await snapshot(pg);
-console.log("DIFF_START"); console.log(s.diff); console.log("DIFF_END");
-console.log("URL=" + pg.url());
-console.log("CONSOLE_ERRORS=" + JSON.stringify(await pg.evaluate(() => window.__gstackErrs)));
-await pg.screenshot({ path: "issue-001-result.jpg", type: "jpeg", quality: 60 });
-console.log("ASIDE_DIR=" + pwd);
-await closeTab(pg);
-console.log("GSTACK_STEP_OK");
+const pg = await openTab("<page-url>");
+await pg._sendToTarget("Emulation.setDeviceMetricsOverride", { width: 375, height: 812, deviceScaleFactor: 2, mobile: true });
+await sleep(300);
+await pg.screenshot({ path: "page-mobile.jpg", type: "jpeg", quality: 60, fullPage: true });
+await pg._sendToTarget("Emulation.clearDeviceMetricsOverride", {});
+console.log("ASIDE_DIR=" + pwd); await closeTab(pg); console.log("GSTACK_STEP_OK");
 '
 ```
 
-Copy both screenshots out of the printed `ASIDE_DIR` into `$REPORT_DIR/screenshots/` and Read them.
+### Phase 5: Document
 
-**Static bugs** (typos, layout issues, missing images):
-1. Take a single annotated screenshot showing the problem
-2. Describe what's wrong
+Confirm each issue by retrying once under the shared loop's exact-replay rule, then
+minimize and report screenshot evidence immediately. A timeout before replay finishes leaves
+confirmation incomplete. Later timeouts leave confirmed defects intact but evidence
+or minimization unfinished.
+
+**Interactive:** Phase 3, `flow = true`. Alternatives: `pg.fill("#email", "qa@example.com")`, `pg.getByRole("button", { name: "Save" }).click()`, `pg.waitForSelector("#done")`, `pg.waitForURL(/dashboard/)`. Link before/after screenshots in repro steps.
+
+**Static** (copy/layout/images): one annotated screenshot and description.
 
 ```bash
 aside repl '
@@ -207,33 +151,12 @@ console.log("ASIDE_DIR=" + pwd); await closeTab(pg); console.log("GSTACK_STEP_OK
 '
 ```
 
-**Write each issue to the report immediately** using the template format from `qa/templates/qa-report-template.md`.
-
 ### Phase 6: Wrap Up
 
-1. **Compute health score** using the rubric below
-2. **Write "Top 3 Things to Fix"** — the 3 highest-severity issues
-3. **Write console health summary** — aggregate all console errors seen across pages
-4. **Update severity counts** in the summary table
-5. **Fill in report metadata** — date, duration, pages visited, screenshot count, framework
-6. **Save baseline** — write `baseline.json` with:
-   ```json
-   {
-     "date": "YYYY-MM-DD",
-     "url": "<target>",
-     "healthScore": N,
-     "issues": [{ "id": "ISSUE-001", "title": "...", "severity": "...", "category": "..." }],
-     "categoryScores": { "console": N, "links": N, ... }
-   }
-   ```
+Format retained evidence without new probes, using `templates/qa-report-template.md`
+from this host's installed QA directory and the caller's artifact/mixed-report rules.
 
-**Regression mode:** After writing the report, load the baseline file. Compare:
-- Health score delta
-- Issues fixed (in baseline but not current)
-- New issues (in current but not baseline)
-- Append the regression section to the report
-
----
+Report score, Top 3 Things to Fix by severity, console health, severity counts, date, duration, page/screenshot counts and framework. Save `baseline.json`: `date` (YYYY-MM-DD), `url`, `healthScore`, `issues` (`id`, `title`, `severity`, `category`), `categoryScores`. Regression: fixed = prior only, new = current only.
 
 ## Health Score Rubric
 
@@ -289,44 +212,15 @@ Use decimal weights (15% = 0.15): `score = Σ (category_score × weight) / Σ te
 
 ## Framework-Specific Guidance
 
-### Next.js
-- Check console for hydration errors (`Hydration failed`, `Text content did not match`)
-- Monitor `_next/data` requests in network — 404s indicate broken data fetching
-- Test client-side navigation (click links, don't just `goto`) — catches routing issues
-- Check for CLS (Cumulative Layout Shift) on pages with dynamic content
-
-### Rails
-- Check for N+1 query warnings in console (if development mode)
-- Verify CSRF token presence in forms
-- Test Turbo/Stimulus integration — do page transitions work smoothly?
-- Check for flash messages appearing and dismissing correctly
-
-### WordPress
-- Check for plugin conflicts (JS errors from different plugins)
-- Verify admin bar visibility for logged-in users
-- Test REST API endpoints (`/wp-json/`)
-- Check for mixed content warnings (common with WP)
-
-### General SPA (React, Vue, Angular)
-- Use `snapshot(pg, { interactive: true })` for navigation — the links script misses client-side routes
-- Check for stale state (navigate away and back — does data refresh?)
-- Test browser back/forward — does the app handle history correctly?
-- Check for memory leaks (monitor console after extended use)
-
----
+- **Next.js:** hydration errors (`Hydration failed`, `Text content did not match`), `_next/data` 404s, link-click routing (not just `goto`), dynamic-content CLS.
+- **Rails:** dev N+1 warnings, form CSRF, Turbo/Stimulus transitions, flash appearance/dismissal.
+- **WordPress:** plugin JS conflicts, signed-in admin bar, `/wp-json/`, mixed content.
+- **SPA:** snapshot navigation, stale state on return, back/forward history, console signs of leaks after extended use.
 
 ## Important Rules
 
-1. **Repro is everything.** Every issue needs at least one screenshot. No exceptions.
-2. **Verify before documenting.** Retry the issue once to confirm it's reproducible, not a fluke.
-3. **Never include credentials.** You never type them — the user signs in inside Aside. Write `[REDACTED]` if a repro step has to mention one.
-4. **Write incrementally.** Append each issue to the report as you find it. Don't batch.
-5. **Never read source code.** Test as a user, not a developer.
-6. **Check console after every interaction.** JS errors that don't surface visually are still bugs.
-7. **Test like a user.** Use realistic data. Walk through complete workflows end-to-end.
-8. **Depth over breadth.** 5-10 well-documented issues with evidence > 20 vague descriptions.
-9. **Never delete output files.** Screenshots and reports accumulate — that's intentional.
-10. **Use `annotatedScreenshot(pg)` when the tree misses a clickable element.** Ref labels drawn on the page find clickable divs the accessibility tree skips; then click by ref or CSS selector.
-11. **Show screenshots to the user.** After every script that saves a screenshot, `cp` it out of the printed `ASIDE_DIR` into `$REPORT_DIR/screenshots/` and use the Read tool on the copied file so the user can see it inline. This is critical — without it, screenshots are invisible to the user.
-12. **Never refuse to use the browser.** When the user invokes /qa or /qa-only, they are requesting browser-based testing in Aside. Never suggest evals, unit tests, curl, or other alternatives as a substitute. Even if the diff appears to have no UI changes, backend changes affect app behavior — always open the app in the browser and test.
-13. **Mutating actions on a non-local target need consent.** Submitting, creating, deleting, purchasing, or changing settings on anything that is not LOCAL follows the "Invocation is consent to LOOK, not to ACT" rule in BROWSER SETUP — one AskUserQuestion per run, before the first such action.
+**Never read source code during browser discovery.** Use realistic end-to-end flows; check console after every interaction. For missing click targets, use annotated labels, then ref/CSS clicks.
+
+Use `[REDACTED]` for credentials. Follow BROWSER SETUP safety/sentinel rules: one AskUserQuestion listing non-LOCAL mutations per run, BEFORE acting. LOOK is not ACT.
+
+**Never refuse to use the browser for a selected browser surface**, even backend-only app changes. Tests/curl cannot replace it. API/CLI/job/worker/webhook targets do not select it.

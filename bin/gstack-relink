@@ -5,7 +5,7 @@
 #   gstack-relink
 #
 # Env overrides (for testing):
-#   GSTACK_STATE_DIR   — override ~/.gstack state directory
+#   GSTACK_HOME     — relocate the state root (chain: bin/gstack-state-root.sh)
 #   GSTACK_INSTALL_DIR — override gstack install directory
 #   GSTACK_SKILLS_DIR  — override target skills directory
 set -euo pipefail
@@ -13,19 +13,49 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GSTACK_CONFIG="${SCRIPT_DIR}/gstack-config"
 
-# Detect install dir
+. "$SCRIPT_DIR/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $SCRIPT_DIR/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
+
+# Install root: an explicit override, else the install this script belongs to
+# (it sits in a skills directory), else the Claude installs the registry
+# recorded for this checkout. Never the global install first: relink from a
+# vendored copy touches only that copy (docs/ADDING_A_HOST.md, ownership rules).
 INSTALL_DIR="${GSTACK_INSTALL_DIR:-}"
 if [ -z "$INSTALL_DIR" ]; then
-  if [ -d "$HOME/.claude/skills/gstack" ]; then
-    INSTALL_DIR="$HOME/.claude/skills/gstack"
-  elif [ -d "${SCRIPT_DIR}/.." ] && [ -f "${SCRIPT_DIR}/../setup" ]; then
-    INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  _SELF_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  _SELF_REAL="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+  if [ -f "$_SELF_ROOT/setup" ] && [ "$(basename "$(dirname "$_SELF_ROOT")")" = skills ]; then
+    INSTALL_DIR="$_SELF_ROOT"
+  else
+    _REG_TARGETS=""
+    if [ -f "$SCRIPT_DIR/gstack-install-registry.sh" ]; then
+      . "$SCRIPT_DIR/gstack-install-registry.sh"
+      _REG_TARGETS="$(gstack_install_registry_rows | awk -F '\t' -v s="$_SELF_REAL" '$1 == "claude" && $6 == s { print $5 "\t" $4 }')"
+    fi
+    _REG_COUNT="$(printf '%s' "$_REG_TARGETS" | grep -c . || true)"
+    if [ "$_REG_COUNT" -gt 1 ]; then
+      _RELINK_FAILED=0
+      while IFS='	' read -r _reg_root _reg_dest; do
+        echo "Relinking $_reg_dest (install root $_reg_root):"
+        GSTACK_INSTALL_DIR="$_reg_root" GSTACK_SKILLS_DIR="$_reg_dest" "$0" "$@" || { echo "  relink failed for $_reg_dest" >&2; _RELINK_FAILED=1; }
+      done <<EOF
+$_REG_TARGETS
+EOF
+      exit "$_RELINK_FAILED"
+    elif [ "$_REG_COUNT" -eq 1 ]; then
+      IFS='	' read -r INSTALL_DIR _reg_dest <<EOF
+$_REG_TARGETS
+EOF
+      GSTACK_SKILLS_DIR="${GSTACK_SKILLS_DIR:-$_reg_dest}"
+    elif [ "$(cd "$HOME/.claude/skills/gstack" 2>/dev/null && pwd -P)" = "$_SELF_REAL" ]; then
+      INSTALL_DIR="$HOME/.claude/skills/gstack"
+    fi
   fi
 fi
 
 if [ -z "$INSTALL_DIR" ] || [ ! -d "$INSTALL_DIR" ]; then
-  echo "Error: gstack install directory not found." >&2
-  echo "Run: cd ~/.claude/skills/gstack && ./setup" >&2
+  echo "Error: no Claude install of this gstack checkout ($SCRIPT_DIR/..) was found." >&2
+  echo "Run its setup to install it: cd \"$(cd "$SCRIPT_DIR/.." && pwd)\" && ./setup" >&2
   exit 1
 fi
 
@@ -35,12 +65,25 @@ SKILLS_DIR="${GSTACK_SKILLS_DIR:-$(dirname "$INSTALL_DIR")}"
 
 # Read prefix setting
 PREFIX=$("$GSTACK_CONFIG" get skill_prefix 2>/dev/null || echo "false")
+# disabled_skills (#1206): no entry for a disabled skill; its files stay.
+DISABLED=" "
+if [ -f "$SCRIPT_DIR/gstack-install-registry.sh" ]; then
+  . "$SCRIPT_DIR/gstack-install-registry.sh"
+  DISABLED="$(gstack_disabled_normalize "$("$GSTACK_CONFIG" get disabled_skills 2>/dev/null || true)")"
+fi
+DISABLED_COUNT=0
 
 # #2569: rendered :user variants (brain-aware blocks) live in an UNTRACKED
 # out-dir instead of the tracked install checkout. When a render exists for a
 # skill, relink serves it — otherwise a config change would silently flip
 # every skill back to the canonical (blockless) source.
-RENDER_DIR="${GSTACK_USER_RENDER_DIR:-${GSTACK_HOME:-$HOME/.gstack}/render/claude}"
+RENDER_DIR="${GSTACK_USER_RENDER_DIR:-}"
+# An install outside the default root serves the per-install render setup
+# recorded for it in the registry (render contract, #1882).
+if [ -z "$RENDER_DIR" ] && command -v gstack_install_render_for >/dev/null 2>&1; then
+  RENDER_DIR="$(gstack_install_render_for claude "$SKILLS_DIR")"
+fi
+RENDER_DIR="${RENDER_DIR:-$GSTACK_STATE_ROOT/render/claude}"
 
 # ─── Ownership gate ───────────────────────────────────────────────────────────
 # relink runs on every ./setup and used to `rm -rf` any same-name entry with a
@@ -58,7 +101,7 @@ RENDER_DIR="${GSTACK_USER_RENDER_DIR:-${GSTACK_HOME:-$HOME/.gstack}/render/claud
 # refreshed in place. WEAK (byte-identity with our source, or gen-skill-docs'
 # two-line banner on a real file) proves only that the SKILL.md came from us:
 # it authorizes touching that one file, never deleting the directory, and a
-# differing file is moved to ${GSTACK_HOME:-~/.gstack}/backups/skills/<ts>/
+# differing file is moved to $GSTACK_STATE_ROOT/backups/skills/<ts>/
 # before we link over it (a user who started their own skill from a gstack
 # SKILL.md looks exactly like a pre-marker legacy copy).
 #
@@ -183,7 +226,7 @@ _report_foreign() {
 
 # Weakly-proven real files we would otherwise overwrite go here, one summary
 # line at the end. mv, not cp: the link that follows needs the path free.
-BACKUP_ROOT="${GSTACK_HOME:-$HOME/.gstack}/backups/skills/$(date +%Y%m%dT%H%M%S)"
+BACKUP_ROOT="$GSTACK_STATE_ROOT/backups/skills/$(date +%Y%m%dT%H%M%S)"
 BACKED_UP=()
 _backup_skill_md() {
   # Non-zero when the file could NOT be moved: the caller leaves the entry alone.
@@ -300,6 +343,13 @@ for skill_dir in "$INSTALL_DIR"/*/; do
   # Skip non-skill directories
   case "$skill" in bin|browse|design|docs|extension|lib|node_modules|scripts|test|.git|.github) continue ;; esac
   [ -f "$skill_dir/SKILL.md" ] || continue
+  case "$DISABLED" in
+    *" ${skill#gstack-} "*)
+      _cleanup_skill_entry "$SKILLS_DIR/$skill" "$skill"
+      case "$skill" in gstack-*) ;; *) _cleanup_skill_entry "$SKILLS_DIR/gstack-$skill" "$skill" ;; esac
+      DISABLED_COUNT=$((DISABLED_COUNT + 1))
+      continue ;;
+  esac
 
   if [ "$PREFIX" = "true" ]; then
     # Don't double-prefix directories already named gstack-*
@@ -371,6 +421,9 @@ if [ "$PREFIX" = "true" ]; then
   echo "Relinked $SKILL_COUNT skills as gstack-*"
 else
   echo "Relinked $SKILL_COUNT skills as flat names"
+fi
+if [ "$DISABLED_COUNT" -gt 0 ]; then
+  echo "Disabled (gstack-config disabled_skills, not registered):$DISABLED"
 fi
 if [ ${#BACKED_UP[@]} -gt 0 ]; then
   echo "Moved ${#BACKED_UP[@]} pre-existing SKILL.md file(s) to $BACKUP_ROOT before linking gstack's: ${BACKED_UP[*]}"

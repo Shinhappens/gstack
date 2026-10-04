@@ -1,8 +1,10 @@
 import {expect,test,spyOn} from 'bun:test';
-import {buildPlanFloorReviewPrompt,validatePlanFloorAssessment,resolvePlanFloorCitations,judgePlanFloorReview,pickPlanFloorMode,pickPlanFloorProductType,type PlanFloorReview} from './helpers/plan-floor-review';
+import {buildPlanFloorReviewPrompt,validatePlanFloorAssessment,resolvePlanFloorCitations,judgePlanFloorReview,pickPlanFloorMode,pickPlanFloorProductType,PLAN_FLOOR_ASSESSMENT_CAP_MS,type PlanFloorReview} from './helpers/plan-floor-review';
 import {FORCING_FLOOR_CEO, FORCING_FLOOR_DEVEX} from './fixtures/forcing-finding-seeds';
 import capturedQuotes from './fixtures/plan-floor-quote-70b.json';
 import productTypes from './fixtures/plan-floor-product-type-70b.json';
+import narrativeConfirmation from './fixtures/devex-narrative-confirmation-36641820398.json';
+import partlyWrongNarrative from './fixtures/devex-narrative-confirmation-36794871032.json';
 const review = ():PlanFloorReview=>({seed:FORCING_FLOOR_CEO,candidate:{transport:'native',identity:'owned:call:question:0',question:{
   header:'Evidence',question:'Pricing is assumed to block adoption without developer interviews. Should we test that premise before launch?',multiSelect:false,
   options:[{label:'Interview developers',description:'Validate pricing as a barrier before changing the tier.'},{label:'Ship the tier',description:'Launch using the current untested premise.'}],
@@ -55,14 +57,15 @@ test('large complete input is preserved; over-limit input is rejected without in
  expect(()=>judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,invoke:(()=>{calls++;throw Error('must not execute');}) as any})).toThrow();
  expect(calls).toBe(0);
 });
-test('replacement judge retains the original CLI model, one turn, 30s cap and absolute case deadline',()=>{
- for(const remaining of [5000,60_000]){
+test('replacement judge retains the original CLI model, one turn, measured cap and absolute case deadline',()=>{
+ expect(PLAN_FLOOR_ASSESSMENT_CAP_MS).toBeGreaterThan(30_000);
+ for(const remaining of [5000,60_000,PLAN_FLOOR_ASSESSMENT_CAP_MS+60_000]){
   const deadlineAt=Date.now()+remaining;let calls=0;
   const actual=judgePlanFloorReview(review(),{binary:'/fake/claude',model:'unchanged-warmup',deadlineAt,invoke:((file,args,opts)=>{
    calls++;expect(file).toBe('/fake/claude');expect(args).toEqual(['-p','--model','unchanged-warmup','--max-turns','1']);
    expect(opts.stdio).toEqual(['pipe','pipe','pipe']);expect(opts.encoding).toBe('utf8');
    expect(opts.input).toBe(buildPlanFloorReviewPrompt(review()));
-   expect(opts.timeout).toBeGreaterThan(0);expect(opts.timeout).toBeLessThanOrEqual(Math.min(30_000,remaining));
+   expect(opts.timeout).toBeGreaterThan(0);expect(opts.timeout).toBeLessThanOrEqual(Math.min(PLAN_FLOOR_ASSESSMENT_CAP_MS,remaining));
    return {status:0,stdout:JSON.stringify(citationFinding()),stderr:''};
   }) as any});expect(calls).toBe(1);expect(actual.kind).toBe('finding');
  }
@@ -93,6 +96,29 @@ test.each([
   invoke:(()=>{calls++;throw Error('must not launch');}) as any});
  expect(actual).toMatchObject({kind:'setup',seedQuote:'',questionQuote:'',optionIndex:null,optionQuote:''});
  expect(calls).toBe(0);
+});
+const capturedNarrative = ():PlanFloorReview=>structuredClone(narrativeConfirmation.review) as PlanFloorReview;
+test.each([
+ ['some wrong',()=>capturedNarrative()],
+ ['partly wrong',()=>structuredClone(partlyWrongNarrative.review) as PlanFloorReview],
+] as const)('captured 0B narrative confirmation (%s) is setup without launching the assessor',(_label,capture)=>{
+ const input=capture(),before=structuredClone(input);let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;throw Error('must not launch');}) as any});
+ expect(actual).toMatchObject({kind:'setup',seedQuote:'',questionQuote:'',optionIndex:null,optionQuote:''});
+ expect(calls).toBe(0);expect(input).toEqual(before);
+});
+test.each([
+ ['a remedy option',(q:any)=>{q.options[2]={label:'Add a hosted sandbox',description:'Skip the local stack for the first call.'};}],
+ ['remedy-only options',(q:any)=>{q.options=[{label:'Automate key issuance',description:'Instant key.'},{label:'Add a copy-paste curl',description:'Prove the server is up.'}];}],
+ ['a non-empathy header',(q:any)=>{q.header='TTHW target';}],
+ ['a brief that poses a finding',(q:any)=>{q.question=q.question.replace(/^D1 — Does this first-run narrative match reality\?/,'D1 — The narrative shows the emailed key stops the clock; should we automate key issuance?');}],
+ ['the match question only below the brief',(q:any)=>{q.question='D1 — Should the quickstart change?\n'+q.question;}],
+] as const)('narrative confirmation with %s is left to the assessor',(_label,change)=>{
+ const input=capturedNarrative();change((input.candidate as any).question);let calls=0;
+ const actual=judgePlanFloorReview(input,{binary:'fake',model:'warmup',deadlineAt:Date.now()+30_000,
+  invoke:(()=>{calls++;return {status:0,stdout:JSON.stringify({kind:'uncertain',seedId:null,questionId:null,optionId:null,reason:'Adversarial narrative control requires assessment.'}),stderr:''};}) as any});
+ expect(calls).toBe(1);expect(actual.kind).toBe('uncertain');
 });
 test('DX TTHW target question is a seeded finding without launching the assessor',()=>{
  for (const [questionText, labels] of [

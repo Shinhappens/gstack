@@ -6,10 +6,11 @@ import { spawnSync } from 'node:child_process';
 const root = path.resolve(import.meta.dir, '../..');
 
 export function createReadinessFixture(kind: 'ready' | 'unknown') {
-  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-ready-'));
-  const home = path.join(workDir, '.fixture-home');
-  const bin = path.join(workDir, '.fixture-bin');
-  fs.mkdirSync(home); fs.mkdirSync(bin);
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-ready-'));
+  const workDir = path.join(base, 'repo');
+  const home = path.join(base, 'home');
+  const bin = path.join(base, 'bin');
+  fs.mkdirSync(workDir); fs.mkdirSync(home); fs.mkdirSync(bin);
   const init = spawnSync('git', ['init', '--quiet'], { cwd: workDir, timeout: 10_000 });
   if (init.status !== 0) throw new Error('readiness fixture git init failed');
   fs.writeFileSync(path.join(workDir, '.gbrain-source'), 'client-fixture\n');
@@ -57,6 +58,6 @@ else { console.error('unsupported operation'); process.exit(3); }
     sourceIntact: () => fs.readFileSync(path.join(workDir, '.gbrain-source'), 'utf8') === pin
       && fs.readFileSync(path.join(stateDir, '.gbrain-sync-state.json'), 'utf8') === state
       && !fs.existsSync(path.join(workDir, 'code')),
-    cleanup: () => fs.rmSync(workDir, { recursive: true, force: true }),
+    cleanup: () => fs.rmSync(base, { recursive: true, force: true }),
   };
 }

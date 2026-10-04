@@ -94,7 +94,7 @@ export function probeAside(timeoutMs = 30_000): AsideProbe {
 
 // ─── Spec ────────────────────────────────────────────────────────────────────
 
-/** CDP Page.printToPDF options, plus make-pdf's Paged.js wait. Inches for paper/margins. */
+/** CDP Page.printToPDF options, plus an optional Paged.js wait. Inches for paper/margins. */
 export interface PdfStepOptions {
   paperWidth?: number;
   paperHeight?: number;
@@ -112,7 +112,12 @@ export interface PdfStepOptions {
   generateDocumentOutline?: boolean;
   pageRanges?: string;
   scale?: number;
-  /** Wait (≤3s, non-fatal) for `window.__pagedjsAfterFired` before printing. */
+  /**
+   * Wait (≤3s, non-fatal) for `window.__pagedjsAfterFired` before printing —
+   * only for pages that load Paged.js themselves (gstack-render
+   * --wait-pagedjs). make-pdf ships no pagination script and never sets it:
+   * its TOC page numbers come from make-pdf/src/toc-pages.ts.
+   */
   waitForPagedJs?: boolean;
 }
 
@@ -296,7 +301,7 @@ export function serveDir(root: string, nonce: string = randomBytes(16).toString(
 // ─── Async spawn (keeps the loopback server's event loop free) ────────────────
 
 async function runProc(cmd: string, args: string[], timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string; error?: string }> {
-  let child: ReturnType<typeof Bun.spawn>;
+  let child: Bun.Subprocess<'ignore', 'pipe', 'pipe'>;
   try {
     child = Bun.spawn([cmd, ...args], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
   } catch (e) {
@@ -608,7 +613,7 @@ export const NO_BROWSER_HELP = "open the Aside app (macOS 15+, aside.com), or ru
 export type EngineChoice =
   | { engine: 'aside'; version: string }
   | { engine: 'browse'; bin: string }
-  | { engine: null; probe: AsideProbe; error: string };
+  | { engine: null; probe: Extract<AsideProbe, { ok: false }>; error: string };
 
 let chosen: EngineChoice | undefined;
 

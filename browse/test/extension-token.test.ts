@@ -16,8 +16,11 @@
  * the network stack) lives in pair-agent-e2e.test.ts.
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
 import * as crypto from 'crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   buildFetchHandler,
   GSTACK_EXTENSION_ID,
@@ -26,8 +29,17 @@ import {
 import { __resetRegistry } from '../src/token-registry';
 import { BrowserManager } from '../src/browser-manager';
 import { resolveConfig } from '../src/config';
+import { usePrivateStateRoot } from '../../test/helpers/private-state-root';
+
+usePrivateStateRoot();
 
 const PINNED_ORIGIN = `chrome-extension://${GSTACK_EXTENSION_ID}`;
+const fixtureDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-extension-token-')));
+const fixtureConfig = resolveConfig({ BROWSE_STATE_FILE: path.join(fixtureDir, 'state/browse.json') });
+
+afterAll(() => {
+  fs.rmSync(fixtureDir, { recursive: true, force: true });
+});
 
 function makeConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
   const token = 'ext-token-test-' + crypto.randomBytes(16).toString('hex');
@@ -35,8 +47,9 @@ function makeConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     authToken: token,
     browsePort: 34567,
     idleTimeoutMs: 1_800_000,
-    config: resolveConfig(),
+    config: fixtureConfig,
     browserManager: new BrowserManager(),
+    ownsTerminalAgent: false,
     startTime: Date.now(),
     ...overrides,
   };
@@ -89,6 +102,29 @@ describe('GET /health never carries a token (IRON RULE)', () => {
     const body = await resp.json() as any;
     expect(body.token).toBeUndefined();
   });
+});
+
+describe('GET /health is liveness-only', () => {
+  beforeEach(() => __resetRegistry());
+
+  // Folds the former server-auth / security-audit-r2 / sidebar-tabs /
+  // server-security-surface source greps into one check on the real body.
+  // #2557: no `security` field (its only data source had no writer).
+  const FORBIDDEN = ['token', 'security', 'currentUrl', 'currentMessage', 'agentStatus', 'messageQueue', 'agentStartTime', 'chatEnabled'];
+
+  for (const [label, browserManager, headers] of [
+    ['default mode', () => new BrowserManager(), {}],
+    ['headed mode + pinned extension Origin', headedBrowserManager, { Origin: PINNED_ORIGIN }],
+  ] as const) {
+    test(`${label}: no token, security, browsing-state or chat fields; terminal port survives`, async () => {
+      const handle = buildFetchHandler(makeConfig({ browserManager: browserManager() }));
+      const resp = await handle.fetchLocal(new Request('http://127.0.0.1:34567/health', { headers }), null);
+      expect(resp.status).toBe(200);
+      const body = await resp.json() as Record<string, unknown>;
+      expect(FORBIDDEN.filter((key) => key in body)).toEqual([]);
+      expect('terminalPort' in body).toBe(true);
+    });
+  }
 });
 
 describe('POST /extension-token pinned-origin bootstrap', () => {

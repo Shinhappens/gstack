@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { initializePlan, prepareMethodology, createSnapshot, preparePhaseClose, prepareAmendedInput } from '../bin/gstack-autoplan-snapshot';
 import { evaluateAutoplanPublication, runPublicationHook, autoplanReadRange, type PublicationHookInput } from '../autoplan/bin/phase-publication-hook.ts';
-import { readOwnedClaudePublicTranscript, type ClaudeParentPublicEvent } from '../lib/claude-public-transcript';
+import { readOwnedClaudePublicTranscript, nativePathSpelling, ownedNativePath, sameNativePath, type ClaudeParentPublicEvent } from '../lib/claude-public-transcript';
 import { prematureAutoplanPhaseEntry } from './helpers/autoplan-method-read-audit';
 import captured from './fixtures/autoplan-publication-boundary-361c.json';
 import consumption from './fixtures/autoplan-phase-consumption-491.json';
@@ -298,10 +298,11 @@ describe('Autoplan parent publication guard', () => {
   test('the literal init parser retains Windows drive and UNC identities', () => {
     const source = fs.readFileSync(path.join(ROOT, 'autoplan/bin/phase-publication-hook.ts'), 'utf8');
     const fn = source.slice(source.indexOf('function initArguments('), source.indexOf('\nfunction invocation('));
-    const parse = new Function('path', 'fs', 'process', 'ownPath',
+    const parse = new Function('path', 'fs', 'process', 'ownPath', 'nativePathSpelling', 'samePath',
       new Bun.Transpiler({ loader: 'ts' }).transformSync(fn) + '\nreturn initArguments;')(
       path.win32, { realpathSync: (file: string) => file }, { platform: 'win32' },
-      (value: unknown) => typeof value === 'string' && path.win32.isAbsolute(value) && path.win32.normalize(value) === value);
+      (value: unknown) => ownedNativePath(value, path.win32), nativePathSpelling,
+      (a: unknown, b: unknown) => sameNativePath(a, b, path.win32));
     for (const root of [String.raw`C:\repo`, String.raw`\\server\share\repo`]) {
       const args = ['source.md', 'active.md', 'restore.md'].map(file => path.win32.join(root, file));
       const script = path.win32.join(root, 'bin/gstack-autoplan-snapshot.ts');
@@ -313,6 +314,13 @@ describe('Autoplan parent publication guard', () => {
       if (!root.startsWith('\\\\')) {
         const native = [script, ...args].map(value => '"' + value + '"');
         expect(parse(`bun ${native[0]} init ${native.slice(1).join(' ')}`, root)).toEqual(args);
+        // gstack-paths prints /c/...; Git Bash hands bun C:/... for the same file.
+        const msys = [script, ...args].map(value => '"/c/' + value.slice(3).replaceAll('\\', '/') + '"');
+        expect(parse(`bun ${msys[0]} init ${msys.slice(1).join(' ')}`, root)).toEqual(args);
+        const lower = [script, ...args].map(value => `'c${value.slice(1)}'`);
+        expect(parse(`bun ${lower[0]} init ${lower.slice(1).join(' ')}`, root)).toEqual(args);
+        for (const bad of ['/cc/repo/source.md', '/c', '/c/repo/../source.md'])
+          expect(parse(`bun "${msys[0]!.slice(1, -1)}" init "${bad}" ${msys.slice(2).join(' ')}`, root)?.[0]).not.toBe(args[0]);
       }
       for (const bad of [command + ' && true', command.replace('source.md', String.raw`..\source.md`),
         command.replace('source.md', 'nested/../source.md'), command.replace(script, path.win32.join(root, 'foreign.ts'))]) {
@@ -1067,4 +1075,310 @@ describe('Autoplan authenticated phase consumption', () => {
     if (expected) expect(detected!.readToolUseId).toBe(request.toolUseId);
   });
 
+});
+
+describe('Autoplan native journal roots and Windows spellings', () => {
+  const windows = process.platform === 'win32';
+  function published(publish = true) {
+    const f = fixture(); if (publish) f.message(); f.current();
+    const { rows } = f.journal();
+    const save = () => fs.writeFileSync(f.input.transcript_path, rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+    return { f, rows, save };
+  }
+  const attachment = (f: ReturnType<typeof fixture>, parentUuid: string | null, extra: object = {}): any => ({
+    uuid: randomUUID(), parentUuid, cwd: f.cwd, sessionId: f.sessionId, isSidechain: false,
+    timestamp: new Date(clock).toISOString(), type: 'attachment',
+    attachment: { type: 'hook_success', hookEvent: 'SessionStart' }, ...extra });
+  const hook = (f: ReturnType<typeof fixture>, project = f.cwd) =>
+    withNativeProjectDirectory(project, () => runPublicationHook(f.input, ROOT));
+  const status = (f: ReturnType<typeof fixture>) =>
+    readOwnedClaudePublicTranscript(f.input.transcript_path, f.cwd, f.sessionId).transcript.status;
+
+  for (const shape of ['one', 'chained', 'stray-before'] as const)
+    test(`a SessionStart attachment root owns the journal beneath it (${shape})`, async () => {
+      const { f, rows, save } = published();
+      const root = attachment(f, null), chain = shape === 'chained' ? [root, attachment(f, root.uuid)] : [root];
+      rows[0].parentUuid = chain.at(-1)!.uuid;
+      rows.unshift(...(shape === 'stray-before' ? [attachment(f, null)] : []), ...chain); save();
+      expect(status(f)).toBe('ready');
+      expect(await hook(f)).toEqual({});
+    });
+
+  test('an attachment root still requires the parent publication', async () => {
+    const { f, rows, save } = published(false);
+    const root = attachment(f, null); rows[0].parentUuid = root.uuid; rows.unshift(root); save();
+    expect(await hook(f)).toMatchObject({ hookSpecificOutput: { permissionDecisionReason: expect.stringContaining('Publish the filled Phase 1') } });
+  });
+
+  test('a message-bearing attachment root is an unrecognized shape: advisory, never ownership', async () => {
+    const { f, rows, save } = published();
+    const root = attachment(f, null, { message: { role: 'system', content: [] } });
+    rows[0].parentUuid = root.uuid; rows.unshift(root); save();
+    const read = readOwnedClaudePublicTranscript(f.input.transcript_path, f.cwd, f.sessionId);
+    expect(read.transcript.status).not.toBe('ready');
+    expect(read.transcript.reason).toBe('unrecognized_shape:first_turn:attachment:hook_success');
+    expect(read.events).toEqual([]);
+    const home = fs.mkdtempSync(path.join(tmpdir(), 'autoplan-guard-home-')); dirs.push(home);
+    const previous = process.env.GSTACK_HOME; process.env.GSTACK_HOME = home;
+    try {
+      const output: any = await hook(f);
+      expect(output.hookSpecificOutput?.permissionDecision).toBeUndefined();
+      expect(output.systemMessage).toContain('phase publication was NOT verified for this session');
+    } finally { if (previous === undefined) delete process.env.GSTACK_HOME; else process.env.GSTACK_HOME = previous; }
+  });
+
+  for (const kind of ['foreign-cwd', 'sidechain', 'competing-conversation', 'competing-user-root'] as const)
+    test(`an attachment root cannot supply ownership: ${kind}`, async () => {
+      const { f, rows, save } = published();
+      const root = attachment(f, null, kind === 'foreign-cwd' ? { cwd: path.join(f.cwd, 'foreign') }
+        : kind === 'sidechain' ? { isSidechain: true } : {});
+      rows[0].parentUuid = root.uuid; rows.unshift(root);
+      if (kind === 'competing-conversation' || kind === 'competing-user-root') {
+        const other = attachment(f, null);
+        const prompt = { ...structuredClone(rows[1]), uuid: randomUUID(), parentUuid: kind === 'competing-user-root' ? null : other.uuid };
+        rows.push(...(kind === 'competing-conversation' ? [other] : []), prompt);
+      }
+      save();
+      expect(status(f)).not.toBe('ready');
+      expect((await hook(f) as any).hookSpecificOutput?.permissionDecision).toBe('deny');
+    });
+
+  test.if(windows)('CLAUDE_PROJECT_DIR spelled C:/ or c:\\ names the native journal cwd', async () => {
+    const { f } = published();
+    expect(await hook(f, f.cwd.replaceAll('\\', '/'))).toEqual({});
+    expect(await hook(f, f.cwd[0]!.toLowerCase() + f.cwd.slice(1))).toEqual({});
+    expect((await hook(f, f.cwd + '\\.') as any).hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+
+  test.if(windows)('an init command spelled with Git Bash /c/ paths binds the same invocation', () => {
+    const f = fixture(); f.message(); f.current();
+    const msys = (file: string) => '/' + file[0]!.toLowerCase() + file.slice(2).replaceAll('\\', '/');
+    (f.events[0] as any).input.command = `bun "${ROOT}/bin/gstack-autoplan-snapshot.ts" init "${msys(f.source)}" "${msys(f.active)}" "${msys(f.restore)}"`;
+    expect(f.evaluate()).toEqual({ allow: true });
+  });
+
+  test.if(windows)('a close packet Read spelled C:/ is still the close Read', () => {
+    const f = fixture(), close = f.events.find(e => e.kind === 'use' && e.toolUseId === 'close') as any;
+    const forward = (close.input!.file_path as string).replaceAll('\\', '/');
+    close.input!.file_path = forward;
+    (f.events.find(e => e.kind === 'result' && e.toolUseId === 'close') as any).file.filePath = forward;
+    f.message(); f.current();
+    expect(f.evaluate()).toEqual({ allow: true });
+  });
+
+  test.if(windows)('an active-plan Edit spelled C:/ after the close Read is still a mutation', () => {
+    const f = fixture(); f.message();
+    f.use('edit', 'Edit', { file_path: f.active.replaceAll('\\', '/'), old_string: 'Keep', new_string: 'Drop' });
+    f.current();
+    expect(f.evaluate()).toMatchObject({ allow: false, reason: expect.stringContaining('mutation is pending') });
+  });
+});
+
+describe('Autoplan phase entry through the gbrain :user render (#2569)', () => {
+  const generator = fs.readFileSync(path.join(ROOT, 'scripts/gen-skill-docs.ts'), 'utf8');
+  const rewriteSectionBase: (content: string, linkRoot: string | null) => string = new Function(
+    new Bun.Transpiler({ loader: 'ts' }).transformSync(generator.slice(generator.indexOf('function rewriteSectionBase('),
+      generator.indexOf('\n}\n', generator.indexOf('function rewriteSectionBase(')) + 2)) + '\nreturn rewriteSectionBase;')();
+  const sections = ['ceo-phase.md', 'design-phase.md', 'dx-phase.md', 'eng-phase.md', 'tasks-aggregator.md'];
+  /** Writes what setup's swap-in render writes: the generator's rewrite with --link-root = the final render root. */
+  function render(root: string, linkRoot = root, edit = (text: string) => text) {
+    fs.mkdirSync(path.join(root, 'autoplan', 'sections'), { recursive: true });
+    for (const name of sections) fs.writeFileSync(path.join(root, 'autoplan', 'sections', name),
+      edit(rewriteSectionBase(fs.readFileSync(path.join(ROOT, 'autoplan/sections', name), 'utf8'), linkRoot)));
+    return root;
+  }
+  function withEnv<T>(env: Record<string, string | undefined>, work: () => T): T {
+    const previous = Object.fromEntries(Object.keys(env).map(k => [k, process.env[k]]));
+    for (const [k, v] of Object.entries(env)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    try { return work(); }
+    finally { for (const [k, v] of Object.entries(previous)) if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+  /** CEO entered through `entry` and published; the next phase entry is the request under judgment. */
+  function entered(entry: string, next?: string) {
+    const f = fixture(), text = fs.readFileSync(entry, 'utf8'), lines = text.split('\n');
+    const use = f.events.find(e => e.kind === 'use' && e.toolUseId === 'entry') as any;
+    const result = f.events.find(e => e.kind === 'result' && e.toolUseId === 'entry') as any;
+    use.input = { file_path: entry, offset: 1 };
+    (result as any).file = { filePath: entry, content: text, startLine: 1, numLines: lines.length, totalLines: lines.length };
+    f.message();
+    if (next) f.input.tool_input = { file_path: next };
+    f.current();
+    return f;
+  }
+  const scratch = () => { const dir = fs.realpathSync(fs.mkdtempSync(path.join(tmpdir(), 'autoplan-render-'))); dirs.push(dir); return dir; };
+  const denied = { allow: false, reason: expect.stringContaining('different or unavailable installation') };
+
+  test('the hook rewrite is the generator rewrite', () => {
+    const linkRoot = path.join(scratch(), 'render', 'claude');
+    for (const name of [...sections, 'phase-close.md']) {
+      const text = fs.readFileSync(path.join(ROOT, 'autoplan/sections', name), 'utf8');
+      const hook = fs.readFileSync(path.join(ROOT, 'autoplan/bin/phase-publication-hook.ts'), 'utf8');
+      const fn = hook.slice(hook.indexOf('function renderSectionBase('), hook.indexOf('\n}\n', hook.indexOf('function renderSectionBase(')) + 2);
+      const ours = new Function(new Bun.Transpiler({ loader: 'ts' }).transformSync(fn) + '\nreturn renderSectionBase;')();
+      expect(ours(text, linkRoot)).toBe(rewriteSectionBase(text, linkRoot));
+    }
+  });
+
+  for (const via of ['GSTACK_USER_RENDER_DIR', 'GSTACK_HOME', 'HOME', 'empty GSTACK_USER_RENDER_DIR'] as const)
+    test(`the render root setup resolves through ${via} is this installation`, () => {
+      const home = scratch(), root = render(via === 'GSTACK_USER_RENDER_DIR' ? path.join(home, 'custom') :
+        via === 'HOME' ? path.join(home, '.gstack', 'render', 'claude') : path.join(home, 'render', 'claude'));
+      const env = via === 'GSTACK_USER_RENDER_DIR' ? { GSTACK_USER_RENDER_DIR: root, GSTACK_HOME: undefined }
+        : via === 'HOME' ? { GSTACK_USER_RENDER_DIR: undefined, GSTACK_HOME: undefined, HOME: home }
+        : { GSTACK_USER_RENDER_DIR: via === 'GSTACK_HOME' ? undefined : '', GSTACK_HOME: home };
+      const f = entered(path.join(root, 'autoplan/sections/ceo-phase.md'), path.join(root, 'autoplan/sections/design-phase.md'));
+      expect(withEnv(env, () => f.evaluate())).toEqual({ allow: true });
+    });
+
+  for (const kind of ['sibling-root', 'other-home', 'linked-out', 'changed-bytes', 'stale-link-root', 'no-render-root'] as const)
+    test(`a render lookalike is a different installation: ${kind}`, () => {
+      const home = scratch(), root = path.join(home, 'render', 'claude');
+      let next = path.join(root, 'autoplan/sections/design-phase.md'), env: Record<string, string | undefined> = { GSTACK_USER_RENDER_DIR: undefined, GSTACK_HOME: home };
+      if (kind === 'sibling-root') { render(root); next = path.join(render(path.join(home, 'render', 'claude2')), 'autoplan/sections/design-phase.md'); }
+      if (kind === 'other-home') { const other = scratch(); render(root); next = path.join(render(path.join(other, 'render', 'claude')), 'autoplan/sections/design-phase.md'); }
+      if (kind === 'linked-out') {
+        const outside = render(path.join(scratch(), 'outside'), root);
+        fs.mkdirSync(path.join(root, 'autoplan'), { recursive: true });
+        fs.symlinkSync(path.join(outside, 'autoplan', 'sections'), path.join(root, 'autoplan', 'sections'), 'junction');
+      }
+      if (kind === 'changed-bytes') render(root, root, text => text + 'Forged instruction.\n');
+      if (kind === 'stale-link-root') render(root, path.join(home, 'previous-render'));
+      if (kind === 'no-render-root') { render(root); env = { GSTACK_USER_RENDER_DIR: path.join(home, 'missing'), GSTACK_HOME: home }; }
+      const f = entered(path.join(ROOT, 'autoplan/sections/ceo-phase.md'), next);
+      expect(withEnv(env, () => f.evaluate())).toMatchObject(denied);
+    });
+});
+
+describe('Autoplan current-use identity: journal spelling vs PreToolUse spelling', () => {
+  // Claude journals the model's file_path verbatim and hands PreToolUse its resolved form.
+  const spellings = (file: string) => [
+    path.join(path.dirname(file), '.') + path.sep + '.' + path.sep + path.basename(file),
+    ...(process.platform === 'win32' ? [path.dirname(file) + '/' + path.basename(file)] : []),
+  ];
+  for (const kind of ['dot-segment', 'forward-slash'] as const)
+    test.if(kind === 'dot-segment' || process.platform === 'win32')(`a ${kind} journal spelling is the same current Read`, () => {
+      const f = fixture(); f.message();
+      const target = f.input.tool_input.file_path as string, journal = spellings(target)[kind === 'dot-segment' ? 0 : 1]!;
+      f.use('next', 'Read', { file_path: journal });
+      expect(f.evaluate()).toEqual({ allow: true });
+    });
+
+  for (const kind of ['other-file', 'extra-field'] as const)
+    test(`a current Read that differs beyond spelling is not the same identity: ${kind}`, () => {
+      const f = fixture(); f.message();
+      const target = f.input.tool_input.file_path as string;
+      f.use('next', 'Read', kind === 'other-file' ? { file_path: path.join(path.dirname(target), 'eng-phase.md') }
+        : { file_path: spellings(target)[0], limit: 5 });
+      expect(f.evaluate()).toMatchObject({ allow: false, reason: expect.stringContaining('identity is unavailable') });
+    });
+});
+
+describe('Autoplan Read coverage of a CRLF artifact', () => {
+  // A CRLF plan carries CRLF into the close packet; Claude's Read reports those lines without CR.
+  const disk = 'Binding: {}\r\n## Implementation plan\r\nKeep it.\nlast line\r\n';
+  const use: any = { kind: 'use', sessionId: 's', toolUseId: 't', name: 'Read', order: 1, input: { file_path: 'C:\\x\\close-packet.md' } };
+  const result = (content: string): any => ({ kind: 'result', sessionId: 's', toolUseId: 't', isError: false, order: 2,
+    file: { filePath: 'C:\\x\\close-packet.md', content, startLine: 1, numLines: 5, totalLines: 5 } });
+  for (const [kind, reported, credited] of [
+    ['crlf-stripped', disk.replace(/\r\n/g, '\n'), true],
+    ['verbatim', disk, true],
+    ['changed-text', disk.replace(/\r\n/g, '\n').replace('Keep it.', 'Drop it.'), false],
+    ['mid-line-cr-dropped', 'Binding: {}\n## Implementation plan\nKeep it.\nlast line\n', true],
+  ] as const)
+    test(`a ${kind} report ${credited ? 'covers' : 'does not cover'} every line`, () => {
+      expect(autoplanReadRange(use, result(reported), disk)).toEqual(credited ? { start: 1, end: 5 } : undefined);
+    });
+  test('a CR inside a line is content, not a line ending', () => {
+    const inner = 'a\rb\nc';
+    const r: any = { ...result('ab\nc'), file: { filePath: 'C:\\x\\close-packet.md', content: 'ab\nc', startLine: 1, numLines: 2, totalLines: 2 } };
+    expect(autoplanReadRange(use, r, inner)).toBeUndefined();
+  });
+});
+
+describe('Autoplan restore-point header line ending', () => {
+  // init writes an LF header above a CRLF plan; Claude's Edit then rewrites every ending as CRLF.
+  for (const [kind, ending, allowed] of [['crlf', '\r\n', true], ['lf', '\n', true],
+    ['trailing-text', ' forged\n', false], ['no-newline', '', false]] as const)
+    test(`a restore-point header ending ${kind} ${allowed ? 'binds' : 'does not bind'} the invocation`, () => {
+      const f = fixture(); f.message(); f.current();
+      const text = fs.readFileSync(f.active, 'utf8'), end = text.indexOf('-->') + 3;
+      fs.writeFileSync(f.active, text.slice(0, end) + ending + text.slice(text.indexOf('\n', end) + 1));
+      expect(f.evaluate()).toEqual(allowed ? { allow: true }
+        : { allow: false, reason: expect.stringContaining('initialization artifacts do not match') });
+    });
+});
+
+describe('Autoplan ownership in a linked git worktree session', () => {
+  const posix = (file: string) => file.replaceAll('\\', '/');
+  /** git worktree add's two-way link: <repo>/.git/worktrees/<name>/gitdir <-> <worktree>/.git. */
+  function admin(repo: string, worktree: string) {
+    const entry = path.join(repo, '.git', 'worktrees', 'session');
+    fs.mkdirSync(entry, { recursive: true });
+    fs.writeFileSync(path.join(entry, 'gitdir'), posix(path.join(worktree, '.git')) + '\n');
+    return entry;
+  }
+  const pointer = (worktree: string, entry: string) => fs.writeFileSync(path.join(worktree, '.git'), `gitdir: ${posix(entry)}\n`);
+  const repo = () => { const dir = fs.realpathSync(fs.mkdtempSync(path.join(tmpdir(), 'autoplan-repo-'))); dirs.push(dir); return dir; };
+  const run = (f: ReturnType<typeof fixture>, root: string) => withNativeProjectDirectory(root, () => runPublicationHook(f.input, ROOT));
+
+  test('the repository root owns its linked worktree journal', async () => {
+    const f = fixture(); f.message(); f.current(); f.journal();
+    const root = repo(); pointer(f.cwd, admin(root, f.cwd));
+    expect(await run(f, root)).toEqual({});
+  });
+
+  test('a linked worktree journal still requires the parent publication', async () => {
+    const f = fixture(); f.current(); f.journal();
+    const root = repo(); pointer(f.cwd, admin(root, f.cwd));
+    expect(await run(f, root)).toMatchObject({ hookSpecificOutput: { permissionDecisionReason: expect.stringContaining('Publish the filled Phase 1') } });
+  });
+
+  test.if(process.platform === 'win32')('a forward-slash, lowercase-drive gitdir names the same worktree', async () => {
+    const f = fixture(); f.message(); f.current(); f.journal();
+    const root = repo(), lower = (file: string) => posix(file[0]!.toLowerCase() + file.slice(1));
+    const entry = path.join(root, '.git', 'worktrees', 'session'); fs.mkdirSync(entry, { recursive: true });
+    fs.writeFileSync(path.join(entry, 'gitdir'), lower(path.join(f.cwd, '.git')) + '\n');
+    fs.writeFileSync(path.join(f.cwd, '.git'), `gitdir: ${lower(entry)}\n`);
+    expect(await run(f, lower(root))).toEqual({});
+  });
+
+  test('worktree.useRelativePaths links resolve against each file\'s own directory', async () => {
+    const f = fixture(); f.message(); f.current(); f.journal();
+    const root = repo(), entry = path.join(root, '.git', 'worktrees', 'session'); fs.mkdirSync(entry, { recursive: true });
+    // Exactly what git 2.55 `-c worktree.useRelativePaths=true worktree add` writes.
+    fs.writeFileSync(path.join(entry, 'gitdir'), posix(path.relative(entry, path.join(f.cwd, '.git'))) + '\n');
+    fs.writeFileSync(path.join(f.cwd, '.git'), `gitdir: ${posix(path.relative(f.cwd, entry))}\n`);
+    expect(await run(f, root)).toEqual({});
+  });
+
+  test('an unrelated linked worktree leaves the exact project-directory owner unchanged', async () => {
+    const f = fixture(); f.message(); f.current(); f.journal();
+    const elsewhere = repo(); fs.mkdirSync(path.join(f.cwd, '.git', 'worktrees', 'session'), { recursive: true });
+    fs.writeFileSync(path.join(f.cwd, '.git', 'worktrees', 'session', 'gitdir'), posix(path.join(elsewhere, '.git')) + '\n');
+    expect(await run(f, f.cwd)).toEqual({});
+  });
+
+  for (const kind of ['no-link', 'worktree-file-only', 'admin-entry-only', 'other-repository',
+    'submodule-gitdir', 'project-is-itself-a-worktree', 'bare-repository'] as const)
+    test(`an unlinked directory cannot own the journal: ${kind}`, async () => {
+      const f = fixture(); f.message(); f.current(); f.journal();
+      const root = repo();
+      if (kind === 'worktree-file-only') pointer(f.cwd, path.join(root, '.git', 'worktrees', 'session'));
+      if (kind === 'admin-entry-only') admin(root, f.cwd);
+      // The root claims the worktree, but the worktree names another repository.
+      if (kind === 'other-repository') { admin(root, f.cwd); pointer(f.cwd, admin(repo(), f.cwd)); }
+      if (kind === 'submodule-gitdir') {
+        admin(root, f.cwd); const modules = path.join(root, '.git', 'modules', 'session');
+        fs.mkdirSync(modules, { recursive: true }); pointer(f.cwd, modules);
+      }
+      // A project directory whose own .git is a file has no worktree registry of its own.
+      if (kind === 'project-is-itself-a-worktree') { fs.writeFileSync(path.join(root, '.git'), 'gitdir: elsewhere\n'); pointer(f.cwd, path.join(root, '.git', 'worktrees', 'session')); }
+      if (kind === 'bare-repository') {
+        const entry = path.join(root, 'worktrees', 'session'); fs.mkdirSync(entry, { recursive: true });
+        fs.writeFileSync(path.join(entry, 'gitdir'), posix(path.join(f.cwd, '.git')) + '\n'); pointer(f.cwd, entry);
+      }
+      const output: any = await run(f, root);
+      expect(output.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(output.hookSpecificOutput.permissionDecisionReason).toContain('code foreign_cwd');
+    });
 });

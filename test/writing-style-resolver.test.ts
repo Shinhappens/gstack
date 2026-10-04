@@ -91,7 +91,7 @@ describe('Writing Style preamble section', () => {
     expect(explainLine).toContain('$_BIN/');
     // The Codex render's fence must reach the script via the host path, not
     // a Claude-specific one.
-    const fenceLine = out.split('\n').find(l => l.includes('_SS='));
+    const fenceLine = out.split('\n').find(l => l.includes('gstack-skill-start" --skill'));
     expect(fenceLine).toBeDefined();
     expect(fenceLine).not.toMatch(/~\/\.claude\//);
     expect(fenceLine).toContain('$GSTACK_BIN');

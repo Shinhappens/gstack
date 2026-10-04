@@ -34,6 +34,8 @@ import {
   E2E_TIERS,
   LLM_JUDGE_TOUCHFILES,
   GLOBAL_TOUCHFILES,
+  E2E_KINDS,
+  BEHAVIOR_WHY,
 } from './touchfiles-data';
 
 /** Repo-relative path of the pure-data file (the map-diff subject). */
@@ -145,6 +147,9 @@ export interface TouchfileMaps {
   E2E_TIERS: Record<string, string>;
   LLM_JUDGE_TOUCHFILES: Record<string, string[]>;
   GLOBAL_TOUCHFILES: string[];
+  /** Absent on base revisions older than the eval-kind registry: every current key then counts as changed. */
+  E2E_KINDS?: Record<string, string>;
+  BEHAVIOR_WHY?: Record<string, string>;
 }
 
 export type MapDiffCause =
@@ -171,6 +176,8 @@ const CURRENT_MAPS: TouchfileMaps = {
   E2E_TIERS,
   LLM_JUDGE_TOUCHFILES,
   GLOBAL_TOUCHFILES,
+  E2E_KINDS,
+  BEHAVIOR_WHY,
 };
 
 function isStringArray(v: unknown): v is string[] {
@@ -193,14 +200,18 @@ function isTouchfileMaps(v: unknown): v is TouchfileMaps {
   return isRecordOfStringArrays(o.E2E_TOUCHFILES)
     && isRecordOfStrings(o.E2E_TIERS)
     && isRecordOfStringArrays(o.LLM_JUDGE_TOUCHFILES)
-    && isStringArray(o.GLOBAL_TOUCHFILES);
+    && isStringArray(o.GLOBAL_TOUCHFILES)
+    && (o.E2E_KINDS === undefined || isRecordOfStrings(o.E2E_KINDS))
+    && (o.BEHAVIOR_WHY === undefined || isRecordOfStrings(o.BEHAVIOR_WHY));
 }
 
 /**
  * Pure map-diff core (injectable for tests — no git, no filesystem).
  *
  * A key counts as CHANGED when it was added to any per-key map, its dep-list
- * array differs, or its tier value flipped. A key counts as REMOVED only when
+ * array differs, or its tier, kind or behavior tolerance changed. A per-key
+ * map missing on the old side (a base revision older than E2E_KINDS /
+ * BEHAVIOR_WHY) makes every key of that map count as added. A key counts as REMOVED only when
  * it is gone from every new per-key map; a key dropped from one map but still
  * present in another (e.g. tier entry deleted, touchfile entry kept) counts
  * as changed — conservative, because the test still exists with a different
@@ -212,7 +223,7 @@ export function diffTouchfileMapsCore(
   oldMaps: TouchfileMaps,
   newMaps: TouchfileMaps,
 ): { changedTests: string[]; removedTests: string[]; globalTouchfilesChanged: boolean } {
-  const perKeyMapNames = ['E2E_TOUCHFILES', 'E2E_TIERS', 'LLM_JUDGE_TOUCHFILES'] as const;
+  const perKeyMapNames = ['E2E_TOUCHFILES', 'E2E_TIERS', 'LLM_JUDGE_TOUCHFILES', 'E2E_KINDS', 'BEHAVIOR_WHY'] as const;
   const changed = new Set<string>();
   const rawRemoved = new Set<string>();
 
@@ -290,6 +301,8 @@ export function diffTouchfileMaps(
         '  E2E_TIERS: m.E2E_TIERS,',
         '  LLM_JUDGE_TOUCHFILES: m.LLM_JUDGE_TOUCHFILES,',
         '  GLOBAL_TOUCHFILES: m.GLOBAL_TOUCHFILES,',
+        '  E2E_KINDS: m.E2E_KINDS,',
+        '  BEHAVIOR_WHY: m.BEHAVIOR_WHY,',
         '}));',
         '',
       ].join('\n'));

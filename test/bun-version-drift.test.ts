@@ -45,10 +45,10 @@ function collectPins(): Pin[] {
 
   const dockerfile = fs.readFileSync(
     path.join(ROOT, '.github', 'docker', 'Dockerfile.ci'), 'utf-8');
-  const dockerPin = dockerfile.match(/bash -s ["']?bun-v([\w.]+)["']?/);
+  const dockerPin = dockerfile.match(/^ARG BUN_VERSION=["']?([\w.]+)["']?$/m);
   pins.push({
     surface: 'Dockerfile.ci',
-    version: dockerPin ? dockerPin[1] : '<no bun-vX.Y.Z positional arg>',
+    version: dockerPin ? dockerPin[1] : '<no ARG BUN_VERSION=X.Y.Z>',
   });
 
   const gitlab = fs.readFileSync(path.join(ROOT, '.gitlab-ci.yml'), 'utf-8');

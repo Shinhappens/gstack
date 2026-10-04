@@ -31,34 +31,18 @@ Check \`REPO_MODE\` from the preamble output.
 
 **If REPO_MODE is \`solo\`:**
 
-Use AskUserQuestion:
-
-> These test failures appear pre-existing (not caused by your branch changes):
->
-> [list each failure with file:line and brief error description]
->
-> Since this is a solo repo, you're the only one who will fix these.
->
-> RECOMMENDATION: Choose A — fix now while the context is fresh. Completeness: 9/10.
-> A) Investigate and fix now (human: ~2-4h / CC: ~15min) — Completeness: 10/10
-> B) Add as P0 TODO — fix after this branch lands — Completeness: 7/10
-> C) Skip — I know about this, ship anyway — Completeness: 3/10
+Ask with AskUserQuestion in the AskUserQuestion Format. List each failure with file:line and a brief error description, say the failures appear pre-existing (not caused by this branch), and say that in a solo repo nobody else will fix them. Options, with A recommended because the context is fresh:
+- A) Investigate and fix now (human: ~2-4h / CC: ~15min) — Completeness 10/10
+- B) Add as P0 TODO — fix after this branch lands — Completeness 7/10
+- C) Skip — I know about this, ship anyway — Completeness 3/10
 
 **If REPO_MODE is \`collaborative\` or \`unknown\`:**
 
-Use AskUserQuestion:
-
-> These test failures appear pre-existing (not caused by your branch changes):
->
-> [list each failure with file:line and brief error description]
->
-> This is a collaborative repo — these may be someone else's responsibility.
->
-> RECOMMENDATION: Choose B — assign it to whoever broke it so the right person fixes it. Completeness: 9/10.
-> A) Investigate and fix now anyway — Completeness: 10/10
-> B) Blame + assign GitHub issue to the author — Completeness: 9/10
-> C) Add as P0 TODO — Completeness: 7/10
-> D) Skip — ship anyway — Completeness: 3/10
+Ask with AskUserQuestion in the AskUserQuestion Format. List each failure the same way, and say that in a collaborative repo these may be someone else's responsibility. Options, with B recommended so the person who broke it fixes it:
+- A) Investigate and fix now anyway — Completeness 10/10
+- B) Blame + assign GitHub issue to the author — Completeness 9/10
+- C) Add as P0 TODO — Completeness 7/10
+- D) Skip — ship anyway — Completeness 3/10
 
 ### Step T4: Execute the chosen action
 

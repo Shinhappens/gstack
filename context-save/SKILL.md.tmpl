@@ -7,8 +7,6 @@ description: |
   so any future session can pick up without losing a beat.
   Use when asked to "save progress", "save state", "context save", or
   "save my work". Pair with /context-restore to resume later.
-  Formerly /checkpoint — renamed because Claude Code treats /checkpoint as a
-  native rewind alias in current environments, which was shadowing this skill.
   (gstack)
 allowed-tools:
   - Bash
@@ -48,7 +46,7 @@ If the user provides a title after the command (e.g., `/context-save auth refact
 use it as the title. Otherwise, infer a title from the current work.
 
 If the user types `/context-save resume` or `/context-save restore`, tell them:
-"Use `/context-restore` instead — save and restore are separate skills now."
+"Use `/context-restore` to resume — restoring is a separate skill."
 
 ---
 
@@ -81,9 +79,29 @@ Using the gathered state plus your conversation history, produce a summary cover
 
 1. **What's being worked on** — the high-level goal or feature
 2. **Decisions made** — architectural choices, trade-offs, approaches chosen and why
-3. **Remaining work** — concrete next steps, in priority order
+3. **Remaining work** — concrete next steps, in priority order, each marked with
+   how this session knows it (see the provenance table below)
 4. **Notes** — anything a future session needs to know (gotchas, blocked items,
    open questions, things that were tried and didn't work)
+
+**Remaining Work provenance.** Every item starts with the status `Open.` and never
+with a completion token such as `[done]` or `[executed]`. Then pick its trailing
+marker by the first rule that applies:
+
+| # | The item is... | Marker | Use when this session... |
+|---|----------------|--------|--------------------------|
+| 1 | a writing step (migration, sync, insert, import, a dialog that writes), with or without a concrete path | `(target state checked)` | inspected the target's schema or state (for example the unique key) |
+| | | `(code read)` | read the writer but not the target |
+| | | `(path assumed)` | inferred the write without reading either |
+| 2 | otherwise, names a concrete path: a runnable command, CLI flag or switch, config key or value, or file or directory path | `(path run)` | executed it and observed the outcome; state the outcome in the item (`exit 0`, `failed: <reason>`) |
+| | | `(path read)` | read the code or file but did not execute it |
+| | | `(path assumed)` | inferred it without running or reading it, however confident |
+| 3 | anything else | none | (`Open.` alone) |
+
+Writing steps have their own markers because whether a write is safe to repeat
+depends on the target's state, not on the code that writes. Examples:
+`Open. Run the suite with CONFIG=staging. (path run) exit 0` and
+`Open. Switch B reads config Y. (path assumed)`.
 
 If the user provided a title, use it. Otherwise, infer a concise title (3-6 words)
 from the work being done.
@@ -118,7 +136,7 @@ allowlist: only `a-z 0-9 - .` survive.
 
 ```bash
 {{SLUG_SETUP}}
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 CHECKPOINT_DIR="$GSTACK_STATE_ROOT/projects/$SLUG/checkpoints"
 mkdir -p "$CHECKPOINT_DIR"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -172,7 +190,7 @@ files_modified:
 
 ### Remaining Work
 
-{Numbered list of concrete next steps, in priority order}
+{Numbered list of concrete next steps, in priority order. Each item starts with `Open.` and ends with its provenance marker from Step 2, or no marker under rule 3.}
 
 ### Notes
 
@@ -180,7 +198,18 @@ files_modified:
 ```
 
 The `files_modified` list comes from `git status --short` (both staged and unstaged
-modified files). Use relative paths from the repo root.
+modified files). Use relative paths from the repo root. Do not write `remote:` or
+`project_root:` yourself; the stamp step below adds them.
+
+Then stamp the project identity. Several projects can share one checkpoints
+directory, so `/context-restore` needs to know which project wrote each file. The helper adds `remote:` (canonical origin:
+lowercased host, no credentials, port or `.git`) and `project_root:` to the
+frontmatter:
+
+```bash
+FILE="<the FILE path printed above>"
+~/.claude/skills/gstack/bin/gstack-slug --stamp-checkpoint "$FILE" && echo "STAMPED"
+```
 
 After writing, confirm to the user:
 
@@ -205,7 +234,7 @@ Restore later with /context-restore.
 
 ```bash
 {{SLUG_SETUP}}
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 CHECKPOINT_DIR="$GSTACK_STATE_ROOT/projects/$SLUG/checkpoints"
 if [ -d "$CHECKPOINT_DIR" ]; then
   echo "CHECKPOINT_DIR=$CHECKPOINT_DIR"
@@ -269,5 +298,4 @@ If there are no saved contexts, tell the user: "No saved contexts yet. Run
 - **Infer, don't interrogate.** Use git state and conversation context to fill in
   the file. Only use AskUserQuestion if the title genuinely cannot be inferred.
 - **This is a gstack skill, not a Claude Code built-in.** When the user types
-  `/context-save`, invoke this skill via the Skill tool. The old `/checkpoint`
-  name collided with Claude Code's native `/rewind` alias — the rename fixed that.
+  `/context-save`, invoke this skill via the Skill tool.

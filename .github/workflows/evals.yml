@@ -125,6 +125,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      slices: ${{ steps.matrix.outputs.slices }}
+      timeout_minutes: ${{ steps.matrix.outputs.timeout_minutes }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -137,11 +140,24 @@ jobs:
         with:
           bun-version: 1.4.0
 
+      # Planner-side reuse: restore this PR's newest receipt store (the report
+      # job saves one merged store per run) and ship ONE filtered set with the
+      # plan, so every trial of a panel sees the same receipts and a newer FAIL
+      # blocks any older PASS for the same inputs.
+      - name: Restore this PR's verified judge and E2E results
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: /tmp/gstack-eval-input-cache
+          key: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}-plan
+          restore-keys: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-
+
       - name: Emit run manifest
         if: github.event_name != 'workflow_dispatch' || inputs.validation_phase == 'all'
         env:
           EVALS_ALL: ${{ (github.event_name == 'workflow_dispatch' && inputs.evals_all) && '1' || '' }}
-        run: EVALS_TIER=gate bun --no-install run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/paid-plan/manifest.json --slices 6
+          EVALS_CACHE_DIR: ${{ github.event_name == 'pull_request' && '/tmp/gstack-eval-input-cache' || '' }}
+        run: EVALS_TIER=gate bun --no-install run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/paid-plan/manifest.json --slice-budget 540 --jobs 2 --max-parallel 16
 
       - name: Emit validation-phase manifest
         if: github.event_name == 'workflow_dispatch' && inputs.validation_phase != 'all'
@@ -152,41 +168,52 @@ jobs:
         run: |
           bun --no-install -e '
           import { mkdirSync, writeFileSync } from "node:fs";
-          import { buildRunManifest, collectPaidTestFiles } from "./scripts/test-paid-shards.ts";
+          import { buildRunManifest, collectPaidTestFiles, restrictManifestSelection } from "./scripts/test-paid-shards.ts";
           const phase = process.env.VALIDATION_PHASE;
           if (!["quality", "cookie-quality", "behavior", "cookie-behavior"].includes(phase)) throw new Error("Invalid validation phase");
           const cookieBehavior = phase === "cookie-behavior";
           const discovered = phase === "cookie-quality" ? ["test/skill-llm-eval.test.ts"]
             : cookieBehavior ? ["test/skill-e2e-bws.test.ts", "test/skill-e2e-qa-workflow.test.ts", "test/skill-e2e-design.test.ts", "test/skill-e2e-diagram.test.ts", "test/skill-e2e-deploy.test.ts"]
             : collectPaidTestFiles().filter(file => file.startsWith("test/skill-llm-eval") === (phase === "quality"));
-          const manifest = buildRunManifest({ tier: "gate", profile: "full", sliceCount: 6, evalsAll: !cookieBehavior && process.env.EVALS_ALL === "1", discovered,
+          const manifest = buildRunManifest({ tier: "gate", profile: "full", sliceBudgetMs: 540000, jobs: 2, evalsAll: !cookieBehavior && process.env.EVALS_ALL === "1", discovered,
             ...(cookieBehavior ? { changedFiles: ["browse/src/cookie-picker-routes.ts", "browse/src/cookie-import-browser.ts", "browse/src/bun-polyfill.cjs"], env: { ...process.env, EVALS_ALL: "" } } : {}) });
-          if (phase === "cookie-quality") manifest.selection = { e2e: [], judges: ["setup-browser-cookies/SKILL.md workflow"] };
-          if (cookieBehavior) manifest.selection = { e2e: ["browse-basic", "browse-snapshot", "qa-quick", "qa-only-no-fix", "design-review-detector-shim-dom", "diagram-triplet", "canary-workflow", "benchmark-workflow"], judges: [] };
-          manifest.selectionReason = phase + " validation subset; " + manifest.selectionReason;
+          const subset = phase === "cookie-quality" ? { e2e: [], judges: ["setup-browser-cookies/SKILL.md workflow"] }
+            : cookieBehavior ? { e2e: ["browse-basic", "browse-snapshot", "qa-quick", "qa-only-no-fix", "design-review-detector-shim-dom", "diagram-triplet", "canary-workflow", "benchmark-workflow"], judges: [] } : null;
+          const restricted = subset ? restrictManifestSelection(manifest, subset, "outside the " + phase + " validation subset") : manifest;
+          restricted.selectionReason = phase + " validation subset; " + manifest.selectionReason;
           mkdirSync("/tmp/paid-plan", { recursive: true });
-          writeFileSync("/tmp/paid-plan/manifest.json", JSON.stringify(manifest, null, 2) + "\n");
-          console.log(phase + ": " + manifest.entries.filter(entry => entry.status === "planned").length + " planned shards");
+          writeFileSync("/tmp/paid-plan/manifest.json", JSON.stringify(restricted, null, 2) + "\n");
+          console.log(phase + ": " + restricted.entries.filter(entry => entry.status === "planned").length + " planned shards");
           '
+
+      - name: Derive the executor matrix from the plan
+        id: matrix
+        run: |
+          echo "slices=$(jq -c '[range(1; .sliceCount + 1)]' /tmp/paid-plan/manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "timeout_minutes=$(jq -e '.plan.ciTimeoutMinutes' /tmp/paid-plan/manifest.json)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: paid-plan
-          path: /tmp/paid-plan/manifest.json
+          path: |
+            /tmp/paid-plan/manifest.json
+            /tmp/paid-plan/receipts
           retention-days: 30
 
   eval-slices:
     runs-on: ubicloud-standard-8
     needs: [build-image, plan-slices]
-    if: always() && needs.build-image.result == 'success' && needs.plan-slices.result == 'success'
-    # Aggregate spawn-concurrency budget: 6 slices x EVALS_JOBS=2 x
-    # EVALS_CONCURRENCY=2 = 24 concurrent tests lane-wide (the old matrix's
-    # 40-way per row queued claude session STARTUP behind 39 siblings and ate
-    # per-test budgets — the documented timeout-flake family). Tune with
-    # parity data before raising.
-    # The complete gate census needs at most 236 minutes per slice; keep
-    # 20 minutes for setup/upload without preempting configured retries.
-    timeout-minutes: 256
+    env:
+      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-eval-slices-${{ matrix.slice }}
+    # !cancelled(), not always(): still runs when build-image was skipped
+    # (image already published), but a newer push's cancel-in-progress stops
+    # it instead of letting a superseded run finish its paid slices first.
+    if: ${{ !cancelled() && needs.build-image.result == 'success' && needs.plan-slices.result == 'success' }}
+    # The planner packs ~9 minutes of recorded work per slice (EVALS_JOBS=2 x
+    # EVALS_CONCURRENCY=2 per runner, never the old 40-way per-row fan-out
+    # that queued claude session STARTUP behind 39 siblings). The job timeout
+    # is the plan's supervised worst case plus 20 minutes setup/upload.
+    timeout-minutes: ${{ fromJSON(needs.plan-slices.outputs.timeout_minutes) }}
     permissions:
       contents: read
       packages: read
@@ -198,8 +225,9 @@ jobs:
       options: --user runner
     strategy:
       fail-fast: false
+      max-parallel: 16
       matrix:
-        slice: [1, 2, 3, 4, 5, 6]
+        slice: ${{ fromJSON(needs.plan-slices.outputs.slices) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -238,17 +266,39 @@ jobs:
           name: paid-plan
           path: /tmp/paid-plan
 
-      # Only this PR's receipts are eligible. No base-branch or cross-PR restore
-      # prefix; every receipt also verifies exact inputs and its original age.
-      - name: Restore this PR's verified judge results
-        if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: /tmp/gstack-eval-input-cache
-          key: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slice }}
-          restore-keys: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-
+      # Receipts come only from the plan (this PR's store, filtered once by the
+      # planner); new receipts land beside the slice results and the report
+      # merges them into the next store.
+      - name: Seed this slice's receipts from the plan
+        run: |
+          mkdir -p /tmp/paid-slice-results/receipts
+          if [ -d /tmp/paid-plan/receipts ]; then cp -a /tmp/paid-plan/receipts/. /tmp/paid-slice-results/receipts/; fi
 
-      - name: Run slice ${{ matrix.slice }}/6
+      # The image ships the pinned Codex CLI off PATH and without a
+      # credential; codex does not read OPENAI_API_KEY from the environment.
+      # Log it in from the secret (same-repo runs only) under a non-default
+      # home. The shard runner hands that home and the CLI to the Codex files
+      # only (scripts/lib/paid-cases.ts scopeCodexAccess); every other paid case sees no
+      # Codex, as before. Without a key the Codex cases fail; they never pass.
+      - name: Authenticate the Codex CLI
+        shell: bash
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          codex="${GSTACK_CI_CODEX_BIN_DIR:?}/codex"
+          export CODEX_HOME="$HOME/.gstack-ci-codex"
+          mkdir -p "$CODEX_HOME"
+          echo "GSTACK_CI_CODEX_HOME=$CODEX_HOME" >> "$GITHUB_ENV"
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::warning::OPENAI_API_KEY is unavailable; Codex eval cases cannot authenticate and will fail."
+            exit 0
+          fi
+          printenv OPENAI_API_KEY | "$codex" login --with-api-key
+          "$codex" login status >/dev/null 2>&1
+
+      - name: Run slice ${{ matrix.slice }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -257,50 +307,45 @@ jobs:
           EVALS_JOBS: "2"
           EVALS_CONCURRENCY: "2"
           GSTACK_EVAL_DIR: /tmp/paid-slice-results
-          EVALS_CACHE_DIR: /tmp/gstack-eval-input-cache
+          EVALS_CACHE_DIR: /tmp/paid-slice-results/receipts
           EVALS_CACHE_REPOSITORY: ${{ github.repository }}
           EVALS_CACHE_PR: ${{ github.event.pull_request.number }}
           EVALS_CACHE_RUNTIME_ID: ${{ needs.build-image.outputs.runtime-id }}
         run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --plan /tmp/paid-plan/manifest.json --slice ${{ matrix.slice }}
 
-      - name: Find finalized passing receipts
-        id: receipts
-        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-        run: |
-          # Only a producer publishes. A later reuse-only slice must not become
-          # the newest prefix match and hide another slice's newly earned pass.
-          for receipt in /tmp/gstack-eval-input-cache/*.json; do
-            [ -f "$receipt" ] || continue
-            if jq -e --arg run "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" '.proof.source.runId == $run' "$receipt" >/dev/null 2>&1; then
-              echo 'present=true' >> "$GITHUB_OUTPUT"
-              break
-            fi
-          done
-
-      # An unrelated failing case does not discard already verified passes.
-      # Failed/retried/partial attempts never become receipts in the first place.
-      - name: Save verified judge results for this PR
-        if: ${{ !cancelled() && steps.receipts.outputs.present == 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: /tmp/gstack-eval-input-cache
-          key: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slice }}
-
+      # Attempt-scoped: a re-run attempt's trials are reported under that
+      # attempt and never replace (or collide with) the first attempt's.
       - name: Upload slice results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: paid-slice-${{ matrix.slice }}
+          name: paid-slice-${{ matrix.slice }}-a${{ github.run_attempt }}
           path: /tmp/paid-slice-results
+          retention-days: 90
+
+      - name: Upload native capture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-captures-${{ env.EVALS_RUN_ID }}
+          include-hidden-files: true
+          path: |
+            ~/.gstack/projects/*/e2e-runs
+            ~/.gstack/projects/*/evals/qa-callers
+            ~/.gstack-dev/e2e-runs
+            ~/.gstack-dev/evals/qa-callers
+          if-no-files-found: ignore
           retention-days: 90
 
       # The spooled per-shard full logs — a red weekly/PR lane three weeks
       # later needs more than a summary line.
-      - name: Upload shard logs on failure
-        if: failure()
+      # always(), not failure(): a failed behavior trial is a verdict and no
+      # longer reds its runner, but its full log is the diagnosis evidence.
+      - name: Upload shard logs
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: paid-slice-${{ matrix.slice }}-logs
+          name: paid-logs-slice-${{ matrix.slice }}-a${{ github.run_attempt }}
           include-hidden-files: true
           # The Fix-bun-temp step points TMPDIR at /home/runner/.cache, so the
           # runner's spool lands THERE, not /tmp — the original /tmp glob
@@ -314,9 +359,10 @@ jobs:
   slices-report:
     runs-on: ubicloud-standard-2
     needs: [plan-slices, eval-slices]
-    # always(): the report must run (and FAIL) when an executor died — a
-    # missing slice artifact reading as green is the class this lane kills.
-    if: always() && needs.plan-slices.result == 'success'
+    # !cancelled(): the report must run (and FAIL) when an executor died — a
+    # missing slice artifact reading as green is the class this lane kills —
+    # but a run superseded by a newer push stops here.
+    if: ${{ !cancelled() && needs.plan-slices.result == 'success' }}
     timeout-minutes: 5
     # contents:read ONLY — this job executes the PR-authored reconcile
     # runner from the PR checkout, so it
@@ -344,11 +390,13 @@ jobs:
           name: paid-plan
           path: /tmp/paid-report
 
+      # One directory per attempt-scoped slice artifact (no merge): shard
+      # records can never overwrite each other, and the report keeps the
+      # first attempt's verdict.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: paid-slice-[0-9]*
+          pattern: paid-slice-*
           path: /tmp/paid-report
-          merge-multiple: true
 
       - name: Reconcile slices against the manifest (fail-closed)
         id: reconcile
@@ -361,16 +409,49 @@ jobs:
           # (caught by the ship review army; the wiring test now pins this).
           echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
+      - name: Stamp trial history series
+        if: always()
+        run: |
+          if [ -f /tmp/paid-report/trial-outcomes.jsonl ]; then
+            bun --no-install run scripts/eval-trial-series.ts /tmp/paid-report/trial-outcomes.jsonl
+          fi
+
+      # One merged receipt store per run: the plan's shipped set, every slice's
+      # new pass receipts, and the report's panel and negative receipts. Saved
+      # last, so the next planner restores it as the newest prefix match.
+      - name: Merge this run's receipts
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          bun --no-install run scripts/e2e-shard-reuse.ts merge /tmp/gstack-eval-input-cache \
+            /tmp/paid-report/receipts /tmp/paid-report/report-receipts /tmp/paid-report/paid-slice-*/receipts
+
+      - name: Save this PR's verified judge and E2E results
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: /tmp/gstack-eval-input-cache
+          key: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}-merged
+
       - name: Upload reconciliation output for the comment job
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: report-verdict
+          name: report-verdict-a${{ github.run_attempt }}
           path: |
             /tmp/report.txt
             /tmp/paid-report/collector-outcomes.json
+            /tmp/paid-report/report-summary.md
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Upload trial outcomes for pass-rate history
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trial-outcomes-pr-a${{ github.run_attempt }}
+          path: /tmp/paid-report/trial-outcomes.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
 
       - name: Fail the workflow when reconciliation failed
         if: steps.reconcile.outputs.exit != '0'
@@ -382,7 +463,7 @@ jobs:
   slices-comment:
     runs-on: ubicloud-standard-2
     needs: slices-report
-    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.slices-report.result != 'skipped'
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.slices-report.result != 'skipped' }}
     timeout-minutes: 5
     permissions:
       pull-requests: write
@@ -398,18 +479,13 @@ jobs:
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: paid-slice-[0-9]*
-          path: /tmp/paid-report
-          merge-multiple: true
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: report-verdict
+          name: report-verdict-a${{ github.run_attempt }}
           path: /tmp/verdict
         continue-on-error: true
 
-      # Verified counts come from the read-only report job, not repo code in
-      # this write-token job. Keeps the
+      # Every count, verdict and failure line comes from the read-only report
+      # job's collector-outcomes v2 (panelVerdict() ran there); this job runs
+      # no repo code and never recomputes a verdict. Keeps the
       # "## E2E Evals" marker so the upsert keeps updating the same comment.
       # Runs even when reconciliation failed — a red lane on the PR is the point.
       - name: Post PR comment
@@ -418,13 +494,14 @@ jobs:
           RECONCILE_EXIT: ${{ needs.slices-report.outputs.reconcile-exit }}
         run: |
           # shellcheck disable=SC2086,SC2059
-          RESULTS=$(find /tmp/paid-report -name '*.json' ! -name 'manifest.json' ! -name 'slice-*.json' ! -name '_partial*' 2>/dev/null | sort)
-          TOTAL=0; PASSED=0; FAILED=0; MANUAL=0; FLAKY=0; EXECUTED=0; REUSED=0; COST="0"
+          TOTAL=0; PASSED=0; FAILED=0; MANUAL=0; EXECUTED=0; REUSED=0; COST="0"
           SUITE_LINES=""
           VERIFIED=/tmp/verdict/paid-report/collector-outcomes.json
           if ! jq -e '
             . as $summary |
-            .version == 1 and (.files | type == "array") and (.totals | type == "object") and
+            .version == 2 and (.files | type == "array") and (.totals | type == "object") and
+            (.headline | type == "array") and (.failures | type == "array") and (.panels | type == "array") and
+            (.verdict.verdict == "GREEN" or .verdict.verdict == "RED") and
             ([.files[] | .total == (.passed + .failed + .manual_accepted) and
               (.total == (.executed + .reused)) and
               ([.total,.passed,.failed,.manual_accepted,.executed,.reused,.attempts,.flaky] | all(. >= 0 and (floor == .))) ] | all) and
@@ -433,100 +510,69 @@ jobs:
               all(. as $key | ([$summary.files[] | .[$key]] | add // 0) == $summary.totals[$key]))
           ' "$VERIFIED" >/dev/null 2>&1; then
             VERIFIED=""
-            echo 'Verified collector summary unavailable; manual acceptance is unavailable/unverified.'
+            echo 'Verified report summary unavailable; no verdict, counts or manual acceptance can be shown.'
           fi
+          HEADLINE='(no verified report headline)'
+          FAILURES=""
           if [ -n "$VERIFIED" ]; then
-            while IFS=$'\t' read -r f T P F M FL EX RE _ATTEMPTS C TIER SHARD; do
+            while IFS=$'\t' read -r _FILE T P F M _FLAKY EX RE _ATTEMPTS C TIER SHARD; do
               [ "$T" -eq 0 ] && continue
               TOTAL=$((TOTAL + T)); PASSED=$((PASSED + P)); FAILED=$((FAILED + F))
-              MANUAL=$((MANUAL + M)); FLAKY=$((FLAKY + FL))
+              MANUAL=$((MANUAL + M))
               EXECUTED=$((EXECUTED + EX)); REUSED=$((REUSED + RE))
               COST=$(echo "$COST + $C" | bc)
               STATUS_ICON="✅"
               [ "$M" -gt 0 ] && STATUS_ICON="⚠ manual/unscored"
               [ "$F" -gt 0 ] && STATUS_ICON="❌"
-              [ "$F" -eq 0 ] && [ "$M" -eq 0 ] && [ "$FL" -gt 0 ] && STATUS_ICON="✅⚠"
               SUITE_LINES="${SUITE_LINES}| ${TIER}/${SHARD} | ${P}/${T} | ${M} | ${EX} | ${RE} | ${STATUS_ICON} | \$${C} |\n"
             done < <(jq -r '.files[] | [.file,.total,.passed,.failed,.manual_accepted,.flaky,.executed,.reused,.attempts,.cost,.tier,.shard] | @tsv' "$VERIFIED")
-          else
-          for f in $RESULTS; do
-            if ! jq -e '.total_tests' "$f" >/dev/null 2>&1; then
-              echo "Skipping malformed JSON: $f"
-              continue
-            fi
-            # FINAL-attempt accounting: eval-store keeps EVERY retry attempt
-            # as its own record (that's the flake telemetry), so counting raw
-            # records marks a pass-on-retry as a failure and inflates totals.
-            # Group by test name and judge the LAST record. Retry metadata
-            # includes both passing and failing final outcomes; show it separately.
-            # Guarded: a file with total_tests but a null/non-array `tests`
-            # passes the -e probe, the group_by then fails, and an empty $T
-            # would abort the whole step under bash -e ([ "" -eq 0 ] is an
-            # error) — killing the comment on exactly the corrupted-artifact
-            # runs where the red evidence matters (claude adversarial).
-            STATS=$(jq -r '[.tests | group_by(.name)[] | last] as $final | "\($final | length) \([$final[] | select(.passed)] | length) \([$final[] | select(.passed | not)] | length) \(.flaky_retries // [] | length) \([$final[] | select(.execution != "reused")] | length) \([$final[] | select(.execution == "reused")] | length)"' "$f" 2>/dev/null) || { echo "Skipping malformed tests[] in: $f"; continue; }
-            read -r T P F FL EX RE <<< "$STATS"
-            [ -z "$T" ] && { echo "Skipping malformed tests[] in: $f"; continue; }
-            C=$(jq -r '.total_cost_usd // 0' "$f")
-            TIER=$(jq -r '.tier // "unknown"' "$f")
-            SHARD=$(jq -r '.shard // "-"' "$f")
-            [ "$T" -eq 0 ] && continue
-            TOTAL=$((TOTAL + T))
-            PASSED=$((PASSED + P))
-            FAILED=$((FAILED + F))
-            FLAKY=$((FLAKY + FL))
-            EXECUTED=$((EXECUTED + EX))
-            REUSED=$((REUSED + RE))
-            COST=$(echo "$COST + $C" | bc)
-            STATUS_ICON="✅"
-            [ "$F" -gt 0 ] && STATUS_ICON="❌"
-            [ "$F" -eq 0 ] && [ "$FL" -gt 0 ] && STATUS_ICON="✅⚠"
-            SUITE_LINES="${SUITE_LINES}| ${TIER}/${SHARD} | ${P}/${T} | unverified | ${EX} | ${RE} | ${STATUS_ICON} | \$${C} |\n"
-          done
+            # Report-sanitized lines (no @-mentions, one capped line each), fenced here.
+            HEADLINE=$(jq -r '.headline[]' "$VERIFIED")
+            FAILURES=$(jq -r '.failures[]' "$VERIFIED")
           fi
 
           COVERAGE=$(jq -r '"Profile: \(.profile // "full") / \(.prCoverage.mode // "broad"); selected behaviors: \(.selection.e2e | if . == null then "all" else length end), judges: \(.selection.judges | if . == null then "all" else length end). Deferred to scheduled/release coverage: \(.prCoverage.deferred // [] | length) behaviors and \(.prCoverage.deferredPromptFiles // [] | length) changed prompt files. Deferred checks did not run and receive no PR-pass credit."' /tmp/paid-report/manifest.json) || COVERAGE='Coverage manifest unavailable; no coverage claim.'
 
           STATUS="✅ PASS"
-          if [ "${RECONCILE_EXIT:-1}" != "0" ] || [ "$FAILED" -gt 0 ]; then STATUS="❌ FAIL"; fi
+          if [ "${RECONCILE_EXIT:-1}" != "0" ] || [ "$FAILED" -gt 0 ] \
+            || { [ -n "$VERIFIED" ] && [ "$(jq -r '.verdict.verdict' "$VERIFIED")" != "GREEN" ]; }; then STATUS="❌ FAIL"; fi
           if [ "$STATUS" = '✅ PASS' ] && [ "$MANUAL" -gt 0 ]; then STATUS='⚠ MANUAL ACCEPTED (unscored)'; fi
-          if [ -z "$VERIFIED" ]; then STATUS='❌ FAIL (manual acceptance unavailable/unverified)'; fi
+          if [ -z "$VERIFIED" ]; then STATUS='❌ FAIL (verified report unavailable)'; fi
 
           BODY="## E2E Evals: ${STATUS}
 
-          **${PASSED} automated passed / ${TOTAL} final results** | **${FAILED} failed, ${MANUAL} manual accepted (unscored; no score-cache credit)** | **${EXECUTED} executed, ${REUSED} reused** | **\$${COST}** total cost | reconcile exit: ${RECONCILE_EXIT:-missing}$([ "$FLAKY" -gt 0 ] && printf ' | ⚠ %s cases with multiple attempts' "$FLAKY")
+          \`\`\`
+          ${HEADLINE}
+          \`\`\`
+
+          **${EXECUTED} executed, ${REUSED} reused** rule/judge records | **${MANUAL} manual accepted (unscored; no score-cache credit)** | **\$${COST}** rule/judge cost | reconcile exit: ${RECONCILE_EXIT:-missing}
 
           ${COVERAGE}
+
+          <details><summary>Rule and judge shards</summary>
 
           | Shard | Automated result | Manual/unscored | Executed | Reused | Status | Cost |
           |-------|------------------|-----------------|----------|--------|--------|------|
           $(echo -e "$SUITE_LINES")
+          </details>
 
           <details><summary>Fail-closed reconciliation</summary>
 
           \`\`\`
-          $(tail -c 4000 /tmp/verdict/report.txt 2>/dev/null || echo '(no reconciliation output)')
+          $(tail -c 4000 /tmp/verdict/report.txt 2>/dev/null | sed 's/@/@\xe2\x80\x8b/g' || echo '(no reconciliation output)')
           \`\`\`
           </details>
 
           ---
-          *Sliced lane: declared PR profile or broad fallback via scripts/test-paid-shards.ts (planner → 6 executors → fail-closed report). Reused scores retain their original provenance and expiry.*"
+          *Sliced lane: planner → duration-packed executors → fail-closed report. Behavior cases run a pre-registered 3-trial panel (PASS at 2/3 with no contract violation); a PASS 2/3 is shown with its failed trial, never as a clean pass. Reused results retain their original provenance and expiry.*"
 
-          if [ "$FAILED" -gt 0 ]; then
-            FAILURES=""
-            for f in $RESULTS; do
-              if ! jq -e '.failed' "$f" >/dev/null 2>&1; then continue; fi
-              if [ -n "$VERIFIED" ]; then
-                FAILS=$(jq -r '[.tests | group_by(.name)[] | last | select(.passed == false and (has("manual_review") | not))][] | "- ❌ \(.name): \(.exit_reason // "unknown")"' "$f" 2>/dev/null || echo "- ⚠️ parse error")
-              else
-                FAILS=$(jq -r '[.tests | group_by(.name)[] | last | select(.passed == false)][] | "- ❌ \(.name): \(.exit_reason // "unknown")"' "$f" 2>/dev/null || echo "- ⚠️ parse error")
-              fi
-              FAILURES="${FAILURES}${FAILS}\n"
-            done
+          if [ -n "$FAILURES" ]; then
             BODY="${BODY}
 
-          ### Failures
-          $(echo -e "$FAILURES")"
+          ### Failures and split verdicts
+          \`\`\`
+          ${FAILURES}
+          \`\`\`"
           fi
 
           COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \

@@ -163,38 +163,12 @@ export const SKILL_CALIBRATION_WEIGHTS: Record<string, number> = {
 export const CACHE_REFRESH_LOCK_TIMEOUT_MS = 5 * 60_000;
 
 /**
- * Retention policy: gstack/skill-run pages auto-archive after this many days.
- * Calibration takes (kind=bet) NEVER archive (long-term scorecard needs them).
- */
-export const SKILL_RUN_RETENTION_DAYS = 90;
-
-/**
  * Schema pack identity. Bumped when adding/removing/renaming page types.
  * On mismatch with the version recorded in _meta.json, the cache layer
  * triggers a FULL rebuild for the affected project.
  */
 export const GSTACK_SCHEMA_PACK_NAME = 'gstack-core';
 export const GSTACK_SCHEMA_PACK_VERSION = '1.0.0';
-
-/**
- * Trust policy values. Drives auto-push of artifacts, calibration write-back
- * eligibility, and user-namespacing strategy.
- */
-export type BrainTrustPolicy = 'personal' | 'shared' | 'unset';
-
-/**
- * Per-transport default policy. Local engines auto-set to personal (single-tenant
- * by construction). Remote endpoints are inferred based on sources_list shape:
- * exactly one source + whoami matches → personal default; multiple sources or
- * federation → ask the policy question.
- */
-export const TRANSPORT_DEFAULT_POLICY: Record<string, BrainTrustPolicy | 'infer'> = {
-  'local-pglite': 'personal',
-  'local-stdio': 'personal',
-  'remote-http-single-tenant': 'personal',
-  'remote-http-ambiguous': 'unset',
-  unknown: 'unset',
-};
 
 /**
  * User-slug fallback chain (D4 A3 defensive default). Resolved once per endpoint

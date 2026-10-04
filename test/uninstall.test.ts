@@ -258,7 +258,7 @@ describe('hook cleanup runs before the install root is deleted', () => {
       fs.mkdirSync(installBin, { recursive: true });
       // The installed copies — the uninstaller under test IS the one inside
       // the root it deletes.
-      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config']) {
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
         const src = path.join(ROOT, 'bin', b);
         const dst = path.join(installBin, b);
         fs.copyFileSync(src, dst);
@@ -317,7 +317,7 @@ describe('the Memorable bridge hook is removed by name and the kept config is le
       const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
       const installBin = path.join(installRoot, 'bin');
       fs.mkdirSync(installBin, { recursive: true });
-      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config']) {
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
         const dst = path.join(installBin, b);
         fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
         fs.chmodSync(dst, 0o755);
@@ -360,7 +360,7 @@ describe('the Memorable arm stays quiet when nothing of its is registered', () =
       const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
       const installBin = path.join(installRoot, 'bin');
       fs.mkdirSync(installBin, { recursive: true });
-      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config']) {
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
         const dst = path.join(installBin, b);
         fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
         fs.chmodSync(dst, 0o755);
@@ -392,7 +392,7 @@ describe('hook cleanup under lock contention is loud, never silent (review-army)
       const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
       const installBin = path.join(installRoot, 'bin');
       fs.mkdirSync(installBin, { recursive: true });
-      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config']) {
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
         const dst = path.join(installBin, b);
         fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
         fs.chmodSync(dst, 0o755);
@@ -449,7 +449,7 @@ describe('the consent key never outlives the hook, even when the config lives ou
       const installBin = path.join(installRoot, 'bin');
       fs.mkdirSync(installBin, { recursive: true });
       fs.mkdirSync(otherRoot, { recursive: true });
-      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config']) {
+      for (const b of ['gstack-uninstall', 'gstack-settings-hook', 'gstack-session-update', 'gstack-config', 'gstack-state-root.sh']) {
         const dst = path.join(installBin, b);
         fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
         fs.chmodSync(dst, 0o755);
@@ -480,7 +480,7 @@ describe('the consent flip does not depend on the hook manager being present', (
       const installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
       const installBin = path.join(installRoot, 'bin');
       fs.mkdirSync(installBin, { recursive: true });
-      for (const b of ['gstack-uninstall', 'gstack-config']) { // no settings hook, no session-update
+      for (const b of ['gstack-uninstall', 'gstack-config', 'gstack-state-root.sh']) { // no settings hook, no session-update
         const dst = path.join(installBin, b);
         fs.copyFileSync(path.join(ROOT, 'bin', b), dst);
         fs.chmodSync(dst, 0o755);
@@ -497,5 +497,67 @@ describe('the consent flip does not depend on the hook manager being present', (
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+describe('state-root safety: only the default root is deleted (docs/state-root.md)', () => {
+  let tmp: string, mockHome: string, installBin: string, installRoot: string;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-uninstall-root-'));
+    mockHome = path.join(tmp, 'home');
+    installRoot = path.join(mockHome, '.claude', 'skills', 'gstack');
+    installBin = path.join(installRoot, 'bin');
+    fs.mkdirSync(installBin, { recursive: true });
+    for (const b of ['gstack-uninstall', 'gstack-config', 'gstack-state-root.sh']) {
+      fs.copyFileSync(path.join(ROOT, 'bin', b), path.join(installBin, b));
+      fs.chmodSync(path.join(installBin, b), 0o755);
+    }
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  function uninstall(args: string[], env: Record<string, string>, input?: string) {
+    return spawnSync('bash', [path.join(installBin, 'gstack-uninstall'), ...args], {
+      cwd: tmp, input, encoding: 'utf-8', timeout: 30_000,
+      env: { ...process.env, HOME: mockHome, GSTACK_SETTINGS_FILE: path.join(mockHome, 'settings.json'),
+        GSTACK_HOME: '', GSTACK_STATE_ROOT: '', GSTACK_STATE_DIR: '', CLAUDE_PLUGIN_DATA: '', ...env } as Record<string, string>,
+    });
+  }
+
+  for (const mode of ['--force', 'interactive'] as const) {
+    test(`a custom GSTACK_HOME root is left in place with the removal command (${mode}); $HOME/.gstack goes`, () => {
+      const custom = path.join(tmp, 'custom-state');
+      fs.mkdirSync(path.join(custom, 'projects'), { recursive: true });
+      fs.mkdirSync(path.join(mockHome, '.gstack'), { recursive: true });
+      const r = mode === '--force' ? uninstall(['--force'], { GSTACK_HOME: custom }) : uninstall([], { GSTACK_HOME: custom }, 'y\n');
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain(`left in place: ${custom} (selected by GSTACK_HOME=${custom})`);
+      expect(r.stderr).toContain(`fix: after checking it, remove it with rm -rf -- '${custom}'`);
+      expect(r.stderr).toContain('docs/state-root.md');
+      expect(fs.existsSync(path.join(custom, 'projects'))).toBe(true);
+      expect(fs.existsSync(path.join(mockHome, '.gstack'))).toBe(false);
+      if (mode === 'interactive') expect(r.stdout).toContain(`(kept) ${custom}`);
+    });
+  }
+
+  for (const [label, target] of [['$HOME', () => mockHome], ['/', () => '/'], ['the gstack checkout', () => installRoot]] as const) {
+    test(`$HOME/.gstack symlinked to ${label} is refused with exit 2 and a fix line`, () => {
+      fs.symlinkSync(target(), path.join(mockHome, '.gstack'));
+      const r = uninstall(['--force'], {});
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain(`gstack-uninstall: refusing to delete ${path.join(mockHome, '.gstack')}: `);
+      expect(r.stderr).toMatch(/^fix: .*docs\/state-root\.md/m);
+      expect(fs.existsSync(path.join(installBin, 'gstack-uninstall'))).toBe(true);
+      expect(fs.lstatSync(path.join(mockHome, '.gstack')).isSymbolicLink()).toBe(true);
+    });
+  }
+
+  test('--keep-state deletes nothing and never refuses', () => {
+    const custom = path.join(tmp, 'custom-state');
+    fs.mkdirSync(custom, { recursive: true });
+    fs.symlinkSync(mockHome, path.join(mockHome, '.gstack'));
+    const r = uninstall(['--force', '--keep-state'], { GSTACK_HOME: custom });
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toContain('left in place:');
+    expect(fs.existsSync(custom)).toBe(true);
+    expect(fs.lstatSync(path.join(mockHome, '.gstack')).isSymbolicLink()).toBe(true);
   });
 });

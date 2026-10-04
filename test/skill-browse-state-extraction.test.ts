@@ -4,20 +4,14 @@ import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 
-// Tripwire for the pid/port extraction snippets in /open-gstack-browser.
+// Tripwire for the port extraction snippet in /open-gstack-browser.
 //
-// Step 0 (pre-flight cleanup) reads the stale daemon's pid out of
-// .gstack/browse.json to kill it; Step 2 reads the port back to tell the user
-// which one the Side Panel needs. Both used `grep -o '"pid":[0-9]*'`, which
-// cannot match: every writer of that file in browse/src/server.ts serializes
-// with `JSON.stringify(state, null, 2)`, so the real bytes are `"pid": 12060`
-// — colon, SPACE, digits.
-//
-// The failure was silent in the worst way. `_OLD_PID` came back empty, the
-// `kill` never ran, browse.json was deleted anyway, and the next `connect`
-// died with "existing daemon has different config (proxy/headed mismatch)"
-// — an error that points at proxy/headed flags, not at the cleanup that
-// no-opped. Observed 2026-08-28 against a daemon left over from a reboot.
+// Step 2 reads the port out of .gstack/browse.json to tell the user which one
+// the Side Panel needs. A `grep -o '"port":[0-9]*'` pattern cannot match:
+// every writer of that file in browse/src/server.ts serializes with
+// `JSON.stringify(state, null, 2)`, so the real bytes are `"port": 34567`
+// — colon, SPACE, digits. (The skill no longer reads the pid at all: the
+// browse CLI owns daemon liveness and replacement.)
 //
 // So this test does not match strings; it RUNS the snippets the skill tells
 // the agent to run, against a state file written exactly the way the server
@@ -38,7 +32,7 @@ function writeStateFile(dir: string, pid: number, port: number): string {
 }
 
 /** Pull the grep pipeline for `field` out of the skill prose and run it. */
-function extractViaSkill(source: string, field: 'pid' | 'port', stateFile: string): string {
+function extractViaSkill(source: string, field: 'port', stateFile: string): string {
   const line = source
     .split('\n')
     .find((l) => l.includes(`grep -o '"${field}":`));
@@ -54,12 +48,11 @@ function extractViaSkill(source: string, field: 'pid' | 'port', stateFile: strin
 
 describe('/open-gstack-browser state-file extraction', () => {
   for (const [label, file] of [['generated', SKILL], ['template', TMPL]] as const) {
-    test(`${label}: pid and port survive the pretty-printed state file`, () => {
+    test(`${label}: the port survives the pretty-printed state file`, () => {
       const source = fs.readFileSync(file, 'utf-8');
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'browse-state-'));
       try {
         const stateFile = writeStateFile(dir, 12060, 34567);
-        expect(extractViaSkill(source, 'pid', stateFile)).toBe('12060');
         expect(extractViaSkill(source, 'port', stateFile)).toBe('34567');
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });

@@ -78,8 +78,8 @@ any documentation. This prevents the "documentation that describes half the feat
 
 ## Step 1: Codebase Archaeology (Research Phase)
 
-**This is the most important step.** Do not skip or rush it. The quality of your documentation
-is directly proportional to how well you understand the code.
+The quality of the documentation depends on how well you understand the code, so this
+step carries the most weight.
 
 1. **Map the project structure:**
 
@@ -380,9 +380,9 @@ Fix any failures before proceeding.
 
 **Redaction scan before commit.** Generated docs frequently contain example
 credentials; scan the staged doc content and block on a HIGH credential (a
-live-format secret in committed docs is a leak). Example configs belong in
-` ```example ` fences won't excuse a live-format secret, but the per-span
-placeholder filter passes obvious docs examples (e.g. `AKIAIOSFODNN7EXAMPLE`):
+live-format secret in committed docs is a leak). The per-span placeholder
+filter passes obvious docs examples (e.g. `AKIAIOSFODNN7EXAMPLE`); a
+live-format secret blocks wherever it appears, fenced or not:
 
 ```bash
 REDACT_VIS=$(~/.claude/skills/gstack/bin/gstack-config get redact_repo_visibility 2>/dev/null)

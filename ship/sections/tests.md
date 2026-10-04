@@ -59,7 +59,9 @@ Store conventions as prose context for use in Step 7. **Skip the rest of bootstr
 
 Absent config files and absent `tests/` directories are NOT evidence of "no tests": Django keeps tests in `<app>/tests.py`, Go in `*_test.go` beside the source, Rust in `#[test]` blocks inside `src/`. A green `python manage.py test` with no `pytest.ini` is a tested project, not a bootstrap candidate.
 
-**If BOOTSTRAP_DECLINED** appears: Print "Test bootstrap previously declined — skipping." **Skip the rest of bootstrap.**
+**If BOOTSTRAP_DECLINED** appears:
+- Step 5's explicit Add tests choice overrides that marker for this invocation only: continue to runtime detection and B2–B3, including framework approval.
+- Otherwise print "Test bootstrap previously declined — skipping" and **skip the rest of bootstrap**.
 
 **If NO ecosystem marker matched:** Use AskUserQuestion:
 "I couldn't detect your project's language. What runtime are you using?"
@@ -113,7 +115,7 @@ If multiple runtimes detected (monorepo) → ask which runtime to set up first, 
 3. Create directory structure (test/, spec/, etc.)
 4. Create one example test matching the project's code to verify setup works
 
-If package installation fails → debug once. If still failing → revert with `git checkout -- package.json package-lock.json` (or equivalent for the runtime). Warn user and continue without tests.
+Record existing files and edits before installing. If package installation fails → debug once. If still failing → undo only the changes this bootstrap made and preserve the user's edits; never blanket-checkout. Warn user and continue without tests.
 
 ### B4.5. First real tests
 
@@ -122,7 +124,7 @@ Generate 3-5 real tests for existing code:
 1. **Find recently changed files:** `git log --since=30.days --name-only --format="" | sort | uniq -c | sort -rn | head -10`
 2. **Prioritize by risk:** Error handlers > business logic with conditionals > API endpoints > pure functions
 3. **For each file:** Write one test that tests real behavior with meaningful assertions. Never `expect(x).toBeDefined()` — test what the code DOES.
-4. Run each test. Passes → keep. Fails → fix once. Still fails → delete silently.
+4. Run each test. Passes → keep. Fails → fix an invalid test or fixture once. Still fails → drop it and name it, with its failure output, in the bootstrap summary; a failure in the code under test is a finding for the user, never a silent deletion.
 5. Generate at least 1 test, cap at 5.
 
 Never import secrets, API keys, or credentials in test files. Use environment variables or test fixtures.
@@ -134,7 +136,7 @@ Never import secrets, API keys, or credentials in test files. Use environment va
 {detected test command}
 ```
 
-If tests fail → debug once. If still failing → revert all bootstrap changes and warn user.
+If tests fail → debug once. If still failing → undo only this bootstrap's own changes, preserve the user's edits, and warn user with the failure.
 
 ### B5.5. CI/CD pipeline
 
@@ -185,7 +187,7 @@ Append a `## Testing` section:
 git status --porcelain
 ```
 
-Only commit if there are changes. Stage all bootstrap files (config, test directory, TESTING.md, CLAUDE.md, .github/workflows/test.yml if created):
+Only commit if there are changes. Stage the bootstrap's own files by name (config, test directory, TESTING.md, CLAUDE.md, .github/workflows/test.yml if created); if unrelated edits are already staged, stop and ask before committing:
 `git commit -m "chore: bootstrap test framework ({framework name})"`
 
 ---
@@ -196,6 +198,15 @@ Only commit if there are changes. Stage all bootstrap files (config, test direct
 
 Use the project's test commands discovered in Step 4 or documented in CLAUDE.md/AGENTS.md. Run every applicable suite; do not assume Rails or Vitest. The commands below are examples only for repositories that actually provide them. Use the same lane labels and exact commands again in Step 16.
 
+**If no applicable test suite exists:** Name the untested scope. AskUserQuestion:
+A) Add tests (recommended), B) Ship with this named testing
+gap, or C) Stop. Reuse an actual prior B answer only for the same scope and
+content; declining bootstrap alone is not that approval. B continues with the
+gap recorded, not passing tests. Independent build, eval, review and QA gates
+still apply. A declared but unavailable suite is a blocker, not an absent suite.
+A runs Step 4 with this new bootstrap choice, then returns here to run the tests.
+C stops this attempt.
+
 **For Rails projects using `bin/test-lane`, do NOT run `RAILS_ENV=test bin/rails db:migrate`** — `bin/test-lane` already calls
 `db:test:prepare` internally, which loads the schema into the correct lane database.
 Running bare test migrations without INSTANCE hits an orphan DB and corrupts structure.sql.
@@ -203,7 +214,7 @@ Running bare test migrations without INSTANCE hits an orphan DB and corrupts str
 Run independent test suites in parallel, each wrapped in the evidence ledger. The
 wrapper is transparent (streams output live, exit code passes through) and
 records `{command, exit, working-tree fingerprint, log path}` to
-`~/.gstack/projects/<slug>/<branch>-evidence.jsonl` — Step 16 cites this
+`$GSTACK_STATE_ROOT/projects/<slug>/<branch>-evidence.jsonl` — Step 16 cites this
 record instead of re-running when the content hasn't changed:
 
 ```bash
@@ -249,34 +260,18 @@ Check `REPO_MODE` from the preamble output.
 
 **If REPO_MODE is `solo`:**
 
-Use AskUserQuestion:
-
-> These test failures appear pre-existing (not caused by your branch changes):
->
-> [list each failure with file:line and brief error description]
->
-> Since this is a solo repo, you're the only one who will fix these.
->
-> RECOMMENDATION: Choose A — fix now while the context is fresh. Completeness: 9/10.
-> A) Investigate and fix now (human: ~2-4h / CC: ~15min) — Completeness: 10/10
-> B) Add as P0 TODO — fix after this branch lands — Completeness: 7/10
-> C) Skip — I know about this, ship anyway — Completeness: 3/10
+Ask with AskUserQuestion in the AskUserQuestion Format. List each failure with file:line and a brief error description, say the failures appear pre-existing (not caused by this branch), and say that in a solo repo nobody else will fix them. Options, with A recommended because the context is fresh:
+- A) Investigate and fix now (human: ~2-4h / CC: ~15min) — Completeness 10/10
+- B) Add as P0 TODO — fix after this branch lands — Completeness 7/10
+- C) Skip — I know about this, ship anyway — Completeness 3/10
 
 **If REPO_MODE is `collaborative` or `unknown`:**
 
-Use AskUserQuestion:
-
-> These test failures appear pre-existing (not caused by your branch changes):
->
-> [list each failure with file:line and brief error description]
->
-> This is a collaborative repo — these may be someone else's responsibility.
->
-> RECOMMENDATION: Choose B — assign it to whoever broke it so the right person fixes it. Completeness: 9/10.
-> A) Investigate and fix now anyway — Completeness: 10/10
-> B) Blame + assign GitHub issue to the author — Completeness: 9/10
-> C) Add as P0 TODO — Completeness: 7/10
-> D) Skip — ship anyway — Completeness: 3/10
+Ask with AskUserQuestion in the AskUserQuestion Format. List each failure the same way, and say that in a collaborative repo these may be someone else's responsibility. Options, with B recommended so the person who broke it fixes it:
+- A) Investigate and fix now anyway — Completeness 10/10
+- B) Blame + assign GitHub issue to the author — Completeness 9/10
+- C) Add as P0 TODO — Completeness 7/10
+- D) Skip — ship anyway — Completeness 3/10
 
 ### Step T4: Execute the chosen action
 
@@ -325,7 +320,7 @@ Use AskUserQuestion:
 
 **After triage:** If any in-branch failures remain unfixed, **STOP**. Do not proceed. If all failures were pre-existing and handled (fixed, TODOed, assigned, or skipped), continue to Step 6.
 
-**If all pass:** Continue silently — just note the counts briefly.
+**If all pass:** Report the pass counts in one line and continue to Step 6.
 
 ---
 

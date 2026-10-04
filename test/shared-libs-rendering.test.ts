@@ -54,8 +54,14 @@ describe('shared-code skill distribution', () => {
       expect(standalone).toContain('including repeated page numbers');
       expect(standalone).toContain('temporary files and files outside the repository');
       expect(standalone).toContain('Keep API responses and intermediate data on stdout or in memory');
-      expect(standalone).toContain('--no-lazy-fetch');
-      expect(standalone).toContain('log.showSignature=false');
+      // Git safety is the installed helper from the trusted global runtime, not a retyped prefix.
+      const safeGit = `~/${host.globalRoot}/bin/gstack-safe-git`;
+      expect(standalone).toContain(`${safeGit} -C <repo> rev-parse --is-inside-work-tree`);
+      expect(standalone).toContain(`${safeGit} ls-files --cached --others --exclude-standard -z`);
+      expect(standalone).toContain('never bare `git`');
+      expect(standalone).not.toContain('git --no-pager');
+      expect(standalone).not.toContain('$GSTACK_ROOT');
+      expect(standalone).not.toContain('{{SAFE_GIT}}');
       expect(standalone).toContain('python3 -I -S');
       expect(standalone).toContain('two explicit committed object IDs');
       expect(standalone).toContain('same Git tree');
@@ -65,18 +71,35 @@ describe('shared-code skill distribution', () => {
       expect(texts[2]).toContain('snapshot_covered_paths');
       expect(texts[2]).toContain('Exclude assume-unchanged, skip-worktree');
       expect(texts[2]).toContain('byte-for-byte with its blob');
-      for (const parent of [texts[2], rendered(host, 'ship')]) {
-        const validation = parent.indexOf('**Validate advisory severity first.**');
+      for (const [skill, parent] of [['review', texts[2]], ['ship', rendered(host, 'ship')]]) {
+        const validation = parent.indexOf(skill === 'ship' ? '1. **Validate severity.**' : '**Validate advisory severity first.**');
         expect(validation).toBeGreaterThanOrEqual(0);
-        expect(validation).toBeLessThan(parent.indexOf('Before classifying findings, check'));
-        expect(parent).toContain('remove `advisory` and retain its `CRITICAL` severity');
-        expect(parent).toContain('Never downgrade severity to make advisory metadata consistent');
-        expect(parent).toContain('Valid INFORMATIONAL advisories remain advisory in every category, including simplification');
-        expect(parent).toContain('contradictory CRITICAL/advisory metadata cannot establish a skipped defect or advisory decision');
-        const merge = parent.indexOf('**Parse findings:**');
-        if (merge >= 0) {
-          expect(parent.indexOf('**Validate advisory severity first.**', merge))
-            .toBeLessThan(parent.indexOf('**Fingerprint and deduplicate:**', merge));
+        expect(validation).toBeLessThan(parent.indexOf(skill === 'ship' ? '2. **Read decisions.**' : 'Before classifying findings, check'));
+        if (skill === 'ship') {
+          const matching = parent.slice(validation).replace(/\s+/g, ' ');
+          expect(matching).toContain('For CRITICAL/advisory contradictions, remove `advisory`, never downgrade severity');
+          expect(matching).toContain('Valid INFORMATIONAL advisories stay advisory, including simplification');
+          expect(matching).toContain('Reject contradictory saved decisions');
+          expect(matching).toContain('they cannot suppress defects');
+        } else {
+          expect(parent).toContain('remove `advisory` and retain its `CRITICAL` severity');
+          expect(parent).toContain('Never downgrade severity to make advisory metadata consistent');
+          expect(parent).toContain('Valid INFORMATIONAL advisories remain advisory in every category, including simplification');
+          expect(parent).toContain('contradictory CRITICAL/advisory metadata cannot establish a skipped defect or advisory decision');
+        }
+        if (host.name !== 'codex' && !host.suppressedResolvers?.includes('REVIEW_ARMY')) {
+          const stages = ['#### 1. Parse outputs', '#### 2. Validate severity', '#### 3. Identify and merge',
+            '#### 4. Apply specialist confidence gates', '#### 5. Score and present specialists'];
+          const positions = stages.map(stage => parent.indexOf(stage));
+          expect(positions.every(position => position >= 0)).toBe(true);
+          expect(positions).toEqual([...positions].sort((a, b) => a - b));
+          const merge = parent.slice(positions[1], positions[2]).replace(/\s+/g, ' ');
+          expect(merge).toContain('remove `advisory` and retain its `CRITICAL` severity');
+          expect(merge).toContain('Never downgrade severity');
+          expect(parent).toContain('Only specialist findings enter this header and `quality_score`; core findings do not');
+        } else {
+          expect(parent).not.toContain('#### 1. Parse outputs');
+          expect(parent).not.toContain('SPECIALIST REVIEW: N findings');
         }
       }
     });
@@ -99,9 +122,9 @@ describe('shared-code skill distribution', () => {
     const headings = ['## AskUserQuestion Format', '## My engineering preferences',
       '## Review record and write policy', '**Plan-review evidence:**',
       '## Confidence Calibration', '## Decision procedure',
-      '### 1. Establish current state', '### 2. Separate independent choices',
-      '### 3. Compare one choice', '### 4. Save the pending record',
-      '### 5. Ask and wait', '### 6. Apply and refresh',
+      '### Prepare an unanswered choice', '**Separate independent choices.**',
+      '**Compare one choice.**', '**Pending-record checkpoint.**',
+      '### Send once and wait', '### Record the answer',
       '### 2. Code quality review', '### Shared-code evaluation rubric', '**Blocked outcome:**'];
     const positions = headings.map(heading => excerpt.indexOf(heading));
     expect(positions.every(index => index >= 0)).toBe(true);

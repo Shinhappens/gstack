@@ -49,7 +49,7 @@ When the user types `/canary`, run this skill.
 ### Phase 1: Setup
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null || echo "SLUG=unknown")"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null) || SLUG=unknown
 mkdir -p .gstack/canary-reports
 mkdir -p .gstack/canary-reports/baselines
 mkdir -p .gstack/canary-reports/screenshots
@@ -224,12 +224,13 @@ Per-page and overall status: BROKEN if any confirmed CRITICAL alert occurred; ot
 Log the result for the review dashboard:
 
 ```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 {{SLUG_EVAL}}
-mkdir -p ~/.gstack/projects/$SLUG
+mkdir -p "$GSTACK_STATE_ROOT"/projects/$SLUG
 ```
 
 Write a JSONL entry: `{"skill":"canary","timestamp":"<ISO>","status":"<HEALTHY/DEGRADED/BROKEN>","url":"<url>","duration_min":<N>,"alerts":<N>}`
-Append it to `~/.gstack/projects/$SLUG/canary-history.jsonl`; never overwrite history.
+Append it to `$GSTACK_STATE_ROOT/projects/$SLUG/canary-history.jsonl` (the directory this block created); never overwrite history.
 
 ### Phase 7: Baseline Update
 
@@ -244,7 +245,7 @@ If the user chooses A, copy the latest screenshots to the baselines directory an
 
 ## Important Rules
 
-- **Speed matters.** Start monitoring within 30 seconds of invocation. Don't over-analyze before monitoring.
+- **Speed matters.** The first minutes after a deploy are the point: reach the first monitoring round as soon as the page list is settled.
 - **Alert on changes, not absolutes.** Compare against baseline, not industry standards.
 - **Screenshots are evidence.** Every alert includes a screenshot path. No exceptions.
 - **Transient tolerance.** Only alert on patterns that persist across 2+ consecutive checks.

@@ -8,8 +8,6 @@ import { setupQuestionEventSource, readPermissionRequestEvents } from './helpers
 import retainedQuestionValidation from './fixtures/eng-auq-validation-error.json';
 import retainedBashDirectory from './fixtures/bash-directory-permission.json';
 import retainedDesignTasksPermission from './fixtures/design-tasks-bash-permission.json';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
-
 const sessionId = '00000000-0000-4000-8000-000000000001';
 const question: NativeQuestion = { question: 'D1 — Which approach?\nMake it reliable. Enforce the delivery policy.', header: 'Approach', multiSelect: false,
   options: ['Extend dispatcher', 'Queue fanout', 'Minimal patch', 'Hold scope'].map(label => ({ label, description: label })) };
@@ -1857,12 +1855,6 @@ function bashHooks() {
   const post = (output: unknown = response, extra: Record<string, unknown> = {}) => emit('PostToolUse', 'bash-1', input, { tool_response: output, ...extra });
   return { source, input, response, emit, post, read };
 }
-
-test('captured directory Bash permission fixture selects every existing permission-helper consumer', () => {
-  const selected = selectTests(['test/fixtures/bash-directory-permission.json'], E2E_TOUCHFILES);
-  expect(selected.reason).toBe('diff');
-  expect(selected.selected.sort()).toEqual(selectTests(['test/helpers/plan-skill-questions.ts'], E2E_TOUCHFILES).selected.sort());
-});
 
 test('captured directory Bash card requires its exact owned request and permits only one grant', () => {
   const { input, card, nativeId } = retainedBashDirectory;

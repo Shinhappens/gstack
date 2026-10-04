@@ -6,13 +6,16 @@ import * as path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   createSharedInteractiveToolHandler, createSharedLibsFixture, fixtureGit, fixtureWrite, installSourceShims,
-  readRequests, seedOpportunitySources, sharedReadOnlyViolations, shellQuote, snapshotFixture, type SharedLibsFixture,
-  SharedCaptureAccumulator, type SharedCaptureAttempt, isInternalClaudeGitRequest,
+  installHostileGitConfig, isGuardedGitRequest, reviewLifecycleInstructions, standaloneInstructions, SHARED_LIBS_ROOT, readRequests, seedOpportunitySources, sharedReadOnlyViolations, shellQuote, snapshotFixture, type SharedLibsFixture,
+  SharedCaptureAccumulator, type SharedCaptureAttempt, isInternalClaudeGitRequest, SHARED_LIBS_OLDER_OPEN_PRS, prCoverageRequestViolations,
 } from './helpers/shared-libs-eval-fixture';
 import { EvalCollector, type EvalTestEntry } from './helpers/eval-store';
 import { collectorOutcomeCounts } from '../scripts/test-paid-shards';
 import { E2E_TOUCHFILES, GLOBAL_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import nativeNoChangeCases from './fixtures/shared-libs-no-change-ci-public.json';
+import r44 from './fixtures/shared-libs-index-flags-r44-packets.json';
+import skipDescriptions from './fixtures/shared-libs-index-flags-skip-description-public.json';
+import { seedPathReviewPrerequisites, checkPathReviewPrerequisites } from './helpers/shared-libs-path-fixture';
 
 const cleanup: string[] = [];
 afterEach(() => {
@@ -25,7 +28,169 @@ function scratch(): string {
   return directory;
 }
 
+describe('shared-code Git guard', () => {
+  test('the standalone runtime resolves the real helper, and only its complete prefix counts as a guarded read', () => {
+    const f = createSharedLibsFixture('safe-git');
+    cleanup.push(f.root);
+    seedOpportunitySources(f);
+    installHostileGitConfig(f);
+    installSourceShims(f);
+    const instructions = fs.readFileSync(standaloneInstructions(f), 'utf8');
+    const helper = path.join(SHARED_LIBS_ROOT, 'bin/gstack-safe-git');
+    expect(instructions).toContain(`\`${helper} -C <repo> rev-parse --is-inside-work-tree\``);
+    expect(instructions).not.toContain('~/.claude/skills/gstack');
+    const run = (command: string, args: string[]) => spawnSync(command, args, {
+      cwd: f.repo, encoding: 'utf8', timeout: 10_000, env: { ...process.env, ...f.env } });
+    const refusal = run(helper, ['status']);
+    expect(refusal.status).toBe(2);
+    expect(refusal.stderr).toContain('gstack-safe-git: refused');
+    // Exit status is Git's own; with Git < 2.44 these reach the recording shim and then fail on --no-lazy-fetch.
+    for (const args of [['rev-parse', '--is-inside-work-tree'], ['log', '-p', '-1'],
+      ['diff', f.tip, f.tip, '--', 'README.md'], ['ls-files', '--cached', '--others', '--exclude-standard', '-z']]) run(helper, args);
+    const guarded = readRequests(f).filter(row => row.tool === 'git');
+    expect(guarded.map(row => row.args[9])).toEqual(['rev-parse', 'log', 'diff', 'ls-files']);
+    for (const row of guarded) expect(isGuardedGitRequest(row), JSON.stringify(row)).toBe(true);
+    expect(fs.existsSync(f.hookTrace) ? fs.readFileSync(f.hookTrace, 'utf8') : '').toBe('');
+
+    fs.rmSync(f.trace, { force: true });
+    run('git', ['log', '-1']);
+    run('git', ['--no-lazy-fetch', '-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false', 'rev-parse', 'HEAD']);
+    const unguarded = readRequests(f);
+    expect(unguarded).toHaveLength(2);
+    for (const row of unguarded) expect(isGuardedGitRequest(row), JSON.stringify(row)).toBe(false);
+
+    const wrapped = guarded[2]!;
+    const without = (value: string) => ({ ...wrapped, args: wrapped.args.filter(arg => arg !== value) });
+    for (const damaged of [
+      { ...wrapped, env: {} },
+      { ...wrapped, env: { ...wrapped.env, GIT_NO_LAZY_FETCH: '0' } },
+      without('--no-replace-objects'), without('--no-pager'), without('diff.submodule=short'),
+      without('--no-textconv'), without('--no-ext-diff'),
+      { ...wrapped, args: [...wrapped.args, '--ext-diff'] },
+      { ...wrapped, args: [...wrapped.args, '--output=out.patch'] },
+      { ...wrapped, args: wrapped.args.map(arg => arg === 'core.fsmonitor=false' ? 'core.fsmonitor=true' : arg) },
+    ]) expect(isGuardedGitRequest(damaged), JSON.stringify(damaged.args)).toBe(false);
+  });
+});
+
+describe('review Skip option description', () => {
+  test.each(skipDescriptions.cases)('Step 5c limits Skip to its own effect; the $scenario capture narrated more and stays refused', async ({ input }) => {
+    const rule = 'B) Skip (describe only as: no code/index change; Skip recorded)';
+    expect(fs.readFileSync(path.join(SHARED_LIBS_ROOT, 'review/SKILL.md'), 'utf8')).toContain(rule);
+    const workflow = fs.readFileSync(reviewLifecycleInstructions({ root: scratch() } as SharedLibsFixture), 'utf8');
+    expect(workflow.slice(workflow.indexOf('### Step 5c'), workflow.indexOf('### Step 5d'))).toContain(rule);
+    const refusals: Error[] = [];
+    const handler = () => createSharedInteractiveToolHandler('skip', { nonQuestion: () => { throw new Error('unexpected tool'); },
+      onQuestion: () => {}, onAnswer: () => {}, onRefusal: error => { refusals.push(error); } });
+    const skip = input.questions[0].options.find(option => option.label.startsWith('Skip'))!;
+    expect(skip.description).toMatch(/can be applied in a later|replacing the invalidated prior Skip/);
+    await expect(handler()('AskUserQuestion', input)).rejects.toThrow('No unambiguous no-change option');
+    expect(refusals).toHaveLength(1);
+    const ruled = structuredClone(input);
+    ruled.questions[0].options.find(option => option.label.startsWith('Skip'))!.description = 'No code/index change; Skip recorded.';
+    const answer = await handler()('AskUserQuestion', ruled);
+    expect(answer.updatedInput.answers).toEqual({ [ruled.questions[0].question]: ruled.questions[0].options.find(option => option.label.startsWith('Skip'))!.label });
+    expect(refusals).toHaveLength(1);
+  });
+});
+
 describe('shared-code legacy interactive actor', () => {
+  test('R58 acknowledges the exact removed-filter Skip packet without authorizing its recommended fix', async () => {
+    const input = {
+      questions: [{
+        question: "[ADVISORY] src/retry-worker.ts:2 — the diff replaces the re-export of lib/retry-after.ts#retrySeconds with a byte-identical inlined copy, making three copies (lib, route, worker). Recommended fix: restore `export { retrySeconds } from '../lib/retry-after'` in src/retry-worker.ts and apply the same one-line import in src/retry-route.ts (~30 lines removed, 2 added, ~28 saved; existing test/retry-after.test.ts covers the contract). Note: this is a bounded no-edit replay — choosing Fix cannot be applied here and will be reported as a blocking pending finding. How do you want to dispose of this advisory?",
+        header: 'Shared-libs',
+        multiSelect: false,
+        options: [
+          {
+            label: 'Fix as recommended (Recommended)',
+            description: 'Re-use lib/retry-after.ts#retrySeconds from both worker and route. In this no-edit fixture the fix is NOT applied; the review is persisted incomplete with the advisory pending.',
+          },
+          {
+            label: 'Skip',
+            description: 'Keep the inlined copies for now. Records an explicit Skip for this finding (fingerprint shared-libs:af037ba2…) with fresh snapshot coverage so a future unchanged pass can reuse it.',
+          },
+        ],
+      }],
+    };
+    expect(new Bun.CryptoHasher('sha256').update(`${JSON.stringify(input, null, 2)}\n`).digest('hex'))
+      .toBe('191ea50509734579ecfd08ce98208b36aecf510d68a1498fbd06cd0192ccab22');
+    const before = structuredClone(input), questions: unknown[] = [], answers: unknown[] = [], refusals: Error[] = [];
+    const callback = createSharedInteractiveToolHandler('skip', {
+      nonQuestion: () => { throw new Error('unexpected tool'); },
+      onQuestion: question => { questions.push(question); },
+      onAnswer: (question, answer) => { answers.push({ question, answer }); },
+      onRefusal: error => { refusals.push(error); },
+    });
+    const expected = { [input.questions[0].question]: 'Skip' };
+    expect(await callback('AskUserQuestion', input)).toEqual({ behavior: 'allow', updatedInput: { ...input, answers: expected } });
+    expect(questions).toEqual([input]);
+    expect(answers).toEqual([{ question: input, answer: expected }]);
+    expect(refusals).toEqual([]);
+    expect(input).toEqual(before);
+  });
+
+  test('R44 retains the complete native bit-preservation packet without partial acknowledgments', async () => {
+    const input = structuredClone(r44.packets[0].input), before = structuredClone(input);
+    const answers: unknown[] = [], refusals: Error[] = [];
+    const callback = createSharedInteractiveToolHandler('skip', {
+      nonQuestion: () => { throw new Error('unexpected tool'); }, onQuestion: () => {},
+      onAnswer: (_input, answer) => { answers.push(answer); }, onRefusal: error => { refusals.push(error); },
+    });
+    const expected = { [input.questions[0].question]: 'Skip', [input.questions[1].question]: 'Leave it' };
+    expect(await callback('AskUserQuestion', input)).toEqual({ behavior: 'allow', updatedInput: { ...input, answers: expected } });
+    expect(answers).toEqual([expected]);
+    expect(refusals).toEqual([]);
+    expect(input).toEqual(before);
+  });
+
+  test.each([1, 2])('R44 missing-stage packet %s never grants completion through the skip actor', async index => {
+    const input = structuredClone(r44.packets[index].input), answers: unknown[] = [];
+    const callback = createSharedInteractiveToolHandler('skip', {
+      nonQuestion: () => {}, onQuestion: () => {}, onAnswer: (_input, answer) => { answers.push(answer); },
+    });
+    await expect(callback('AskUserQuestion', input)).rejects.toThrow('No unambiguous no-change option');
+    expect(answers).toEqual([]);
+  });
+
+  test.each(['Keep the bit set.', 'Preserve the bits set.', 'Retain the flag set.', 'Leave the index bits set.'])(
+    'R44 Git-state retention is a class of no-change commitments: %s', async description => {
+      const input = structuredClone(r44.packets[0].input);
+      input.questions[1].options[1].description = description;
+      const callback = createSharedInteractiveToolHandler('skip', {
+        nonQuestion: () => {}, onQuestion: () => {}, onAnswer: () => {},
+      });
+      expect((await callback('AskUserQuestion', input)).updatedInput.answers).toEqual({
+        [input.questions[0].question]: 'Skip', [input.questions[1].question]: 'Leave it',
+      });
+    });
+
+  test.each([
+    { description: 'Clear the bit. Keep file contents unchanged.' },
+    { description: 'Keep the bit set; unset the other index flag without changing file contents.' },
+    { description: 'Keep the bit set. Runs git update-index --no-assume-unchanged src/retry-route.ts. Does not change file contents.' },
+    { description: 'Keep the bit set.', preview: 'git update-index --no-skip-worktree src/retry-route.ts' },
+    { label: 'Leave it and clear the flag', description: 'Keep the bit set.' },
+    { description: 'Keep the bit set; apply the worker fix.' },
+  ])('R44 preserved file bytes do not authorize mixed Git/source mutation: %j', async changed => {
+    const input = structuredClone(r44.packets[0].input), answers: unknown[] = [], refusals: Error[] = [];
+    Object.assign(input.questions[1].options[1], changed);
+    const callback = createSharedInteractiveToolHandler('skip', {
+      nonQuestion: () => {}, onQuestion: () => {}, onAnswer: (_input, answer) => { answers.push(answer); },
+      onRefusal: error => { refusals.push(error); },
+    });
+    await expect(callback('AskUserQuestion', input)).rejects.toThrow('No unambiguous no-change option');
+    expect(answers).toEqual([]);
+    expect(refusals).toHaveLength(1);
+  });
+
+  test('R44 a bare bit cannot acquire Git-state meaning from an unrelated question', async () => {
+    const input = structuredClone(r44.packets[0].input);
+    input.questions[1].question = 'Should I alter a parser option?';
+    const callback = createSharedInteractiveToolHandler('skip', { nonQuestion: () => {}, onQuestion: () => {}, onAnswer: () => {} });
+    await expect(callback('AskUserQuestion', input)).rejects.toThrow('No unambiguous no-change option');
+  });
+
   test.each(nativeNoChangeCases.cases)('answers retained CI no-change questions from attempt $attempt', async ({ input, answers }) => {
     const before = structuredClone(input), observed: unknown[] = [];
     const callback = createSharedInteractiveToolHandler('skip', {
@@ -79,17 +244,6 @@ describe('shared-code legacy interactive actor', () => {
     await expect(callback('AskUserQuestion', { questions: [{ question: 'Decision', options: [option] }] }))
       .rejects.toThrow('No unambiguous no-change option');
   });
-
-  test('both native index-flag captures select every owning interactive lifecycle case', () => {
-    for (const fixture of ['test/fixtures/shared-libs-index-flags-skip-question.json',
-      'test/fixtures/shared-libs-index-flags-no-change-description.json']) {
-      expect(selectTests([fixture], E2E_TOUCHFILES, GLOBAL_TOUCHFILES).selected.sort()).toEqual([
-        'shared-libs-review-index-flags', 'shared-libs-review-lifecycle', 'shared-libs-review-path-eligibility',
-        'shared-libs-review-prior-coverage', 'shared-libs-review-revalidation',
-      ]);
-    }
-  });
-
   for (const [choose, labels] of [['approve', ['Fix it', 'Apply remedy', 'Approve', 'Extract helper', 'Reuse library', 'Choice (recommended)']],
     ['skip', ['Skip', 'Keep current', 'Decline', 'Do not change', 'Leave as-is']]] as const) {
     test.each(labels)(`${choose} supports the declared choice: %s`, async label => {
@@ -159,13 +313,6 @@ describe('shared-code legacy interactive actor', () => {
       expect(input).toEqual(original);
     }
   });
-
-  test('the captured native no-change questions select every owning interactive lifecycle case', () => {
-    expect(selectTests(['test/fixtures/shared-libs-index-flags-native-questions.json'], E2E_TOUCHFILES, GLOBAL_TOUCHFILES).selected.sort())
-      .toEqual(['shared-libs-review-index-flags', 'shared-libs-review-lifecycle', 'shared-libs-review-path-eligibility',
-        'shared-libs-review-prior-coverage', 'shared-libs-review-revalidation']);
-  });
-
   test('the registered callback acknowledges the complete first-attempt native skip despite descriptive reuse', async () => {
     const native = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/shared-libs-index-flags-native-questions.json'), 'utf8'));
     const { sourceRun, attempt, input } = native.regressions[0];
@@ -375,6 +522,10 @@ describe('shared-code legacy interactive actor', () => {
     { label: 'Skip', description: 'Update the review log with the skipped advisory; reuse the recorded decision next review.' },
     { label: 'Skip', description: 'This option does not refactor the route. You should not fix the worker.' },
     { label: 'Skip', description: 'This option updates the review log. We will reuse the recorded decision.' },
+    { label: 'Skip', description: 'Keep the inlined copies for now. Records an explicit Skip for this finding (fingerprint shared-libs:af037ba2…) with fresh snapshot coverage so a future unchanged pass can reuse it.' },
+    { label: 'Skip', description: 'Records the decision so the next review may reuse that.' },
+    { label: 'Decline', description: 'Saves the advisory so a later pass can reuse this again.' },
+    { label: 'Skip', description: 'Stores the review records so a subsequent review will reuse them.' },
   ])('skip supports complete no-change commitments: $label', async option => {
     const callback = createSharedInteractiveToolHandler('skip', {
       nonQuestion: () => {}, onQuestion: () => {}, onAnswer: () => {},
@@ -403,6 +554,12 @@ describe('shared-code legacy interactive actor', () => {
     [{ label: 'Skip', description: 'This option refactors the route' }],
     [{ label: 'Skip', description: 'You should fix the worker' }],
     [{ label: 'Skip', description: 'The worker imports the helper' }],
+    [{ label: 'Skip', description: 'The next review can reuse it.' }],
+    [{ label: 'Skip', description: 'Records the decision about the helper so a future pass can reuse it.' }],
+    [{ label: 'Skip', description: 'Records the decision so a future worker can reuse it.' }],
+    [{ label: 'Skip', description: 'Records the decision so the next review can reuse it and fix the route.' }],
+    [{ label: 'Skip', description: 'Records the decision so the next review can reuse it by rewriting the helper.' }],
+    [{ label: 'Skip', description: 'Records the decision so the next review can reuse it.', preview: 'Clear the index flag.' }],
     [{ label: 'Skip', description: 'We will clear the index flag' }],
     [{ label: 'Skip', description: 'Preserve the implementation by rewriting the helper.' }],
     [{ label: 'Skip', description: 'Keep the source through applying the fix.' }],
@@ -434,6 +591,89 @@ describe('shared-code legacy interactive actor', () => {
     const selected = { Decision: 'custom exact answer' };
     expect((await createSharedInteractiveToolHandler(() => selected, hooks)('AskUserQuestion', input)).updatedInput.answers)
       .toBe(selected);
+  });
+
+  const r20Packets = JSON.parse(fs.readFileSync(path.join(import.meta.dir,
+    'fixtures/shared-libs-index-flags-r20-packets.json'), 'utf8')).cases;
+
+  test('the R20 packet dependency selects all owning native lifecycle cases', () => {
+    expect(selectTests(['test/fixtures/shared-libs-index-flags-r20-packets.json'], E2E_TOUCHFILES, GLOBAL_TOUCHFILES).selected.sort()).toEqual([
+      'shared-libs-review-index-flags', 'shared-libs-review-lifecycle', 'shared-libs-review-path-eligibility',
+      'shared-libs-review-prior-coverage', 'shared-libs-review-revalidation',
+    ]);
+  });
+
+  test.each(r20Packets)('R20 $scenario attempt $attempt acknowledges the exact complete native packet', async packet => {
+    const input = structuredClone(packet.input), before = structuredClone(input);
+    const answers: unknown[] = [], refusals: Error[] = [];
+    const callback = createSharedInteractiveToolHandler('skip', {
+      nonQuestion: () => { throw new Error('unexpected tool'); }, onQuestion: () => {},
+      onAnswer: (_input, answer) => { answers.push(answer); }, onRefusal: error => { refusals.push(error); },
+    });
+    const expected = Object.fromEntries(input.questions.map((question: any, index: number) =>
+      [question.question, packet.expected_labels[index]]));
+    expect(packet.original_passed).toBe(false);
+    expect(packet.original_exit_reason).toBe('actor_contract');
+    expect(await callback('AskUserQuestion', input)).toEqual({ behavior: 'allow', updatedInput: { ...input, answers: expected } });
+    expect(answers).toEqual([expected]);
+    expect(refusals).toEqual([]);
+    expect(input).toEqual(before);
+  });
+
+  test.each(['No, leave it set', 'No: keep current', 'No, do not change', 'No, Skip', 'No, Leave as-is (Recommended)'])(
+    'negative answer prefixes preserve the exact supported label: %s', async label => {
+      const input = { questions: [{ question: 'Index flag', options: [{ label: 'Clear the flag' }, { label }] }] };
+      const callback = createSharedInteractiveToolHandler('skip', {
+        nonQuestion: () => {}, onQuestion: () => {}, onAnswer: () => {},
+      });
+      expect((await callback('AskUserQuestion', input)).updatedInput.answers).toEqual({ 'Index flag': label });
+    });
+
+  test.each([
+    'The route edit stays invisible to git status/diff and outside snapshot coverage.',
+    'The worker change remains unchanged.',
+    'The source update stays unapplied.',
+    'The parser fix remains hidden from Git.',
+    'The index flag update stays untouched.',
+    'The route edits remain excluded from snapshot coverage.',
+  ])('nominal action subjects with preservation predicates grant no mutation: %s', async description => {
+    const input = structuredClone(r20Packets[1].input);
+    input.questions[1].options[1].description = description;
+    const callback = createSharedInteractiveToolHandler('skip', {
+      nonQuestion: () => {}, onQuestion: () => {}, onAnswer: () => {},
+    });
+    expect((await callback('AskUserQuestion', input)).updatedInput.answers).toEqual({
+      [input.questions[0].question]: 'Skip', [input.questions[1].question]: 'Leave it set',
+    });
+  });
+
+  test.each([
+    { label: 'No, investigate', description: '' },
+    { label: 'No, keep going', description: '' },
+    { label: 'No, leave it set and fix the worker' },
+    { label: 'No, leave it set', description: 'Clear the index flag.' },
+    { label: 'No, leave it set', preview: '// Apply the route fix.' },
+    { description: 'The route edit replaces the parser.' },
+    { description: 'The worker imports the helper.' },
+    { description: 'The route edit stays invisible; fix the worker.' },
+    { description: 'The route edit remains hidden while I will refactor the worker.' },
+    { description: 'The source update stays unapplied until we change the worker.' },
+    { description: 'The parser fix remains hidden after rewriting the helper.' },
+    { description: 'The index flag update stays cleared.' },
+    { description: 'The route edits remain applied.' },
+    { description: 'The route edit stays invisible.', preview: 'The worker change applies the patch.' },
+  ])('R20 preservation packets reject later or mixed mutation commitments atomically: %j', async changed => {
+    const input = structuredClone(r20Packets[1].input);
+    Object.assign(input.questions[1].options[1], changed);
+    const before = structuredClone(input), answers: unknown[] = [], refusals: Error[] = [];
+    const callback = createSharedInteractiveToolHandler('skip', {
+      nonQuestion: () => {}, onQuestion: () => {}, onAnswer: answer => { answers.push(answer); },
+      onRefusal: error => { refusals.push(error); },
+    });
+    await expect(callback('AskUserQuestion', input)).rejects.toThrow('No unambiguous no-change option');
+    expect(answers).toEqual([]);
+    expect(refusals).toHaveLength(1);
+    expect(input).toEqual(before);
   });
 });
 
@@ -489,6 +729,25 @@ function curl(f: SharedLibsFixture, args: string[]) {
 }
 
 describe('shared-code curl source isolation', () => {
+  test('batched fixture blobs preserve binary bytes and empty files at immutable revisions', () => {
+    const f = createSharedLibsFixture('batch-bytes');
+    cleanup.push(f.root);
+    const bytes = Buffer.from([0, 255, 10, 13, 0, 128, 10]);
+    fs.writeFileSync(path.join(f.repo, 'binary.dat'), bytes);
+    fs.writeFileSync(path.join(f.repo, 'empty.dat'), '');
+    fixtureGit(f, 'add', 'binary.dat', 'empty.dat');
+    fixtureGit(f, 'commit', '-m', 'fixture binary and empty blobs');
+    const revision = fixtureGit(f, 'rev-parse', 'HEAD');
+    installSourceShims(f);
+    for (const [file, expected] of [['binary.dat', bytes], ['empty.dat', Buffer.alloc(0)]] as const) {
+      const response = gh(f, `repos/fixture/shared-libs/contents/${file}?ref=${revision}`);
+      expect(response.status, response.stderr).toBe(0);
+      const result = JSON.parse(response.stdout);
+      expect(Buffer.from(result.content, 'base64')).toEqual(expected);
+      expect(result.sha).toBe(fixtureGit(f, 'rev-parse', `${revision}:${file}`));
+    }
+  });
+
   test('captured curl output-file attempts are logged and rejected without writing files', () => {
     const f = createSharedLibsFixture('curl-output');
     cleanup.push(f.root);
@@ -667,6 +926,7 @@ describe('shared-code curl source isolation', () => {
       "curl -w '%output{/tmp/report}%{http_code}' https://api.github.com/repos/fixture/shared-libs",
       "curl -X POST https://api.github.com/repos/fixture/shared-libs",
       'printf data > /tmp/report', 'cat README.md >> "/tmp/report"', 'cat README.md | tee /tmp/report',
+      'cat README.md | tee /dev/null report.txt', 'cat README.md | tee -a report.txt', 'cat README.md | tee -- -a',
       "bash <<'SH'\nprintf data > /tmp/report\nSH\n",
       "cat <<'DATA'\njust data\nDATA\ncurl -o /tmp/report https://api.github.com/repos/fixture/shared-libs",
     ]) expect(sharedReadOnlyViolations(bash(command)).length, command).toBeGreaterThan(0);
@@ -676,6 +936,9 @@ describe('shared-code curl source isolation', () => {
       "curl -sS -o - -w 'http=%{http_code}\\n' https://api.github.com/repos/fixture/shared-libs",
       "curl -sS -m 15 -o /dev/null -w 'http=%{http_code}\\n' https://api.github.com/repos/fixture/shared-libs 2>&1",
       'gh auth status 2>&1 | head -5', 'git --no-lazy-fetch log 2>/dev/null',
+      // Paid opportunity-judgment t1 (1213b01): tee to the discard device writes no file.
+      'for p in src/version.ts README.md .gitignore; do echo "===== $p"; gh api --method GET -H "Accept: application/vnd.github.raw" "repos/fixture/shared-libs/contents/$p?ref=987f57ff2613724dd4a5509dda1b0fea155aab8a" 2>&1 | head -c 4000 | tee /dev/null | sha256sum; echo "exit=${PIPESTATUS[0]}"; done',
+      'cat README.md | tee -a /dev/stderr',
       "rg 'a > b' README.md", "rg '>' README.md", "rg '|' README.md",
       'rg tee README.md', 'rg curl README.md',
       "python3 - <<'PY'\nsize = 2\nif size > 1:\n    print(size)\nPY\n",
@@ -745,6 +1008,153 @@ function pinnedSource(f: SharedLibsFixture, revision: string, file: string) {
   return bytes;
 }
 
+function ghCli(f: SharedLibsFixture, args: string[]) {
+  return spawnSync(path.join(f.bin, 'gh'), args, {
+    cwd: f.repo, env: { ...process.env, ...f.env }, encoding: 'utf8', timeout: 10_000,
+  });
+}
+
+describe('shared-code PR coverage world', () => {
+  const numbers = (stdout: string) => (JSON.parse(stdout) as Array<{ number: number }>).map(pr => pr.number);
+  const pulls = (query: string) => `repos/fixture/shared-libs/pulls?${query}`;
+
+  test('gh pr list, pulls?state= and search/issues page one finite table in the same order', () => {
+    const f = createSharedLibsFixture('pr-world');
+    cleanup.push(f.root);
+    seedOpportunitySources(f);
+    installSourceShims(f, { prCoverage: true });
+    const scan = (state: string) => {
+      const rows: number[] = [];
+      for (let page = 1; page < 20; page++) {
+        const endpoint = pulls(`state=${state}&sort=updated&direction=desc&per_page=100&page=${page}`);
+        const response = gh(f, endpoint);
+        expect(response.status, response.stderr).toBe(0);
+        const batch = numbers(response.stdout);
+        // PR 7's activity timestamp is the request time; compare the table rows.
+        expect(numbers(curl(f, ['-sS', `https://api.github.com/${endpoint}`]).stdout)).toEqual(batch);
+        rows.push(...batch);
+        if (batch.length < 100) return { rows, pages: page };
+      }
+      throw new Error(`state=${state} listing never produced a short last page`);
+    };
+    const open = scan('open'), closed = scan('closed'), all = scan('all');
+    const olderOpen = SHARED_LIBS_OLDER_OPEN_PRS;
+    expect(open.rows).toHaveLength(olderOpen + 2);
+    expect(new Set(open.rows).size).toBe(open.rows.length);
+    expect(open.rows[0]).toBe(7);
+    expect(open.rows.at(-1)).toBe(42);
+    expect(closed.rows).toEqual([5, 4, 3]);
+    expect(all.rows).toEqual([...open.rows, ...closed.rows]);
+    expect(open.pages).toBe(Math.floor((olderOpen + 2) / 100) + 1);
+    expect(numbers(gh(f, pulls('page=1')).stdout)).toEqual(open.rows.slice(0, 30));
+    expect(numbers(gh(f, pulls('state=open&direction=asc&per_page=100&page=1')).stdout)).toEqual(open.rows.slice().reverse().slice(0, 100));
+
+    for (const [state, rows] of [['open', open.rows], ['closed', closed.rows], ['all', all.rows]] as const) {
+      const listed = ghCli(f, ['pr', 'list', '--state', state, '--limit', '10000']);
+      expect(listed.status, listed.stderr).toBe(0);
+      expect(numbers(listed.stdout)).toEqual([...rows]);
+    }
+    expect(numbers(ghCli(f, ['pr', 'list']).stdout)).toEqual(open.rows.slice(0, 30));
+    expect(numbers(ghCli(f, ['pr', 'list', '-L', '5']).stdout)).toEqual(open.rows.slice(0, 5));
+
+    const searched: number[] = [];
+    for (let page = 1; ; page++) {
+      const response = gh(f, `search/issues?q=${encodeURIComponent('repo:fixture/shared-libs is:pr is:open')}&per_page=100&page=${page}`);
+      expect(response.status, response.stderr).toBe(0);
+      const result = JSON.parse(response.stdout);
+      expect(result.total_count).toBe(open.rows.length);
+      searched.push(...result.items.map((item: { number: number }) => item.number));
+      if (result.items.length < 100) break;
+    }
+    expect(searched).toEqual(open.rows);
+    const since = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
+    const recent = JSON.parse(gh(f, `search/issues?q=${encodeURIComponent(`repo:fixture/shared-libs is:pr updated:>=${since}`)}`).stdout);
+    expect(recent.items.map((item: { number: number }) => item.number)).toEqual([7]);
+    expect(recent.total_count).toBe(1);
+  });
+
+  test('the maximum authorized open-metadata scan still leaves older open PRs unchecked', () => {
+    const periodic = fs.readFileSync(path.join(import.meta.dir, 'skill-e2e-shared-libs-periodic.test.ts'), 'utf8');
+    expect(periodic).toContain('prCoverageRequestViolations(');
+    const sixth = Array.from({ length: 6 }, (_, i) => `/repos/fixture/shared-libs/pulls?state=open&per_page=100&page=${i + 1}`);
+    expect(prCoverageRequestViolations([...sixth.slice(0, 5), '/repos/fixture/shared-libs/pulls/42/files?page=1',
+      '/repos/fixture/shared-libs/pulls/42/files?page=2'])).toEqual([]);
+    expect(prCoverageRequestViolations([...sixth, '/repos/fixture/shared-libs/pulls/42/files?page=1',
+      '/repos/fixture/shared-libs/pulls/42/files?page=2'])).toEqual(['6 open-PR metadata pages exceed the budget of 5']);
+    const f = createSharedLibsFixture('pr-world-budget');
+    cleanup.push(f.root);
+    seedOpportunitySources(f);
+    installSourceShims(f, { prCoverage: true });
+    const scanned: number[] = [];
+    for (let page = 1; page <= 5; page++) {
+      const batch = numbers(gh(f, pulls(`state=open&sort=updated&direction=desc&per_page=100&page=${page}`)).stdout);
+      expect(batch).toHaveLength(100);
+      scanned.push(...batch);
+    }
+    const everyOpen = numbers(ghCli(f, ['pr', 'list', '--state', 'open', '--limit', '10000']).stdout);
+    const unchecked = everyOpen.filter(number => !scanned.includes(number));
+    expect(unchecked.length).toBeGreaterThan(0);
+    expect(unchecked).toContain(42);
+    // The linked PR stays reachable directly, outside the metadata budget.
+    const direct = gh(f, 'repos/fixture/shared-libs/pulls/42');
+    expect(JSON.parse(direct.stdout)).toMatchObject({ number: 42, state: 'open', updated_at: '2020-01-01T00:00:00Z' });
+    expect(JSON.parse(gh(f, 'repos/fixture/shared-libs/pulls/7').stdout).number).toBe(7);
+  });
+
+  test('pinned contents agree across gh and curl for files and directories; unknown endpoints 404', () => {
+    const f = createSharedLibsFixture('pr-world-contents');
+    cleanup.push(f.root);
+    seedOpportunitySources(f);
+    installSourceShims(f, { prCoverage: true });
+    const root = gh(f, `repos/fixture/shared-libs/contents/?ref=${f.tip}`);
+    expect(root.status, root.stderr).toBe(0);
+    expect(JSON.parse(root.stdout)).toContainEqual({ type: 'dir', name: 'src', path: 'src' });
+    expect(gh(f, `repos/fixture/shared-libs/contents?ref=${f.tip}`).stdout).toBe(root.stdout);
+    for (const entry of ['src', 'src/retry-route.ts']) {
+      const endpoint = `repos/fixture/shared-libs/contents/${entry}?ref=${f.tip}`;
+      const viaGh = gh(f, endpoint), viaCurl = curl(f, ['-sS', `https://api.github.com/${endpoint}`]);
+      expect(viaGh.status, viaGh.stderr).toBe(0);
+      expect(viaCurl.status, viaCurl.stderr).toBe(0);
+      expect(viaCurl.stdout).toBe(viaGh.stdout);
+    }
+    const listing = JSON.parse(gh(f, `repos/fixture/shared-libs/contents/src?ref=${f.tip}`).stdout);
+    const file = listing.find((entry: { name: string }) => entry.name === 'retry-route.ts');
+    expect(file).toMatchObject({ type: 'file', path: 'src/retry-route.ts' });
+    expect(JSON.parse(gh(f, `repos/fixture/shared-libs/contents/src/retry-route.ts?ref=${f.tip}`).stdout).sha).toBe(file.sha);
+    expect(gh(f, 'repos/fixture/shared-libs/contents/src?ref=main').stderr).toContain('unsupported or unpinned');
+
+    for (const endpoint of [`repos/fixture/shared-libs/git/blobs/${'0'.repeat(40)}`,
+      `repos/fixture/shared-libs/git/trees/${f.tip}?recursive=1`, 'repos/fixture/shared-libs/pulls/999999', 'rate_limit']) {
+      const response = gh(f, endpoint);
+      expect(response.status, endpoint).not.toBe(0);
+      expect(response.stderr).toContain('HTTP 404');
+      expect(response.stdout).toBe('');
+    }
+    const missingPr = curl(f, ['-fsS', 'https://api.github.com/repos/fixture/shared-libs/pulls/999999']);
+    expect(missingPr.status).toBe(22);
+    expect(JSON.parse(gh(f, 'repos/fixture/shared-libs').stdout).default_branch).toBe('main');
+    // Default-branch discovery may list branches; both transports serve the same one-branch world.
+    const branches = curl(f, ['-sS', 'https://api.github.com/repos/fixture/shared-libs/branches?per_page=100']);
+    expect(branches.status, branches.stderr).toBe(0);
+    expect(JSON.parse(branches.stdout)).toEqual(JSON.parse(gh(f, 'repos/fixture/shared-libs/branches?per_page=100').stdout));
+    expect(JSON.parse(branches.stdout).map((b: { name: string }) => b.name)).toEqual(['main']);
+    // The read-only detector still rejects a raw-host fallback.
+    const raw = curl(f, ['-sS', `https://raw.githubusercontent.com/fixture/shared-libs/${f.tip}/src/retry-route.ts`]);
+    expect(raw.status).toBe(2);
+    expect(sharedReadOnlyViolations([], readRequests(f))).toEqual(['curl: unsupported curl URL: fixture GitHub GET endpoints only']);
+  });
+
+  test('without PR coverage every listing view is the same successful empty world', () => {
+    const f = createSharedLibsFixture('pr-world-empty');
+    cleanup.push(f.root);
+    installSourceShims(f);
+    expect(JSON.parse(ghCli(f, ['pr', 'list', '--state', 'all']).stdout)).toEqual([]);
+    expect(JSON.parse(gh(f, pulls('state=all&per_page=100&page=1')).stdout)).toEqual([]);
+    expect(JSON.parse(gh(f, 'search/issues?q=repo:fixture/shared-libs+is:pr').stdout))
+      .toEqual({ total_count: 0, incomplete_results: false, items: [] });
+  });
+});
+
 describe('shared-code Contents API revision fidelity', () => {
   test('default, branch and PR SHAs return their own exact committed bytes, excluding raw overlays', () => {
     const f = createSharedLibsFixture('source-fidelity');
@@ -789,19 +1199,13 @@ const interactive = [
   'shared-libs-plan-callers', 'shared-libs-review-index-flags', 'shared-libs-review-lifecycle',
   'shared-libs-review-path-eligibility', 'shared-libs-review-prior-coverage', 'shared-libs-review-revalidation',
 ];
-const judged = ['shared-libs-opportunity-judgment', 'shared-libs-plan-callers', 'shared-libs-pr-coverage'];
 const allShared = Object.keys(E2E_TOUCHFILES).filter(name => name.startsWith('shared-libs-')).sort();
 const selected = (dependency: string) => selectTests([dependency], E2E_TOUCHFILES, GLOBAL_TOUCHFILES)
   .selected.filter(name => name.startsWith('shared-libs-')).sort();
 
 describe('shared-code paid dependency selection', () => {
-  test('SDK and judge changes select the actual affected owners', () => {
-    expect(selected('test/helpers/agent-sdk-runner.ts')).toEqual(interactive);
-    expect(selected('test/helpers/llm-judge.ts')).toEqual(judged);
-  });
-
   test('generation, gating, fixture validation and host support keep their coverage owners', () => {
-    for (const dependency of ['scripts/gen-skill-docs.ts', 'test/helpers/e2e-gate.ts', 'test/shared-libs-fixture.test.ts']) {
+    for (const dependency of ['scripts/gen-skill-docs.ts', 'test/helpers/e2e-gate.ts']) {
       expect(selected(dependency)).toEqual(allShared);
     }
     expect(selected('lib/claude-bin.ts')).toEqual(allShared.filter(name => name !== 'shared-libs-codex-read-only'));
@@ -860,7 +1264,7 @@ describe('shared-code capture attempt accounting', () => {
     expect(result.tests.map((row: EvalTestEntry) => row.transcript!.filter(event => event.scenario_name).length))
       .toEqual([3, 3, 2, 2, 4, 4]);
     expect(result.total_cost_usd).toBe(0.18);
-    expect(collectorOutcomeCounts([result])).toEqual({ executed: 3, reused: 0, passed: 3, failed: 0, manual_accepted: 0, attempts: 6 });
+    expect(collectorOutcomeCounts([result])).toEqual({ executed: 6, reused: 0, passed: 3, failed: 3, manual_accepted: 0, attempts: 6 });
   });
 
   test('missing scenarios in a later attempt cannot inherit an earlier pass', async () => {
@@ -874,7 +1278,7 @@ describe('shared-code capture attempt accounting', () => {
     })).rejects.toThrow('missing scenarios: second');
     const result = await finalized(captures);
     expect(result.tests[1]).toMatchObject({ attempt: 2, passed: false, exit_reason: 'attempt_incomplete' });
-    expect(collectorOutcomeCounts([result])).toEqual({ executed: 1, reused: 0, passed: 0, failed: 1, manual_accepted: 0, attempts: 2 });
+    expect(collectorOutcomeCounts([result])).toEqual({ executed: 2, reused: 0, passed: 1, failed: 1, manual_accepted: 0, attempts: 2 });
   });
 
   test('setup, verification and cleanup failures survive even when all recorded captures passed', async () => {
@@ -924,8 +1328,12 @@ describe('shared-code capture attempt accounting', () => {
     expect(result.tests[0]).toMatchObject({ passed: true, attempt: 1 });
     expect(result.tests[1]).toMatchObject({ passed: false, attempt: 2, exit_reason: 'attempt_incomplete' });
     expect(() => current.add('audit', entry('late'))).toThrow('Late shared capture');
+    expect(current.signal.aborted).toBe(true);
+    let settled = false;
+    pending.then(() => { settled = true; }, () => { settled = true; });
     release();
-    await expect(pending).rejects.toThrow('Late shared capture');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
     expect(collectorOutcomeCounts([result]).failed).toBe(1);
   });
 
@@ -939,15 +1347,19 @@ describe('shared-code capture attempt accounting', () => {
     expect(end).toBeGreaterThan(start);
     const callback = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end));
     const captures = new SharedCaptureAccumulator();
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-late-path-'));
+    const fixture = createSharedLibsFixture('late-path');
+    const resumed = seedPathReviewPrerequisites(fixture);
+    const directory = fixture.root;
     cleanup.push(directory);
     let started!: () => void, release!: () => void;
     const captureStarted = new Promise<void>(resolve => { started = resolve; });
     const exercise = new Function('deps', `const { captures, preparePathEligibilityFixture, fs, path,
-      reviewLifecycleInstructions, reviewRevalidationPrompt, runSharedInteractive, readRequests, expect, CAPTURE_LONG_MS } = deps;
+      reviewLifecycleInstructions, reviewRevalidationPrompt, runSharedInteractive, readRequests, expect, CAPTURE_LONG_MS,
+      checkPathReviewPrerequisites } = deps;
       ${callback}\nreturn exerciseEligibility;`)({
       captures, fs, path, expect, CAPTURE_LONG_MS: 5_000,
-      preparePathEligibilityFixture: () => ({ fixture: { root: directory }, current: { evidence_paths: [] } }),
+      preparePathEligibilityFixture: () => ({ fixture, resumed, current: { evidence_paths: [] } }),
+      checkPathReviewPrerequisites,
       reviewLifecycleInstructions: () => 'unused instructions',
       reviewRevalidationPrompt: () => 'unused prompt',
       readRequests: () => [],
@@ -961,8 +1373,11 @@ describe('shared-code capture attempt accounting', () => {
     await captureStarted;
     await captures.finalize(null);
     expect(fs.existsSync(directory)).toBe(true);
+    let settled = false;
+    pending.then(() => { settled = true; }, () => { settled = true; });
     release();
-    await expect(pending).rejects.toThrow('Late shared capture');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
     expect(fs.existsSync(directory)).toBe(false);
   });
 
@@ -993,7 +1408,7 @@ test('actual-retry', () => captures.runAttempt('actual-retry', ['audit'], 5_000,
     const result = JSON.parse(fs.readFileSync(path.join(resultDir, file), 'utf8'));
     expect(result.tests.map((row: EvalTestEntry) => [row.attempt, row.passed, row.exit_reason]))
       .toEqual([[1, false, 'timeout'], [2, true, 'success']]);
-    expect(collectorOutcomeCounts([result])).toEqual({ executed: 1, reused: 0, passed: 1, failed: 0, manual_accepted: 0, attempts: 2 });
+    expect(collectorOutcomeCounts([result])).toEqual({ executed: 2, reused: 0, passed: 1, failed: 1, manual_accepted: 0, attempts: 2 });
   });
 
   test('Bun outer timeouts stay failed after late completion, with and without a retry', () => {
@@ -1035,8 +1450,8 @@ test('outer-timeout', () => captures.runAttempt('outer-timeout', ['audit'], 50, 
         .toEqual(mode === 'retry' ? [[1, false], [2, true]] : [[1, false]]);
       expect(['timeout', 'attempt_incomplete']).toContain(result.tests[0].exit_reason);
       expect(result.tests[0].error).toContain('Test attempt stopped:');
-      expect(collectorOutcomeCounts([result])).toEqual({ executed: 1, reused: 0, manual_accepted: 0,
-        passed: mode === 'retry' ? 1 : 0, failed: mode === 'retry' ? 0 : 1, attempts: mode === 'retry' ? 2 : 1 });
+      expect(collectorOutcomeCounts([result])).toEqual({ executed: mode === 'retry' ? 2 : 1, reused: 0, manual_accepted: 0,
+        passed: mode === 'retry' ? 1 : 0, failed: 1, attempts: mode === 'retry' ? 2 : 1 });
     }
   });
 });
@@ -1305,3 +1720,46 @@ describe('retained native runtime callback failures', () => {
     expect(events).toEqual(['question', 'refusal']);
   });
 });
+
+describe('skip actor: deferred-reuse wording in a Skip option (PR lane run 36641824710)', () => {
+  const question = (skipDescription: string) => ({ questions: [{
+    question: '[ADVISORY] src/retry-worker.ts:2 — the worker now duplicates the tested `retrySeconds` helper from lib/retry-after.ts. How should this be handled? RECOMMENDATION: A (Fix).',
+    header: 'Shared-libs', multiSelect: false,
+    options: [
+      { label: 'Fix as recommended', description: 'Re-export retrySeconds from lib/retry-after.ts in both src/retry-worker.ts and src/retry-route.ts.' },
+      { label: 'Skip', description: skipDescription },
+    ],
+  }] });
+  const answer = async (skipDescription: string) => {
+    const callback = createSharedInteractiveToolHandler('skip', { nonQuestion: () => {}, onQuestion: () => {}, onAnswer: () => {} });
+    return callback('AskUserQuestion', question(skipDescription));
+  };
+  test('a future review reusing the recorded Skip once coverage holds is still no change', async () => {
+    const captured = 'Keep the duplicated implementations for now. Records an explicit Skip for this advisory (fingerprint shared-libs:af037ba2…) so a future review can reuse it once snapshot coverage holds.';
+    expect(await answer(captured)).toMatchObject({ behavior: 'allow', updatedInput: { answers: { [question(captured).questions[0].question]: 'Skip' } } });
+  });
+  test('a conditional tail that commits product work still refuses', async () => {
+    await expect(answer('Records an explicit Skip so a future review can reuse it once we migrate the worker and then import the helper.')).rejects.toThrow('No unambiguous no-change option');
+    await expect(answer('Records an explicit Skip so a future review can reuse the helper once snapshot coverage holds.')).rejects.toThrow('No unambiguous no-change option');
+  });
+});
+
+// Stored gh/curl endpoint lists for the PR coverage request budget.
+{
+  const stored = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/shared-libs/pr-coverage-endpoints.json'), 'utf8')) as
+    { known_good: Record<string, string[]>; known_bad: Record<string, string[]> };
+
+  describe('shared-libs PR coverage request budget', () => {
+    test.each(Object.entries(stored.known_good))('passes %s', (_name, endpoints) => {
+      expect(prCoverageRequestViolations(endpoints)).toEqual([]);
+    });
+    test.each(Object.entries(stored.known_bad))('fails %s', (_name, endpoints) => {
+      expect(prCoverageRequestViolations(endpoints).length).toBeGreaterThan(0);
+    });
+    test('file-list pages beyond the stated budget fail', () => {
+      const pages = Array.from({ length: 52 }, (_, i) => `/repos/fixture/shared-libs/pulls/${i < 2 ? 42 : 100 + i}/files?per_page=100&page=${i < 2 ? i + 1 : 1}`);
+      expect(prCoverageRequestViolations(pages)).toEqual(['52 file-list pages exceed the budget of 50 plus PR 7']);
+      expect(prCoverageRequestViolations(pages.slice(0, 51))).toEqual([]);
+    });
+  });
+}

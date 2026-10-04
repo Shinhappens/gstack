@@ -5,7 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { outsideVoiceCommand, outsideVoicePreflight, outsideVoiceInvocation } from '../scripts/resolvers/outside-voice';
-import { generateCodexDocReview, generateCodexPlanReview } from '../scripts/resolvers/review';
+import { generateAdversarialStep, generateCodexDocReview, generateCodexPlanReview } from '../scripts/resolvers/outside-voice-steps';
 import { validateOutsideReview } from '../lib/outside-review-result';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { ALL_HOST_CONFIGS } from '../hosts';
@@ -13,6 +13,46 @@ import { ALL_HOST_CONFIGS } from '../hosts';
 const ROOT = path.resolve(import.meta.dir, '..');
 const TEMP = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-outside-preflight-'));
 afterAll(() => fs.rmSync(TEMP, { recursive: true, force: true }));
+
+test('adversarial outside failures retain the required native pass without duplicate dispatch', () => {
+  for (const host of ALL_HOST_CONFIGS) {
+    for (const skillName of ['ship', 'review']) {
+      const ctx: TemplateContext = { host: host.name, skillName, tmplPath: `${skillName}/SKILL.md.tmpl`, paths: HOST_PATHS[host.name] };
+      const preflight = outsideVoicePreflight(ctx, { disabledBehavior: 'codex-only' });
+      expect(preflight).toMatch(/(?:do not dispatch a duplicate|without duplicating it)/);
+      expect(preflight).not.toMatch(/fall(?:ing)? back to (?:a|the) .*subagent/i);
+      const output = generateAdversarialStep(ctx);
+      expect(output).toContain('adversarial subagent (always runs)');
+      expect(output).toContain('For non-ready modes, retain the native pass above; do not dispatch it again.');
+      expect(output.match(/Retain the required native pass without duplicating it; it cannot complete outside coverage\./g)).toHaveLength(2);
+      expect(output).not.toContain("Use the caller's fallback");
+      expect(output).toContain('Only this optional outside adversarial pass is non-blocking');
+      expect(output).toContain('GATE: MISSING COVERAGE');
+      expect(outsideVoiceInvocation(ctx)).toContain("Use the caller's fallback; missing coverage is never clean/PASS.");
+      const disabled = outsideVoicePreflight(ctx, { disabledBehavior: 'skip-all' });
+      expect(disabled).toMatch(/(?:do NOT fall back|Disabled ends this entire extra review step)/);
+    }
+  }
+});
+
+test('ship design availability is an existing automatic choice, not a new opt-in', () => {
+  for (const host of ALL_HOST_CONFIGS) {
+    const ctx: TemplateContext = { host: host.name, skillName: 'ship', tmplPath: 'ship/SKILL.md.tmpl', paths: HOST_PATHS[host.name] };
+    const output = outsideVoicePreflight(ctx, { disabledBehavior: 'opt-in' });
+    expect(output).toContain('Ship attempts this optional design check automatically when frontend review applies');
+    expect(output).toContain('No additional opt-in is needed');
+    expect(output).toContain('Step 11 keeps its separate outside-review switch');
+    expect(output).toContain('`CODEX_MODE` reports provider availability, not user consent');
+    expect(output).not.toContain('Honor this caller’s existing opt-in/skip choice');
+    expect(output).not.toContain('This caller has its own opt-in/skip control');
+    const other = outsideVoicePreflight({ ...ctx, skillName: 'review' }, { disabledBehavior: 'opt-in' });
+    expect(other).toContain('Honor this caller’s existing opt-in/skip choice');
+    expect(other).not.toContain('No additional opt-in is needed');
+    expect(other).toContain('_OUTSIDE_CFG=enabled # This caller has its own opt-in/skip control.');
+    expect(output.match(/```bash\n([\s\S]*?)\n```/)![1]).toBe(other.match(/```bash\n([\s\S]*?)\n```/)![1].replace(
+      '_OUTSIDE_CFG=enabled # This caller has its own opt-in/skip control.', '_OUTSIDE_CFG=enabled'));
+  }
+});
 
 test('CEO and Eng describe the actual disabled route and completion validator', () => {
   for (const host of ALL_HOST_CONFIGS) {
@@ -24,7 +64,10 @@ test('CEO and Eng describe the actual disabled route and completion validator', 
         expect(output.replace(/\s+/g, ' ')).toContain('If preflight selected `disabled`, use the guarded record below');
         expect(output).toContain('"outside_status":"disabled"');
       } else expect(output).toContain('persist `outside_status: disabled` with the guarded');
-      const prompt = output.slice(output.indexOf('"IMPORTANT:'), output.indexOf('\n<plan content>"'));
+      const promptEnd = output.indexOf('\n<plan content>"');
+      const prompt = output.slice(output.lastIndexOf('\n"', promptEnd) + 1, promptEnd);
+      expect(prompt.startsWith('"')).toBe(true);
+      expect(prompt.split('\n')[0]).toContain('.claude/skills/');
       expect(prompt).toContain('End with Recommendation: <action> because <specific reason>');
       expect(prompt).toContain('If there are no findings, say so and explain why');
       const invocation = outsideVoiceInvocation(ctx);

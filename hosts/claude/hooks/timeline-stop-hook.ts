@@ -38,6 +38,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { runBin } from './spawn-bin';
+import { resolveStateRoot } from '../../../lib/state-root';
+import { logHookError as sharedLogHookError } from './hook-log';
 
 const DEADLINE_MS = 2000;
 const MAX_TIMELINE_BYTES = 10 * 1024 * 1024;
@@ -68,21 +70,8 @@ function readTimelineTail(timelinePath: string, size: number): string {
   }
 }
 
-function stateRoot(): string {
-  return process.env.GSTACK_HOME || path.join(os.homedir(), '.gstack');
-}
-
 function logHookError(msg: string): void {
-  try {
-    const root = stateRoot();
-    fs.mkdirSync(root, { recursive: true });
-    fs.appendFileSync(
-      path.join(root, 'hook-errors.log'),
-      `${new Date().toISOString()} timeline-stop-hook: ${msg}\n`,
-    );
-  } catch {
-    // best-effort; never block the session because logging failed
-  }
+  sharedLogHookError('timeline-stop-hook', msg);
 }
 
 interface TimelineEntry {
@@ -120,7 +109,7 @@ function main(): void {
     return;
   }
 
-  const timelinePath = path.join(stateRoot(), 'projects', slug, 'timeline.jsonl');
+  const timelinePath = path.join(resolveStateRoot(), 'projects', slug, 'timeline.jsonl');
   let stat: fs.Stats;
   try {
     stat = fs.statSync(timelinePath);

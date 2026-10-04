@@ -10,10 +10,10 @@
  *   - wide mermaid sequence diagram          → promotes (provenance automatic)
  *   - wide mermaid with page=portrait fence  → MUST stay portrait (veto)
  *
- * Also runs the --toc combo: Paged.js isn't shipped in v1 (TOC renders
- * without page numbers, the print falls through after 3s), so named-page
- * landscape must survive a --toc run unchanged. If Paged.js ever lands and
- * re-paginates, this is the test that catches the interaction.
+ * Also runs the --toc combo: --toc prints until the TOC's page numbers match
+ * the layout (make-pdf/src/toc-pages.ts), so named-page landscape must
+ * survive those repeated prints unchanged. toc-gate.test.ts owns the page
+ * numbers themselves.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -22,7 +22,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { resolvePopplerTool } from "../../src/pdftotext";
-import { browserAvailable, NO_BROWSER_REASON } from "./browser-available";
+import { browserAvailable, NO_BROWSER_REASON } from "../../../test/helpers/browser-available";
 
 const FIXTURE = path.resolve(__dirname, "../fixtures/landscape-gate.md");
 const ROOT = path.resolve(__dirname, "../../..");

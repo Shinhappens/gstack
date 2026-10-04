@@ -24,11 +24,12 @@
 
 import { describe } from 'bun:test';
 
-export type E2ETier = 'gate' | 'periodic';
+export type E2ETier = 'gate' | 'periodic' | 'marathon';
 
 /**
  * True when this process should run whole-file-gated paid tests of `tier`:
- * EVALS=1 AND EVALS_TIER exactly equals the tier.
+ * EVALS=1 AND EVALS_TIER exactly equals the tier. 'marathon' cases (full
+ * end-to-end flows) therefore never run in the gate/PR or periodic lanes.
  *
  * Deliberate consequence: EVALS=1 with EVALS_TIER unset is false for BOTH
  * tiers. Tierless runs (`test:evals` / `eval:bg` / `eval:bg:all`) skip every

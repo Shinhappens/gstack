@@ -23,6 +23,7 @@ import {
   extractPtyCookie, buildPtySetCookie,
   PTY_COOKIE_NAME, __resetPtySessions,
 } from '../src/pty-session-cookie';
+import { makeServer, stubRouteContext, callRoute, routeEntry } from './route-test-harness';
 
 const SERVER_SRC = fs.readFileSync(path.join(import.meta.dir, '../src/server.ts'), 'utf-8');
 const AGENT_SRC = fs.readFileSync(path.join(import.meta.dir, '../src/terminal-agent.ts'), 'utf-8');
@@ -89,17 +90,19 @@ describe('Source-level guard: /pty-session is not on the tunnel surface', () => 
   });
 });
 
-describe('Source-level guard: /health does NOT surface ptyToken', () => {
-  test('/health response body does not include ptyToken', () => {
-    const healthIdx = SERVER_SRC.indexOf("url.pathname === '/health'");
-    expect(healthIdx).toBeGreaterThan(-1);
-    // Slice from /health through the response close-bracket.
-    const slice = SERVER_SRC.slice(healthIdx, healthIdx + 2000);
-    // The /health JSON.stringify body must not mention the cookie token.
+describe('/health does NOT surface ptyToken', () => {
+  test('/health response body does not include ptyToken', async () => {
     // It's allowed to include `terminalPort` (a port number, not auth).
-    expect(slice).not.toContain('ptyToken');
-    expect(slice).not.toContain('gstack_pty');
-    expect(slice).toContain('terminalPort');
+    const ctx = stubRouteContext({
+      browserManager: { isHealthy: async () => true, getConnectionMode: () => 'launched', getTabCount: () => 1 } as any,
+      terminal: { readPort: () => 4242, grantToken: async () => true, restartSession: async () => true },
+    });
+    const text = await (await callRoute('GET', '/health', ctx)).text();
+    const body = JSON.parse(text);
+    expect(body.terminalPort).toBe(4242);
+    expect(Object.keys(body).sort()).toEqual(['mode', 'status', 'tabs', 'terminalPort', 'uptime']);
+    expect(text).not.toContain('ptyToken');
+    expect(text).not.toContain('gstack_pty');
   });
 });
 
@@ -229,21 +232,28 @@ describe('Source-level guard: terminal-agent', () => {
   });
 });
 
-describe('Source-level guard: server.ts /pty-session route', () => {
-  test('validates AUTH_TOKEN, grants over loopback, returns token + Set-Cookie', () => {
-    const route = SERVER_SRC.slice(SERVER_SRC.indexOf("url.pathname === '/pty-session'"));
+describe('/pty-session route', () => {
+  test('validates AUTH_TOKEN, grants over loopback, returns token + Set-Cookie', async () => {
     // Must check auth before minting.
-    const beforeMint = route.slice(0, route.indexOf('mintPtySessionToken'));
-    expect(beforeMint).toContain('validateAuth');
-    // Must call the loopback grant before responding (otherwise the
-    // agent's validTokens Set never sees the token and /ws would 401).
-    expect(route).toContain('grantPtyToken');
-    // Must return the token in the JSON body for the
-    // Sec-WebSocket-Protocol auth path (cross-port cookies don't survive
-    // SameSite=Strict from a chrome-extension origin).
-    expect(route).toContain('ptySessionToken');
-    // Set-Cookie is kept as a fallback for non-browser callers.
-    expect(route).toContain('Set-Cookie');
-    expect(route).toContain('buildPtySetCookie');
+    expect(routeEntry('POST', '/pty-session').auth).toBe('root-bearer');
+    const server = makeServer();
+    try {
+      const denied = await server.local('/pty-session', { method: 'POST' });
+      expect(denied.status).toBe(401);
+    } finally { server.cleanup(); }
+    // Must call the loopback grant before responding (otherwise the agent's
+    // validTokens Set never sees the token and /ws would 401), return the
+    // token in the JSON body for the Sec-WebSocket-Protocol auth path
+    // (cross-port cookies don't survive SameSite=Strict from a
+    // chrome-extension origin), and keep Set-Cookie as a fallback for
+    // non-browser callers.
+    const granted: string[] = [];
+    const ctx = stubRouteContext({
+      terminal: { readPort: () => 4242, grantToken: async (token) => { granted.push(token); return true; }, restartSession: async () => true },
+    });
+    const resp = await callRoute('POST', '/pty-session', ctx);
+    const body = await resp.json() as any;
+    expect(granted).toEqual([body.ptySessionToken]);
+    expect(resp.headers.get('set-cookie')).toBe(buildPtySetCookie(body.ptySessionToken));
   });
 });

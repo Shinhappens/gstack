@@ -1,4 +1,5 @@
 import { expect, beforeAll, afterAll } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
 import {
@@ -202,7 +203,7 @@ Analyze the git history and produce the narrative report as described in the SKI
       timeout: CAPTURE_MS,
       testName: 'retro',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/retro', result);

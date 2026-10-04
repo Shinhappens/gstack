@@ -22,7 +22,7 @@ printf '%s' "$GBRAIN_POOLER_URL" | ~/.claude/skills/gstack/bin/gstack-gbrain-sup
 If the verify exit code is 3 (direct-connection URL), the verifier's own
 message explains the fix; surface it and re-prompt for a Session Pooler URL.
 
-On success, hand off to gbrain via env var (D10, never argv):
+On success, hand off to gbrain via env var (never argv):
 
 ```bash
 GBRAIN_DATABASE_URL="$GBRAIN_POOLER_URL" gbrain init --non-interactive --json
@@ -31,9 +31,9 @@ GBRAIN_DATABASE_URL="$GBRAIN_POOLER_URL" gbrain init --non-interactive --json
 Then `unset GBRAIN_POOLER_URL GBRAIN_DATABASE_URL` immediately. The URL is
 now persisted in `~/.gbrain/config.json` at mode 0600 by gbrain itself.
 
-### Path 2a (Supabase, auto-provision — D7)
+### Path 2a (Supabase, auto-provision)
 
-Show the D11 PAT scope disclosure verbatim BEFORE collecting the token:
+Show this PAT scope disclosure verbatim BEFORE collecting the token:
 
 > *This Supabase Personal Access Token grants full read/write/delete access
 > to every project in your Supabase account, not just the `gbrain` one we're
@@ -51,7 +51,7 @@ Then:
 read_secret_to_env SUPABASE_ACCESS_TOKEN "Paste PAT: "
 ```
 
-Ask the D17 tier prompt via AskUserQuestion: "Which Supabase tier?" Present
+Ask the tier question via AskUserQuestion: "Which Supabase tier?" Present
 Free (2-project limit, pauses after 7d inactivity) vs Pro ($25/mo, no
 pauses, recommended for real use). Explain that tier is **org-level** (per
 the Management API contract) — user picks their org based on its current
@@ -77,7 +77,7 @@ Generate the DB password (never shown to the user):
 export DB_PASS=$(openssl rand -base64 24)
 ```
 
-Set up a SIGINT trap (D12 basic recovery):
+Set up a SIGINT trap so an interrupted provision can be resumed or deleted:
 
 ```bash
 trap 'echo ""; echo "gstack-gbrain: interrupted. In-flight ref: $INFLIGHT_REF"; \
@@ -113,9 +113,9 @@ After success, emit the PAT revocation reminder:
 
 Walk the user through the supabase.com steps:
 1. Login at https://supabase.com/dashboard
-2. Click "New Project," name it `gbrain`, pick a region, copy the generated
-   database password (you'll need it for paste-back? no — it's embedded in
-   the pooler URL we collect next)
+2. Click "New Project," name it `gbrain`, pick a region, and copy the
+   generated database password — the pooler URL in step 4 must carry it
+   (replace any `[YOUR-PASSWORD]` placeholder before pasting)
 3. Wait ~2 min for the project to initialize
 4. Settings → Database → Connection Pooler → Session → copy the URL (port
    6543)
@@ -128,9 +128,9 @@ Then follow the same secret-read + verify + init flow as Path 1.
 # gstack default: voyage-code-3 (1024d) when VOYAGE_API_KEY is set — code
 # retrieval beats general-purpose embeddings on real code queries (validated
 # A/B). Without the key, gbrain auto-selects (OpenAI 1536d when available).
-# Never select gbrain's legacy zeroentropyai recipe for a new brain: the hosted
-# API sunsets September 4, 2026 (#2365); the wireup helper warns existing installs.
-set --  # flags ride the positional params — unquoted $VAR breaks under zsh word-splitting (#1798)
+# Never select gbrain's legacy zeroentropyai recipe for a new brain: its hosted
+# API's sunset date (September 4, 2026) has passed; the wireup helper warns existing installs.
+set --  # flags ride the positional params — unquoted $VAR breaks under zsh word-splitting
 if [ -n "${VOYAGE_API_KEY:-}" ]; then
   set -- --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
 fi
@@ -157,7 +157,7 @@ Read with plain `read -r` (no secret hygiene needed — the URL alone isn't
 a credential). Validate it starts with `https://` (require TLS for any
 non-loopback host); refuse `http://` for non-localhost.
 
-**4b. Collect bearer token via the secret-read helper (D10, never argv).**
+**4b. Collect bearer token via the secret-read helper (never argv).**
 
 ```bash
 . ~/.claude/skills/gstack/bin/gstack-gbrain-lib.sh
@@ -186,7 +186,7 @@ Capture two values from the verify output for downstream steps:
 - `URL_FORM_SUPPORTED` (`true|false`) — passed to `gstack-artifacts-init` in
   Step 7 to control which form of the brain-admin hookup command is printed.
 
-**4d. (Path 4) Offer local PGLite for code search.** Per plan D10/D11, ask:
+**4d. (Path 4) Offer local PGLite for code search.** Ask:
 
 > D# — Want symbol-aware code search on this machine?
 > Project/branch/task: <one-sentence grounding using detected slug + branch>
@@ -208,7 +208,7 @@ Capture two values from the verify output for downstream steps:
 >   ❌ Symbol code queries fall back to Grep in this repo's worktrees
 > Net: A = full split-engine; B = remote-only.
 
-**If A (Yes)**: install + init local PGLite with rollback-safe semantics (D7):
+**If A (Yes)**: install + init local PGLite with rollback-safe semantics:
 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-gbrain-install || exit $?
@@ -222,7 +222,7 @@ fi
 # VOYAGE_API_KEY is set. It wins the A/B over voyage-4-large and OpenAI
 # text-embedding-3-large on this codebase's symbol queries. Falls back to
 # gbrain's auto-selected provider when the key isn't present.
-set --  # flags ride the positional params — unquoted $VAR breaks under zsh word-splitting (#1798)
+set --  # flags ride the positional params — unquoted $VAR breaks under zsh word-splitting
 if [ -n "${VOYAGE_API_KEY:-}" ]; then
   set -- --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
 fi
@@ -233,21 +233,20 @@ if ! gbrain init --pglite --json "$@"; then
 fi
 ```
 
-Then continue to Step 5a. The remote-http MCP registration in 5a runs as
-today; the local PGLite is independent of MCP registration (Claude Code talks
+Then continue to Step 5a. The remote-http MCP registration in 5a runs
+unchanged; the local PGLite is independent of MCP registration (Claude Code talks
 to the remote brain via MCP for queries; `gbrain` CLI talks to local PGLite
 for code-def/refs/callers).
 
 **If B (No)**: skip the install + init. The local engine stays absent.
 `gbrain_local_status` will be `missing-config` (or `no-cli` if gbrain isn't
-installed). `/sync-gbrain` will SKIP the code stage cleanly per plan D12.
+installed). `/sync-gbrain` will SKIP the code stage cleanly.
 
 **4e. Skip Steps 3, 4 (other paths) and 5 (local doctor) when B was picked.**
 When A was picked, Step 3 already ran (via gstack-gbrain-install) and Step 4
 already ran (via `gbrain init --pglite`); jump straight to Step 5a. When B
 was picked, Steps 3/4/5 are no-ops; also skip Step 7.5 (transcript ingest)
-since memory-stage routes through the artifacts pipeline in remote-http mode
-per plan D11.
+since memory-stage routes through the artifacts pipeline in remote-http mode.
 
 The bearer token (`GBRAIN_MCP_TOKEN`) stays in process env until Step 5a's
 `claude mcp add --header` consumes it; then `unset GBRAIN_MCP_TOKEN`
@@ -264,7 +263,7 @@ timeout 180s gbrain migrate --to supabase --url "$URL" --json
 timeout 180s gbrain migrate --to pglite --json
 ```
 
-If `timeout` returns 124 (exit code for timeout): surface D9 message
+If `timeout` returns 124 (exit code for timeout): surface this message
 ("Migration didn't complete in 3 minutes — another gstack session may be
 holding a lock on the source brain. Close other workspaces and re-run
 `/setup-gbrain --switch`. Your original brain is untouched."). STOP.

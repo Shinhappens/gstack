@@ -3,7 +3,8 @@
  *
  * Pins three contracts:
  * 1. Allowlist semantics: contamination vars dropped, basics/auth/network
- *    kept, overrides merge last, EVALS_HERMETIC=0 is byte-identical legacy.
+ *    kept, overrides merge last, EVALS_HERMETIC=0 is the legacy env plus the
+ *    DISABLE_AUTOUPDATER pin.
  * 2. Seed-config shape: 20-char key suffix, trusted dirs, undefined-key safe.
  * 3. Dir lifecycle: /.claude suffix (extractPlanFilePath contract —
  *    claude-pty-runner.ts:191), sync singleton reuse, pid-aware GC.
@@ -167,7 +168,7 @@ describe('buildHermeticEnv allowlist', () => {
 });
 
 describe('EVALS_HERMETIC=0 escape hatch', () => {
-  test('returns byte-identical legacy env, overrides still last', () => {
+  test('returns the legacy env plus the updater pin, overrides still last', () => {
     const base = { ...CONTAMINATED, EVALS_HERMETIC: '0' } as NodeJS.ProcessEnv;
     const e = buildHermeticEnv(base, HERMETIC_VARS, { GSTACK_HEADLESS: '1' });
     // Legacy spread: every base var survives, hermeticVars NOT applied.
@@ -175,7 +176,7 @@ describe('EVALS_HERMETIC=0 escape hatch', () => {
     expect(e.CLAUDE_CONFIG_DIR).toBe('/Users/op/.claude');
     expect(e.GSTACK_HOME).toBe('/Users/op/.gstack');
     expect(e.GSTACK_HEADLESS).toBe('1');
-    expect(e).toEqual({ ...(base as Record<string, string>), GSTACK_HEADLESS: '1' });
+    expect(e).toEqual({ ...(base as Record<string, string>), DISABLE_AUTOUPDATER: '1', GSTACK_HEADLESS: '1' });
   });
 
   test('isHermeticEnabled reads at call time (ESM-hoist safety)', () => {

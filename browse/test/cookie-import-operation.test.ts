@@ -315,3 +315,138 @@ describe('registered import callers', () => {
     try { expect((await route('GET', '?code=' + expired)).status).toBe(403); } finally { Date.now = now; }
   });
 });
+
+describe('Windows Opera receipts and profile diagnostics', () => {
+  const operaDb = (profile: string, rows: Array<{ domain: string; name: string; value?: string; encrypted?: Buffer }>) => {
+    const dir = path.join(home, 'AppData/Roaming/Opera Software/Opera Stable', profile, 'Network');
+    fs.mkdirSync(dir, { recursive: true });
+    expect(fs.realpathSync(dir).startsWith(fs.realpathSync(home) + path.sep)).toBe(true);
+    const db = new Database(path.join(dir, 'Cookies'));
+    db.run('CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT, expires_utc INTEGER, is_secure INTEGER, is_httponly INTEGER, has_expires INTEGER, samesite INTEGER)');
+    for (const row of rows) db.run('INSERT INTO cookies VALUES (?, ?, ?, ?, ?, 0, 1, 1, 0, 1)', [row.domain, row.name, row.value ?? '', row.encrypted ?? Buffer.alloc(0), '/']);
+    db.close();
+  };
+  const onPlatform = async <T>(value: string, run: () => Promise<T>): Promise<T> => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const appData = process.env.APPDATA;
+    delete process.env.APPDATA;
+    Object.defineProperty(process, 'platform', { value, configurable: true });
+    try { return await run(); } finally {
+      Object.defineProperty(process, 'platform', platform);
+      if (appData === undefined) delete process.env.APPDATA; else process.env.APPDATA = appData;
+    }
+  };
+  const recovery = 'Sign in manually: run `$B handoff`, sign in to the intended account in the window that opens, then run `$B resume` (needs a display). See BROWSER.md, Platform limits.';
+
+  test('App-Bound-only Opera rows return a failed receipt without native extraction', async () => {
+    operaDb('Default', [{ domain: '.example.test', name: 'bound', encrypted: Buffer.from('v20synthetic') }]);
+    const native = spyOn(importer, 'importCookiesViaCdp');
+    try {
+      for (const verifyAuth of [false, true]) {
+        const result = await onPlatform('win32', () => runCookieImport({ browser: 'opera', profile: 'Default', domains: ['example.test'], verifyAuth }, { page, url: currentUrl }, () => {}, verifyAuth ? { identitySelector: '#me', expectedIdentity: 'me' } : {}));
+        expect(result).toEqual({
+          browser: 'opera', profile: 'Default', imported: 0, failed: 1, domainCounts: {},
+          failureReasons: { unsupported_encryption: 1 }, outcome: 'failed', reset: 'not_requested',
+          verification: { verified: false, reason: verifyAuth ? 'no_cookies_imported' : 'not_requested' },
+          message: `Some selected Opera cookies use App-Bound Encryption, which gstack cannot decrypt for this browser. ${recovery}`,
+        });
+      }
+      expect(native).not.toHaveBeenCalled();
+      expect(context.addCookies).not.toHaveBeenCalled();
+    } finally {
+      native.mockRestore();
+    }
+  });
+
+  test('mixed App-Bound and undecryptable Opera rows name both causes', async () => {
+    operaDb('Default', [{ domain: '.example.test', name: 'bound', encrypted: Buffer.from('v20synthetic') }]);
+    const imported = spyOn(importer, 'importCookies').mockResolvedValue({ cookies: [], count: 0, failed: 2, domainCounts: {}, failureReasons: { unsupported_encryption: 1, decryption_failed: 1 } });
+    try {
+      const result = await onPlatform('win32', () => runCookieImport({ browser: 'opera', profile: 'Default', domains: ['example.test'] }, { page, url: currentUrl }, () => {}));
+      expect(result.failureReasons).toEqual({ decryption_failed: 1, unsupported_encryption: 1 });
+      expect(result.outcome).toBe('failed');
+      expect(result.message).toBe(`Opera cookies could not be imported: some use App-Bound Encryption and others could not be decrypted. ${recovery}`);
+    } finally {
+      imported.mockRestore();
+    }
+  });
+
+  test('partial Opera imports apply readable cookies and warn about skipped App-Bound rows', async () => {
+    operaDb('Default', [
+      { domain: '.example.test', name: 'plain', value: 'synthetic-plain' },
+      { domain: '.example.test', name: 'bound', encrypted: Buffer.from('v20synthetic') },
+    ]);
+    const native = spyOn(importer, 'importCookiesViaCdp');
+    try {
+      const result = await onPlatform('win32', () => runCookieImport({ browser: 'opera', profile: 'Default', domains: ['example.test'] }, { page, url: currentUrl }, () => {}));
+      expect(result).toMatchObject({ imported: 1, failed: 1, outcome: 'partial', failureReasons: { unsupported_encryption: 1 } });
+      expect(result.message).toBe('Some Opera cookies use App-Bound Encryption and were skipped, so the session may not be restored. Check with `$B reload` (or --verify-auth); if you are signed out, run `$B handoff`, sign in, then `$B resume`.');
+      expect(context.addCookies).toHaveBeenCalledTimes(1);
+      expect(native).not.toHaveBeenCalled();
+    } finally {
+      native.mockRestore();
+    }
+  });
+
+  test('native extraction guard rejects browsers without a native mapping before loading it', async () => {
+    await onPlatform('win32', async () => {
+      await expect(importer.importCookiesViaCdp('opera', ['example.test'])).rejects.toMatchObject({ code: 'native_unsupported_browser' });
+      await expect(importer.importCookiesViaCdp('arc', ['example.test'])).rejects.toMatchObject({ code: 'not_supported' });
+    });
+  });
+
+  test('CLI receipt text lists sorted failure reasons after the message', async () => {
+    const { formatCookieImportResult } = await import('../src/cookie-import-operation');
+    const base = { browser: 'opera', profile: 'Default', imported: 0, failed: 2, domainCounts: {}, outcome: 'failed' as const, reset: 'not_requested' as const, verification: { verified: false, reason: 'not_requested' }, message: 'Message.' };
+    expect(formatCookieImportResult({ ...base, failureReasons: { unsupported_encryption: 1, decryption_failed: 1 } })).toContain('Message. Failure reasons: decryption_failed=1, unsupported_encryption=1. Storage reset:');
+    expect(formatCookieImportResult({ ...base, failureReasons: {} })).toContain('Message. Storage reset:');
+  });
+
+  test('a missing browser reports where it looked instead of asking for a profile', async () => {
+    await onPlatform('darwin', async () => {
+      const error: any = await runCookieImport({ browser: 'opera', domains: ['example.test'] }, { page, url: currentUrl }, () => {}).catch(caught => caught);
+      expect(error.code).toBe('not_installed');
+      expect(error.message.startsWith('Opera cookie import is available on Windows only.')).toBe(true);
+      expect(error.message).toContain('%APPDATA%\\Opera Software\\Opera Stable');
+      expect(error.message).toContain('Browsers available on this OS:');
+      expect(error.message).toContain('Chrome (chrome)');
+    });
+    await onPlatform('win32', async () => {
+      const error: any = await runCookieImport({ browser: 'opera-gx', domains: ['example.test'] }, { page, url: currentUrl }, () => {}).catch(caught => caught);
+      expect(error.code).toBe('not_installed');
+      expect(error.message).toContain('No supported Opera GX cookie database found.');
+      expect(error.message).toContain(path.join('AppData', 'Roaming', 'Opera Software', 'Opera GX Stable', 'Default', 'Network', 'Cookies'));
+      expect(error.message).toContain('Supported layout: %APPDATA%\\Opera Software\\Opera GX Stable\\<Default|Profile N>\\Network\\Cookies');
+    });
+  });
+
+  test('profile diagnostics explain ambiguity, empty matches, unreadable profiles and --all', async () => {
+    installProfile();
+    installProfile('Profile 2');
+    const run = (options: any) => runCookieImport({ browser: 'chromium', ...options }, { page, url: currentUrl }, () => {}).catch(caught => caught);
+    let error = await run({ domains: ['example.test'] });
+    expect(error.code).toBe('profile_required');
+    expect(error.message).toBe('Chromium has several profiles with cookies for example.test: Default, Profile 2. Retry with --profile "<dir>", or run `$B cookie-import-browser chromium` to choose in the picker.');
+    error = await run({ domains: ['missing.test'] });
+    expect(error.message).toBe('No Chromium profile has cookies for missing.test. Check the domain and that you are signed in to it in Chromium.');
+    error = await run({ all: true });
+    expect(error.message).toBe('Chromium has several profiles: Default, Profile 2. Retry with --profile "<dir>", or run `$B cookie-import-browser chromium` to choose in the picker.');
+    fs.writeFileSync(path.join(home, '.config/chromium/Profile 2/Cookies'), 'not a database');
+    error = await run({ domains: ['example.test'] });
+    expect(error.code).toBe('profile_required');
+    expect(error.message).toBe('Chromium profiles Profile 2 could not be read (the browser may be locking them). Close Chromium and retry, or pass --profile. Profiles with cookies for example.test: Default.');
+    expect(error.message).not.toContain('synthetic-session');
+  });
+
+  test('a profile that appears after listing asks for an explicit profile', async () => {
+    const list = spyOn(importer, 'listProfiles').mockReturnValue([]);
+    try {
+      installProfile();
+      const error: any = await runCookieImport({ browser: 'chromium', domains: ['example.test'] }, { page, url: currentUrl }, () => {}).catch(caught => caught);
+      expect(error.code).toBe('profile_required');
+      expect(error.message).toContain('Chromium profiles changed while selecting.');
+    } finally {
+      list.mockRestore();
+    }
+  });
+});

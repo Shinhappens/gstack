@@ -18,8 +18,8 @@ B) Start a new conversation
 
 2. Create temp files:
 ```bash
-TMPRESP=$(mktemp "$TMP_ROOT/codex-resp-XXXXXX")
-TMPERR=$(mktemp "$TMP_ROOT/codex-err-XXXXXX")
+TMPRESP=$(mktemp "$TMP_ROOT/codex-resp-XXXXXX") || { echo "ERROR: mktemp failed in TMP_ROOT=$TMP_ROOT; not running codex without its temp file" >&2; exit 1; }
+TMPERR=$(mktemp "$TMP_ROOT/codex-err-XXXXXX") || { echo "ERROR: mktemp failed in TMP_ROOT=$TMP_ROOT; not running codex without its temp file" >&2; exit 1; }
 ```
 
 3. **Plan review auto-detection:** If the user's prompt is about reviewing a plan,
@@ -46,7 +46,7 @@ Boundary section (always-loaded skeleton) to every prompt sent to Codex, includi
 consult questions.
 
 Prepend the boundary and persona to the user's prompt:
-"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do not invoke any installed skill (Codex home skills/, .agents/); answer directly. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
 
 You are a brutally honest technical reviewer. Review this plan for: logical gaps and
 unstated assumptions, missing error handling or edge cases, overcomplexity (is there a
@@ -58,14 +58,14 @@ THE PLAN:
 <full plan content, embedded verbatim>"
 
 For non-plan consult prompts (user typed `/codex <question>`), still prepend the boundary:
-"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do not invoke any installed skill (Codex home skills/, .agents/); answer directly. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
 
 <user's question>"
 
 4. Run codex exec with **JSONL output** to capture reasoning traces. Use
-`timeout: 660000` on the Bash call (for both new and resumed sessions) — the gate
-sits ABOVE the 600s wrapper so the wrapper fires first with its explicit stall
-message:
+`timeout: 600000` on the Bash call (the tool's maximum; for both new and resumed
+sessions) — the gate sits ABOVE the 540s wrapper so the wrapper fires first, ends Codex,
+and prints its explicit stall message:
 
 If the user passed `--xhigh`, use `"xhigh"` instead of `"medium"`.
 
@@ -77,8 +77,10 @@ if [ -z "$PYTHON_CMD" ]; then
   echo "ERROR: Python 3 is required to parse Codex JSON output. Install python3 or python and retry." >&2
   exit 1
 fi
+source ~/.claude/skills/gstack/bin/gstack-codex-probe || exit 1
+_gstack_codex_select_model exec || exit 1
 # Fix 1: wrap with timeout (gtimeout/timeout fallback chain via probe helper)
-_gstack_codex_timeout_wrapper 600 codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
+_gstack_codex_timeout_wrapper 540 codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
 import sys, json
 turn_completed_count = 0
 turn_failed = False
@@ -113,7 +115,7 @@ for line in sys.stdin:
             err = obj.get('error',{}).get('message','') or 'no error message in event'
             print(f'[codex turn FAILED] {err}', flush=True, file=sys.stderr)
     except: pass
-# Three-way completeness check (#2671; consult previously had NONE): a STATED
+# Three-way completeness check: a STATED
 # failure is a failure, not a network problem; only silence is a disconnect.
 if turn_failed:
     print('[codex] turn.failed received — the turn errored (reason above), not a disconnect.', flush=True, file=sys.stderr)
@@ -121,21 +123,21 @@ elif turn_completed_count == 0:
     print('[codex warning] No turn.completed event received — possible mid-stream disconnect.', flush=True, file=sys.stderr)
 "
 # Fix 1: hang detection for Consult new-session (mirrors Challenge + resume)
-_CODEX_EXIT=${PIPESTATUS[0]:-${pipestatus[1]}}  # bash sets PIPESTATUS; zsh (lowercase, 1-indexed) falls through (#2669)
+_CODEX_EXIT=${PIPESTATUS[0]:-${pipestatus[1]}}  # bash sets PIPESTATUS; zsh (lowercase, 1-indexed) falls through
 if [ "$_CODEX_EXIT" = "124" ]; then
-  _gstack_codex_log_event "codex_timeout" "600"
+  _gstack_codex_log_event "codex_timeout" "540"
   _gstack_codex_log_hang "consult" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
-  echo "Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
+  echo "Codex stalled past 9 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
 elif [ "$_CODEX_EXIT" != "0" ]; then
   # Surface non-zero exits so the calling agent doesn't read "no output" as
-  # a silent model/API stall. See #1327.
+  # a silent model/API stall.
   echo "[codex exit $_CODEX_EXIT] $(head -1 "$TMPERR" 2>/dev/null || echo "no stderr captured")"
   head -20 "$TMPERR" 2>/dev/null | sed 's/^/  /' || true
   _gstack_codex_log_event "codex_nonzero_exit" "consult:$_CODEX_EXIT"
 fi
 ```
 
-**Session-cost reality (#2387, measured):** every `codex exec` call — resumed
+**Session-cost reality (measured):** every `codex exec` call — resumed
 or fresh — pays Codex's ~21K-token session prelude (its skill catalogue +
 instructions); `resume` does NOT amortize it (a measured resume came in
 slightly ABOVE a fresh call). Resume buys conversational continuity, never
@@ -152,19 +154,21 @@ if [ -z "$PYTHON_CMD" ]; then
   exit 1
 fi
 cd "$_REPO_ROOT" || exit 1
+source ~/.claude/skills/gstack/bin/gstack-codex-probe || exit 1
+_gstack_codex_select_model exec || exit 1
 # Fix 1: wrap with timeout (gtimeout/timeout fallback chain via probe helper)
-_gstack_codex_timeout_wrapper 600 codex exec resume <session-id> "<prompt>" -c 'sandbox_mode="read-only"' -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
+_gstack_codex_timeout_wrapper 540 codex exec resume <session-id> "<prompt>" -c 'sandbox_mode="read-only"' -c "model=\"${_GSTACK_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 "$PYTHON_CMD" -u -c "
 <same python streaming parser as above, with flush=True on all print() calls>
 "
 # Fix 1: same hang detection pattern as new-session block
-_CODEX_EXIT=${PIPESTATUS[0]:-${pipestatus[1]}}  # bash sets PIPESTATUS; zsh (lowercase, 1-indexed) falls through (#2669)
+_CODEX_EXIT=${PIPESTATUS[0]:-${pipestatus[1]}}  # bash sets PIPESTATUS; zsh (lowercase, 1-indexed) falls through
 if [ "$_CODEX_EXIT" = "124" ]; then
-  _gstack_codex_log_event "codex_timeout" "600"
+  _gstack_codex_log_event "codex_timeout" "540"
   _gstack_codex_log_hang "consult-resume" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
-  echo "Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
+  echo "Codex stalled past 9 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
 elif [ "$_CODEX_EXIT" != "0" ]; then
   # Surface non-zero exits so the calling agent doesn't read "no output" as
-  # a silent model/API stall. See #1327.
+  # a silent model/API stall.
   echo "[codex exit $_CODEX_EXIT] $(head -1 "$TMPERR" 2>/dev/null || echo "no stderr captured")"
   head -20 "$TMPERR" 2>/dev/null | sed 's/^/  /' || true
   _gstack_codex_log_event "codex_nonzero_exit" "consult-resume:$_CODEX_EXIT"
@@ -195,8 +199,8 @@ Session saved — run /codex again to continue this conversation.
    "Note: Claude Code disagrees on X because Y."
 
 8. **Synthesis recommendation (REQUIRED).** Emit ONE recommendation line
-summarizing what the user should do based on Codex's consult output, in the
-canonical format the AskUserQuestion judge grades:
+summarizing what the user should do based on Codex's consult output, in this
+format:
 
 ```
 Recommendation: <action> because <one-line reason that names the most actionable insight from Codex>

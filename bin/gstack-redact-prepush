@@ -27,10 +27,10 @@
  */
 import { spawnSync } from "child_process";
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import { normalizeWithMap, scan, type Finding } from "../lib/redact-engine";
 import { mkdirpSync } from "../lib/fs-utils";
+import { resolveStateRoot } from "../lib/state-root";
 
 const ZERO = /^0+$/;
 let emptyTree: string | undefined;
@@ -241,7 +241,7 @@ function addedLinesFromNewCommits(localSha: string, remoteSha: string): string |
     // gitStrict: a failed diff must never read as "nothing added" (#1946).
     out.push(gitStrict([
       "show", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv",
-      "--cc", "--format=", sha,
+      "--src-prefix=a/", "--dst-prefix=b/", "--cc", "--format=", sha,
     ]));
   }
   return out.join("\n");
@@ -275,7 +275,7 @@ function addedLinesFor(localSha: string, remoteSha: string): string {
   // content before we ever see it. (#2498)
   const diff = gitStrict([
     "diff", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv",
-    range,
+    "--src-prefix=a/", "--dst-prefix=b/", range,
   ]);
   return collectAddedLines(diff);
 }
@@ -291,17 +291,44 @@ function collectAddedLines(diff: string): string {
   // renders as "+++<content>" — the old blanket startsWith("+++") skip
   // silently dropped exactly those lines from the scan.
   let inHunk = false;
+  let file = "";
+  let fileLines: string[] = [];
+  const flush = () => {
+    added.push(...releaseVersionExempt(file, fileLines));
+    fileLines = [];
+  };
   for (const line of diff.split("\n")) {
     // `diff --` rather than `diff --git`: a merge scanned with --cc emits
     // `diff --cc <path>`, so a --git-only reset left inHunk true across file
     // boundaries and read the next file's `+++ b/...` header as content. Only
     // noise (it over-scans, never under-scans), but the boundary is real.
-    if (line.startsWith("diff --")) { inHunk = false; continue; }
+    if (line.startsWith("diff --")) { flush(); file = ""; inHunk = false; continue; }
     if (line.startsWith("@@")) { inHunk = true; continue; }
+    if (!inHunk && line.startsWith("+++ ")) { file = line.startsWith("+++ b/") ? line.slice(6) : ""; continue; }
     if (!inHunk && (line.startsWith("+++") || line.startsWith("---"))) continue;
-    if (line.startsWith("+")) added.push(line.slice(1));
+    if (line.startsWith("+")) fileLines.push(line.slice(1));
   }
+  flush();
   return added.join("\n");
+}
+
+const VERSION_FILE_CONTENT = /^\d+(?:\.\d+)+$/;
+const CHANGELOG_RELEASE_VERSION = /^(#{1,6}[\t ]*\[?v?)\d+(?:\.\d+){3}(?=[\]\t ]|$)/;
+
+/**
+ * #2856: a 4-part release version (MAJOR.MINOR.PATCH.MICRO) is shaped exactly like a
+ * public IPv4 address, so /ship's own VERSION bump and CHANGELOG heading
+ * raised pii.ip_public on every release. Exempt only those two release
+ * artifacts, decided from the pushed diff alone (works in shallow clones):
+ * a root VERSION whose entire added content is one version string, and the
+ * version token of a root CHANGELOG.md release heading (the rest of the
+ * heading is still scanned). Every other file — and any other position in
+ * these two — is scanned unchanged; the engine's global allowlist is untouched.
+ */
+function releaseVersionExempt(file: string, lines: string[]): string[] {
+  if (file === "VERSION" && lines.length === 1 && VERSION_FILE_CONTENT.test(lines[0].trim())) return [];
+  if (file === "CHANGELOG.md") return lines.map((l) => l.replace(CHANGELOG_RELEASE_VERSION, "$1VERSION"));
+  return lines;
 }
 
 /**
@@ -416,7 +443,7 @@ function scanAddedLines(added: string, opts: Parameters<typeof scan>[1]): Findin
 
 function logSkip(reason: string): void {
   try {
-    const home = process.env.GSTACK_HOME || path.join(os.homedir(), ".gstack");
+    const home = resolveStateRoot();
     const dir = path.join(home, "security");
     // mkdirpSync, not bare mkdirSync: bun-on-Windows EEXIST (#2635). This site
     // is try-wrapped by the caller, so the old failure was a silent skip-log

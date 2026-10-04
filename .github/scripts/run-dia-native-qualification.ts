@@ -429,6 +429,7 @@ async function freshWorker(configFile: string) {
       receipt.reason = 'comparison_chromium_control';
       launchAttempted = true;
       comparisonControl = await runDiaLaunchComparison(account, 'control');
+      if (!comparisonControl) throw new Error('comparison_control_failed');
       receipt.comparisonControl = comparisonControl;
       if (!comparisonControl.ready || !comparisonControl.cleanup?.confirmed) throw new Error('comparison_control_failed');
       receipt.preflight.headlessChromium = true;

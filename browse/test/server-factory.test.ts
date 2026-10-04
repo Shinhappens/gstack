@@ -15,6 +15,9 @@ import * as crypto from 'crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { usePrivateStateRoot } from '../../test/helpers/private-state-root';
+
+usePrivateStateRoot();
 
 const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-server-factory-'));
 const fixtureConfig = resolveConfig({ BROWSE_STATE_FILE: path.join(fixtureDir, 'state/browse.json') });

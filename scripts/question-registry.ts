@@ -467,6 +467,22 @@ export const QUESTIONS = {
     signal_key: 'decision-autonomy',
     description: "Canary detected regressions — roll back the deploy?",
   },
+  'land-and-deploy-ci-override': {
+    id: 'land-and-deploy-ci-override',
+    skill: 'land-and-deploy',
+    category: 'approval',
+    door_type: 'one-way',
+    options: ['accept', 'reject'],
+    description: "Merge this head while these named non-required CI checks are red or pending?",
+  },
+  'land-and-deploy-no-ci-confirm': {
+    id: 'land-and-deploy-no-ci-confirm',
+    skill: 'land-and-deploy',
+    category: 'approval',
+    door_type: 'one-way',
+    options: ['accept', 'reject'],
+    description: "No CI ran on this head — merge it anyway?",
+  },
 
   // -----------------------------------------------------------------------
   // /cso — security audit

@@ -37,7 +37,8 @@ const run = async opts => {
   expect(fs.existsSync(opts.workingDirectory)).toBe(true);
   if (attempt === 2) fs.writeFileSync(path.join(opts.workingDirectory, 'review-output.md'), ${JSON.stringify(report)});
   return { exitReason: attempt === 1 ? 'timeout' : 'success', browseErrors: [],
-    toolCalls: [{ tool: 'Agent', input: { description: 'Red Team review', run_in_background: false }, output: 'NO FINDINGS' }] };
+    toolCalls: [{ tool: 'Agent', input: { description: 'Performance specialist review', run_in_background: false }, output: 'NO FINDINGS' },
+      { tool: 'Agent', input: { description: 'Red Team review', run_in_background: false }, output: 'NO FINDINGS' }] };
 };
 new Function('describe', 'test', 'expect', 'beforeAll', 'afterAll',
   'JUDGE_MS', 'CAPTURE_MS', 'SESSION_DRAIN_GRACE_MS', 'runSkillTest',

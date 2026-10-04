@@ -1,7 +1,7 @@
 /**
  * cli.ts error → exit code mapping, pinned through the REAL CLI process.
  *
- *   exit 0 success / 1 bad args / 2 render error / 3 Paged.js timeout / 4 no browser
+ *   exit 0 success / 1 bad args / 2 render error / 3 TOC page numbers failed / 4 no browser
  *
  * `main()` is not exported and runs only under `import.meta.main`, so the
  * catch block cannot be driven in-process. Each case spawns `bun cli.ts`
@@ -214,13 +214,13 @@ describe("cli.ts maps the thrown error class to the exit code (orchestrator stub
     expect(noPath.stderr.trim()).toBe("$P: file not found: ENOENT: no such file or directory");
   });
 
-  test("an error named PagedJsTimeout → exit 3", () => {
+  test("a TocPaginationError → exit 3, never a PDF with empty TOC page cells", () => {
     const r = runCli(["generate", inputMd], {
-      preload: stubOrchestrator("pagedjs", `Object.assign(new Error("Paged.js did not finish within 3000ms"), { name: "PagedJsTimeout" })`),
+      preload: stubOrchestrator("toc-pages", `Object.assign(new Error("TOC page numbers did not settle after 3 prints"), { name: "TocPaginationError" })`),
     });
-    expect(r.code).toBe(ExitCode.PagedJsTimeout);
+    expect(r.code).toBe(ExitCode.TocPagination);
     expect(r.code).toBe(3);
-    expect(r.stderr.trim()).toBe("$P: Paged.js did not finish within 3000ms");
+    expect(r.stderr.trim()).toBe("$P: --toc: TOC page numbers did not settle after 3 prints");
     expect(r.stdout).toBe("");
   });
 

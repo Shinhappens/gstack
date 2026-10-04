@@ -57,17 +57,28 @@ export const OPENAI_LITMUS_CHECKS = [
 export const CODEX_WEB_SEARCH_FLAG = `-c 'web_search="cached"'`;
 
 /**
- * Default model for gstack-owned Codex invocations.
+ * Default model for gstack-owned Codex invocations when nothing else chooses.
  *
- * Conductor's current Codex CLI default may lag the frontier model exposed to
- * agents, so gstack pins its own default and lets users override it per shell
- * with GSTACK_CODEX_MODEL or per invocation with an explicit `-c model=...`.
- * The -c form is accepted by both `codex exec` and `codex review`.
+ * The runtime model is resolved per invocation kind by
+ * `_gstack_codex_select_model exec|review` (bin/gstack-codex-probe, backed by
+ * resolveCodexRuntimeModel in scripts/resolve-codex-generation-model.ts):
+ * explicit request, then GSTACK_CODEX_MODEL, then Codex config.toml (`model`;
+ * `review_model` first for native review; honors CODEX_HOME), then this default
+ * (#2914). The selection is printed before the first paid call and the probe
+ * checks the same record the flags below pass.
  */
 export const CODEX_FRONTIER_MODEL = 'gpt-6-astra';
-export const CODEX_MODEL_CONFIG_FLAG = `-c "model=\\"\${GSTACK_CODEX_MODEL:-${CODEX_FRONTIER_MODEL}}\\""`;
-// Native review prefers review_model over model when the user has pinned it.
-export const CODEX_REVIEW_MODEL_CONFIG_FLAG = `${CODEX_MODEL_CONFIG_FLAG} -c "review_model=\\"\${GSTACK_CODEX_MODEL:-${CODEX_FRONTIER_MODEL}}\\""`;
+/**
+ * Nested gstack Codex calls are one-shot reviews: keep installed skills (gstack's
+ * own included) out of the model's context so the reviewer cannot re-run a whole
+ * skill workflow inside its budget (#2847). Read-only sandboxes do not prevent this.
+ */
+export const CODEX_SKILLS_ISOLATION_FLAG = '-c skills.include_instructions=false';
+const SELECTED_MODEL = '${_GSTACK_CODEX_SEL:?}';
+/** Requires `_gstack_codex_select_model exec` earlier in the same shell; `:?` stops an unselected command. */
+export const CODEX_MODEL_CONFIG_FLAG = `-c "model=\\"${SELECTED_MODEL}\\"" ${CODEX_SKILLS_ISOLATION_FLAG}`;
+/** Requires `_gstack_codex_select_model review`; native review prefers review_model, so both carry the selection. */
+export const CODEX_REVIEW_MODEL_CONFIG_FLAG = `-c "review_model=\\"${SELECTED_MODEL}\\"" ${CODEX_MODEL_CONFIG_FLAG}`;
 
 /**
  * Shared Codex error handling block for resolver output.
@@ -111,11 +122,14 @@ On any error: continue — ${feature} is informational, not a gate.`;
  *   - `codex-only` (diff adversarial): disabled gates only the Codex passes; the
  *     free Claude adversarial subagent still runs.
  */
-export function codexPreflight(opts: { modeVar?: string; disabledBehavior: 'skip-all' | 'codex-only' }): string {
+export function codexPreflight(opts: { modeVar?: string; disabledBehavior: 'skip-all' | 'codex-only'; nativeReview?: boolean }): string {
   const m = opts.modeVar ?? '_CODEX_MODE';
   const disabledLine = opts.disabledBehavior === 'codex-only'
     ? 'Skip the Codex passes only; the Claude adversarial subagent below STILL runs (it is free and fast). Print: "Codex passes skipped (codex_reviews disabled) — running Claude adversarial only."'
     : 'Skip this section entirely; do NOT fall back to a Claude subagent — disabled means no extra review step. Print: "Codex review skipped (codex_reviews disabled). Re-enable: `gstack-config set codex_reviews enabled`."';
+  const nativeRoute = opts.disabledBehavior === 'codex-only'
+    ? 'Keep the required Claude adversarial pass; do not dispatch a duplicate.'
+    : 'Fall back to the Claude subagent path.';
   return `\`\`\`bash
 # Codex preflight: one block (functions sourced here don't persist to later blocks).
 _TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
@@ -123,11 +137,6 @@ _CODEX_CFG=$(~/.claude/skills/gstack/bin/gstack-config get codex_reviews 2>/dev/
 source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null || true
 if [ "$_CODEX_CFG" = "disabled" ]; then
   ${m}="disabled"
-# Running-under-Codex presence probe (#2519): a live Codex session exports
-# CODEX_THREAD_ID / CODEX_SANDBOX into every shell it spawns (verified
-# against a live \`codex exec 'env | grep -i codex'\` capture, codex 0.147.0).
-# Nested codex spawns from inside a Codex host multiply token burn
-# (observed: one /review = 15M tokens). A stale own-harness artifact must stop.
 elif { [ -n "\${CODEX_THREAD_ID:-}" ] || [ -n "\${CODEX_SANDBOX:-}" ] || [ "\${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
   ${m}="under_codex"
 elif ! command -v codex >/dev/null 2>&1; then
@@ -137,7 +146,8 @@ elif ! _gstack_codex_auth_probe >/dev/null 2>&1; then
 else
   # Capture the probe's code: 2 means the CLI cannot execute at all, which is a
   # different problem (and a different fix) from a model the account can't use.
-  _gstack_codex_model_probe; _CODEX_MP=$?
+  _gstack_codex_model_probe; _CODEX_MP=$?${opts.nativeReview ? `
+  [ "$_CODEX_MP" -ne 0 ] || { _gstack_codex_model_probe review; _CODEX_MP=$?; }` : ''}
   if [ "$_CODEX_MP" -eq 2 ]; then
     ${m}="broken_install"
   elif [ "$_CODEX_MP" -ne 0 ]; then
@@ -151,17 +161,17 @@ echo "CODEX_MODE: $${m}"
 
 Branch on the echoed \`CODEX_MODE\`:
 - **\`disabled\`** — the user turned Codex reviews off (\`codex_reviews=disabled\`). ${disabledLine}
-- **\`not_installed\`** — Codex CLI absent. Print: "Codex not installed — falling back to a Claude subagent (fresh context, but the same harness; model identity is unknown). Install Codex for an actual outside-model read: \`npm install -g @openai/codex\`." Fall back to the Claude subagent path.
+- **\`not_installed\`** — Codex CLI absent. Print: "Codex not installed; outside coverage unavailable. Install: \`npm install -g @openai/codex\`." ${nativeRoute}
 - **\`under_codex\`** — stale artifact selected its own harness. Print: "Codex outside review unavailable: harness mismatch; no outside process started. Missing coverage. Repair: setup --host codex." Skip the outside invocation and follow the workflow's native-review instructions below. Conflicting inherited harness markers are not grounds to guess another provider.
-- **\`not_authed\`** — installed but no credentials. Print: "Codex installed but not authenticated — falling back to a Claude subagent (same harness; model identity is unknown). Run \`codex login\` or set \`$CODEX_API_KEY\`." Fall back to the Claude subagent path.
-- **\`broken_install\`** — the CLI is on PATH but cannot execute (spawn ENOENT, non-executable binary, missing vendor payload). Print: "Codex is installed but its binary cannot run — Codex passes skipped. Reinstall: \`npm install -g @openai/codex\`." Relay the probe's HINT lines and fall back to the Claude subagent path. This state exists because a missing binary used to land in the model probe's fail-open bucket and report \`ready\`, so every Codex pass was skipped silently (#2742).
-- **\`model_unusable\`** — authed but the account cannot use gstack's selected Codex model (#2477: HTTP 400 on every call). Relay the probe's HINT lines, tell the user the one-line fix (set \`GSTACK_CODEX_MODEL=<supported-model>\` or pass an explicit \`-c model=...\` override), and fall back to the Claude subagent path. The ~10s round trip is cached for 1h; timeouts fail open to \`ready\`.
+- **\`not_authed\`** — installed but no credentials. Print: "Codex not authenticated; outside coverage unavailable. Run \`codex login\` or set \`$CODEX_API_KEY\`." ${nativeRoute}
+- **\`broken_install\`** — the CLI is on PATH but cannot execute (spawn ENOENT, non-executable binary, missing vendor payload). Print: "Codex is installed but its binary cannot run — Codex passes skipped. Reinstall: \`npm install -g @openai/codex\`." Relay the probe's HINT lines. ${nativeRoute}
+- **\`model_unusable\`** — the selected model (see \`CODEX_MODEL:\`) is invalid or unavailable to the account (HTTP 400 on every call). Relay the probe's HINT lines and the fix (\`GSTACK_CODEX_MODEL=<supported-model>\` or config.toml \`model\`); never substitute a model. ${nativeRoute} The ~10s round trip is cached for 1h; timeouts fail open to \`ready\`.
 - **\`ready\`** — run the Codex pass below.`;
 }
 
 /**
- * Canonical foreground-dispatch guidance (#497 → #2440 → third recurrence at
- * /ship Step 18). Claude Code v2.1.198 made Agent-tool subagents run in the
+ * Canonical foreground-dispatch guidance (#497 → #2440 → a third recurrence at
+ * a /ship documentation dispatch). Claude Code v2.1.198 made Agent-tool subagents run in the
  * BACKGROUND by default; a synchronous dispatch site must pass the flag
  * explicitly or the parent waits on output that never arrives. Rendered via
  * {{FOREGROUND_DISPATCH_NOTE}} in section templates; resolver sites may
@@ -171,4 +181,4 @@ Branch on the echoed \`CODEX_MODE\`:
 export const CC_BACKGROUND_DEFAULT_SINCE = 'Claude Code v2.1.198';
 
 export const FOREGROUND_DISPATCH_NOTE =
-  `**Foreground required:** pass \`run_in_background: false\` on the Agent call — subagents run in the BACKGROUND by default since ${CC_BACKGROUND_DEFAULT_SINCE}. (Merely omitting the flag no longer produces a foreground run; it must be explicitly false.) The dispatch happens ONLY via the Agent tool: invoking the target as a Skill, or executing its workflow inline in your own context, is WRONG even though the skill may appear in your available-skills list — inline execution forfeits the fresh-context isolation this dispatch exists for, and the explicit flag already makes the Agent call block. (Where a step defines an inline FALLBACK, it applies only after a dispatched subagent has failed.)`;
+  `**Foreground required:** pass \`run_in_background: false\` on the Agent call — subagents run in the background by default since ${CC_BACKGROUND_DEFAULT_SINCE}, so omitting the flag gives a background run. Dispatch through the Agent tool only: invoking the target as a Skill, or executing its workflow inline in your own context, forfeits the fresh-context isolation this dispatch exists for, even though the skill may appear in your available-skills list; the explicit flag already makes the Agent call block. (Where a step defines an inline fallback, it applies only after a dispatched subagent has failed.)`;

@@ -50,6 +50,8 @@ describeIfSelected('PlanTune E2E', ['plan-tune-inspect'], () => {
     for (const script of [
       'gstack-slug',
       'gstack-config',
+      'gstack-state-root.sh',
+      'gstack-remote-identity.sh',
       'gstack-question-log',
       'gstack-question-preference',
       'gstack-developer-profile',

@@ -10,8 +10,8 @@
 
 import { execFileSync } from "child_process";
 import fs from "fs";
-import os from "os";
 import path from "path";
+import { resolveStateRoot } from "../../lib/state-root";
 
 export interface DaemonState {
   pid: number;
@@ -48,11 +48,11 @@ export function resolveLockFilePath(stateFile: string = resolveStateFilePath()):
 }
 
 export function resolveDaemonLogPath(): string {
-  return path.join(os.homedir(), ".gstack", "design-daemon.log");
+  return path.join(resolveStateRoot(), "design-daemon.log");
 }
 
 export function resolveStartupLogPath(): string {
-  return path.join(os.homedir(), ".gstack", "design-daemon-startup.log");
+  return path.join(resolveStateRoot(), "design-daemon-startup.log");
 }
 
 /**

@@ -3,6 +3,8 @@ import { defineHost } from './define-host';
 const claude = defineHost({
   name: 'claude',
   displayName: 'Claude Code',
+  tier: 'full',
+  capabilities: { toolExecution: true, questions: 'native', planMode: true, delegation: true, browser: true, safetyHooks: 'enforced' },
 
   usesEnvVars: false,  // primary host — literal ~ paths, no $GSTACK_ROOT env vars
 
@@ -31,7 +33,7 @@ const claude = defineHost({
     linkingStrategy: 'real-dir-symlink',
   },
 
-  coAuthorTrailer: 'Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>',
+  coAuthorTrailer: 'Co-Authored-By: Claude <noreply@anthropic.com>',
   learningsMode: 'full',
 });
 

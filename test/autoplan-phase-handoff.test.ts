@@ -8,7 +8,6 @@ import { initializePlan, prepareMethodology, createSnapshot, amendImplementation
 import { autoplanPhaseCompletions } from './helpers/autoplan-phase-observer';
 import { auditAutoplanMethodReads, loadAutoplanMethodologyBinding } from './helpers/autoplan-method-read-audit';
 import { readPlanCountTranscript, type NativePublicToolEvent } from './helpers/plan-count-transcript';
-import { readPlanSkillCompletion } from './helpers/plan-skill-completion';
 import captured from './fixtures/autoplan-phase-handoff-6714.json';
 
 const ROOT = resolve(import.meta.dir, '..');
@@ -197,7 +196,6 @@ test('captured parent text and a following tool can share a response without end
   expect(result.hits.map(hit => hit.phase)).toEqual(phases);
   expect(result.tools).toHaveLength(4);
   expect(result.hits.every((hit, index) => hit.ts < Date.parse(result.tools[index]!.timestamp))).toBe(true);
-  expect(readPlanSkillCompletion(root, textEnvelope!.sessionId, 'Phase 3 complete.')).toBeNull();
   // Tool arguments, tool results and sidechain text are not parent announcements.
   expect(read([{ ...rows[1], message: { ...rows[1]!.message, content: [{ type: 'tool_use', id: 'source',
     name: 'Bash', input: { command: 'echo "Phase 1 complete."' } }] } }]).hits).toEqual([]);

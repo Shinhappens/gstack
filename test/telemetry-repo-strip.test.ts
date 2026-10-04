@@ -34,9 +34,9 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { spawnSync } from 'bun';
 import fs from 'fs';
 import path from 'path';
+import { runCapturedCommand } from './helpers/sync-command-capture';
 
 const ROOT = path.resolve(__dirname, '..');
 const SYNC = path.join(ROOT, 'bin', 'gstack-telemetry-sync');
@@ -164,11 +164,13 @@ describe('telemetry no-repo-identity-egress invariant', () => {
     for (const e of strippedRepoExprs) {
       sedArgs.push('-e', e);
     }
-    const out = spawnSync(['sed', ...sedArgs], {
-      stdin: Buffer.from(sample),
+    const out = runCapturedCommand('sed', sedArgs, {
+      input: sample,
+      captureStdout: true,
       timeout: 30_000,
     });
-    const cleaned = out.stdout.toString();
+    expect(out.status, out.stderr).toBe(0);
+    const cleaned = out.stdout;
 
     // No repo/branch identity survives, value or key.
     expect(cleaned).not.toContain('my-secret-repo');
@@ -199,8 +201,8 @@ describe('telemetry no-repo-identity-egress invariant', () => {
     expect(anonymous).toBeTruthy();
 
     const runJq = (filter: string, input: string) => {
-      const out = spawnSync(['jq', '-c', filter], { stdin: Buffer.from(input), timeout: 30_000 });
-      return { exitCode: out.exitCode, stdout: out.stdout.toString().trim() };
+      const out = runCapturedCommand('jq', ['-c', filter], { input, captureStdout: true, timeout: 30_000 });
+      return { exitCode: out.status, stdout: out.stdout.trim() };
     };
 
     const id = runJq(identified!, sample);

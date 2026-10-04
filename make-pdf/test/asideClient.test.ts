@@ -77,13 +77,15 @@ describe("pdfStepOptions", () => {
     expect(pdfStepOptions({ output: "o", pageNumbers: false }).displayHeaderFooter).toBeUndefined();
   });
 
-  test("tagged/outline/printBackground/preferCSSPageSize/toc map to their CDP names", () => {
-    const o = pdfStepOptions({ output: "o", tagged: true, outline: true, printBackground: true, preferCSSPageSize: true, toc: true });
+  test("tagged/outline/printBackground/preferCSSPageSize map to their CDP names", () => {
+    const o = pdfStepOptions({ output: "o", tagged: true, outline: true, printBackground: true, preferCSSPageSize: true });
     expect(o.generateTaggedPDF).toBe(true);
     expect(o.generateDocumentOutline).toBe(true);
     expect(o.printBackground).toBe(true);
     expect(o.preferCSSPageSize).toBe(true);
-    expect(o.waitForPagedJs).toBe(true);
+    // #2903: TOC page numbers come from toc-pages.ts's print loop, never from
+    // the browser-side 3s Paged.js wait (no pagination script ships).
+    expect(o.waitForPagedJs).toBeUndefined();
     // false never emits the key (CDP defaults apply)
     expect(pdfStepOptions({ output: "o", tagged: false, outline: false }).generateTaggedPDF).toBeUndefined();
   });

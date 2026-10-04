@@ -62,8 +62,8 @@ This draft is the review target, not the current branch. For this invocation,
 I want only the review-mode decision; I will handle optional Office Hours and
 setup separately, and run the substantive review later. No review mode has
 been selected. For this mode-only handoff, use the full selected mode name in
-the normal audit record's user_choice and recommended fields, and name it in
-your public decision. A menu letter alone would not identify the chosen mode.`;
+the normal audit record's user_choice and recommended fields and in the skill's
+normal mode handoff line. A menu letter alone would not identify the chosen mode.`;
 
 describeE2E('AUTO_DECIDE opt-in preserved under Conductor flags (periodic)', () => {
   test('user-opted-in question still auto-decides when AskUserQuestion is --disallowedTools', async () => {

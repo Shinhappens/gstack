@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const DIFF_REVIEWS = new Set(['review', 'adversarial-review', 'codex-review', 'design-review-lite', 'ship']);
+const SHARED_LIBS_COVERAGE_VERSION = 1;
 
 function record(value: unknown): value is Record<string, any> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -62,6 +64,103 @@ export function canReuseSharedLibsAdvisory(
   return currentFinding.evidence_paths.every((path: string) => priorCovered.has(path) && covered.has(path));
 }
 
+export function sharedLibsSnapshotCoverage(repo: string, wtree: string, paths: unknown, env = process.env): string[] {
+  if (!repo || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(wtree) || !Array.isArray(paths) ||
+      !Array.from(paths).every(relativeSourcePath)) return [];
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', ['--no-replace-objects', '-c', 'core.fsmonitor=false',
+      '-c', 'core.untrackedCache=false', ...args], {
+      cwd: repo, env: { ...env, GIT_OPTIONAL_LOCKS: '0', GIT_LITERAL_PATHSPECS: '1', GIT_NO_LAZY_FETCH: '1' },
+      timeout: 10_000, maxBuffer: 64 * 1024 * 1024,
+    });
+    if (result.status !== 0 || result.error) throw new Error('Git snapshot inspection failed');
+    return result.stdout;
+  };
+  try {
+    const config = new Map(git('config', '--list', '-z').toString().split('\0').filter(Boolean).map(item => {
+      const split = item.indexOf('\n');
+      return split < 0 ? [item.toLowerCase(), 'true'] as const
+        : [item.slice(0, split).toLowerCase(), item.slice(split + 1)] as const;
+    }));
+    if (config.has('core.autocrlf') && config.get('core.autocrlf')?.toLowerCase() !== 'false') return [];
+    if ([...config.keys()].some(key => key === 'extensions.partialclone' || /^remote\..*\.promisor$/.test(key))) return [];
+    if (git('cat-file', '-t', wtree).toString().trim() !== 'tree') return [];
+  } catch { return []; }
+
+  return [...new Set(paths as string[])].filter(path => {
+    let fd: number | undefined;
+    try {
+      let absolute = repo;
+      for (const component of path.split('/')) {
+        absolute = join(absolute, component);
+        const stat = lstatSync(absolute);
+        if (stat.isSymbolicLink() || (!stat.isDirectory() && absolute !== join(repo, path))) return false;
+      }
+      const before = lstatSync(absolute);
+      if (!before.isFile()) return false;
+      const ignored = spawnSync('git', ['-c', 'core.fsmonitor=false', 'check-ignore', '--no-index', '-q', '--', path], {
+        cwd: repo, env: { ...env, GIT_OPTIONAL_LOCKS: '0', GIT_LITERAL_PATHSPECS: '0' }, timeout: 10_000,
+      });
+      if (ignored.status !== 1 || ignored.error) return false;
+      const tracked = git('ls-files', '-v', '-z', '--', path).toString();
+      if (tracked ? tracked !== `H ${path}\0`
+        : git('ls-files', '--others', '--exclude-standard', '-z', '--', path).toString() !== `${path}\0`) return false;
+      if (tracked) {
+        const stage = git('ls-files', '--stage', '--sparse', '-z', '--', path).toString();
+        if (!/^(?:100644|100755) [0-9a-f]+ 0\t/.test(stage) || stage.split('\0').filter(Boolean).length !== 1) return false;
+      }
+      const names = ['filter', 'working-tree-encoding', 'ident', 'text', 'eol', 'crlf'];
+      const attrs = git('check-attr', '-z', ...names, '--', path).toString().split('\0');
+      if (attrs.length !== names.length * 3 + 1) return false;
+      for (let i = 0; i < names.length; i++) {
+        if (attrs[i * 3] !== path || attrs[i * 3 + 1] !== names[i] ||
+            !['unspecified', 'unset'].includes(attrs[i * 3 + 2])) return false;
+      }
+      const entry = git('ls-tree', '-z', wtree, '--', path).toString();
+      const match = /^(100644|100755) blob ([0-9a-f]+)\t([^\0]+)\0$/.exec(entry);
+      if (!match || match[3] !== path) return false;
+      if (process.platform !== 'win32' && (Boolean(before.mode & 0o111) !== (match[1] === '100755'))) return false;
+      fd = openSync(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const bytes = readFileSync(fd);
+      const after = fstatSync(fd);
+      if ((['dev', 'ino', 'mode', 'size', 'mtimeMs', 'ctimeMs'] as const).some(key => before[key] !== after[key])) return false;
+      return bytes.equals(git('cat-file', 'blob', match[2]));
+    } catch { return false; }
+    finally { if (fd !== undefined) closeSync(fd); }
+  });
+}
+
+export function checkSharedLibsReuse(finding: unknown, token: string, env = process.env): Record<string, any> {
+  const fingerprint = sharedLibsFingerprint(finding);
+  const result: Record<string, any> = { reusable: false, fingerprint };
+  if (!fingerprint || !record(finding) || !/^[0-9a-f-]{36}$/.test(token) ||
+      !env.GSTACK_REVIEW_REPO || !env.GSTACK_REVIEW_BRANCH || !env.GSTACK_STAMP_WTREE ||
+      !env.GSTACK_REVIEW_DIR || !env.GSTACK_REVIEW_LOG) return result;
+  try {
+    const start = JSON.parse(readFileSync(join(env.GSTACK_REVIEW_DIR, '.review-starts', `${token}.json`), 'utf8'));
+    result.review_start = start;
+    if (start.skill !== 'review' || start.repo !== env.GSTACK_REVIEW_REPO ||
+        start.branch !== env.GSTACK_REVIEW_BRANCH || start.wtree !== env.GSTACK_STAMP_WTREE) return result;
+    const snapshot = {
+      wtree: start.wtree, branch_id: sha256(start.branch),
+      covered_paths: sharedLibsSnapshotCoverage(start.repo, start.wtree, finding.evidence_paths, env),
+    };
+    result.snapshot = snapshot;
+    const rows = readFileSync(env.GSTACK_REVIEW_LOG, 'utf8').split('\n').filter(Boolean);
+    for (const row of rows.reverse()) {
+      let prior;
+      try { prior = JSON.parse(row); } catch { continue; }
+      if (!record(prior) || prior.shared_libs_coverage_version !== SHARED_LIBS_COVERAGE_VERSION ||
+          !Array.isArray(prior.findings)) continue;
+      if (prior.findings.some(value => canReuseSharedLibsAdvisory(value, finding, prior, snapshot))) {
+        result.reusable = true;
+        return result;
+      }
+    }
+  } catch { return result; }
+  return result;
+}
+
 export function captureReviewStart(skill: string, env = process.env): string {
   if (!DIFF_REVIEWS.has(skill) || !env.GSTACK_STAMP_WTREE || !env.GSTACK_REVIEW_REPO) {
     throw new Error('cannot capture a diff review without a working-tree fingerprint');
@@ -77,7 +176,7 @@ export function captureReviewStart(skill: string, env = process.env): string {
 }
 
 export function bindReview(rec: Record<string, any>, token: string, env = process.env): Record<string, any> {
-  for (const key of ['commit_full', 'tree', 'wtree', 'dirty', 'review_binding', 'review_freshness']) delete rec[key];
+  for (const key of ['commit_full', 'tree', 'wtree', 'dirty', 'review_binding', 'review_freshness', 'shared_libs_coverage_version']) delete rec[key];
   if (env.GSTACK_STAMP_COMMIT_FULL) rec.commit_full = env.GSTACK_STAMP_COMMIT_FULL;
   if (env.GSTACK_STAMP_TREE) rec.tree = env.GSTACK_STAMP_TREE;
   if (env.GSTACK_STAMP_DIRTY) rec.dirty = env.GSTACK_STAMP_DIRTY === 'true';
@@ -108,6 +207,19 @@ export function bindReview(rec: Record<string, any>, token: string, env = proces
     ...(typeof start?.branch === 'string' && start.branch.length > 0 ? { branch_id: sha256(start.branch) } : {}),
   };
   if (state === 'verified') rec.wtree = end;
+  if (rec.skill === 'review' && Array.isArray(rec.findings)) {
+    rec.shared_libs_coverage_version = SHARED_LIBS_COVERAGE_VERSION;
+    for (const finding of rec.findings) {
+      if (!record(finding)) continue;
+      delete finding.snapshot_covered_paths;
+      if (finding.advisory !== true || finding.severity !== 'INFORMATIONAL') continue;
+      const fingerprint = sharedLibsFingerprint(finding);
+      if (!fingerprint) continue;
+      finding.fingerprint = fingerprint;
+      finding.snapshot_covered_paths = state === 'verified' && finding.action === 'skipped'
+        ? sharedLibsSnapshotCoverage(env.GSTACK_REVIEW_REPO!, end!, finding.evidence_paths, env) : [];
+    }
+  }
   return rec;
 }
 

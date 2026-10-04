@@ -7,8 +7,8 @@ Pretext API usage patterns. Follow them exactly.
 
 **Pattern 1: Basic height computation (Simple layout, Card/grid)**
 ```js
-import { prepare, layout } from './pretext-inline.js'
-// Or if inlined: const { prepare, layout } = window.Pretext
+import { prepare, layout } from '@chenglou/pretext'
+// Vanilla HTML: omit the import; this code follows the inlined bundle in the same <script type="module">
 
 // 1. PREPARE — one-time, after fonts load
 await document.fonts.ready
@@ -47,37 +47,26 @@ for (const el of elements) {
 
 **Pattern 2: Shrinkwrap / tight-fit containers (Chat bubbles)**
 ```js
-import { prepareWithSegments, walkLineRanges } from './pretext-inline.js'
+import { prepareWithSegments, walkLineRanges } from '@chenglou/pretext'
 
-// Find the tightest width that produces the same line count
-function shrinkwrap(text, font, maxWidth, lineHeight) {
+// Tight-fit width: lay out at maxWidth, then shrink the bubble to its widest line
+function shrinkwrap(text, font, maxWidth) {
   const segs = prepareWithSegments(text, font)
-  let bestWidth = maxWidth
-  walkLineRanges(segs, maxWidth, (lineCount, startIdx, endIdx) => {
-    // walkLineRanges calls back with progressively narrower widths
-    // The first call gives us the line count at maxWidth
-    // We want the narrowest width that still produces this line count
+  let widest = 0
+  const lineCount = walkLineRanges(segs, maxWidth, (line) => {
+    widest = Math.max(widest, line.width)
   })
-  // Binary search for tightest width with same line count
-  const { lineCount: targetLines } = layout(prepare(text, font), maxWidth, lineHeight)
-  let lo = 0, hi = maxWidth
-  while (hi - lo > 1) {
-    const mid = (lo + hi) / 2
-    const { lineCount } = layout(prepare(text, font), mid, lineHeight)
-    if (lineCount === targetLines) hi = mid
-    else lo = mid
-  }
-  return hi
+  return { width: Math.ceil(widest), lineCount }
 }
 ```
 
 **Pattern 3: Text around obstacles (Editorial layout)**
 ```js
-import { prepareWithSegments, layoutNextLine } from './pretext-inline.js'
+import { prepareWithSegments, layoutNextLine } from '@chenglou/pretext'
 
 function layoutAroundObstacles(text, font, containerWidth, lineHeight, obstacles) {
   const segs = prepareWithSegments(text, font)
-  let state = null
+  let cursor = { segmentIndex: 0, graphemeIndex: 0 }
   let y = 0
   const lines = []
 
@@ -90,11 +79,11 @@ function layoutAroundObstacles(text, font, containerWidth, lineHeight, obstacles
       }
     }
 
-    const result = layoutNextLine(segs, state, availWidth, lineHeight)
+    const result = layoutNextLine(segs, cursor, availWidth)
     if (!result) break
 
     lines.push({ text: result.text, width: result.width, x: 0, y })
-    state = result.state
+    cursor = result.end
     y += lineHeight
   }
 
@@ -104,21 +93,21 @@ function layoutAroundObstacles(text, font, containerWidth, lineHeight, obstacles
 
 **Pattern 4: Full line-by-line rendering (Complex editorial)**
 ```js
-import { prepareWithSegments, layoutWithLines } from './pretext-inline.js'
+import { prepareWithSegments, layoutWithLines } from '@chenglou/pretext'
 
 const segs = prepareWithSegments(text, font)
 const { lines, height } = layoutWithLines(segs, containerWidth, lineHeight)
 
-// lines = [{ text, width, x, y }, ...]
+// lines = [{ text, width, start, end }, ...] (no x/y: line i sits at y = i * lineHeight)
 // Use for Canvas/SVG rendering or custom DOM positioning
-for (const line of lines) {
+lines.forEach((line, i) => {
   const span = document.createElement('span')
   span.textContent = line.text
   span.style.position = 'absolute'
-  span.style.left = `${line.x}px`
-  span.style.top = `${line.y}px`
+  span.style.left = '0px'
+  span.style.top = `${i * lineHeight}px`
   container.appendChild(span)
-}
+})
 ```
 
 ### Pretext API Reference
@@ -136,16 +125,17 @@ layout(prepared, maxWidth, lineHeight) → { height, lineCount }
 prepareWithSegments(text, font) → handle
   Like prepare() but enables line-level APIs below.
 
-layoutWithLines(segs, maxWidth, lineHeight) → { lines: [{text, width, x, y}...], height }
-  Full line-by-line breakdown. For Canvas/SVG rendering.
+layoutWithLines(segs, maxWidth, lineHeight) → { lineCount, height, lines: [{text, width, start, end}...] }
+  Full line-by-line breakdown (no x/y: line i is at y = i * lineHeight). For Canvas/SVG rendering.
 
-walkLineRanges(segs, maxWidth, onLine) → void
-  Calls onLine(lineCount, startIdx, endIdx) for each possible layout.
-  Find minimum width for N lines. For tight-fit containers.
+walkLineRanges(segs, maxWidth, onLine) → lineCount
+  Calls onLine({ width, start, end }) once per line at maxWidth (no text built).
+  The widest line's width is the tight-fit container width. For chat bubbles.
 
-layoutNextLine(segs, state, maxWidth, lineHeight) → { text, width, state } | null
+layoutNextLine(segs, cursor, maxWidth) → { text, width, start, end } | null
   Iterator. Different maxWidth per line = text around obstacles.
-  Pass null as initial state. Returns null when text is exhausted.
+  Start with cursor { segmentIndex: 0, graphemeIndex: 0 }; pass result.end next.
+  Returns null when text is exhausted. Takes no lineHeight: advance y yourself.
 
 clearCache() → void
   Clears internal measurement caches. Use when cycling many fonts.

@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {getQuestion} from '../scripts/question-registry';
-import {E2E_TOUCHFILES} from './helpers/touchfiles-data';
 import {CARVE_GUARDS} from './helpers/carve-guards';
 const root=path.resolve(import.meta.dir,'..');
 const temp=fs.mkdtempSync(path.join(os.tmpdir(),'gstack-ceo-mode-preference-'));
@@ -121,13 +120,11 @@ test('only an explicit user selection or enabled successful mode check bypasses 
   expect(s).toContain('For >15 planned changed files, recommend SCOPE REDUCTION');
   expect(document).toContain('more than 8 files or more than 2 new classes/services');
   expect(s.replace(/\s+/g,' ')).toContain('ask about each proposed addition or cut, including those prompted by file-count thresholds');
-  expect(s).toContain('Count distinct planned file additions, edits and deletions, labeling estimates');
+  expect(s.replace(/\s+/g,' ')).toContain('Count distinct planned file additions, edits and deletions');
+  expect(s.replace(/\s+/g,' ')).toContain('mark estimated counts as estimates');
   expect(s).toContain('These modes differ in kind, not coverage; do NOT score completeness');
   expect(document).toContain('Note: options differ in kind, not coverage — no completeness score.');
  }
-});
-test('the new render/runtime regression belongs to the existing auto-decide owner',()=>{
- expect(Object.entries(E2E_TOUCHFILES).filter(([,v])=>v.includes('test/ceo-mode-preference-al.test.ts')).map(([k])=>k)).toEqual(['auto-decide-preserved']);
 });
 test('rendered mode contract stays within the existing canonical skeleton cap',()=>{
  // --out-dir changes section-link roots only. Undo that output-location

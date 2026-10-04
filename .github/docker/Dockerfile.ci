@@ -77,13 +77,27 @@ RUN curl --retry 5 --retry-delay 5 --retry-connrefused -fsSL "https://nodejs.org
     && npm --version
 
 # Bun (install to /usr/local so non-root users can access it).
-# The version MUST be passed as a positional arg — bun.sh/install ignores a
-# BUN_VERSION env var, so the old `| BUN_VERSION=x.y.z bash` form silently
-# installed latest on every image rebuild (observed: 1.3.13/1.3.14 drift vs
-# the 1.3.10 devs ran locally).
+# The exact release archive, verified by SHA-256 before it is unpacked
+# (#1706). The old `curl https://bun.sh/install | bash -s bun-vX.Y.Z` ran
+# whatever script the network served at build time, and before that the
+# `| BUN_VERSION=x.y.z bash` form silently installed latest on every rebuild.
+# Hashes come from the release's SHASUMS256.txt. The image builds linux/amd64
+# only (the Node.js tarball above is linux-x64); an architecture without a
+# verified archive fails here. test/ci-image-cli-pin.test.ts pins this shape.
+ARG BUN_VERSION=1.4.0
+ARG TARGETARCH
 ENV BUN_INSTALL="/usr/local"
-RUN curl --retry 5 --retry-delay 5 --retry-connrefused -fsSL https://bun.sh/install \
-    | bash -s "bun-v1.4.0"
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) bun_target=linux-x64; bun_sha256=2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452 ;; \
+      *) echo "Dockerfile.ci: no verified Bun ${BUN_VERSION} archive for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl --retry 5 --retry-delay 5 --retry-connrefused -fsSL \
+      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-${bun_target}.zip" -o /tmp/bun.zip \
+    && echo "${bun_sha256}  /tmp/bun.zip" | sha256sum -c - \
+    && unzip -q /tmp/bun.zip -d /tmp/bun \
+    && install -D -m 0755 "/tmp/bun/bun-${bun_target}/bun" "${BUN_INSTALL}/bin/bun" \
+    && rm -rf /tmp/bun /tmp/bun.zip \
+    && test "$(bun --version)" = "${BUN_VERSION}"
 
 # Claude CLI — pinned to an EXACT version, same discipline as the bun pin
 # above. The PTY harness (test/helpers/claude-pty-runner.ts) screen-scrapes
@@ -93,7 +107,27 @@ RUN curl --retry 5 --retry-delay 5 --retry-connrefused -fsSL https://bun.sh/inst
 # skillify HOME discovery on 2.1.237, guard/freeze hooks on 2.1.162).
 # Bump deliberately, via a PR that runs the PTY gate against the new TUI.
 # test/ci-image-cli-pin.test.ts fails the free suite if this pin is removed.
-RUN npm i -g @anthropic-ai/claude-code@2.1.251
+# 2.1.284 is the first pin that recognizes the eval model claude-fable-5-1.
+# 2.1.251 already sent it effort "high", but ran it as an unknown model with
+# a generic system prompt. Users on stable (2.1.280) and latest (2.1.285) get
+# the fable-5-1 profile: its own system prompt, 64k max_tokens and per-turn
+# effort, which only moves the same effort value into the conversation.
+# Census 36626737820 on 2.1.284 looked slower mostly because the API was:
+# its SDK-only judge evals, which never start this CLI, were 25% slower too.
+RUN npm i -g @anthropic-ai/claude-code@2.1.284
+
+# Codex CLI — exact pin, same discipline as the claude pin above, so the
+# Codex eval files execute in CI instead of self-skipping. Installed OFF PATH:
+# a skill's outside-voice probe (`command -v codex`) must keep reporting
+# not_installed in every other paid case. The paid shard runner puts this
+# directory on PATH only for the Codex files (scripts/lib/paid-cases.ts scopeCodexAccess).
+# The image carries no credential: the eval workflows run `codex login
+# --with-api-key` from the OPENAI_API_KEY secret in same-repo runs only
+# (codex 0.160.0 does not read OPENAI_API_KEY from the environment).
+ENV GSTACK_CI_CODEX_BIN_DIR=/opt/codex/bin
+RUN npm i -g --prefix=/opt/codex @openai/codex@0.160.0 \
+    && test -x /opt/codex/bin/codex \
+    && ! command -v codex
 
 # Playwright system deps (Chromium) — needed for browse E2E tests
 RUN npx playwright install-deps chromium
@@ -137,7 +171,7 @@ RUN npx playwright install chromium \
     && chmod -R a+rX /opt/playwright-browsers
 
 # Verify everything works
-RUN bun --version && node --version && claude --version && jq --version && gh --version \
+RUN bun --version && node --version && claude --version && /opt/codex/bin/codex --version && jq --version && gh --version \
     && python3 --version && command -v file && command -v pdftotext && command -v pdffonts && command -v pdfinfo \
     && npx playwright --version \
     && fc-match "Liberation Sans" | grep -qi "Liberation" \

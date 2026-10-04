@@ -29,7 +29,9 @@ BASH_COMPAT=50
 
 set -uo pipefail
 
-GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
+. "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select
+GSTACK_HOME="$_gstack_sr_root"
 # Maildir-style spool: one FILE per record, <epoch>-<pid>-<uniq>.json.
 # Writers (gstack-brain-enqueue, --discover-new) create records via tmp-file
 # + atomic rename; the drain deletes exactly the files it snapshotted. No
@@ -243,10 +245,11 @@ compute_paths_to_stage() {
   local mode="$1"
   local class_file="${2:-}"
   local snapshot_file="${3:-}"
-  python3 - "$GSTACK_HOME" "$QUEUE_DIR" "$ALLOWLIST" "$PRIVACY_MAP" "$SKIP_FILE" "$mode" "$class_file" "$snapshot_file" <<'PYEOF'
+  local transcripts_ok="${4:-0}"
+  python3 - "$GSTACK_HOME" "$QUEUE_DIR" "$ALLOWLIST" "$PRIVACY_MAP" "$SKIP_FILE" "$mode" "$class_file" "$snapshot_file" "$transcripts_ok" <<'PYEOF'
 import sys, json, os, fnmatch, glob
 
-gstack_home, spool_dir, allowlist_path, privacy_path, skip_path, mode, class_file, snapshot_file = sys.argv[1:9]
+gstack_home, spool_dir, allowlist_path, privacy_path, skip_path, mode, class_file, snapshot_file, transcripts_ok = sys.argv[1:10]
 
 def load_lines(path):
     try:
@@ -363,6 +366,11 @@ for p in sorted(queue_paths):
     if not path_matches_any(p, allowlist_globs):
         classified["dropped"]["unmatched"].append(p)
         continue
+    # Staged transcript pages need transcript consent; without it they stay
+    # queued (retained) and on disk, and push once the user consents.
+    if transcripts_ok != "1" and p.split("/")[0] == "transcripts":
+        classified["retained"].append(p)
+        continue
     # Must survive privacy mode filter — held entries STAY QUEUED (retained):
     # they would sync under a higher artifacts_sync_mode, and reporting them
     # as "no allowlisted changes" was #2549's misattribution.
@@ -383,6 +391,40 @@ if class_file:
 for p in final:
     print(p)
 PYEOF
+}
+
+# Transcript consent comes from the one shared policy reader
+# (lib/transcript-consent.ts): every merged state root, the new@ cutoff and the
+# transcript_repos allowlist. Without bun nothing transcript-related can be
+# checked, so transcript pages are held (fail-closed).
+CONSENT_TS="$SCRIPT_DIR/../lib/transcript-consent.ts"
+transcript_policy() {
+  command -v bun >/dev/null 2>&1 || return 2
+  GSTACK_STATE_ROOT="$GSTACK_HOME" bun run "$CONSENT_TS" "$@"
+}
+
+# 0 when staged transcript pages may sync at all.
+transcripts_consented() {
+  transcript_policy --check 2>/dev/null
+}
+
+# Before every push: scan the unpublished range for transcript pages outside
+# the current consent; when some exist, the helper rewrites gstack-brain-sync's
+# own unpublished commits without them, or refuses (exit 3) when it cannot.
+# Returns 0 when the push may go ahead. A range that touches no transcript
+# page needs no scan (and no bun).
+guard_unpublished_range() {
+  local branch range="HEAD" rc=0
+  branch=$(git -C "$GSTACK_HOME" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  if [ -n "$branch" ] && [ "$branch" != "HEAD" ] && git -C "$GSTACK_HOME" rev-parse --verify --quiet "origin/$branch" >/dev/null 2>&1; then
+    range="origin/$branch..HEAD"
+  fi
+  [ -n "$(git -C "$GSTACK_HOME" log --format= --name-only "$range" -- transcripts 2>/dev/null | head -1)" ] || return 0
+  transcript_policy --guard-unpublished || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "BRAIN_SYNC: push blocked: unpushed commits hold transcript pages and bun is not on PATH to check them against your transcript consent" >&2
+  fi
+  [ "$rc" -eq 0 ]
 }
 
 # Finalize the drain: delete exactly the spool record files this drain
@@ -618,7 +660,7 @@ subcmd_once() {
     det_now=$(date +%s)
     det_last=$(cat "$GSTACK_HOME/.brain-last-push-attempt" 2>/dev/null || echo 0)
     case "$det_last" in ''|*[!0-9]*) det_last=0 ;; esac
-    if [ "$det_unpushed" -gt 0 ] && [ "$det_unpushed" -eq "$det_total" ] && [ $(( det_now - det_last )) -ge 600 ]; then
+    if [ "$det_unpushed" -gt 0 ] && [ "$det_unpushed" -eq "$det_total" ] && [ $(( det_now - det_last )) -ge 600 ] && guard_unpublished_range; then
       echo "$det_now" > "$GSTACK_HOME/.brain-last-push-attempt" 2>/dev/null || true
       local det_host
       det_host=$(remote_host)
@@ -657,7 +699,12 @@ subcmd_once() {
   # snapshot manifest but no classification. Finalizing on that state is what
   # used to wipe the queue — so on a nonzero exit, warn loudly, do NOT call
   # finalize_queue, and leave everything queued for the next drain.
-  if ! compute_paths_to_stage "$mode" "$class_file" "$snapshot_file" > "$paths_file"; then
+  # Tightened consent (new@ cutoff, narrower transcript_repos): remove the
+  # unpublished staged pages it now excludes before anything is staged.
+  [ -d "$GSTACK_HOME/transcripts" ] && { transcript_policy --purge || true; }
+  local transcripts_ok=0
+  transcripts_consented && transcripts_ok=1
+  if ! compute_paths_to_stage "$mode" "$class_file" "$snapshot_file" "$transcripts_ok" > "$paths_file"; then
     echo "BRAIN_SYNC: warning: queue classification failed — no records consumed; next run re-drains" >&2
     write_status "error" "classification failed; queue preserved (next run retries)"
     exit 0
@@ -722,6 +769,8 @@ subcmd_once() {
       exit 0
     }
 
+  # Nothing outside the transcript consent is pushed; a refused rewrite keeps the commit local.
+  guard_unpublished_range || { write_status "blocked" "push blocked: unpushed commits hold transcript pages outside your transcript consent; commit retained locally"; finalize_queue "$snapshot_file" "$class_file" "$paths_file"; exit 0; }
   # Push. On reject, fetch + merge (merge driver handles JSONL) + retry once.
   local push_err
   push_err=$(git -C "$GSTACK_HOME" push origin HEAD 2>&1 >/dev/null) || {
@@ -745,7 +794,7 @@ subcmd_once() {
         bash -c 'git -C "$1" fetch origin 2>/dev/null' _ "$GSTACK_HOME"; then
       local branch
       branch=$(git -C "$GSTACK_HOME" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
-      if git -C "$GSTACK_HOME" merge --no-edit "origin/$branch" >/dev/null 2>&1; then
+      if git -C "$GSTACK_HOME" merge --no-edit "origin/$branch" >/dev/null 2>&1 && guard_unpublished_range; then
         if GSTACK_HOME="$GSTACK_HOME" _receipted_git closed brain-sync "$push_host" curated-memory-git-push "artifacts_sync_mode!=off" \
             bash -c 'git -C "$1" push origin HEAD 2>/dev/null' _ "$GSTACK_HOME"; then
           finalize_queue "$snapshot_file" "$class_file" "$paths_file"

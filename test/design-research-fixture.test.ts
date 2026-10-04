@@ -1,8 +1,6 @@
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { extractDesignResearchContract } from './helpers/skill-fixture';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
-
 const source = readFileSync(new URL('../design-consultation/SKILL.md', import.meta.url), 'utf8');
 
 test('research-only fixture supplies actual readiness and egress dependencies without expanding scope', () => {
@@ -22,10 +20,4 @@ test('research-only fixture supplies actual readiness and egress dependencies wi
 test.each(['## BROWSER SETUP', '### Rules for driving a real browser', '## Web research runs in Aside',
   '## Phase 2: Research', '**Step 1: Identify', '**Step 2: Visual research', '_aside_exec()'])('missing %s fails closed before a paid run', marker => {
   expect(() => extractDesignResearchContract(source.replace(marker, 'REMOVED'))).toThrow();
-});
-
-test('research fixture changes select their actual live consumer', () => {
-  for (const file of ['test/helpers/skill-fixture.ts', 'test/design-research-fixture.test.ts']) {
-    expect(selectTests([file], E2E_TOUCHFILES, []).selected).toContain('design-consultation-research');
-  }
 });

@@ -3,11 +3,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createPtyScreen } from './helpers/pty-screen';
-import { capturePlanCountQuestion, createPlanCountPermissionGuard, isPermissionDialogVisible, matchesNativePlanQuestion, nativePlanCallFingerprint, stripAnsi } from './helpers/claude-pty-runner';
-import { autoplanRoutingSetupInput } from './helpers/autoplan-setup-question';
+import { capturePlanCountQuestion, createPlanCountPermissionGuard, isPermissionDialogVisible, stripAnsi } from './helpers/claude-pty-runner';
 import { createPlanCountSnapshotWriter } from './helpers/plan-count-artifacts';
-import { pickCeoCompletionHandoff } from './helpers/ceo-completion-handoff';
-import type { NativePlanQuestionCall } from './helpers/plan-count-transcript';
 
 function seed(frame: { initial: string[]; cursor: { x: number; y: number } }): string {
   return '\x1b[?1049h\x1b[2J' + frame.initial.map((line, i) => `\x1b[${i + 1};1H${line}\x1b[K`).join('') +
@@ -69,69 +66,6 @@ describe('owned PTY viewport', () => {
       expect(question?.options).toHaveLength(2);
     } finally { await screen.dispose(); }
   });
-
-  test('clipped native handoff preserves its bound manual choice in either option order', async () => {
-    for (const contextLines of [36, 41]) for (const reverse of [false, true]) {
-      // The captured CEO handoff explains the required gate in this choice.
-      // Keep that native evidence even when the viewport clips its heading.
-      const options = [{ label: 'Run /plan-eng-review next',
-        description: 'Eng Review is the only required gate before shipping. Covers architecture, code quality, tests, and performance at the diff level. Run it now to clear the shipping gate.',
-      }, { label: "Done — I'll handle reviews manually" }];
-      if (reverse) options.reverse();
-      const call: NativePlanQuestionCall = { sessionId: 'long-handoff', toolUseId: 'pending', answered: false,
-        questions: [{ header: 'Next review',
-          question: 'CEO review is complete. Which next review should run? <gstack-qid:plan-ceo-next-steps>\n' +
-            Array.from({ length: contextLines }, (_, i) => `Review context line ${i + 1}: the existing requirements remain approved.`).join('\n'),
-          options }] };
-      const q = call.questions[0]!;
-      const screen = await createPtyScreen(120, 40);
-      try {
-        screen.write(`☐ ${q.header}\r\n${q.question.replace(/\n/g, '\r\n')}\r\n` +
-          `❯ 1. ${options[0]!.label}\r\n  2. ${options[1]!.label}\r\nEnter to select · ↑/↓ to navigate · Esc to cancel`);
-        const current = await screen.read();
-        expect(current).not.toContain('☐ Next review');
-        expect(current.includes('<gstack-qid:')).toBe(contextLines === 36);
-        expect(matchesNativePlanQuestion(current, call)).toBe(true);
-        const seen = new Set<string>();
-        const capture = capturePlanCountQuestion(current, seen, 0, false, call);
-        expect(capture?.nativeCall).toBe(call);
-        expect(pickCeoCompletionHandoff(nativePlanCallFingerprint(call, 0, false), capture!)).toBe(reverse ? 1 : 2);
-        expect(capturePlanCountQuestion(current, seen, 1, false, call)).toBeNull();
-        for (const unrelated of [
-          // Same choices are not identity, even with an intact native footer.
-          current.slice(current.indexOf('❯ 1.')),
-          current.replace('Review context line', 'Unrelated context line'),
-          'A different question with shared context?\n' + current,
-          current.replace('2. ' + options[1]!.label, '2. Approve a new implementation task'),
-          current.replace('↑/↓ to navigate', '↑/↓ to navigte'),
-          current + '\nDo you want to create another.md?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend',
-        ]) {
-          expect(matchesNativePlanQuestion(unrelated, call)).toBe(false);
-          const other = capturePlanCountQuestion(unrelated, new Set(), 0, false, call);
-          expect(other?.nativeCall).toBeUndefined();
-          if (other) expect(pickCeoCompletionHandoff(nativePlanCallFingerprint(call, 0, false), other)).toBeNull();
-        }
-        expect(capturePlanCountQuestion(current, new Set(), 0, false, { ...call, failed: true })?.nativeCall).toBeUndefined();
-      } finally { await screen.dispose(); }
-    }
-  });
-
-  for (const chunkSize of [37, 4096]) {
-    test(`captured routing redraw recovers the intact manual option (${chunkSize}-character chunks)`, async () => {
-      const frame = fixture('autoplan');
-      const screen = await createPtyScreen(frame.cols, frame.rows);
-      try {
-        screen.write(seed(frame));
-        for (let i = 0; i < frame.update.length; i += chunkSize) screen.write(frame.update.slice(i, i + chunkSize));
-        const current = await screen.read();
-        expect(current.split('\n').map(line => line.trimEnd())).toEqual(frame.expected.map((line: string) => line.trimEnd()));
-        expect(current).toContain("2. No thanks, I'll invoke skills manually");
-        expect(stripAnsi(frame.update)).toContain("2. N thanks, I'll invokeskillsmanually");
-        expect(autoplanRoutingSetupInput(current, new Set())).toBe('1');
-      } finally { await screen.dispose(); }
-    });
-  }
-
   test('historical file results release a new current permission but cannot activate stale scrollback', () => {
     const menu = 'Do you want to create plan.md?\n❯1.Yes\n2.No\nEsc to cancel · Tab to amend';
     const completed = menu + '\n⎿ Wrote 44 lines';

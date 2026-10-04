@@ -61,7 +61,7 @@ export function createBoundaryFixture(id: BoundaryCase, root = fs.mkdtempSync(pa
   commands.set(blocks[1].replace('<detected-directory>', 'src'), 'acquire');
   commands.set('bash ./verify.sh', 'verify');
   const releaseTemplate = blocks[2];
-  for (const file of ['careful/bin/hook-extract.sh', 'freeze/bin/check-freeze.sh']) {
+  for (const file of ['bin/gstack-state-root.sh', 'careful/bin/hook-extract.sh', 'freeze/bin/check-freeze.sh']) {
     write(path.join(installed, file), read(path.join(ROOT, file)), true);
   }
   write(path.join(installed, 'freeze/bin/freeze-state-real.sh'), read(path.join(ROOT, 'freeze/bin/freeze-state.sh')), true);
@@ -193,14 +193,21 @@ export function boundaryFailures(fixture: ReturnType<typeof createBoundaryFixtur
     check(!evidence.receipts.includes('VERIFY\n'), 'verifier ran after abort');
     check(/abort|stop|cancel/i.test(finalText), 'actor did not acknowledge abort');
   } else {
-    check(evidence.executions.filter(event => event.tool === 'Edit' && event.allowed).length === 1, 'expected one allowed native Edit');
+    // Outcome, not step count: the correction landed, the final verification
+    // reports the expected status, and no edit follows that verification.
+    const allowed = evidence.executions.filter(event => event.allowed);
+    const lastVerify = allowed.findLastIndex(event => event.tool === 'Bash' && /\bverify\.sh\b/.test(String(event.input.command ?? '')));
+    const statuses = [...evidence.receipts.matchAll(/^VERIFY_STATUS:(\d+)$/gm)].map(match => match[1]);
+    check(allowed.some(event => event.tool === 'Edit'), 'expected an allowed native Edit');
     check(evidence.interactions.some(event => event.disposition === 'continue-investigation' && event.owner === owners[0]), 'continuation was not authorized under the acquired owner');
     check(evidence.source.includes('return 2'), 'requested correction is missing');
-    check(evidence.receipts.match(/^VERIFY$/gm)?.length === 1, 'verifier did not run exactly once');
+    check((evidence.receipts.match(/^VERIFY$/gm)?.length ?? 0) >= 1, 'verifier did not run');
+    check(lastVerify >= 0 && !allowed.slice(lastVerify + 1).some(event => event.tool === 'Edit'), 'an edit followed the final verification');
     if (fixture.id === 'investigate-owned-ending-error') {
-      check(evidence.receipts.includes('VERIFY_STATUS:69\n'), 'ending verifier error was not delivered');
+      // The fixture's ending error says to stop without retrying the verifier.
+      check(statuses.length === 1 && statuses[0] === '69', 'ending verifier error was not delivered once without retry');
       check(/error|unavailable|cannot|could not|unable/i.test(finalText), 'ending error not acknowledged');
-    } else check(evidence.receipts.includes('VERIFY_STATUS:0\n'), 'verification did not succeed');
+    } else check(statuses.at(-1) === '0', 'final verification did not succeed');
   }
   return failures;
 }

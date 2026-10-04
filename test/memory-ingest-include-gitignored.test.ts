@@ -14,7 +14,7 @@
  * from a healthy one, and the memory corpus quietly stops growing.
  *
  * Two tests here:
- *  1. Source pin (same shape as memory-ingest-no-put_page.test.ts): the flag
+ *  1. Source pin: the flag
  *     is present in active code, so removing it trips the build.
  *  2. Behavioural proof of the underlying collision, using git's own ignore
  *     machinery. No gbrain and no network required.

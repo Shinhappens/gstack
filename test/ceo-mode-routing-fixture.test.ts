@@ -52,6 +52,8 @@ mock.module(path.join(root,'test/helpers/ceo-mode-option.ts'),()=>({
   ceoExpansionPacingChoice:()=>{current.pacingChoices++;return scenario.startsWith('pacing')&&(!current.pacingSent||scenario==='pacing-repeated')?{call:{questions:[]},index:scenario==='pacing-unsupported'?0:1}:null;},
   ceoExpansionPacingReady:()=>{current.pacingChecks++;return (scenario==='pacing'||scenario==='pacing-repeated')&&current.pacingChecks>=3;},
   ceoModeSubmissionInput:()=>scenario==='mode-submit'&&!current.submitted?'\\r':null,
+  ceoModePacketTabAnswer:()=>null,
+  holdDeferKeepIndex:()=>null,
   nextCeoModeNavigation:(_visible,target)=>{
     if(scenario==='navigation')throw new Error('fixture navigation failed');
     current.mode=target; return {kind:'mode',index:target==='HOLD SCOPE'?2:1,question};

@@ -1,8 +1,9 @@
 ## Step 10: Address Greptile review comments (if PR exists)
 
-**Dispatch the fetch + classification as a subagent** using the Agent tool with `subagent_type: "general-purpose"`. The subagent pulls every Greptile comment, runs the escalation detection algorithm, and classifies each comment. Parent receives a structured list and handles user interaction + file edits.
-
-{{FOREGROUND_DISPATCH_NOTE}}
+Dispatch a subagent through Agent with `subagent_type: "general-purpose"` and
+`run_in_background: false`, using Step 7's shared foreground-dispatch rule.
+It fetches and classifies all Greptile comments,
+including escalation tiers; the parent handles decisions and queues approved fixes.
 
 **Subagent prompt:**
 
@@ -10,18 +11,25 @@
 >
 > For each comment, assign: `classification` (`valid_actionable`, `already_fixed`, `false_positive`, `suppressed`), `escalation_tier` (1 or 2), the file:line or [top-level] tag, body summary, and permalink URL.
 >
-> If no PR exists, `gh` fails, the API errors, or there are zero comments, output: `{"total":0,"comments":[]}` and stop.
->
-> Otherwise, output a single JSON object on the LAST LINE of your response:
-> `{"total":N,"comments":[{"classification":"...","escalation_tier":N,"ref":"file:line","summary":"...","permalink":"url"},...]}`
+> Return one JSON object on the LAST LINE:
+> `{"status":"complete|no_pr|unavailable","total":N,"comments":[{"classification":"...","escalation_tier":N,"ref":"file:line","summary":"...","permalink":"url"},...],"reason":"..."}`
+> Use `complete` only after a successful fetch, including zero comments; `no_pr` only after confirming no PR exists; `unavailable` for `gh`/API errors or incomplete classification. The latter two return zero total and an empty array. State the failure reason for `unavailable`; otherwise use an empty reason.
 
 **Parent processing:**
 
-Parse the LAST line as JSON.
+Parse the LAST line as JSON. Require the declared status, a nonnegative integer
+total matching the comments array, and the status/reason invariants above. An
+unknown or missing status is unavailable, never an empty successful review.
 
-If `total` is 0, skip this step silently. Continue to Step 11.
+For `no_pr`, record "Greptile: no PR exists"; for `complete` with zero comments,
+record "Greptile: fetched, zero comments". Both continue to Step 11.
 
-**If the subagent fails, returns invalid JSON, or never completes (backgrounded despite the flag, or no final output after ~10 minutes — stop waiting; if a backgrounded task is still running, stop it first so a late result never lands mid-ship):** print `Greptile triage did not complete — review the PR comments manually` and continue to Step 11, recording the triage as UNAVAILABLE — not as zero comments — in the PR body: add the literal line `Greptile triage: UNAVAILABLE (dispatch failed)` to the review-results section Step 19 assembles (an unavailable triage must not read as a clean one; Step 20's metrics schema carries no triage field, so the PR body is the record). Do not block /ship on the triage subagent.
+**Unavailable triage:** A returned `unavailable`, failed dispatch, invalid result,
+or missing completion after ~10 minutes takes this route. Stop a running child
+and confirm it stopped before continuing. Print `Greptile triage did not complete — review the PR comments manually`.
+Include `Greptile triage: UNAVAILABLE (dispatch failed)` and the actual reason in
+Step 19's review results; Step 20 has no triage field. Continue to Step 11 without
+claiming zero comments or completed triage. This optional triage does not block ship.
 
 Otherwise, print: `+ {total} Greptile comments ({valid_actionable} valid, {already_fixed} already fixed, {false_positive} FP)`.
 
@@ -31,7 +39,7 @@ For each comment in `comments`:
 - The comment (file:line or [top-level] + body summary + permalink URL)
 - `RECOMMENDATION: Choose A because [one-line reason]`
 - Options: A) Fix now, B) Acknowledge and ship anyway, C) It's a false positive
-- If user chooses A: apply the fix, commit the fixed files (`git add <fixed-files> && git commit -m "fix: address Greptile review — <brief description>"`), reply using the **Fix reply template** from greptile-triage.md (include inline diff + explanation), and save to both per-project and global greptile-history (type: fix).
+- If user chooses A: queue the approved fix without editing here. After that fix passes review and tests, use the **Fix reply template** from greptile-triage.md (inline diff + explanation) and save per-project/global greptile-history (type: fix).
 - If user chooses C: reply using the **False Positive reply template** from greptile-triage.md (include evidence + suggested re-rank), save to both per-project and global greptile-history (type: fp).
 
 **VALID BUT ALREADY FIXED:** Reply using the **Already Fixed reply template** from greptile-triage.md — no AskUserQuestion needed:
@@ -45,9 +53,13 @@ For each comment in `comments`:
   - B) Fix it anyway (if trivial)
   - C) Ignore silently
 - If user chooses A: reply using the **False Positive reply template** from greptile-triage.md (include evidence + suggested re-rank), save to both per-project and global greptile-history (type: fp)
+- If user chooses B: queue the approved fix, as above.
 
 **SUPPRESSED:** Skip silently — these are known false positives from previous triage.
 
-**After all comments are resolved:** If fixes were applied, run Step 5 and any affected checks from Steps 6–8, then repeat Step 9 on the changed tree before continuing to Step 11. Keep the replies already sent; do not repeat unchanged comment decisions. If no fixes were applied, continue to Step 11.
+**After triage:** If fixes were approved, save their approvals and comment references.
+Run Step 9's full review/fix loop, then return here. Finish the saved replies
+without asking again about completed fixes, and classify new comments.
+With no queued fixes, continue to Step 11.
 
 ---

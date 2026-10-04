@@ -13,6 +13,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { isPairAgentEnabled } from '../src/config';
+import { stubRouteContext, callRoute } from './route-test-harness';
 
 const SERVER_SRC = fs.readFileSync(path.join(import.meta.dir, '../src/server.ts'), 'utf-8');
 const CLI_SRC = fs.readFileSync(path.join(import.meta.dir, '../src/cli.ts'), 'utf-8');
@@ -111,11 +112,20 @@ describe('gate wiring — every tunnel activation point consults the guard', () 
     expect(branch).not.toContain('install ngrok');
   });
 
-  test('/tunnel/start refuses with the enable hint when disabled', () => {
-    const startIdx = SERVER_SRC.indexOf("url.pathname === '/tunnel/start'");
-    const block = SERVER_SRC.slice(startIdx, startIdx + 1200);
-    expect(block).toContain('if (!isPairAgentEnabled())');
-    expect(block).toContain('gstack-config set pair_agent on');
+  test('/tunnel/start refuses with the enable hint when disabled', async () => {
+    const neverTunnel = () => { throw new Error('a disabled gate must not touch the tunnel'); };
+    const ctx = stubRouteContext({
+      tunnel: { state: neverTunnel, close: neverTunnel, resolveAuthtoken: neverTunnel, start: neverTunnel },
+    });
+    tmpHomeWith({ pair_agent: 'off' });
+    const resp = await callRoute('POST', '/tunnel/start', ctx);
+    expect(resp.status).toBe(403);
+    expect(await resp.json()).toEqual({
+      error: 'pair-agent is off (tunnel exposes this browser beyond the machine)',
+      hint: 'enable once with: gstack-config set pair_agent on — or run /pair-agent, which asks for consent and sets it',
+    });
+    tmpHomeWith(null);
+    expect((await callRoute('POST', '/tunnel/start', ctx)).status).toBe(403);
   });
 
   test('BROWSE_TUNNEL=1 startup skips tunnel bind when disabled', () => {

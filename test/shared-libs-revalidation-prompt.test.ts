@@ -2,11 +2,18 @@
 import { describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import {
-  createSharedInteractiveToolHandler, reviewPrompt, reviewRevalidationPrompt,
+  createSharedInteractiveToolHandler, createSharedLibsFixture, fixtureWrite, reviewPrompt, reviewRevalidationPrompt,
   SHARED_INTERACTIVE_MAX_TURNS, SHARED_LIBS_ROOT, type SharedLibsFixture,
 } from './helpers/shared-libs-eval-fixture';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
+import { hasTrustedSharedLibsCheck } from './helpers/shared-libs-review-start-evidence';
+import stageScope from './fixtures/shared-libs-lifecycle-r59-stage-scope-public.json';
+import { seedPathReviewPrerequisites, checkPathReviewPrerequisites, hasPathReviewPrerequisiteReceipt,
+  type PathEligibilityFixture } from './helpers/shared-libs-path-fixture';
+import * as fixtureHelpers from './helpers/shared-libs-eval-fixture';
 
 const f = { root: '/fixture root', repo: '/fixture root/repo', state: '/fixture root/state',
   bin: '/fixture root/bin' } as SharedLibsFixture;
@@ -29,34 +36,85 @@ function pathCaptureAdapter(capture: (...args: any[]) => Promise<any>) {
   const rows: { scenario: string; row: any }[] = [];
   const removed: string[] = [];
   const attempts: any[] = [];
+  let ownedAttempt: any;
   const fixtures = new Map<string, SharedLibsFixture>();
+  const prepared = new Map<string, PathEligibilityFixture>();
   const afterCompletion = () => { throw new Error('A non-success capture reached completion checks'); };
   const exercise = new Function('deps', `const { captures, preparePathEligibilityFixture, fs, path,
     reviewLifecycleInstructions, reviewPrompt, reviewRevalidationPrompt, runSharedInteractive, readRequests,
-    toolCommandTrace, sourceReadTrace, fixtureWorkingTree, reviewRecords, expect, CAPTURE_LONG_MS } = deps;
+    toolCommandTrace, sourceReadTrace, fixtureGit, fixtureWorkingTree, reviewRecords, expect, CAPTURE_LONG_MS,
+    hasTrustedSharedLibsCheck, SHARED_LIBS_ROOT, checkPathReviewPrerequisites, hasPathReviewPrerequisiteReceipt } = deps;
     ${transpile(pathsSource.slice(start, end))} return exerciseEligibility;`)({
     captures: { runAttempt: async (name: string, kinds: string[], timeout: number, work: any) => {
       attempts.push({ name, kinds, timeout });
-      return work({ add: (scenario: string, row: any) => rows.push({ scenario, row }) });
+      ownedAttempt = { signal: new AbortController().signal, remainingMs: () => timeout,
+        add: (scenario: string, row: any) => rows.push({ scenario, row }) };
+      return work(ownedAttempt);
     } },
     preparePathEligibilityFixture: (kind: string) => {
-      const root = path.join('/fixture root', kind);
-      const fixture = { root, repo: path.join(root, 'repo'), state: path.join(root, 'state'),
-        bin: path.join(root, 'bin') } as SharedLibsFixture;
-      fixtures.set(kind, fixture);
-      return { fixture, current: { evidence_paths: ['src/retry-route.ts'] } };
+      const fixture = createSharedLibsFixture(`prompt-${kind}`);
+      fixtureWrite(fixture, 'src/retry-route.ts', 'authored caller');
+      const value = { fixture, current: { evidence_paths: ['src/retry-route.ts'] },
+        sourcePaths: ['src/retry-route.ts'], rawPaths: [], beforeTree: '', resumed: seedPathReviewPrerequisites(fixture) };
+      prepared.set(kind, value);
+      fixtures.set(kind, value.fixture);
+      return value;
     },
-    fs: { readFileSync: () => 'authored caller', writeFileSync: () => {},
-      rmSync: (root: string) => { removed.push(root); } }, path,
+    fs: { ...fs, rmSync: (root: string) => { removed.push(root); fs.rmSync(root, { recursive: true, force: true }); } }, path,
     reviewLifecycleInstructions: (fixture: SharedLibsFixture) => path.join(fixture.root, 'review-lifecycle.md'),
     reviewPrompt, reviewRevalidationPrompt, runSharedInteractive: capture, readRequests: () => [],
     toolCommandTrace: afterCompletion, sourceReadTrace: afterCompletion,
-    fixtureWorkingTree: afterCompletion, reviewRecords: afterCompletion, expect, CAPTURE_LONG_MS,
+    fixtureGit: afterCompletion, fixtureWorkingTree: afterCompletion, reviewRecords: afterCompletion, expect, CAPTURE_LONG_MS,
+    hasTrustedSharedLibsCheck, SHARED_LIBS_ROOT, checkPathReviewPrerequisites, hasPathReviewPrerequisiteReceipt,
   });
-  return { exercise, rows, removed, attempts, fixtures };
+  return { exercise, rows, removed, attempts, fixtures, prepared, get attempt() { return ownedAttempt; } };
 }
 
 describe('bounded shared-code revalidation prompt', () => {
+  // The harness prompt's wording is not a contract: the paid shared-libs E2Es
+  // measure whether it works. These checks keep its machine-shaped parts:
+  // exact receipt commands, interpolated paths and budgets, branch selection,
+  // prefix/suffix identity, ordering and the absence of a supplied token.
+  test('the actor scope replaces the captured R59 exploratory stage instead of adding another prerequisite', () => {
+    const prompt = reviewPrompt(f, instructions, input, { actorCommand: 'cat /fixture/stage-output.json' });
+    expect(prompt).toContain('cat /fixture/stage-output.json');
+    const excluded = prompt.slice(prompt.indexOf('Do not perform QA scope/method asset loads'), prompt.indexOf('Existing tests'));
+    for (const packet of stageScope.outside_component) {
+      expect(packet.result.tool_use_id).toBe(packet.call.id);
+      expect(packet.result.is_error).not.toBe(true);
+      expect(packet.result.content.length).toBeGreaterThan(0);
+      expect(excluded).toContain(packet.boundary);
+    }
+    expect(stageScope.post_fix_verification.call.input.command).toContain('bun test test/retry-after.test.ts');
+    expect(stageScope.post_fix_verification.result.content).toContain('worker===lib true route===lib true');
+    for (const other of [reviewPrompt(f, instructions, input), reviewRevalidationPrompt(f, instructions, input),
+      reviewRevalidationPrompt(f, instructions, input, { input: '/fixture/resumed.json', checkCommand: 'check-prerequisites' })]) {
+      expect(other).not.toContain('Do not perform QA scope/method asset loads');
+    }
+  });
+
+  test('edit-capable replay declares its actor instead of the fixed revalidation coverage', () => {
+    const prompt = reviewPrompt(f, instructions, input, { actorCommand: 'cat /fixture/stage-output.json' });
+    expect(prompt).toContain('cat /fixture/stage-output.json');
+    expect(prompt).not.toContain('Required reviewer coverage for this scoped replay');
+    expect(prompt).not.toContain('Do not edit target source');
+  });
+
+  test('resumed path scope supplies prerequisites without replacing completion or default caller instructions', () => {
+    const resumed = { input: '/isolated/synthetic-prerequisites.json', checkCommand: 'fixture-prerequisite-check' };
+    const original = reviewRevalidationPrompt(f, instructions, input);
+    const prompt = reviewRevalidationPrompt(f, instructions, input, resumed);
+    expect(original).toContain('Required reviewer coverage for this scoped replay');
+    expect(prompt).not.toContain('Required reviewer coverage for this scoped replay');
+    expect(prompt).toContain(resumed.input);
+    expect(prompt).toContain(resumed.checkCommand);
+    expect(prompt.slice(prompt.indexOf('Revalidation fixture execution contract:')))
+      .toBe(original.slice(original.indexOf('Revalidation fixture execution contract:')));
+    // The review completion rule names both prerequisite stages by step number.
+    const production = fs.readFileSync(path.join(SHARED_LIBS_ROOT, 'review/SKILL.md.tmpl'), 'utf8');
+    expect(production.split('\n').some(line => /Step 4\.8\b/.test(line) && /Step 4\.7\b/.test(line))).toBe(true);
+  });
+
   test('adds execution guidance after the complete shared prompt without supplying an answer or token', () => {
     const base = reviewPrompt(f, instructions, input);
     const prompt = reviewRevalidationPrompt(f, instructions, input);
@@ -64,19 +122,53 @@ describe('bounded shared-code revalidation prompt', () => {
     const contract = prompt.slice(base.length);
     expect(contract).toContain(`${SHARED_INTERACTIVE_MAX_TURNS} assistant turns`);
     expect(contract).toContain(path.join(f.state, 'projects/fixture-shared-libs/.review-starts/<REVIEW_START>.json'));
-    expect(contract).toContain('token actually returned by --start');
-    expect(contract).toContain('separate, successful Read tool call or a single cat command');
-    expect(contract).toContain('Do not combine the record read with --start, the diff or other diagnostic commands');
-    expect(contract).toContain('if the read fails, retry it before proceeding');
+    expect(contract.indexOf('Read that token\'s record')).toBeGreaterThan(-1);
+    expect(contract.indexOf('Read that token\'s record')).toBeLessThan(contract.indexOf('Then read the diff in a subsequent call'));
     expect(contract).not.toMatch(/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}/);
-    expect(contract).toContain('Batch independent required source reads');
-    expect(contract).toContain('Preserve every required evidence check and dependency');
-    expect(contract).toContain('complete, untruncated read-back');
-    expect(contract).toContain('same tool invocation');
-    expect(contract).toContain('then return the final review summary');
-    expect(contract).toContain('Failed persistence or verification remains a failure');
-    expect(contract).toContain("Late source changes still require the workflow's normal re-review");
+    expect(prompt).toContain(`${SHARED_LIBS_ROOT}/review/sections/shared-code-reuse.md`);
+    expect(prompt.indexOf('Your first response holds')).toBeLessThan(prompt.indexOf("gstack-review-log' --start review"));
     expect(contract).not.toContain('choose Skip');
+  });
+
+  test('declares isolated receipt commands', () => {
+    const prompt = reviewRevalidationPrompt(f, instructions, input);
+    const commands = [...prompt.matchAll(/```bash\n([\s\S]*?)\n```/g)].map(match => match[1]);
+    expect(commands).toHaveLength(3);
+    expect(commands[0]).toBe(`'${SHARED_LIBS_ROOT}/bin/gstack-review-log' --start review`);
+    expect(commands[1]).toBe(`'${SHARED_LIBS_ROOT}/bin/gstack-review-log' --check-shared-libs REVIEW_START <<'GSTACK_REVALIDATION_FINDING'\nCURRENT_FINDING_JSON\nGSTACK_REVALIDATION_FINDING`);
+    expect(commands[2]).toBe(`'${SHARED_LIBS_ROOT}/bin/gstack-review-log' 'FINAL_REVIEW_JSON' --finish REVIEW_START && '${SHARED_LIBS_ROOT}/bin/gstack-review-read'`);
+  });
+
+  test('step 5 branches on the checker result, reusable:true before reusable:false', () => {
+    const prompt = reviewRevalidationPrompt(f, instructions, input);
+    const step5 = prompt.slice(prompt.indexOf('5. Act on the checker result'), prompt.indexOf('6. Complete final evidence'));
+    expect(step5.indexOf('reusable:true')).toBeGreaterThan(-1);
+    expect(step5.indexOf('reusable:true')).toBeLessThan(step5.indexOf('reusable:false'));
+    expect(prompt).not.toContain("Record the supplied finding's disposition under its own");
+  });
+
+  test('the shared review prompt maps exact trusted asset roots and documented interfaces', () => {
+    const prompt = reviewPrompt(f, instructions, input);
+    expect(prompt).toContain(`${SHARED_LIBS_ROOT}/review/checklist.md`);
+    expect(prompt).toContain(`${SHARED_LIBS_ROOT}/review/sections/`);
+    expect(prompt).toContain(`../qa/sections/<name>.md is ${SHARED_LIBS_ROOT}/qa/sections/<name>.md`);
+    expect(prompt).toContain(`${SHARED_LIBS_ROOT}/bin`);
+    expect(prompt).toContain(`${SHARED_LIBS_ROOT}/lib`);
+    expect(prompt).toContain(f.bin);
+    for (const iface of ['gstack-review-log --start review', '--check-shared-libs REVIEW_START',
+      '--finish REVIEW_START', 'gstack-review-read']) expect(prompt).toContain(iface);
+  });
+
+  test('common guidance states the finish+read-back receipt directly, not by a dangling step 6 reference', () => {
+    const lifecycle = reviewPrompt(f, instructions, input, { actorCommand: 'bun /fx/stage-actor.ts run' });
+    const revalidation = reviewRevalidationPrompt(f, instructions, input);
+    for (const prompt of [lifecycle, revalidation]) {
+      expect(prompt).toContain('--finish REVIEW_START');
+      expect(prompt).not.toContain('exactly as step 6 shows');
+    }
+    const commands = [...revalidation.matchAll(/```bash\n([\s\S]*?)\n```/g)].map(match => match[1]);
+    expect(commands[2]).toBe(`'${SHARED_LIBS_ROOT}/bin/gstack-review-log' 'FINAL_REVIEW_JSON' --finish REVIEW_START && '${SHARED_LIBS_ROOT}/bin/gstack-review-read'`);
+    expect(lifecycle).not.toContain('step 6');
   });
 
   test('the actual revalidation capture uses the wrapper and preserves the skip actor', async () => {
@@ -87,19 +179,126 @@ describe('bounded shared-code revalidation prompt', () => {
     expect(start).toBeGreaterThan(marker.length);
     expect(end).toBeGreaterThan(start);
     const result = { exitReason: 'success' };
+    const resumed = { input: '/fixture root/resumed-review-prerequisites.json', checkCommand: 'fixture-prerequisite-check' };
     const calls: any[] = [];
     const callback = transpile(`async function invokeCapture() { ${scenario.slice(start, end)} }`);
-    const invoke = new Function('deps', `const { f, instructions, input, reviewRevalidationPrompt, runSharedInteractive } = deps;
+    const attempt = { signal: new AbortController().signal, remainingMs: () => CAPTURE_LONG_MS, add() {} };
+    const invoke = new Function('deps', `const { f, instructions, input, resumed, attempt, reviewRevalidationPrompt, runSharedInteractive } = deps;
       let questions = []; ${callback} return invokeCapture;`)({
-      f, instructions, input, reviewRevalidationPrompt,
+      f, instructions, input, resumed, attempt, reviewRevalidationPrompt,
       runSharedInteractive: async (...args: any[]) => { calls.push(args); return { result, questions: [] }; },
     });
     expect(await invoke()).toBe(result);
-    expect(calls).toEqual([[f, 'shared-libs-review-revalidation', reviewRevalidationPrompt(f, instructions, input), 'skip']]);
+    expect(calls).toEqual([[f, 'shared-libs-review-revalidation', reviewRevalidationPrompt(f, instructions, input, resumed), 'skip', { attempt, prerequisiteSource: 'synthetic-fixture-input' }]]);
     const lifecycle = source.slice(source.indexOf("test('shared-libs-review-lifecycle'"), source.indexOf("test('shared-libs-review-revalidation'"));
-    expect(lifecycle).toContain('reviewPrompt(f, instructions, input)');
+    expect(lifecycle).toContain('reviewPrompt(f, instructions, input, stageActor, seed)');
     expect(lifecycle).not.toContain('reviewRevalidationPrompt(');
   });
+
+  test('all four registered revalidation variants supply prerequisites only after their state changes', async () => {
+    const contexts = new Map<string, any>(), labels = new Map<string, string>(), rows: any[] = [];
+    let registered: () => Promise<void>;
+    const record = source.slice(source.indexOf('async function recordCapture('), source.indexOf('\nfunction assertReadOnly('));
+    const registration = source.slice(source.indexOf("  test('shared-libs-review-revalidation'"), source.lastIndexOf('\n});'));
+    new Function('deps', `const { test, captures, fs, path, expect, CAPTURE_LONG_MS,
+      createSharedLibsFixture, seedReviewSources, fixtureWrite, installNormalizingFilter, seedSkippedAdvisory,
+      fixtureWorkingTree, fixtureGit, reviewLifecycleInstructions, seedPathReviewPrerequisites, checkPathReviewPrerequisites,
+      reviewRevalidationPrompt, runSharedInteractive } = deps; ${transpile(record + registration)}`)({
+      ...fixtureHelpers, fs, path, expect, CAPTURE_LONG_MS,
+      test: (name: string, body: () => Promise<void>, timeout: number) => {
+        expect(name).toBe('shared-libs-review-revalidation'); expect(timeout).toBe(CAPTURE_LONG_MS); registered = body;
+      },
+      captures: { runAttempt: async (_name: string, cases: string[], _timeout: number, work: any) => {
+        expect(cases).toEqual(['unchanged', 'secondary', 'branch', 'filtered']);
+        return work({ signal: new AbortController().signal, remainingMs: () => _timeout,
+          add: (scenario: string, row: any) => rows.push({ scenario, row }) });
+      } },
+      createSharedLibsFixture: (label: string) => { const f = fixtureHelpers.createSharedLibsFixture(label); labels.set(f.root, label); return f; },
+      seedPathReviewPrerequisites: (f: SharedLibsFixture) => {
+        const resumed = seedPathReviewPrerequisites(f), checked = checkPathReviewPrerequisites(f, resumed.input);
+        expect(checked.settled).toBe(true);
+        const label = labels.get(f.root)!;
+        expect(checked.context.binding.branch).toBe(label === 'revalidate-branch' ? 'feature-a' : 'feature/a');
+        const caller = fs.readFileSync(path.join(f.repo, 'src/retry-route.ts'), 'utf8');
+        if (label === 'revalidate-secondary') expect(caller).toContain('Caller integration changed after the skipped review');
+        if (label === 'revalidate-filtered') expect(caller).toContain('RAW-ONLY changed caller bytes after the skipped review');
+        contexts.set(f.root, { resumed, checked });
+        return resumed;
+      }, checkPathReviewPrerequisites,
+      runSharedInteractive: async (f: SharedLibsFixture, name: string, prompt: string, choice: string, options: any) => {
+        expect(name).toBe('shared-libs-review-revalidation'); expect(choice).toBe('skip');
+        expect(options).toEqual({ attempt: expect.objectContaining({ add: expect.any(Function) }), prerequisiteSource: 'synthetic-fixture-input' });
+        const supplied = contexts.get(f.root);
+        expect(checkPathReviewPrerequisites(f, supplied.resumed.input)).toEqual(supplied.checked);
+        expect(prompt).toBe(reviewRevalidationPrompt(f, path.join(f.root, 'review-lifecycle.md'), path.join(f.root, 'current-advisory.jsonl'), supplied.resumed));
+        throw new Error('Free revalidation boundary reached');
+      },
+    });
+    await expect(registered!()).rejects.toThrow('Free revalidation boundary reached');
+    expect(contexts.size).toBe(4);
+    expect(rows).toHaveLength(4);
+    expect(rows.every(({ row }) => row.passed === false)).toBe(true);
+    for (const root of contexts.keys()) expect(fs.existsSync(root)).toBe(false);
+  }, 30_000);
+
+  test('the registered verify enforces true reuse (no question, no current advisory) versus false fresh decision', async () => {
+    const record = source.slice(source.indexOf('async function recordCapture('), source.indexOf('\nfunction assertReadOnly('));
+    const registration = source.slice(source.indexOf("  test('shared-libs-review-revalidation'"), source.lastIndexOf('\n});'));
+    const labels = new Map<string, string>();
+    const stubTrue = () => true;
+    let mutateUnchangedQuestion = false;
+    let rows: any[] = [];
+    const persistFinal = (fx: SharedLibsFixture, findings: any[]) => {
+      const log = path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log');
+      const env = { ...process.env, ...fx.env, PATH: process.env.PATH, GSTACK_HOME: fx.state };
+      const token = execFileSync(log, ['--start', 'review'], { cwd: fx.repo, env, encoding: 'utf8', timeout: 30_000 }).trim();
+      execFileSync(log, [JSON.stringify({ skill: 'review', timestamp: new Date().toISOString(),
+        status: 'clean', issues_found: 0, critical: 0, informational: 0, quality_score: 10,
+        findings, completed: true, converged: true, cycles: 0 }), '--finish', token],
+      { cwd: fx.repo, env, encoding: 'utf8', timeout: 30_000 });
+      return token;
+    };
+    const build = () => new Function('deps', `const { test, captures, fs, path, expect, CAPTURE_LONG_MS, createHash, SHARED_LIBS_ROOT,
+      createSharedLibsFixture, seedReviewSources, fixtureWrite, installNormalizingFilter, seedSkippedAdvisory,
+      fixtureWorkingTree, fixtureGit, reviewLifecycleInstructions, seedPathReviewPrerequisites, checkPathReviewPrerequisites,
+      reviewRevalidationPrompt, runSharedInteractive, toolCommandTrace, reviewRecords,
+      hasTrustedSharedLibsCheck, hasTrustedReviewStartRead, hasPathReviewPrerequisiteReceipt } = deps; ${transpile(record + registration)}`)({
+      ...fixtureHelpers, fs, path, expect, CAPTURE_LONG_MS, createHash, SHARED_LIBS_ROOT,
+      hasTrustedSharedLibsCheck: stubTrue, hasTrustedReviewStartRead: stubTrue, hasPathReviewPrerequisiteReceipt: stubTrue,
+      checkPathReviewPrerequisites, seedPathReviewPrerequisites,
+      test: (_name: string, body: () => Promise<void>) => { registered = body; },
+      captures: { runAttempt: async (_name: string, _cases: string[], _timeout: number, work: any) =>
+        work({ signal: new AbortController().signal, remainingMs: () => _timeout,
+          add: (scenario: string, row: any) => rows.push({ scenario, row }) }) },
+      createSharedLibsFixture: (label: string) => { const fx = fixtureHelpers.createSharedLibsFixture(label); labels.set(fx.root, label); return fx; },
+      runSharedInteractive: async (fx: SharedLibsFixture) => {
+        const label = labels.get(fx.root)!;
+        const advisory = fixtureHelpers.reviewRecords(fx).find((r: any) => r.skill === 'review').findings[0];
+        const token = persistFinal(fx, label === 'revalidate-unchanged' ? [] : [{ ...advisory, action: 'skipped' }]);
+        const result = { exitReason: 'success', events: [], toolCalls: [
+          { tool: 'Bash', input: { command: `'${path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log')}' --check-shared-libs ${token}` } },
+          { tool: 'Bash', input: { command: `'${path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-read')}'` } },
+          { tool: 'Read', input: { file_path: path.join(fx.repo, 'src/retry-route.ts') } },
+          { tool: 'Read', input: { file_path: path.join(fx.repo, 'lib/retry-after.ts') } },
+        ] };
+        const questions = label === 'revalidate-unchanged'
+          ? (mutateUnchangedQuestion ? [{ q: 'reconfirm prior skip?' }] : [])
+          : [{ q: 'reuse the helper here?' }];
+        return { result, questions };
+      },
+    });
+    let registered: () => Promise<void>;
+    build();
+    await registered!();
+    expect(rows).toHaveLength(4);
+    expect(rows.every(({ row }) => row.passed === true)).toBe(true);
+
+    rows = [];
+    mutateUnchangedQuestion = true;
+    build();
+    await expect(registered!()).rejects.toThrow();
+    expect(rows.find(({ scenario }) => scenario === 'unchanged').row.passed).toBe(false);
+  }, 60_000);
 
   test('the actual interactive runner uses the declared existing limit without changing clocks or actor', async () => {
     const start = helper.indexOf('export async function runSharedInteractive(');
@@ -124,15 +323,20 @@ describe('bounded shared-code revalidation prompt', () => {
         resolveClaudeBinary: () => '/fixture/claude' },
       provider: { query: () => { throw new Error('No provider may run in this free adapter'); } },
     });
-    await invoke(f, 'shared-libs-review-revalidation', 'prompt', 'skip');
+    const attempt = { signal: new AbortController().signal, remainingMs: () => CAPTURE_LONG_MS, add() {} };
+    const plain = await invoke(f, 'shared-libs-review-revalidation', 'prompt', 'skip', { attempt });
     expect(shimCalls).toBe(1);
+    expect(plain.result.fixturePrerequisiteSource).toBeUndefined();
     expect(observed.maxTurns).toBe(SHARED_INTERACTIVE_MAX_TURNS);
     expect(observed.maxTurns).toBe(30);
     expect(observed.maxRetries).toBe(0);
+    expect(observed.signal).toBe(attempt.signal);
     expect(observed.model).toBeUndefined();
     expect(observed.allowedTools).toContain('AskUserQuestion');
     expect(CAPTURE_MS).toBe(300_000);
     expect(CAPTURE_LONG_MS).toBe(600_000);
+    const supplied = await invoke(f, 'shared-libs-review-revalidation', 'prompt', 'skip', { attempt, prerequisiteSource: 'synthetic-fixture-input' });
+    expect(supplied.result.fixturePrerequisiteSource).toBe('synthetic-fixture-input');
   });
 
   test('actual recordCapture rejects native max-turns even after verified CURRENT persistence', async () => {
@@ -180,9 +384,9 @@ describe('bounded shared-code revalidation prompt', () => {
     for (const kind of kinds) {
       const fixture = adapter.fixtures.get(kind)!;
       const expected = reviewRevalidationPrompt(fixture, path.join(fixture.root, 'review-lifecycle.md'),
-        path.join(fixture.root, 'current-advisory.jsonl'))
+        path.join(fixture.root, 'current-advisory.jsonl'), adapter.prepared.get(kind)!.resumed)
         + '\nAll named caller sources are first-party authored runtime code. Inspect them directly, including any Git/path boundary, before deciding whether the previous review decision can be reused. The fixture contains no generated caller sources.';
-      expect(calls.find(call => call[0] === fixture)).toEqual([fixture, name, expected, 'skip']);
+      expect(calls.find(call => call[0] === fixture)).toEqual([fixture, name, expected, 'skip', { attempt: adapter.attempt }]);
       expect(adapter.rows.find(row => row.scenario === kind)?.row.passed).toBe(false);
       expect(adapter.removed).toContain(fixture.root);
     }

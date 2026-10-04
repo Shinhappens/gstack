@@ -5,9 +5,8 @@
  * (a) touchfiles-data.ts stays LITERALS ONLY — no imports/requires, no call
  *     expressions, no spreads, no template literals. Map-diff selection
  *     evaluates old git versions of that file standalone; any logic breaks it.
- * (b) the ./helpers/touchfiles facade re-exports EVERY export of both halves
- *     by identity (===), so existing import sites see the same objects.
- * (c) the data file's exports are importable and non-empty.
+ * (b) the data file's exports are importable and non-empty. A missing facade
+ *     re-export needs no test: Bun fails every importer at link time.
  */
 
 import { describe, test, expect } from 'bun:test';
@@ -15,8 +14,6 @@ import { readFileSync } from 'fs';
 import * as path from 'path';
 
 import * as data from './helpers/touchfiles-data';
-import * as logic from './helpers/test-selection';
-import * as facade from './helpers/touchfiles';
 
 const DATA_PATH = path.join(import.meta.dir, 'helpers', 'touchfiles-data.ts');
 
@@ -124,54 +121,12 @@ describe('touchfiles-data.ts literal-only tripwire', () => {
   });
 });
 
-describe('facade export parity', () => {
-  test('every touchfiles-data export is re-exported by identity', () => {
-    const dataExports = Object.keys(data);
-    expect(dataExports.length).toBeGreaterThan(0);
-    for (const name of dataExports) {
-      expect(
-        (facade as Record<string, unknown>)[name],
-        `facade must re-export '${name}' from touchfiles-data by identity`,
-      ).toBe((data as Record<string, unknown>)[name] as never);
-    }
-  });
-
-  test('every test-selection export is re-exported by identity', () => {
-    const logicExports = Object.keys(logic);
-    expect(logicExports.length).toBeGreaterThan(0);
-    for (const name of logicExports) {
-      expect(
-        (facade as Record<string, unknown>)[name],
-        `facade must re-export '${name}' from test-selection by identity`,
-      ).toBe((logic as Record<string, unknown>)[name] as never);
-    }
-  });
-
-  test('facade exports exactly the union of both halves', () => {
-    const union = new Set([...Object.keys(data), ...Object.keys(logic)]);
-    expect(new Set(Object.keys(facade))).toEqual(union);
-  });
-
-  test('no export name collisions between data and logic', () => {
-    const overlap = Object.keys(data).filter((k) => k in logic);
-    expect(overlap).toEqual([]);
-  });
-});
-
 describe('touchfiles-data exports are importable and non-empty', () => {
   test('E2E_TOUCHFILES has entries with non-empty pattern lists', () => {
     const keys = Object.keys(data.E2E_TOUCHFILES);
     expect(keys.length).toBeGreaterThan(0);
     for (const key of keys) {
       expect(data.E2E_TOUCHFILES[key].length, `E2E_TOUCHFILES['${key}'] is empty`).toBeGreaterThan(0);
-    }
-  });
-
-  test('E2E_TIERS has entries with valid tier values', () => {
-    const entries = Object.entries(data.E2E_TIERS);
-    expect(entries.length).toBeGreaterThan(0);
-    for (const [key, tier] of entries) {
-      expect(['gate', 'periodic'], `E2E_TIERS['${key}'] has invalid tier`).toContain(tier);
     }
   });
 

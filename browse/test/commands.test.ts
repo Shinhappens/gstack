@@ -17,6 +17,7 @@ import { WRITE_COMMANDS, READ_COMMANDS, META_COMMANDS, PAGE_CONTENT_COMMANDS, wr
 import { consoleBuffer, networkBuffer, dialogBuffer, addConsoleEntry, addNetworkEntry, addDialogEntry, CircularBuffer } from '../src/buffers';
 import * as fs from 'fs';
 import { spawn } from 'child_process';
+import { isProcessAlive } from '../src/error-handling';
 import * as path from 'path';
 import * as os from 'os';
 
@@ -961,13 +962,20 @@ describe('CLI lifecycle', () => {
       restartedPid = JSON.parse(fs.readFileSync(stateFile, 'utf-8')).pid;
       fs.unlinkSync(stateFile);
     }
+    let daemonSurvivedStop = false;
     if (restartedPid) {
-      try { process.kill(restartedPid, 'SIGTERM'); } catch {}
+      try { process.kill(restartedPid, 'SIGINT'); } catch {}
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline && isProcessAlive(restartedPid)) await Bun.sleep(50);
+      daemonSurvivedStop = isProcessAlive(restartedPid);
+      if (daemonSurvivedStop) try { process.kill(restartedPid, 'SIGKILL'); } catch {}
     }
 
     expect(result.code).toBe(0);
     expect(result.stdout).toContain('Status: healthy');
     expect(result.stderr).toContain('Starting server');
+    expect(restartedPid).toBeGreaterThan(0);
+    expect(daemonSurvivedStop).toBe(false);
   }, 20000);
 });
 

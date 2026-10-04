@@ -35,6 +35,7 @@
  */
 
 import { expect, beforeAll, afterAll } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { execFileSync, spawnSync } from 'child_process';
 import {
@@ -173,7 +174,10 @@ describeIfSelected(
 case "$1" in
   --version) echo "gbrain test-0.41.0"; exit 0 ;;
   search) echo "[]"; exit 0 ;;
-  get_page) echo ""; exit 0 ;;
+  # Real gbrain: \`get <slug>\` reads a page back; \`get_page\` is an MCP tool
+  # name, not a CLI verb.
+  get) cat "${payloadDir}/$2.md" 2>/dev/null; exit 0 ;;
+  get_page) echo "Unknown command: get_page" >&2; exit 1 ;;
   put)
     SLUG="$2"
     shift 2
@@ -228,7 +232,7 @@ exit 0
           collector: evalCollector,
           name: '/office-hours-brain-writeback',
           suite: 'Office Hours Brain Writeback E2E',
-          model: 'claude-sonnet-4-6',
+          model: resolveEvalModel('capture'),
           run: (signal) => runSkillTest({
             signal,
             prompt: `Read office-hours/SKILL.md for the workflow.
@@ -245,7 +249,7 @@ This is a test of the brain-writeback path. Do NOT skip the gbrain save step und
             timeout: CAPTURE_LONG_MS,
             testName: 'office-hours-brain-writeback',
             runId,
-            model: 'claude-sonnet-4-6',
+            model: resolveEvalModel('capture'),
             env: childEnv,
           }),
           validate: (result) => {

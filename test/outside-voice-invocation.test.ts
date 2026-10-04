@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { outsideVoiceCommand, type OutsideCommandOptions } from '../scripts/resolvers/outside-voice';
+import { outsideVoiceCommand, outsideVoiceInvocation, type OutsideCommandOptions } from '../scripts/resolvers/outside-voice';
 import { type TemplateContext, HOST_PATHS } from '../scripts/resolvers/types';
 import { validateOutsideReview } from '../lib/outside-review-result';
 
@@ -47,7 +47,7 @@ function environment(host: 'codex' | 'claude'): NodeJS.ProcessEnv {
     GSTACK_CLAUDE_BIN:process.execPath, GSTACK_CLAUDE_BIN_ARGS:JSON.stringify([FAKE_CLAUDE]),
     CAPTURE, FAKE_PROVIDER:host === 'codex' ? 'claude-code' : 'codex',
     CODEX_THREAD_ID:host === 'codex' ? 'codex-fixture' : '', CODEX_SANDBOX:'',
-    CLAUDECODE:host === 'claude' ? '1' : '', GSTACK_ACTIVE_HOST:host,
+    CLAUDECODE:host === 'claude' ? '1' : '', GSTACK_ACTIVE_HOST:host, CODEX_HOME:TMP, GSTACK_CODEX_MODEL:'',
     PATH:`${BIN}${path.delimiter}${process.env.PATH}`,
     GIT_AUTHOR_NAME:'Test',GIT_AUTHOR_EMAIL:'test@example.invalid',GIT_COMMITTER_NAME:'Test',GIT_COMMITTER_EMAIL:'test@example.invalid'};
 }
@@ -182,6 +182,10 @@ describe('generated outside-review dispatch', () => {
     const result = invoke('claude',{structuredBase:'main',gate:'structured'},{FAKE_RESPONSE:'[P1] Seeded data-loss bug\nREVIEW_COMPLETE'});
     expect(result.status).toBe(0);
     expect(capture().args.slice(0,3)).toEqual(['review','--base','main']);
+    // Native review carries the review-kind selection in both settings and no skill catalog (#2914, #2847).
+    expect(capture().args).toContain('review_model="gpt-6-astra"');
+    expect(capture().args).toContain('model="gpt-6-astra"');
+    expect(capture().args).toContain('skills.include_instructions=false');
     expect(capture().prompt).toBe('');
     // Completion is distinct from approval; the caller retains the P1 fail gate.
     expect(validateOutsideReview('[P1] Seeded data-loss bug','structured')).toEqual({completed:true,gate:'fail'});
@@ -232,7 +236,8 @@ describe('generated outside-review dispatch', () => {
   test('autoplan retains its Codex timeout event and hang record', () => {
     const events = path.join(TMP, 'autoplan-events');
     const probe = path.join(BIN, 'gstack-codex-probe');
-    fs.writeFileSync(probe, `_gstack_codex_timeout_wrapper() { echo 'Partial finding'; return 124; }
+    fs.writeFileSync(probe, `_gstack_codex_select_model() { _GSTACK_CODEX_SEL=gpt-6-astra; }
+_gstack_codex_timeout_wrapper() { echo 'Partial finding'; return 124; }
 _gstack_codex_log_event() { printf '%s %s\\n' "$1" "$2" >> "$FAKE_EVENTS"; }
 _gstack_codex_log_hang() { printf '%s %s\\n' "$1" "$2" >> "$FAKE_EVENTS"; }
 `);
@@ -257,4 +262,63 @@ _gstack_codex_log_hang() { printf '%s %s\\n' "$1" "$2" >> "$FAKE_EVENTS"; }
       expect(invoke('claude', {}, { FAKE_RESPONSE: response }).status).toBe(0);
     });
   }
+
+  test('#2776: a provider that ignores TERM is killed at its deadline, keeping partial output', () => {
+    const stubborn = path.join(TMP, 'stubborn-bin');
+    const pidFile = path.join(TMP, 'stubborn.pid');
+    fs.mkdirSync(stubborn, { recursive: true });
+    fs.writeFileSync(path.join(stubborn, 'codex'), `#!/bin/bash
+trap '' TERM
+echo $$ > "$STUBBORN_PID"
+echo 'Partial finding before the deadline'
+sleep 30
+echo 'Recommendation: approve because the late answer arrived.'
+`, { mode: 0o755 });
+    const ctx: TemplateContext = { skillName: 'review', tmplPath: 'review/SKILL.md.tmpl', host: 'claude', paths: HOST_PATHS.codex };
+    const command = outsideVoiceCommand(ctx, { promptFile: PROMPT, timeoutMs: 1000 });
+    const started = Date.now();
+    const result = spawnSync('bash', ['-c', command], { cwd: DIR, encoding: 'utf8', timeout: 10000,
+      env: { ...environment('claude'), PATH: `${stubborn}${path.delimiter}${process.env.PATH}`, STUBBORN_PID: pidFile, _GSTACK_CODEX_KILL_AFTER: '1' } });
+    expect(result.status).toBe(124);
+    expect(Date.now() - started).toBeLessThan(8000);
+    expect(result.stdout).toContain('Partial finding before the deadline');
+    expect(result.stdout).not.toContain('late answer');
+    expect(result.stderr).toContain('missing coverage');
+    expect(result.stdout).not.toContain('OUTSIDE_STATUS: completed');
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
+  test('#2914: an invalid model choice is unavailable coverage before any Codex process starts', () => {
+    const result = invoke('claude', {}, { GSTACK_CODEX_MODEL: 'gpt"; touch NEVER; "' });
+    expect(result.status).toBe(1);
+    expect(fs.existsSync(CAPTURE)).toBe(false);
+    expect(fs.existsSync(path.join(DIR, 'NEVER'))).toBe(false);
+    expect(result.stderr).toContain('outside review unavailable; missing coverage');
+    expect(result.stderr).toContain('GSTACK_CODEX_MODEL=<model>');
+    expect(result.stdout).not.toContain('OUTSIDE_STATUS: completed');
+  });
+
+  test('#2914: the selected model and its source are printed before the call', () => {
+    fs.writeFileSync(path.join(TMP, 'config.toml'), 'model = "gpt-5.6-terra"\n');
+    try {
+      const result = invoke('claude');
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain(`CODEX_MODEL: gpt-5.6-terra (exec; source: ${path.join(TMP, 'config.toml')} model)`);
+      expect(capture().args).toContain('model="gpt-5.6-terra"');
+      expect(capture().args).toContain('skills.include_instructions=false');
+    } finally { fs.rmSync(path.join(TMP, 'config.toml'), { force: true }); }
+  });
+
+  test('#2776: every invocation derives its outer gate from the provider deadline, capped at 600000ms', () => {
+    for (const host of ['claude', 'codex'] as const) {
+      const ctx: TemplateContext = { skillName: 'review', tmplPath: 'review/SKILL.md.tmpl', host, paths: HOST_PATHS.claude };
+      for (const [requested, provider] of [[120000, 120000], [300000, 300000], [540000, 540000], [600000, 540000]]) {
+        const rendered = outsideVoiceInvocation(ctx, { timeoutMs: requested });
+        const gates = [...rendered.matchAll(/timeout: (\d+)/g)].map(m => Number(m[1]));
+        expect(gates).toEqual([provider + 60000]);
+        expect(rendered).toContain(host === 'claude' ? `_gstack_codex_timeout_wrapper ${provider / 1000} codex` : `--timeout-ms ${provider}`);
+      }
+    }
+  });
 });

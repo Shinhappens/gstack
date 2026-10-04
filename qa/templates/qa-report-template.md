@@ -13,7 +13,6 @@
 | **Pages visited** | {COUNT} |
 | **Screenshots** | {COUNT} |
 | **Framework** | {DETECTED or "Unknown"} |
-| **Index** | [All QA runs](./index.md) |
 
 ## Health Score: {SCORE}/100
 

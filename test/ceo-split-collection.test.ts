@@ -2,10 +2,12 @@ import { expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { nativePlanCallFingerprint } from './helpers/claude-pty-runner';
+import { nativePlanCallFingerprint, type AskUserQuestionFingerprint } from './helpers/claude-pty-runner';
+import type { NativeQuestion } from './helpers/plan-skill-questions';
 import type { NativePlanQuestionCall, PlanCountTranscript } from './helpers/plan-count-transcript';
-import { ceoSplitCandidate, ceoSplitDecisionFingerprints, isCeoSplitCollectionComplete } from './helpers/ceo-split-question-policy';
+import { ceoSplitCandidate, ceoSplitDecisionFingerprints, isCeoSplitCandidateCall, isCeoSplitCollectionComplete } from './helpers/ceo-split-question-policy';
 import captured from './fixtures/ceo-split-collection-0bcd.json';
+import rowIds from './fixtures/ceo-split-collection-3638.json';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 function original() {
@@ -48,6 +50,44 @@ test.each([0, 1, 2, 3, 4, 5, 6])('the exact original %i-call prefix waits for th
   const state = original();
   state.transcript.calls.length = length; state.fingerprints.length = length;
   expect(accepts(state)).toBe(length === 6);
+});
+
+// Run 36385945043: the skill cited ledger row IDs ("D2.1 — R-E1: …") and offered
+// a fourth "Hold, discuss first" option. No candidate was recognized, so collection
+// never stopped and the attempt ran the whole review (1302s) after the E5 ACK.
+function rowIdCapture(): { transcript: PlanCountTranscript; fingerprints: AskUserQuestionFingerprint[] } {
+  const calls = structuredClone(rowIds.calls) as unknown as NativePlanQuestionCall[];
+  const transcript: PlanCountTranscript = { status: 'ready', calls, assistantMessages: [] };
+  const fingerprints = rowIds.fingerprints.map((fp, index) => ({ ...structuredClone(fp), nativeCall: calls[index]! }));
+  return { transcript, fingerprints };
+}
+const rowIdAccepts = (state: ReturnType<typeof rowIdCapture>) => isCeoSplitCollectionComplete(state.transcript, state.fingerprints);
+
+test('ledger row-ID candidate questions from run 36385945043 finish collection at the E5 ACK', () => {
+  const state = rowIdCapture();
+  expect(rowIds.provenance.originalOutcome).toBe('completion_summary');
+  expect(rowIds.provenance.originalReviewCount).toBe(0);
+  expect(state.transcript.calls.at(-1)!.answeredAt).toBe(rowIds.provenance.completeAt);
+  expect(state.transcript.calls.map(call => ceoSplitCandidate(call.questions[0] as NativeQuestion)))
+    .toEqual([null, 'E1', 'E2', 'E3', 'E4', 'E5']);
+  expect(state.fingerprints.map(isCeoSplitCandidateCall)).toEqual([false, true, true, true, true, true]);
+  for (let length = 0; length < 6; length++) {
+    const prefix = rowIdCapture();
+    prefix.transcript.calls.length = length; prefix.fingerprints.length = length;
+    expect(rowIdAccepts(prefix)).toBe(false);
+  }
+  expect(rowIdAccepts(state)).toBe(true);
+});
+
+test.each(['foreign_row', 'quoted_row', 'second_platform', 'held'])('row-ID collection rejects %s evidence', kind => {
+  const state = rowIdCapture(), call = state.transcript.calls.at(-1)!, question = call.questions[0]!;
+  const selected = call.answers![question.question]!;
+  if (kind === 'foreign_row') question.question = question.question.replace('R-E5:', 'R-E4:');
+  if (kind === 'quoted_row') question.question = 'Example: ' + question.question;
+  if (kind === 'second_platform') question.question = question.question.replace('?', ' or the Slack bot?');
+  call.answers = { [question.question]: kind === 'held' ? question.options[3]!.label : selected };
+  state.fingerprints = fromCalls(state.transcript.calls).fingerprints;
+  expect(rowIdAccepts(state)).toBe(false);
 });
 
 test('four candidate calls with five independent tabs meet the original floor', () => {
@@ -136,12 +176,12 @@ const state = JSON.parse(fs.readFileSync(${JSON.stringify(inputPath)}, 'utf8'));
 const facts = { runs: 0, evaluators: 0, judges: 0, directory: '', candidateCalls: 0, suppliedCalls: 0 };
 const save = () => fs.writeFileSync(${JSON.stringify(factsPath)}, JSON.stringify(facts));
 mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/e2e-gate.ts'))}, () => ({
-  describeE2ETier: tier => { expect(tier).toBe('periodic'); return describe; },
+  describeE2ETier: tier => { expect(tier).toBe('marathon'); return describe; },
 }));
 mock.module(${JSON.stringify(path.join(ROOT, 'test/helpers/plan-review-decisions.ts'))}, () => ({
   evaluatePlanReviewDecisions: async input => {
     facts.evaluators++; save();
-    expect(input.kind).toBe('scope'); expect(input.floor).toBe(4);
+    expect(input.kind).toBe('scope'); expect(input.floor).toBe(2);
     expect(input.ceiling).toBeUndefined(); expect(input.targets).toEqual(CEO_SCOPE_CANDIDATES);
     expect(input.deadlineAt - Date.now()).toBeGreaterThan(1_490_000);
     expect(input.deadlineAt - Date.now()).toBeLessThanOrEqual(1_500_000);

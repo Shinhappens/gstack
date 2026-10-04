@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { NativeQuestion } from './plan-skill-questions';
@@ -54,16 +54,6 @@ export const DESIGN_BOARD_ACTOR_PROTOCOL = [
   'decisions, visual verification, and the remaining review still apply.',
   '',
 ].join('\n');
-
-/** Declare the fixture user's interface before launch, without changing its plan. */
-export function seedDesignBoardActorProtocol(cwd: string): void {
-  fs.appendFileSync(path.join(cwd, 'CLAUDE.md'), `\n${DESIGN_BOARD_ACTOR_PROTOCOL}`);
-  const git = (args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe', timeout: 10_000 });
-  git(['add', 'CLAUDE.md']);
-  git(['-c', 'user.name=Finding fixture', '-c', 'user.email=fixture@gstack.test', 'commit', '-m', 'Declare Design board fixture actor interface']);
-  git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
-}
-
 // The native picker is synchronous. Keep identity checks and the real board
 // submission together in a bounded child; the counting driver still owns the
 // subsequent terminal input and requires its native acknowledgment.

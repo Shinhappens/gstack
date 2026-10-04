@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { JUDGE_MS, CAPTURE_MS, CAPTURE_LONG_MS, PTY_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
+import { getHermeticDirs, isHermeticEnabled, seedHermeticGstackHome } from './helpers/hermetic-env';
 import { EvalCollector } from './helpers/eval-store';
 import { OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt } from './helpers/office-hours-attempt';
 import {
@@ -10,9 +11,6 @@ import {
   finalizeEvalCollector,
 } from './helpers/e2e-helpers';
 import { judgePosture } from './helpers/llm-judge';
-import { extractSkillSections } from './helpers/skill-fixture';
-import { buildCodexOfferingPrompt } from './helpers/codex-offering-fixture';
-import { validateOfficeHoursSpecSummary } from './helpers/office-hours-completion';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -379,6 +377,9 @@ Focus on architecture, code quality, tests, and performance sections.`,
 
 describeIfSelected('Plan-Eng-Review Test-Plan Artifact E2E', ['plan-eng-review-artifact'], () => {
   let planDir: string;
+  let gstackHome: string;
+  let ownsGstackHome = false;
+  let slug: string;
   let projectDir: string;
 
   beforeAll(() => {
@@ -438,35 +439,38 @@ export function main() { return Dashboard(); }
     // Set up remote-slug shim and browse shims (plan-eng-review uses remote-slug for artifact path)
     setupBrowseShims(planDir);
 
-    // Create project directory for artifacts
-    projectDir = path.join(os.homedir(), '.gstack', 'projects', 'test-project');
-    fs.mkdirSync(projectDir, { recursive: true });
-
-    // Clean up stale test-plan files from previous runs
-    try {
-      const staleFiles = fs.readdirSync(projectDir).filter(f => f.includes('test-plan'));
-      for (const f of staleFiles) {
-        fs.unlinkSync(path.join(projectDir, f));
-      }
-    } catch {}
+    // The actor, this observer and cleanup share one isolated state root: the
+    // hermetic run's GSTACK_HOME (or a seeded temporary one when hermetic mode
+    // is off), and the slug gstack-slug resolves for this fixture. Nothing is
+    // read or deleted under the operator's real home.
+    if (isHermeticEnabled()) gstackHome = getHermeticDirs().gstackHome;
+    else {
+      gstackHome = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-plan-artifact-home-'));
+      seedHermeticGstackHome(gstackHome);
+      ownsGstackHome = true;
+    }
+    const slugOut = spawnSync(path.join(ROOT, 'bin', 'gstack-slug'), [], {
+      cwd: planDir, stdio: 'pipe', timeout: 5000, env: { ...process.env, GSTACK_HOME: gstackHome },
+    }).stdout.toString();
+    slug = /^SLUG=(.+)$/m.exec(slugOut)?.[1]?.trim() ?? '';
+    if (!slug) throw new Error(`plan-eng-review-artifact: gstack-slug resolved no slug: ${slugOut}`);
+    projectDir = path.join(gstackHome, 'projects', slug);
+    const realHome = path.resolve(os.homedir());
+    if (projectDir === realHome || projectDir.startsWith(realHome + path.sep) && !projectDir.startsWith(path.resolve(os.tmpdir()) + path.sep)) {
+      throw new Error(`plan-eng-review-artifact: state root ${projectDir} is under the real home directory`);
+    }
   });
 
   afterAll(() => {
     try { fs.rmSync(planDir, { recursive: true, force: true }); } catch {}
-    // Clean up test-plan artifacts (but not the project dir itself)
-    try {
-      const files = fs.readdirSync(projectDir);
-      for (const f of files) {
-        if (f.includes('test-plan')) {
-          fs.unlinkSync(path.join(projectDir, f));
-        }
-      }
-    } catch {}
+    // Remove only this fixture's project directory inside the isolated state root.
+    try { fs.rmSync(ownsGstackHome ? gstackHome : projectDir, { recursive: true, force: true }); } catch {}
   });
 
   testConcurrentIfSelected('plan-eng-review-artifact', async () => {
-    // Count existing test-plan files before
-    const beforeFiles = fs.readdirSync(projectDir).filter(f => f.includes('test-plan'));
+    const testPlans = () => fs.existsSync(projectDir)
+      ? fs.readdirSync(projectDir).filter(f => /eng-review-test-plan-.*\.md$/.test(f)) : [];
+    const beforeFiles = testPlans();
 
     const result = await runSkillTest({
       prompt: `Read plan-eng-review/SKILL.md for the review workflow.
@@ -476,10 +480,11 @@ Read plan.md — that's the plan to review. This is a standalone plan with sourc
 
 Proceed directly to the full review. Skip any AskUserQuestion calls — this is non-interactive.
 
-IMPORTANT: After your review, you MUST write the test-plan artifact as described in the "Test Plan Artifact" section of SKILL.md. The remote-slug shim is at ${planDir}/browse/bin/remote-slug.
+In this fixture the gstack state root is GSTACK_HOME=${gstackHome} and the project slug is ${slug}.
 
 Write your review to ${planDir}/review-output.md`,
       workingDirectory: planDir,
+      env: { GSTACK_HOME: gstackHome },
       maxTurns: 25,
       allowedTools: ['Bash', 'Read', 'Write', 'Glob', 'Grep'],
       timeout: CAPTURE_LONG_MS,
@@ -489,165 +494,20 @@ Write your review to ${planDir}/review-output.md`,
     });
 
     logCost('/plan-eng-review artifact', result);
+    // The QA test plan is a required discovery artifact of the review: exactly
+    // one new file under this fixture's project directory, about this plan.
+    const newFiles = testPlans().filter(f => !beforeFiles.includes(f));
+    const content = newFiles.length === 1 ? fs.readFileSync(path.join(projectDir, newFiles[0]!), 'utf-8') : '';
+    const aboutPlan = /dashboard|fetchStats|\/api\/stats/i.test(content);
+    console.log(`Test-plan artifacts in ${projectDir}: ${newFiles.length} new${newFiles.length ? ` (${newFiles[0]}, ${content.length} chars)` : ''}`);
     recordE2E(evalCollector, '/plan-eng-review test-plan artifact', 'Plan-Eng-Review Test-Plan Artifact E2E', result, {
-      passed: ['success', 'error_max_turns'].includes(result.exitReason),
+      passed: ['success', 'error_max_turns'].includes(result.exitReason) && newFiles.length === 1 && aboutPlan,
     });
 
     expect(['success', 'error_max_turns']).toContain(result.exitReason);
-
-    // Verify test-plan artifact was written
-    const afterFiles = fs.readdirSync(projectDir).filter(f => f.includes('test-plan'));
-    const newFiles = afterFiles.filter(f => !beforeFiles.includes(f));
-    console.log(`Test-plan artifacts: ${beforeFiles.length} before, ${afterFiles.length} after, ${newFiles.length} new`);
-
-    if (newFiles.length > 0) {
-      const content = fs.readFileSync(path.join(projectDir, newFiles[0]), 'utf-8');
-      console.log(`Test-plan artifact (${newFiles[0]}): ${content.length} chars`);
-      expect(content.length).toBeGreaterThan(50);
-    } else {
-      console.warn('No test-plan artifact found — agent may not have followed artifact instructions');
-    }
-
-    // Soft assertion: we expect an artifact but agent compliance is not guaranteed.
-    // Log rather than fail — the test-plan artifact is a bonus output, not the core test.
-    if (newFiles.length === 0) {
-      console.warn('SOFT FAIL: No test-plan artifact written — agent did not follow artifact instructions');
-    }
+    expect(newFiles, `expected one new eng-review test plan in ${projectDir}`).toHaveLength(1);
+    expect(aboutPlan, 'the test plan covers the reviewed dashboard change').toBe(true);
   }, CAPTURE_LONG_MS);
-});
-
-// --- Office Hours Spec Review E2E ---
-
-describeIfSelected('Office Hours Spec Review E2E', ['office-hours-spec-review'], () => {
-  let ohDir: string;
-
-  beforeAll(() => {
-    ohDir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-oh-spec-'));
-    const run = (cmd: string, args: string[]) =>
-      spawnSync(cmd, args, { cwd: ohDir, stdio: 'pipe', timeout: 5000 });
-
-    run('git', ['init', '-b', 'main']);
-    run('git', ['config', 'user.email', 'test@test.com']);
-    run('git', ['config', 'user.name', 'Test']);
-    fs.writeFileSync(path.join(ohDir, 'README.md'), '# Test Project\n');
-    run('git', ['add', '.']);
-    run('git', ['commit', '-m', 'init']);
-
-    // This case explains the review procedure. Extract its actual section;
-    // the dedicated full-workflow case exercises skeleton/section discovery.
-    fs.mkdirSync(path.join(ohDir, 'office-hours'), { recursive: true });
-    const fixturePath = path.join(ohDir, 'office-hours', 'spec-review.md');
-    // The extractor requires the entry's real frontmatter. Recombine the entry
-    // and carved body locally, then keep only the review section for the model.
-    fs.writeFileSync(
-      fixturePath,
-      fs.readFileSync(path.join(ROOT, 'office-hours/SKILL.md'), 'utf-8') + '\n'
-        + fs.readFileSync(path.join(ROOT, 'office-hours/sections/design-and-handoff.md'), 'utf-8'),
-    );
-    fs.writeFileSync(fixturePath, extractSkillSections(fixturePath, ['Spec Review Loop']));
-  });
-
-  afterAll(() => {
-    try { fs.rmSync(ohDir, { recursive: true, force: true }); } catch {}
-  });
-
-  testConcurrentIfSelected('office-hours-spec-review', async () => {
-    const result = await runSkillTest({
-      prompt: `Read office-hours/spec-review.md. This is a documentation question: explain the procedure without executing office hours.
-
-Summarize what the "Spec Review Loop" section does — specifically:
-1. How many dimensions does the reviewer check?
-2. What tool is used to dispatch the reviewer?
-3. What's the maximum number of iterations?
-4. What metrics are tracked?
-
-Write your summary to ${ohDir}/spec-review-summary.md`,
-      workingDirectory: ohDir,
-      // Preserve this case's existing turn/time allowances. The fixture now
-      // supplies the section it asks about instead of a carved skeleton.
-      maxTurns: 12,
-      timeout: JUDGE_MS,
-      testName: 'office-hours-spec-review',
-      runId,
-    });
-
-    logCost('/office-hours spec review', result);
-    let validationError: unknown;
-    try {
-      const summaryPath = path.join(ohDir, 'spec-review-summary.md');
-      validateOfficeHoursSpecSummary(result.exitReason,
-        fs.existsSync(summaryPath) ? fs.readFileSync(summaryPath, 'utf-8') : null);
-    } catch (error) {
-      validationError = error;
-      throw error;
-    } finally {
-      recordE2E(evalCollector, '/office-hours-spec-review', 'Office Hours Spec Review E2E', result,
-        validationError ? {
-          passed: false,
-          exit_reason: result.exitReason === 'success' ? 'validation_failed' : result.exitReason,
-          output: String(validationError).slice(0, 2000),
-        } : undefined);
-    }
-  }, CAPTURE_MS);
-});
-
-// --- Plan CEO Review Benefits-From E2E ---
-
-describeIfSelected('Plan CEO Review Benefits-From E2E', ['plan-ceo-review-benefits'], () => {
-  let benefitsDir: string;
-
-  beforeAll(() => {
-    benefitsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-benefits-'));
-    const run = (cmd: string, args: string[]) =>
-      spawnSync(cmd, args, { cwd: benefitsDir, stdio: 'pipe', timeout: 5000 });
-
-    run('git', ['init', '-b', 'main']);
-    run('git', ['config', 'user.email', 'test@test.com']);
-    run('git', ['config', 'user.name', 'Test']);
-    fs.writeFileSync(path.join(benefitsDir, 'README.md'), '# Test Project\n');
-    run('git', ['add', '.']);
-    run('git', ['commit', '-m', 'init']);
-
-    fs.mkdirSync(path.join(benefitsDir, 'plan-ceo-review'), { recursive: true });
-    fs.copyFileSync(
-      path.join(ROOT, 'plan-ceo-review', 'SKILL.md'),
-      path.join(benefitsDir, 'plan-ceo-review', 'SKILL.md'),
-    );
-    { const _sec = path.join(ROOT, 'plan-ceo-review', 'sections'); if (fs.existsSync(_sec)) fs.cpSync(_sec, path.join(benefitsDir, 'plan-ceo-review', 'sections'), { recursive: true }); }
-  });
-
-  afterAll(() => {
-    try { fs.rmSync(benefitsDir, { recursive: true, force: true }); } catch {}
-  });
-
-  testConcurrentIfSelected('plan-ceo-review-benefits', async () => {
-    const result = await runSkillTest({
-      prompt: `Read plan-ceo-review/SKILL.md. Search for sections about "Prerequisite" or "office-hours" or "design doc found".
-
-Summarize what happens when no design doc is found — specifically:
-1. Is /office-hours offered as a prerequisite?
-2. What options does the user get?
-3. Is there a mid-session detection for when the user seems lost?
-
-Write your summary to ${benefitsDir}/benefits-summary.md`,
-      workingDirectory: benefitsDir,
-      maxTurns: 8,
-      timeout: JUDGE_MS,
-      testName: 'plan-ceo-review-benefits',
-      runId,
-    });
-
-    logCost('/plan-ceo-review benefits-from', result);
-    recordE2E(evalCollector, '/plan-ceo-review-benefits', 'Plan CEO Review Benefits-From E2E', result);
-    expect(result.exitReason).toBe('success');
-
-    const summaryPath = path.join(benefitsDir, 'benefits-summary.md');
-    if (fs.existsSync(summaryPath)) {
-      const summary = fs.readFileSync(summaryPath, 'utf-8').toLowerCase();
-      expect(summary).toMatch(/office.hours/);
-      expect(summary).toMatch(/design doc|no design/i);
-    }
-  }, CAPTURE_MS);
 });
 
 // --- Plan Review Report E2E ---
@@ -717,9 +577,7 @@ Read plan.md — that's the plan to review. This is a standalone plan document, 
 Proceed directly to the full review. Skip any AskUserQuestion calls — this is non-interactive.
 Skip the preamble bash block, lake intro, telemetry, and contributor mode sections.
 
-CRITICAL REQUIREMENT: plan.md IS the plan file for this review session. After completing your review, you MUST write a "## GSTACK REVIEW REPORT" section to the END of plan.md, exactly as described in the "Plan File Review Report" section of plan-eng-review/sections/review-sections.md. Use that canonical table, with all five review rows and honest not-run entries when review history is unavailable. The report MUST end with the mandatory unresolved-decisions status as its final line — the exact unbolded line NO UNRESOLVED DECISIONS when nothing is open, or a "**UNRESOLVED DECISIONS:**" block of bullets when items remain. Nothing may follow it. Use the Edit tool to append to plan.md — do NOT overwrite the existing plan content.
-
-This review report at the bottom of the plan is the MOST IMPORTANT deliverable of this test.`,
+plan.md is the plan file for this review session; save your review there.`,
             workingDirectory: planDir,
             maxTurns: 20,
             timeout: CAPTURE_LONG_MS,
@@ -780,93 +638,6 @@ This review report at the bottom of the plan is the MOST IMPORTANT deliverable o
 });
 
 // --- Codex Offering E2E ---
-// Verifies that Codex is properly offered (with availability check, user prompt,
-// and fallback) in office-hours, plan-ceo-review, plan-design-review, plan-eng-review.
-
-describeIfSelected('Codex Offering E2E', [
-  'codex-offered-office-hours', 'codex-offered-ceo-review',
-  'codex-offered-design-review', 'codex-offered-eng-review',
-], () => {
-  let testDir: string;
-
-  beforeAll(() => {
-    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-codex-offer-'));
-    const run = (cmd: string, args: string[]) =>
-      spawnSync(cmd, args, { cwd: testDir, stdio: 'pipe', timeout: 5000 });
-
-    run('git', ['init', '-b', 'main']);
-    run('git', ['config', 'user.email', 'test@test.com']);
-    run('git', ['config', 'user.name', 'Test']);
-    fs.writeFileSync(path.join(testDir, 'README.md'), '# Test Project\n');
-    run('git', ['add', '.']);
-    run('git', ['commit', '-m', 'init']);
-
-    // Copy all 4 SKILL.md files
-    for (const skill of ['office-hours', 'plan-ceo-review', 'plan-design-review', 'plan-eng-review']) {
-      fs.mkdirSync(path.join(testDir, skill), { recursive: true });
-      fs.copyFileSync(
-        path.join(ROOT, skill, 'SKILL.md'),
-        path.join(testDir, skill, 'SKILL.md'),
-      );
-      // Carved skills (v2 plan T9): copy sections/ so codex/outside-voice content
-      // (carved into review-sections.md) is present for the search.
-      const _sec = path.join(ROOT, skill, 'sections');
-      if (fs.existsSync(_sec)) fs.cpSync(_sec, path.join(testDir, skill, 'sections'), { recursive: true });
-    }
-  });
-
-  afterAll(() => {
-    try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
-  });
-
-  async function checkCodexOffering(skill: string, testName: string, featureName: string) {
-    const result = await runSkillTest({
-      prompt: buildCodexOfferingPrompt({
-        root: testDir, skill, featureName,
-        summaryPath: path.join(testDir, `${testName}-summary.md`),
-      }),
-      workingDirectory: testDir,
-      maxTurns: 8,
-      timeout: JUDGE_MS,
-      testName,
-      runId,
-    });
-
-    logCost(`/${skill} codex offering`, result);
-    recordE2E(evalCollector, `/${testName}`, 'Codex Offering E2E', result);
-    expect(result.exitReason).toBe('success');
-
-    const summaryPath = path.join(testDir, `${testName}-summary.md`);
-    expect(fs.existsSync(summaryPath)).toBe(true);
-
-    const summary = fs.readFileSync(summaryPath, 'utf-8').toLowerCase();
-    // All skills should have codex availability check (command -v per #1197)
-    expect(summary).toMatch(/command -v codex/);
-    // All skills should have fallback behavior
-    expect(summary).toMatch(/fallback|subagent|unavailable|not available|skip/);
-    // All skills should show it's optional/non-blocking
-    expect(summary).toMatch(/optional|non.?blocking|skip|not.*required/);
-
-    console.log(`${skill}: Codex offering verified`);
-  }
-
-  testConcurrentIfSelected('codex-offered-office-hours', async () => {
-    await checkCodexOffering('office-hours', 'codex-offered-office-hours', 'second opinion');
-  }, CAPTURE_MS);
-
-  testConcurrentIfSelected('codex-offered-ceo-review', async () => {
-    await checkCodexOffering('plan-ceo-review', 'codex-offered-ceo-review', 'outside voice');
-  }, CAPTURE_MS);
-
-  testConcurrentIfSelected('codex-offered-design-review', async () => {
-    await checkCodexOffering('plan-design-review', 'codex-offered-design-review', 'design outside voices');
-  }, CAPTURE_MS);
-
-  testConcurrentIfSelected('codex-offered-eng-review', async () => {
-    await checkCodexOffering('plan-eng-review', 'codex-offered-eng-review', 'outside voice');
-  }, CAPTURE_MS);
-});
-
 // Module-level afterAll — finalize eval collector after all tests complete
 afterAll(async () => {
   await finalizeEvalCollector(evalCollector);

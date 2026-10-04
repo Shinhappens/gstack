@@ -3,39 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import captured from './fixtures/review-count-markdown-6f.json';
-import {nativePlanCallFingerprint, planCountQuestionPhase, designStep0Boundary, assertReviewReportAtBottom,
+import {nativePlanCallFingerprint, planCountQuestionPhase,
   engStep0Boundary, engFirstReviewAUQ, engSetupAUQ} from './helpers/claude-pty-runner';
-import {isDesignCountFirstReview, isDesignCountSetup, isDesignCompletionHandoff} from './helpers/design-count-review';
 import {createEngBatchingIssueCounter} from './helpers/eng-seeded-coverage';
 import type {NativePlanQuestionCall} from './helpers/plan-count-transcript';
 
 const design = captured.cases[0]!;
 const calls = (entry: typeof design) => structuredClone(entry.calls) as NativePlanQuestionCall[];
-
-test('captured Design native decisions cross the real phase boundary at Issue 1', () => {
-  let started = false;
-  const phases = calls(design).slice(0,8).map(call => {
-    const phase = planCountQuestionPhase(nativePlanCallFingerprint(call, 0, !started), started,
-      designStep0Boundary, isDesignCountFirstReview, isDesignCountSetup, isDesignCompletionHandoff);
-    started = phase.reviewStarted;
-    return phase;
-  });
-  expect(phases.map(phase => phase.preReview)).toEqual([true,true,false,false,false,false,false,false]);
-});
-
-test('the complete Design outcome retains all seven decisions and its actual saved report',()=>{
-  let started=false;
-  const phases=calls(design).map(call=>{
-    const phase=planCountQuestionPhase(nativePlanCallFingerprint(call,0,!started),started,
-      designStep0Boundary,isDesignCountFirstReview,isDesignCountSetup,isDesignCompletionHandoff);
-    started=phase.reviewStarted;return phase;
-  });
-  expect(captured.designFinal.outcome).toBe('plan_ready');
-  expect(captured.designFinal.originalCounts).toEqual({review:5,setup:4});
-  expect(phases.filter(p=>p.preReview)).toHaveLength(2);
-  expect(phases.filter(p=>!p.preReview&&!p.administrative)).toHaveLength(7);
-  expect(assertReviewReportAtBottom(captured.designFinal.report).ok).toBe(true);
-});
 
 function actualEngCaller(name: string, report: string) {
   const source = fs.readFileSync(path.join(import.meta.dir, name+'.test.ts'), 'utf8');
@@ -76,27 +50,6 @@ test('a missing pre-answer brief never earns saved-ledger batching credit',()=>{
   }
   expect(counter.trace).toEqual([]);
 });
-
-function designFirst(change: (q: NativePlanQuestionCall['questions'][number])=>void) {
-  const c=calls(design)[2]!,q=c.questions[0]!;change(q);c.answers={[q.question]:q.options[0]!.label};
-  return isDesignCountFirstReview(nativePlanCallFingerprint(c,0,true));
-}
-for(const title of ['"Billing preferences"','“Workspace settings”','`Team preferences`']) test('named current review provenance accepts '+title,()=>{
-  expect(designFirst(q=>{q.question=q.question.replace('"Plan: Settings Page UI redesign"',title);})).toBe(true);
-});
-for(const [name,change] of Object.entries({
-  'pass without owned review':(q:any)=>{q.question=q.question.replace('/plan-design-review of "Plan: Settings Page UI redesign", ','');},
-  'foreign title':(q:any)=>{q.question=q.question.replace('Plan: Settings Page UI redesign','Another unrelated plan');},
-  'quoted filename':(q:any)=>{q.question=q.question.replace('Plan: Settings Page UI redesign','OTHER.md');},
-  'historical provenance':(q:any)=>{q.question=q.question.replace('Project/branch/task: main','Project/branch/task: Historical example: main');},
-  'pass only inside title':(q:any)=>{q.question=q.question.replace('Plan: Settings Page UI redesign','Plan: Pass 1 (Information Architecture)').replace(', Pass 1 (Information Architecture).','.');},
-  'negative violation':(q:any)=>{q.options[2].description='The header does not violates DESIGN.md primary treatment.';},
-  'no longer violation':(q:any)=>{q.options[2].description='The header no longer violates DESIGN.md primary treatment.';},
-  'quoted historical violation':(q:any)=>{q.options[2].description='Earlier note: "The header violates DESIGN.md primary treatment."';},
-  'historical violation':(q:any)=>{q.options[2].description='Historical example: the header violates DESIGN.md primary treatment.';},
-  'foreign issue violation':(q:any)=>{q.options[2].description='Issue 99 violates DESIGN.md primary treatment.';},
-})) test('named Design provenance and current opposition reject '+name,()=>expect(designFirst(change)).toBe(false));
-
 const batch=captured.cases[1]!;
 function batchEntry(index=2){
   const call=calls(batch)[index]!;

@@ -2,7 +2,7 @@
 <!-- Regenerate: bun run gen:skill-docs -->
 ### Step 1.5 remediation: broken-engine AskUserQuestion + repair branches
 
-The user has a non-working local engine (Garry's repro: `~/.gbrain/config.json`
+The user has a non-working local engine (for example, `~/.gbrain/config.json`
 points at a dead Postgres URL). Fire a targeted AskUserQuestion BEFORE Step 2:
 
 > D# — Your local gbrain engine isn't responding. How do you want to fix it?
@@ -39,7 +39,7 @@ with `GSTACK_DETECT_NO_CACHE=1` (busts the 60s cache). If the new
 `gbrain_local_status` is `ok`, continue to Step 2. If still `broken-db` or
 `broken-config`, fire the same AskUserQuestion again (the user picks again).
 
-**If B (Switch to PGLite)** — execute the rollback-safe init sequence (plan D7):
+**If B (Switch to PGLite)** — execute the rollback-safe init sequence:
 
 ```bash
 BACKUP="$HOME/.gbrain/config.json.gstack-bak-$(date +%s)"
@@ -47,9 +47,9 @@ mv "$HOME/.gbrain/config.json" "$BACKUP"
 # gstack default: voyage-code-3 (1024d) when VOYAGE_API_KEY is set — best for
 # code retrieval. Without the key, fall back to gbrain's own auto-selected
 # embedding provider chain (OpenAI 1536d when OPENAI_API_KEY is present, etc.).
-# Never select gbrain's legacy zeroentropyai recipe for a new brain: the hosted
-# API sunsets September 4, 2026 (#2365); the wireup helper warns existing installs.
-set --  # flags ride the positional params — unquoted $VAR breaks under zsh word-splitting (#1798)
+# Never select gbrain's legacy zeroentropyai recipe for a new brain: its hosted
+# API's sunset date (September 4, 2026) has passed; the wireup helper warns existing installs.
+set --  # flags ride the positional params — unquoted $VAR breaks under zsh word-splitting
 if [ -n "${VOYAGE_API_KEY:-}" ]; then
   set -- --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
 fi

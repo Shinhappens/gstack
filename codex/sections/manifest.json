@@ -2,7 +2,7 @@
   "$schema": "https://gstack.dev/schemas/section-manifest.json",
   "skill": "codex",
   "version": 1,
-  "note": "PASSIVE registry (v2 plan T9 / CM2). Fields are IDs, file paths, human titles, and human-readable trigger text ONLY. The skeleton's Step 1 mode dispatch is the ONLY place that decides WHEN to read a section (the three modes are mutually exclusive — at most one section loads per invocation); required-reads live in the E2E fixtures. No machine predicate here — see docs/designs/v2_PLAN.md:663.",
+  "note": "PASSIVE registry (v2 plan T9 / CM2). Fields are IDs, file paths, human titles, and human-readable trigger text ONLY. The skeleton's Step 1 mode dispatch is the ONLY place that decides WHEN to read a section (the three modes are mutually exclusive — at most one section loads per invocation); required section reads are checked by test/carve-section-loading-codex.test.ts. No machine predicate here — see docs/designs/v2_PLAN.md:663.",
   "sections": [
     {
       "id": "review-mode",

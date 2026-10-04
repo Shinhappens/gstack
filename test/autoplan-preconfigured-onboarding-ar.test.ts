@@ -5,8 +5,6 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { seedAutoplanOnboarding } from './helpers/autoplan-preconfigured-fixture';
 import { DESIGN_DOC_DISCOVERY_BLOCK } from '../scripts/resolvers/design-doc-discovery';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
-
 const root = resolve(import.meta.dir, '..');
 const read = (file: string) => readFileSync(join(root, file), 'utf8');
 const original = read('test/fixtures/plans/autoplan-dashboard.md');
@@ -25,7 +23,7 @@ function fixture(plan = original) {
   const env = { PATH: process.env.PATH!, HOME: home, GSTACK_HOME: state, GSTACK_STATE_ROOT: state };
   const start = () => execFileSync(join(root, 'bin/gstack-skill-start'), ['--skill', 'autoplan'],
     { cwd, env, encoding: 'utf8', timeout: 30_000 });
-  const discover = () => execFileSync('bash', ['-c', DESIGN_DOC_DISCOVERY_BLOCK],
+  const discover = () => execFileSync('bash', ['-c', DESIGN_DOC_DISCOVERY_BLOCK.replaceAll('~/.claude/skills/gstack/bin/', `${root}/bin/`)],
     { cwd, env: { ...env, SLUG: 'chain-fixture', BRANCH: 'main' }, encoding: 'utf8', timeout: 5000 }).trim();
   return { cwd, home, state, planFile, start, discover, cleanup: () => rmSync(temp, { recursive: true, force: true }) };
 }
@@ -109,21 +107,5 @@ test('existing project routing or design files are never overwritten', () => {
       expect(readFileSync(join(f.cwd, existing), 'utf8')).toBe('Existing project material\n');
       expect(existsSync(join(f.cwd, 'docs/designs/dashboard-context.md'))).toBe(false);
     } finally { f.cleanup(); }
-  }
-});
-
-test('only the paid chain seeds prerequisites before launch and still enters every review gate', () => {
-  const caller = read('test/skill-e2e-autoplan-chain.test.ts');
-  expect(caller.match(/seedAutoplanOnboarding\(tempDir\)/g)).toHaveLength(1);
-  expect(caller.indexOf('fs.copyFileSync(UI_FIXTURE')).toBeLessThan(caller.indexOf('seedAutoplanOnboarding(tempDir)'));
-  expect(caller.indexOf('seedAutoplanOnboarding(tempDir)')).toBeLessThan(caller.indexOf("gitRun(['add', '.'])"));
-  expect(caller.indexOf('seedAutoplanOnboarding(tempDir)')).toBeLessThan(caller.indexOf('launchClaudePty({'));
-  expect(caller).toContain("session.send('/autoplan\\r')");
-  expect(caller).toContain('if (!ceo || !design || !dx || !eng)');
-  expect(caller).toContain("for (const phase of ['ceo', 'design', 'dx', 'eng'])");
-  expect(caller).toContain('expect(methodologyAudit.some(audit => audit.phase === phase && audit.passed)).toBe(true)');
-  expect(read('test/helpers/plan-count-fixture.ts')).not.toContain('seedAutoplanOnboarding');
-  for (const file of ['test/helpers/autoplan-preconfigured-fixture.ts', 'test/autoplan-preconfigured-onboarding-ar.test.ts']) {
-    expect(selectTests([file], E2E_TOUCHFILES).selected).toEqual(['autoplan-chain-pty']);
   }
 });

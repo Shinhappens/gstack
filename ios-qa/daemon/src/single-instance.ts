@@ -8,8 +8,8 @@
 import { readFile, mkdir, unlink } from 'fs/promises';
 import { existsSync, openSync, writeSync, closeSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
-import { homedir } from 'os';
 import { spawn } from 'child_process';
+import { resolveStateRoot } from '../../../lib/state-root';
 
 export interface PidfileContents {
   pid: number;
@@ -19,7 +19,7 @@ export interface PidfileContents {
 
 export function defaultPidfilePath(): string {
   return process.env.GSTACK_IOS_DAEMON_PIDFILE
-    ?? join(homedir(), '.gstack', 'ios-qa-daemon.pid');
+    ?? join(resolveStateRoot(), 'ios-qa-daemon.pid');
 }
 
 /**

@@ -72,6 +72,7 @@ export async function spawnDaemonForTest(
     DESIGN_DAEMON_IDLE_MS: String(opts.idleMs ?? 60_000),
     DESIGN_DAEMON_CHECK_MS: String(opts.checkMs ?? 1000),
     DESIGN_DAEMON_VERSION: "test-version",
+    GSTACK_HOME: path.join(path.dirname(stateFile), "gstack-home"),
     ...(opts.env ?? {}),
   };
 

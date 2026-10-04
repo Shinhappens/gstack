@@ -15,6 +15,7 @@
  */
 
 import type { TemplateContext, ResolverFn } from './types';
+import { getHostConfig } from '../../hosts/index';
 import { outsideVoiceFor, outsideVoiceGuard, outsideVoiceInvocation, outsideVoicePreflight, outsideVoiceProvenance, generateOutsideVoiceRouting } from './outside-voice';
 
 // Domain modules
@@ -22,7 +23,11 @@ import { generatePreamble } from './preamble';
 import { generateTestFailureTriage } from './preamble';
 import { generateDesignMethodology, generateDesignHardRules, generateDesignOutsideVoices, generateDesignReviewLite, generateDesignSketch, generateDesignSetup, generateDesignMockup, generateDesignShotgunLoop, generateTasteProfile, generateUXPrinciples, generateOverusedFonts, generateDesignSlopBullets, generateDesignDetector, generateDesignMdCheck } from './design';
 import { generateTestBootstrap, generateTestCoverageAuditPlan, generateTestCoverageAuditShip, generateTestCoverageGateShip } from './testing';
-import { generateReviewDashboard, generatePlanFileReviewReport, generatePlanReviewApprovalCheck, generateExitPlanModeGate, generateAntiShortcutClause, generateSpecReviewLoop, generateBenefitsFrom, generateCodexSecondOpinion, generateAdversarialStep, generateCodexPlanReview, generateCodexDocReview, generatePlanCompletionAuditShip, generatePlanCompletionGateShip, generatePlanCompletionAuditReview, generatePlanVerificationExec, generateScopeDrift, generateCrossReviewDedup } from './review';
+import { generateReviewDashboard, generatePlanFileReviewReport } from './review-dashboard';
+import { generatePlanReviewApprovalCheck, generateExitPlanModeGate, generatePlanCompletionAuditShip, generatePlanCompletionGateShip, generatePlanCompletionAuditReview, generatePlanVerificationExec } from './plan-gates';
+import { generateAntiShortcutClause, generateSpecReviewLoop, generateBenefitsFrom } from './spec-review';
+import { generateCodexSecondOpinion, generateAdversarialStep, generateCodexPlanReview, generateCodexDocReview } from './outside-voice-steps';
+import { generateScopeDrift, generateCrossReviewDedup, generateSharedCodeReuse } from './review-scope';
 import { generateSlugEval, generateSlugSetup, generateBaseBranchDetect, generateDeployBootstrap, generateQAMethodology, generateCoAuthorTrailer, generateChangelogWorkflow, generateCodexWebSearchFlag, generateCodexModelConfigFlag, generateCodexReviewModelConfigFlag, generateClaudeModelFlag, generateSetupCommand } from './utility';
 import { generateLearningsSearch, generateLearningsLog } from './learnings';
 import { generateConfidenceCalibration } from './confidence';
@@ -38,7 +43,9 @@ import { generateThirdPartyActions } from './third-party-actions';
 import { generateAsideSetup, generateAsideCookbook, generateAsideResearch, generateUntrustedContentWarning, asideExecPrelude } from './aside';
 import { generateCommandReference, generateSnapshotFlags, generateBrowseSetup, generateBrowseFallback } from './browse';
 import { generateDesignDocDiscovery } from './design-doc-discovery';
-import { generateSharedLibsRubric } from './shared-libs';
+import { generateSharedLibsRubric, generateSafeGitPath } from './shared-libs';
+import { generateTestValueBar, generateTestValueMessage } from './test-value';
+import { generateQAScope, generateQAExploratory, generateQAFunctional, generateQAResource, generateQAReview, generateQAReviewPreflight, generateQAMethodReads } from './qa';
 
 export const RESOLVERS: Record<string, ResolverFn> = {
   AUTOPLAN_PUBLICATION_HOOK: generateAutoplanPublicationHook,
@@ -49,7 +56,7 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   OUTSIDE_PROVIDER: (ctx) => outsideVoiceFor(ctx).id,
   HOST_ID: (ctx) => ctx.host,
   OUTSIDE_PREFLIGHT: (ctx, args) => outsideVoicePreflight(ctx, { disabledBehavior: args?.[0] === 'opt-in' ? 'opt-in' : 'codex-only' }),
-  OUTSIDE_INVOCATION: (ctx, args) => outsideVoiceInvocation(ctx, { timeoutMs: args?.[0] === 'spec' ? 120000 : 600000, gate: args?.[0] === 'spec' ? 'spec' : 'review', reasoningEffort: args?.[0] === 'spec' ? 'medium' : 'high' }),
+  OUTSIDE_INVOCATION: (ctx, args) => outsideVoiceInvocation(ctx, { timeoutMs: args?.[0] === 'spec' ? 120000 : 540000, gate: args?.[0] === 'spec' ? 'spec' : 'review', reasoningEffort: args?.[0] === 'spec' ? 'medium' : 'high' }),
   OUTSIDE_PROVENANCE: (ctx, args) => outsideVoiceProvenance(ctx, args?.[0] ?? ctx.skillName),
   SLUG_EVAL: generateSlugEval,
   SLUG_SETUP: generateSlugSetup,
@@ -61,6 +68,8 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   THIRD_PARTY_ACTIONS: generateThirdPartyActions,
   DESIGN_DOC_DISCOVERY: generateDesignDocDiscovery,
   SHARED_LIBS_RUBRIC: generateSharedLibsRubric,
+  SAFE_GIT: generateSafeGitPath,
+  SHARED_CODE_REUSE: generateSharedCodeReuse,
   UNTRUSTED_CONTENT_WARNING: generateUntrustedContentWarning,
   COMMAND_REFERENCE: generateCommandReference,
   SNAPSHOT_FLAGS: generateSnapshotFlags,
@@ -73,6 +82,13 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   ASIDE_EXEC_PRELUDE: asideExecPrelude,
   BASE_BRANCH_DETECT: generateBaseBranchDetect,
   QA_METHODOLOGY: generateQAMethodology,
+  QA_SCOPE: generateQAScope,
+  QA_EXPLORATORY: generateQAExploratory,
+  QA_FUNCTIONAL: generateQAFunctional,
+  QA_RESOURCE: generateQAResource,
+  QA_REVIEW: generateQAReview,
+  QA_REVIEW_PREFLIGHT: generateQAReviewPreflight,
+  QA_METHOD_READS: generateQAMethodReads,
   DESIGN_METHODOLOGY: generateDesignMethodology,
   DESIGN_HARD_RULES: generateDesignHardRules,
   OVERUSED_FONTS: generateOverusedFonts,
@@ -91,6 +107,8 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   TEST_COVERAGE_AUDIT_PLAN: generateTestCoverageAuditPlan,
   TEST_COVERAGE_AUDIT_SHIP: generateTestCoverageAuditShip,
   TEST_COVERAGE_GATE_SHIP: generateTestCoverageGateShip,
+  TEST_VALUE_BAR: generateTestValueBar,
+  TEST_VALUE_MESSAGE: generateTestValueMessage,
   TEST_FAILURE_TRIAGE: generateTestFailureTriage,
   SPEC_REVIEW_LOOP: generateSpecReviewLoop,
   DESIGN_SKETCH: generateDesignSketch,
@@ -122,6 +140,10 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   DX_FRAMEWORK: generateDxFramework,
   TASTE_PROFILE: generateTasteProfile,
   BIN_DIR: (ctx) => ctx.paths.binDir,
+  // Literal bin dir for skills that skip the shared preamble, where
+  // $GSTACK_BIN is never set (#2906): the per-install root when rendering for
+  // one, else the host's default global root.
+  INSTALLED_BIN_DIR: (ctx) => ctx.installRoot ? `${ctx.installRoot.replace(/\/+$/, '')}/bin` : `~/${getHostConfig(ctx.host).globalRoot}/bin`,
   FOREGROUND_DISPATCH_NOTE: () => FOREGROUND_DISPATCH_NOTE,
   GBRAIN_CONTEXT_LOAD: generateGBrainContextLoad,
   GBRAIN_SAVE_RESULTS: generateGBrainSaveResults,

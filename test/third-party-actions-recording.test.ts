@@ -24,10 +24,11 @@ const recoveryResponses = JSON.parse(readFile(path.join(root, 'test/fixtures/thi
 const writeFile = fs.writeFileSync.bind(fs);
 const remove = fs.rmSync.bind(fs);
 const source = readFile(path.join(root, 'test/helpers/e2e-helpers.ts'), 'utf8');
-const start = source.indexOf('export function recordE2E(');
-const end = source.indexOf('/**', start);
-if (start < 0 || end < 0) throw new Error('recordE2E source boundary missing');
-const recordSource = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end).replace('export function', 'function'));
+const start = source.indexOf('const INFRA_EXIT_REASONS');
+const recordStart = source.indexOf('export function recordE2E(');
+const end = source.indexOf('/**', recordStart);
+if (start < 0 || recordStart < start || end < 0) throw new Error('recordE2E source boundary missing');
+const recordSource = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end).replaceAll('export function', 'function'));
 const recordE2E = new Function(recordSource + '\\nreturn recordE2E;')();
 const cases = new Map();
 const records = [];

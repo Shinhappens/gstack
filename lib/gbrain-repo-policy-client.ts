@@ -18,8 +18,8 @@
 
 import { spawnSync } from "child_process";
 import { existsSync } from "fs";
-import { homedir } from "os";
 import { join } from "path";
+import { mergedStateRoots, resolveStateRoot } from "./state-root";
 
 export type RepoPolicyTierValue = "deny" | "read-only" | "read-write" | "none";
 
@@ -39,13 +39,16 @@ export interface RepoPolicyResult {
 
 /** Absolute path of the policy store for this env (GSTACK_HOME-aware). */
 export function repoPolicyStorePath(env: NodeJS.ProcessEnv = process.env): string {
-  const home = env.GSTACK_HOME || join(env.HOME || homedir(), ".gstack");
+  const home = resolveStateRoot(env);
   return join(home, "gbrain-repo-policy.json");
 }
 
-/** No store on disk = no policy was ever set (the fast path — no subprocess). */
+/**
+ * No store on disk = no policy was ever set (the fast path — no subprocess).
+ * The ~/.gstack store counts too: its deny tiers merge into every state root.
+ */
 export function hasRepoPolicyStore(env: NodeJS.ProcessEnv = process.env): boolean {
-  return existsSync(repoPolicyStorePath(env));
+  return mergedStateRoots(env).some((root) => existsSync(join(root, "gbrain-repo-policy.json")));
 }
 
 /** The bash script that owns the store — resolved relative to this file (lib/ → bin/), never cwd. */

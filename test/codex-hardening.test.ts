@@ -1,4 +1,4 @@
-import { generateAdversarialStep } from '../scripts/resolvers/review';
+import { generateAdversarialStep } from '../scripts/resolvers/outside-voice-steps';
 import { RESOLVERS } from '../scripts/resolvers';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 import { describe, test, expect } from 'bun:test';
@@ -278,13 +278,14 @@ describe('gstack-codex-probe: timeout wrapper + namespace hygiene', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-gto-stub-'));
     try {
       const stub = path.join(dir, 'gtimeout');
-      fs.writeFileSync(stub, '#!/bin/bash\necho gtimeout_chosen_$1\n');
+      fs.writeFileSync(stub, '#!/bin/bash\necho gtimeout_chosen "$@"\n');
       fs.chmodSync(stub, 0o755);
       const r = runProbe({
         snippet: `_gstack_codex_timeout_wrapper 5 echo nope`,
         env: { PATH: `${dir}:/bin:/usr/bin` },
       });
-      expect(r.stdout.trim()).toBe('gtimeout_chosen_5');
+      // The KILL escalation (#2776) precedes the duration, as timeout(1) requires.
+      expect(r.stdout.trim()).toBe('gtimeout_chosen -k 10 5 echo nope');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -308,6 +309,85 @@ describe('gstack-codex-probe: timeout wrapper + namespace hygiene', () => {
         env: { PATH: dir },
       });
       expect(r.stdout).toContain('rc=124');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const native of [false, true]) test(`${native ? 'bash-native watchdog' : 'timeout(1)'} KILLs a child that ignores TERM after the grace period (#2776)`, () => {
+    // An uncooperative provider used to outlive its deadline, so the outer
+    // tool gate killed the whole call and the partial output was lost.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-watchdog-stubborn-'));
+    try {
+      for (const tool of native ? ['bash', 'sleep', 'cat'] : []) {
+        const resolved = spawnSync('bash', ['-c', `command -v ${tool}`], { timeout: 5000 });
+        fs.symlinkSync(resolved.stdout.toString().trim(), path.join(dir, tool));
+      }
+      const stubborn = path.join(dir, 'stubborn');
+      fs.writeFileSync(stubborn, `#!${spawnSync('bash', ['-c', 'command -v bash'], { timeout: 5000 }).stdout.toString().trim()}\ntrap '' TERM\necho partial\nsleep 30\necho late\n`, { mode: 0o755 });
+      const r = runProbe({
+        snippet: `_GSTACK_CODEX_KILL_AFTER=1 _gstack_codex_timeout_wrapper 1 "${stubborn}"; echo "rc=$?"`,
+        env: native ? { PATH: dir } : {},
+      });
+      expect(r.stdout).toContain('partial');
+      expect(r.stdout).not.toContain('late');
+      expect(r.stdout).toContain('rc=124');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('bash-native watchdog reports its timeout while still retiring after TERM', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-watchdog-race-'));
+    try {
+      for (const tool of ['bash', 'sleep']) {
+        const resolved = spawnSync('bash', ['-c', `command -v ${tool}`], { timeout: 5000 });
+        expect(resolved.status).toBe(0);
+        fs.symlinkSync(resolved.stdout.toString().trim(), path.join(dir, tool));
+      }
+      const r = runProbe({
+        snippet: `
+kill() {
+  builtin kill "$@"
+  local rc=$?
+  if [ "$1" = -TERM ] && [ "$rc" -eq 0 ]; then sleep 0.2; fi
+  return "$rc"
+}
+_gstack_codex_timeout_wrapper 0.1 sleep 30
+printf 'rc=%s\\n' "$?"
+`,
+        env: { PATH: dir },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('rc=124\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const [name, command, expected] of [
+    ['success', 'printf finished', 'finishedrc=0\n'],
+    ['ordinary failure', "bash -c 'exit 7'", 'rc=7\n'],
+    ['independent signal', "bash -c 'kill -TERM $$'", 'rc=143\n'],
+  ]) test(`bash-native watchdog preserves ${name} without waiting for its deadline`, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-watchdog-early-'));
+    try {
+      for (const tool of ['bash', 'sleep']) {
+        const resolved = spawnSync('bash', ['-c', `command -v ${tool}`], { timeout: 5000 });
+        expect(resolved.status).toBe(0);
+        fs.symlinkSync(resolved.stdout.toString().trim(), path.join(dir, tool));
+      }
+      const r = runProbe({
+        snippet: `
+trap 'printf caller-term' TERM
+output=$(_gstack_codex_timeout_wrapper 10 ${command}; printf 'rc=%s\\n' "$?")
+printf '%s\\n' "$output"
+trap -p TERM
+`,
+        env: { PATH: dir },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe(`${expected}trap -- 'printf caller-term' SIGTERM\n`);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -468,8 +548,8 @@ describe('codex review-mode section Step 2A: PROMPT + --base mutual exclusion gu
 // which downstream reads as "Codex reviewed and found nothing".
 describe('codex timeout wrapper: /review + /ship diff passes', () => {
   const WRAPPED_SITES = [
-    'scripts/resolvers/review.ts', // generator (source of truth)
-    'review/sections/adversarial.md', // review section (Step 5.7 carved out of the skeleton)
+    'scripts/resolvers/outside-voice-steps.ts', // generator (source of truth)
+    'review/sections/adversarial.md', // review section (Step 4.8 carved out of the skeleton)
     'ship/sections/adversarial.md', // ship section source
   ];
 
@@ -478,7 +558,7 @@ describe('codex timeout wrapper: /review + /ship diff passes', () => {
   const BASH_GATE_MS = 600000;
 
   for (const relPath of WRAPPED_SITES) {
-    const read = () => relPath === 'scripts/resolvers/review.ts'
+    const read = () => relPath === 'scripts/resolvers/outside-voice-steps.ts'
       ? generateAdversarialStep({ host: 'claude', paths: HOST_PATHS.claude, skillName: 'review', tmplPath: 'review/SKILL.md.tmpl' })
       : fs.readFileSync(path.join(ROOT, relPath), 'utf8');
 
@@ -566,15 +646,37 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
       expect(content).not.toContain(
         'If no `[P1]` markers are found (only `[P2]` or no findings) — the gate is **PASS**',
       );
-      // The new rule: FAIL on non-zero exit, empty output, and untagged
-      // output; [P0] recognized as blocking; PASS reachable only through the
-      // explicit tagged-advisory-only branch.
+      // The rule: FAIL on non-zero exit and empty output; [P0] recognized as
+      // blocking; untagged completed output is UNVERIFIED (#2769) — neither a
+      // PASS nor a FAIL; PASS reachable only through the explicit
+      // tagged-advisory-only branch, which now includes P3.
       expect(content).toContain('The gate FAILS CLOSED');
       expect(content).toContain('`_CODEX_EXIT` is non-zero (including 124) → **GATE: FAIL**');
       expect(content).toContain('empty or whitespace-only → **GATE: FAIL**');
-      expect(content).toContain('untagged output');
       expect(content).toContain('`[P0]`');
       expect(content).toContain('PASS is only reachable through check 5');
+    });
+
+    test(`${relPath}: (b2) a clean untagged review is UNVERIFIED, and P2/P3-only output can PASS (#2769)`, () => {
+      const content = read();
+      expect(content).toContain(
+        'anywhere → **GATE: UNVERIFIED** (Codex completed and tagged nothing; read\n      the output above)',
+      );
+      expect(content).toContain('GATE: UNVERIFIED (Codex completed and tagged nothing; read the output above)');
+      expect(content).toContain('(only P2/P3 advisory) →\n      **GATE: PASS**');
+      expect(content).not.toContain('**GATE: FAIL** (fail-closed: untagged output');
+      expect(content).toContain('"unverified" if UNVERIFIED');
+      // The captured clean review from the real CLI carries no severity tag, so
+      // check 4 is the branch it takes; the captured P2 review takes check 5.
+      const fixtures = path.join(ROOT, 'test', 'fixtures', 'codex-review');
+      const clean = fs.readFileSync(path.join(fixtures, 'clean-review.stdout.txt'), 'utf-8');
+      const p2 = fs.readFileSync(path.join(fixtures, 'p2-review.stdout.txt'), 'utf-8');
+      const tagged = (t: string) => /\[P[0-3]\]|(^|\s)P[0-3]:/m.test(t);
+      const blocking = (t: string) => /\[P[01]\]|(^|\s)P[01]:/m.test(t);
+      expect(clean.trim().length).toBeGreaterThan(0);
+      expect(tagged(clean)).toBe(false);
+      expect(tagged(p2)).toBe(true);
+      expect(blocking(p2)).toBe(false);
     });
 
     test(`${relPath}: (c) every Bash gate sits strictly above its section's wrapper budgets`, () => {

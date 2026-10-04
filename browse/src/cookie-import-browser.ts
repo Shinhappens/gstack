@@ -10,11 +10,15 @@
  *   │ 1. Resolve the cookie DB from the browser profile dir           │
  *   │    - macOS: ~/Library/Application Support/<browser>/<profile>   │
  *   │    - Linux: ~/.config/<browser>/<profile>                       │
+ *   │    - Windows: %LOCALAPPDATA% or %APPDATA% (Opera) /<browser>/   │
+ *   │      <profile>/Network/Cookies, falling back to <profile>/Cookies│
  *   │                                                                  │
  *   │ 2. Derive the AES key                                            │
  *   │    - macOS v10: Keychain password, PBKDF2(..., iter=1003)       │
  *   │    - Linux v10: "peanuts", PBKDF2(..., iter=1)                  │
  *   │    - Linux v11: libsecret/secret-tool password, iter=1          │
+ *   │    - Windows v10: DPAPI-unprotect Local State os_crypt key      │
+ *   │    - Windows v20 (App-Bound): not decryptable here              │
  *   │                                                                  │
  *   │ 3. For each cookie with encrypted_value starting with "v10"/     │
  *   │    "v11":                                                        │
@@ -24,6 +28,8 @@
  *   │    - Remove PKCS7 padding                                       │
  *   │    - Skip first 32 bytes of Chromium cookie metadata            │
  *   │    - Remaining bytes = cookie value (UTF-8)                     │
+ *   │    Windows v10: AES-256-GCM(nonce=ev[3:15], tag=last 16 bytes); │
+ *   │    drop a leading SHA-256(host_key) when present (DB meta v24+) │
  *   │                                                                  │
  *   │ 4. If encrypted_value is empty but `value` field is set,        │
  *   │    use value directly (unencrypted cookie)                      │
@@ -46,12 +52,14 @@ import { isIP } from 'node:net';
 
 export interface BrowserInfo {
   name: string;
-  dataDir: string; // primary storage dir (retained for compatibility with existing callers/tests)
+  dataDir: string | null; // macOS directory; null when that platform has no supported location
   keychainService: string;
   aliases: string[];
   linuxDataDir?: string;
   linuxApplication?: string;
   windowsDataDir?: string;
+  windowsDataRoot?: 'local' | 'roaming';
+  windowsNative?: true;
 }
 
 export interface ProfileEntry {
@@ -107,12 +115,15 @@ interface BrowserMatch {
 
 const BROWSER_REGISTRY: BrowserInfo[] = [
   { name: 'Comet',    dataDir: 'Comet/',                      keychainService: 'Comet Safe Storage',          aliases: ['comet', 'perplexity'] },
-  { name: 'Chrome',   dataDir: 'Google/Chrome/',             keychainService: 'Chrome Safe Storage',         aliases: ['chrome', 'google-chrome', 'google-chrome-stable'], linuxDataDir: 'google-chrome/', linuxApplication: 'chrome', windowsDataDir: 'Google/Chrome/User Data/' },
-  { name: 'Chromium', dataDir: 'chromium/',                  keychainService: 'Chromium Safe Storage',       aliases: ['chromium'], linuxDataDir: 'chromium/', linuxApplication: 'chromium', windowsDataDir: 'Chromium/User Data/' },
+  { name: 'Chrome',   dataDir: 'Google/Chrome/',             keychainService: 'Chrome Safe Storage',         aliases: ['chrome', 'google-chrome', 'google-chrome-stable'], linuxDataDir: 'google-chrome/', linuxApplication: 'chrome', windowsDataDir: 'Google/Chrome/User Data/', windowsNative: true },
+  { name: 'Chromium', dataDir: 'chromium/',                  keychainService: 'Chromium Safe Storage',       aliases: ['chromium'], linuxDataDir: 'chromium/', linuxApplication: 'chromium', windowsDataDir: 'Chromium/User Data/', windowsNative: true },
   { name: 'Arc',      dataDir: 'Arc/User Data/',             keychainService: 'Arc Safe Storage',            aliases: ['arc'] },
   { name: 'Dia',      dataDir: 'Dia/User Data/',             keychainService: 'Dia Safe Storage',            aliases: ['dia'] },
-  { name: 'Brave',    dataDir: 'BraveSoftware/Brave-Browser/', keychainService: 'Brave Safe Storage',        aliases: ['brave'], linuxDataDir: 'BraveSoftware/Brave-Browser/', linuxApplication: 'brave', windowsDataDir: 'BraveSoftware/Brave-Browser/User Data/' },
-  { name: 'Edge',     dataDir: 'Microsoft Edge/',            keychainService: 'Microsoft Edge Safe Storage', aliases: ['edge'], linuxDataDir: 'microsoft-edge/', linuxApplication: 'microsoft-edge', windowsDataDir: 'Microsoft/Edge/User Data/' },
+  { name: 'Brave',    dataDir: 'BraveSoftware/Brave-Browser/', keychainService: 'Brave Safe Storage',        aliases: ['brave'], linuxDataDir: 'BraveSoftware/Brave-Browser/', linuxApplication: 'brave', windowsDataDir: 'BraveSoftware/Brave-Browser/User Data/', windowsNative: true },
+  { name: 'Edge',     dataDir: 'Microsoft Edge/',            keychainService: 'Microsoft Edge Safe Storage', aliases: ['edge'], linuxDataDir: 'microsoft-edge/', linuxApplication: 'microsoft-edge', windowsDataDir: 'Microsoft/Edge/User Data/', windowsNative: true },
+  // Windows-only. Local State sits directly under the browser root in %APPDATA% — no User Data segment.
+  { name: 'Opera',    dataDir: null,                         keychainService: 'Opera Safe Storage',          aliases: ['opera'], windowsDataDir: 'Opera Software/Opera Stable/', windowsDataRoot: 'roaming' },
+  { name: 'Opera GX', dataDir: null,                         keychainService: 'Opera GX Safe Storage',       aliases: ['opera-gx', 'operagx'], windowsDataDir: 'Opera Software/Opera GX Stable/', windowsDataRoot: 'roaming' },
 ];
 
 // ─── Key Cache ──────────────────────────────────────────────────
@@ -134,14 +145,12 @@ export function findInstalledBrowsers(): BrowserInfo[] {
     for (const platform of getSearchPlatforms()) {
       const dataDir = getDataDirForPlatform(browser, platform);
       if (!dataDir) continue;
-      const browserDir = path.join(getBaseDir(platform), dataDir);
+      const browserDir = path.join(getBaseDir(platform, browser), dataDir);
       try {
         const entries = fs.readdirSync(browserDir, { withFileTypes: true });
         if (entries.some(e => {
           if (!e.isDirectory() || !e.name.startsWith('Profile ')) return false;
-          const profileDir = path.join(browserDir, e.name);
-          return fs.existsSync(path.join(profileDir, 'Cookies'))
-            || (platform === 'win32' && fs.existsSync(path.join(profileDir, 'Network', 'Cookies')));
+          return profileCookieCandidates(platform, path.join(browserDir, e.name)).some(candidate => fs.existsSync(candidate));
         })) return true;
       } catch {}
     }
@@ -160,14 +169,14 @@ export function listSupportedBrowserNames(): string[] {
  * List available profiles for a browser.
  */
 export function listProfiles(browserName: string): ProfileEntry[] {
-  const browser = resolveBrowser(browserName);
+  const browser = resolveBrowserInfo(browserName);
   const profiles: ProfileEntry[] = [];
 
   // Scan each supported platform for profile directories
   for (const platform of getSearchPlatforms()) {
     const dataDir = getDataDirForPlatform(browser, platform);
     if (!dataDir) continue;
-    const browserDir = path.join(getBaseDir(platform), dataDir);
+    const browserDir = path.join(getBaseDir(platform, browser), dataDir);
     if (!fs.existsSync(browserDir)) continue;
 
     let profileNames: Record<string, { name?: unknown }> = {};
@@ -185,11 +194,7 @@ export function listProfiles(browserName: string): ProfileEntry[] {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       if (entry.name !== 'Default' && !entry.name.startsWith('Profile ')) continue;
-      // Chrome 80+ on Windows stores cookies under Network/Cookies
-      const cookieCandidates = platform === 'win32'
-        ? [path.join(browserDir, entry.name, 'Network', 'Cookies'), path.join(browserDir, entry.name, 'Cookies')]
-        : [path.join(browserDir, entry.name, 'Cookies')];
-      if (!cookieCandidates.some(p => fs.existsSync(p))) continue;
+      if (!profileCookieCandidates(platform, path.join(browserDir, entry.name)).some(p => fs.existsSync(p))) continue;
 
       // Avoid duplicates if the same profile appears on multiple platforms
       if (profiles.some(p => p.name === entry.name)) continue;
@@ -274,7 +279,7 @@ export async function withCookieReadRetry<T>(operation: () => T | Promise<T>): P
  * List unique cookie domains + counts from a browser's DB. No decryption.
  */
 export function listDomains(browserName: string, profile = 'Default'): { domains: DomainEntry[]; browser: string } {
-  const browser = resolveBrowser(browserName);
+  const browser = resolveBrowserInfo(browserName);
   const match = getBrowserMatch(browser, profile);
   const db = openDb(match.dbPath, browser.name);
   try {
@@ -306,7 +311,7 @@ export async function importCookies(
     const normalized = normalizeCookieDomain(domain);
     return [normalized, '.' + normalized];
   }))];
-  const browser = resolveBrowser(browserName);
+  const browser = resolveBrowserInfo(browserName);
   const match = getBrowserMatch(browser, profile);
   const db = openDb(match.dbPath, browser.name);
 
@@ -350,9 +355,17 @@ export async function importCookies(
   }
 }
 
+/**
+ * Throw the same typed not-installed error an import would raise when the
+ * profile has no cookie database; returns quietly when one exists.
+ */
+export function assertCookieDatabase(browserName: string, profile: string): void {
+  getBrowserMatch(resolveBrowserInfo(browserName), profile);
+}
+
 // ─── Internal: Browser Resolution ───────────────────────────────
 
-function resolveBrowser(nameOrAlias: string): BrowserInfo {
+export function resolveBrowserInfo(nameOrAlias: string): BrowserInfo {
   const needle = nameOrAlias.toLowerCase().trim();
   const found = BROWSER_REGISTRY.find(b =>
     b.aliases.includes(needle) || b.name.toLowerCase() === needle
@@ -360,11 +373,39 @@ function resolveBrowser(nameOrAlias: string): BrowserInfo {
   if (!found) {
     const supported = BROWSER_REGISTRY.flatMap(b => b.aliases).join(', ');
     throw new CookieImportError(
-      `Unknown browser '${nameOrAlias}'. Supported: ${supported}`,
+      `Unknown browser '${nameOrAlias}'. Supported on this OS: ${hostBrowserTokens()}. All names: ${supported}`,
       'unknown_browser',
     );
   }
   return found;
+}
+
+const PLATFORM_LABELS: Record<BrowserPlatform, string> = { darwin: 'macOS', linux: 'Linux', win32: 'Windows' };
+
+function joinLabels(labels: string[]): string {
+  return labels.length <= 1 ? labels.join('') : `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
+}
+
+function hostBrowserTokens(): string {
+  const host = getHostPlatform();
+  return BROWSER_REGISTRY
+    .filter(browser => !host || getDataDirForPlatform(browser, host) !== null)
+    .map(browser => `${browser.name} (${browser.aliases[0]})`)
+    .join(', ');
+}
+
+function symbolicLocation(browser: BrowserInfo, platform: BrowserPlatform): string {
+  const dataDir = getDataDirForPlatform(browser, platform)!.replace(/\/$/, '');
+  if (platform === 'darwin') return `~/Library/Application Support/${dataDir}`;
+  if (platform === 'linux') return `~/.config/${dataDir}`;
+  return `${browser.windowsDataRoot === 'roaming' ? '%APPDATA%' : '%LOCALAPPDATA%'}\\${dataDir.replace(/\//g, '\\')}`;
+}
+
+function profileCookieCandidates(platform: BrowserPlatform, profileDir: string): string[] {
+  // Chrome 80+ on Windows stores cookies under Network/Cookies; fall back to Cookies
+  return platform === 'win32'
+    ? [path.join(profileDir, 'Network', 'Cookies'), path.join(profileDir, 'Cookies')]
+    : [path.join(profileDir, 'Cookies')];
 }
 
 function validateProfile(profile: string): void {
@@ -393,14 +434,21 @@ function getSearchPlatforms(): BrowserPlatform[] {
 }
 
 function getDataDirForPlatform(browser: BrowserInfo, platform: BrowserPlatform): string | null {
-  if (platform === 'darwin') return browser.dataDir;
+  if (platform === 'darwin') return browser.dataDir || null;
   if (platform === 'linux') return browser.linuxDataDir || null;
   return browser.windowsDataDir || null;
 }
 
-function getBaseDir(platform: BrowserPlatform): string {
+function windowsBaseDir(browser: BrowserInfo): string {
+  if (browser.windowsDataRoot !== 'roaming') return path.join(os.homedir(), 'AppData', 'Local');
+  const appData = process.env.APPDATA;
+  if (typeof appData === 'string' && path.win32.isAbsolute(appData.trim())) return appData.trim();
+  return path.join(os.homedir(), 'AppData', 'Roaming');
+}
+
+function getBaseDir(platform: BrowserPlatform, browser: BrowserInfo): string {
   if (platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support');
-  if (platform === 'win32') return path.join(os.homedir(), 'AppData', 'Local');
+  if (platform === 'win32') return windowsBaseDir(browser);
   return path.join(os.homedir(), '.config');
 }
 
@@ -409,12 +457,8 @@ function findBrowserMatch(browser: BrowserInfo, profile: string): BrowserMatch |
   for (const platform of getSearchPlatforms()) {
     const dataDir = getDataDirForPlatform(browser, platform);
     if (!dataDir) continue;
-    const baseProfile = path.join(getBaseDir(platform), dataDir, profile);
-    // Chrome 80+ on Windows stores cookies under Network/Cookies; fall back to Cookies
-    const candidates = platform === 'win32'
-      ? [path.join(baseProfile, 'Network', 'Cookies'), path.join(baseProfile, 'Cookies')]
-      : [path.join(baseProfile, 'Cookies')];
-    for (const dbPath of candidates) {
+    const baseProfile = path.join(getBaseDir(platform, browser), dataDir, profile);
+    for (const dbPath of profileCookieCandidates(platform, baseProfile)) {
       try {
         if (fs.existsSync(dbPath)) {
           return { browser, platform, dbPath };
@@ -429,17 +473,31 @@ function getBrowserMatch(browser: BrowserInfo, profile: string): BrowserMatch {
   const match = findBrowserMatch(browser, profile);
   if (match) return match;
 
-  const attempted = getSearchPlatforms()
-    .map(platform => {
-      const dataDir = getDataDirForPlatform(browser, platform);
-      return dataDir ? path.join(getBaseDir(platform), dataDir, profile, 'Cookies') : null;
-    })
-    .filter((entry): entry is string => entry !== null);
+  const platforms = getSearchPlatforms().filter(platform => getDataDirForPlatform(browser, platform) !== null);
+  const rootFor = (platform: BrowserPlatform) => path.join(getBaseDir(platform, browser), getDataDirForPlatform(browser, platform)!);
+  const checked = `Checked: ${platforms.flatMap(platform => profileCookieCandidates(platform, path.join(rootFor(platform), profile))).join(', ')}.`;
+  const host = getHostPlatform();
 
-  throw new CookieImportError(
-    `${browser.name} is not installed (no cookie database at ${attempted.join(' or ')})`,
-    'not_installed',
-  );
+  if (host && !platforms.includes(host)) {
+    const locations = platforms.map(platform => `${symbolicLocation(browser, platform)} on ${PLATFORM_LABELS[platform]}`).join('; ');
+    throw new CookieImportError(
+      `${browser.name} cookie import is available on ${joinLabels(platforms.map(platform => PLATFORM_LABELS[platform]))} only. It reads ${locations}. Browsers available on this OS: ${hostBrowserTokens()}. ${checked}`,
+      'not_installed',
+    );
+  }
+
+  if (platforms.some(platform => fs.existsSync(rootFor(platform)))) {
+    const available = listProfiles(browser.name).map(entry => entry.name);
+    throw new CookieImportError(
+      `${browser.name} profile '${profile}' not found. Available: ${available.length ? available.join(', ') : 'none'}. ${checked}`,
+      'not_installed',
+    );
+  }
+
+  const layout = browser.windowsDataRoot === 'roaming'
+    ? ` Supported layout: ${symbolicLocation(browser, 'win32')}\\<Default|Profile N>\\Network\\Cookies. Legacy root-level layouts, side profiles and portable installs are not supported; sign in manually with \`$B handoff\` instead.`
+    : '';
+  throw new CookieImportError(`No supported ${browser.name} cookie database found. ${checked}${layout}`, 'not_installed');
 }
 
 // ─── Internal: SQLite Access ────────────────────────────────────
@@ -563,7 +621,7 @@ async function getWindowsAesKey(browser: BrowserInfo): Promise<Buffer> {
   const dataDir = getDataDirForPlatform(browser, platform);
   if (!dataDir) throw new CookieImportError(`No Windows data dir for ${browser.name}`, 'not_installed');
 
-  const localStatePath = path.join(getBaseDir(platform), dataDir, 'Local State');
+  const localStatePath = path.join(getBaseDir(platform, browser), dataDir, 'Local State');
   let localState: any;
   try {
     localState = JSON.parse(fs.readFileSync(localStatePath, 'utf-8'));
@@ -784,7 +842,11 @@ function decryptCookieValue(row: RawCookie, keys: Map<string, Buffer>, platform:
     const ciphertext = ev.slice(15, ev.length - 16);
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce) as crypto.DecipherGCM;
     decipher.setAuthTag(tag);
-    return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf-8');
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    // Cookie DB meta version 24+ prefixes the value with SHA-256(host_key).
+    const hostHash = crypto.createHash('sha256').update(row.host_key).digest();
+    const prefixed = plaintext.length >= 32 && plaintext.subarray(0, 32).equals(hostHash);
+    return (prefixed ? plaintext.subarray(32) : plaintext).toString('utf-8');
   }
 
   // macOS / Linux: AES-128-CBC — structure: v10/v11(3) + ciphertext
@@ -844,14 +906,17 @@ export async function importCookiesViaCdp(
 ): Promise<ImportResult> {
   if (domains.length === 0) return { cookies: [], count: 0, failed: 0, domainCounts: {} };
   if (process.platform !== 'win32') throw new CookieImportError('Native extraction is only supported on Windows', 'not_supported');
-  const browser = resolveBrowser(browserName);
+  const browser = resolveBrowserInfo(browserName);
   validateProfile(profile);
   const dataDir = getDataDirForPlatform(browser, 'win32');
   if (!dataDir) throw new CookieImportError('This browser is not supported on Windows', 'not_supported');
+  if (!browser.windowsNative) {
+    throw new CookieImportError(`${browser.name} has no native cookie extraction. Sign in manually: run \`$B handoff\`, sign in, then \`$B resume\`.`, 'native_unsupported_browser');
+  }
   const { importNativeCookies } = await import('./cookie-import-native');
   const cookies = await importNativeCookies({
     browserName: browser.name,
-    userDataDir: path.join(getBaseDir('win32'), dataDir),
+    userDataDir: path.join(getBaseDir('win32', browser), dataDir),
     profile,
     domains: [...new Set(domains.flatMap(domain => {
       const normalized = normalizeCookieDomain(domain);

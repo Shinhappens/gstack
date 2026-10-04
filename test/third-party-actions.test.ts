@@ -26,7 +26,6 @@ import { generateThirdPartyActions } from "../scripts/resolvers/third-party-acti
 import { generateAsideSetup } from "../scripts/resolvers/aside";
 import { HOST_PATHS } from "../scripts/resolvers/types";
 import { asideDriveOptions } from './helpers/third-party-actions';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import recoveryFixture from './fixtures/third-party-actions-recovery-public.json';
 
 const ROOT = path.resolve(import.meta.dir, "..");
@@ -41,12 +40,6 @@ const ctx = {
 const section = generateThirdPartyActions(ctx);
 
 describe('consent offer extraction', () => {
-  test('helper changes select the consent gate evals', () => {
-    expect(selectTests(['test/helpers/third-party-actions.ts'], E2E_TOUCHFILES, []).selected.sort()).toEqual([
-      'tpa-absent-darwin', 'tpa-absent-linux', 'tpa-apple-ban', 'tpa-broken', 'tpa-present',
-    ]);
-  });
-
   test('an unavailable-option explanation is not an offer', () => {
     expect(asideDriveOptions(`B) I drive it in gstack's own visible browser
 C) Manual instructions

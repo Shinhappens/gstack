@@ -35,7 +35,7 @@ jobs:
       # take ~12s combined. The one history consumer (the added-lines diff)
       # fetches its exact base/head SHAs below — an exact-SHA fetch, not a
       # guessed depth, so long-lived branches and merge queues still resolve.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.0
@@ -93,3 +93,6 @@ jobs:
           scripts/build-app.sh
           scripts/write-version-files.sh
           browse/scripts/build-node-server.sh
+          scripts/ubicloud/ubi-runner.sh
+          scripts/ubicloud/setup-free-suite.sh
+          scripts/ubicloud/test-free.sh

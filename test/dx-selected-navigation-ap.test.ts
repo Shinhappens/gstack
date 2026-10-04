@@ -6,8 +6,6 @@ import captured from './fixtures/dx-selected-navigation-ap.json';
 import { hasNativePlanTerminal, classifyPlanCountFrame } from './helpers/claude-pty-runner';
 import { isRecordedDxManualNavigation } from './helpers/dx-selected-navigation';
 import type { NativePlanQuestionCall, PlanCountTranscript } from './helpers/plan-count-transcript';
-import { E2E_TOUCHFILES } from './helpers/touchfiles-data';
-
 type Edit = (calls: NativePlanQuestionCall[], transcript: PlanCountTranscript, report: string) => void;
 function replay(edit?: Edit) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dx-selected-navigation-'));
@@ -112,11 +110,5 @@ describe('completed DX review with selected manual navigation', () => {
     expect(replay((_calls, t) => { t.planReadyRequests![0]!.sessionId = 'foreign'; })).toBe(false);
     expect(replay((_calls, t) => { t.planReadyRequests![0]!.failed = true; })).toBe(false);
     expect(replay((_calls, t) => { t.planReadyRequests![0]!.timestamp = captured.calls[1]!.answeredAt; })).toBe(false);
-  });
-  test('shared completion owners select this helper and regression', () => {
-    for (const owner of ['plan-ceo-finding-count', 'plan-design-finding-count', 'plan-eng-finding-count', 'plan-devex-finding-count']) {
-      for (const file of ['test/helpers/dx-selected-navigation.ts', 'test/dx-selected-navigation-ap.test.ts',
-        'test/fixtures/dx-selected-navigation-ap.json']) expect(E2E_TOUCHFILES[owner]).toContain(file);
-    }
   });
 });

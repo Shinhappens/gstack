@@ -12,8 +12,6 @@ import { validateNavigationUrl } from './url-validation';
 import { checkScope, type TokenInfo } from './token-registry';
 import { validateOutputPath, validateReadPath, SAFE_DIRECTORIES, escapeRegExp } from './path-security';
 import { guardScreenshotBuffer, guardScreenshotPath } from './screenshot-size-guard';
-// Re-export for backward compatibility (tests import from meta-commands)
-export { validateOutputPath, escapeRegExp } from './path-security';
 import * as Diff from 'diff';
 import * as fs from 'fs';
 import * as path from 'path';

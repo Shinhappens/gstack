@@ -24,19 +24,13 @@
  */
 
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import {
   egressLedgerPath,
   listReceipts,
   resolveEgressHome,
   verifyLedger,
 } from '../lib/egress-receipt';
-
-// import.meta.dir is Windows-safe; new URL(import.meta.url).pathname yields
-// '/C:/...' with percent-encoded spaces there, which would make the
-// gstack-config spawn silently fail and grants report every default. Matches
-// the sibling bin/*.ts convention.
-const BIN_DIR = import.meta.dir;
+import { readConfigKey } from '../lib/state-root';
 
 /**
  * Strip control characters (incl. ANSI escapes) from ledger-derived strings
@@ -64,11 +58,9 @@ function usage(message: string): never {
   process.exit(2);
 }
 
+/** The shared config reader (lib/state-root.ts); '' when unset (callers apply gstack-config's defaults). */
 function configGet(key: string): string {
-  const result = spawnSync(path.join(BIN_DIR, 'gstack-config'), ['get', key], {
-    encoding: 'utf-8',
-  });
-  return (result.stdout || '').trim();
+  return readConfigKey(key) ?? '';
 }
 
 function egressList(args: string[], home: string): number {

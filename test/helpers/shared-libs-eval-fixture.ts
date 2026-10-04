@@ -6,6 +6,8 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { extractSkillSections, sliceBetween } from './skill-fixture';
 import type { EvalCollector, EvalTestEntry } from './eval-store';
+import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
+import { SESSION_DRAIN_GRACE_MS } from './session-drain-policy';
 
 export const SHARED_LIBS_ROOT = path.resolve(import.meta.dir, '../..');
 export const SHARED_INTERACTIVE_MAX_TURNS = 30;
@@ -14,6 +16,8 @@ const nodeBin = Bun.which('node') || '/usr/bin/node';
 export const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 export interface SharedCaptureAttempt {
+  readonly signal: AbortSignal;
+  remainingMs(): number;
   add(scenario: string, entry: EvalTestEntry): void;
 }
 
@@ -26,7 +30,9 @@ interface SharedAttemptState {
   error?: string;
   contractErrors: string[];
   deadline: number;
-  stopped?: 'deadline' | 'superseded';
+  controller: AbortController;
+  timer?: ReturnType<typeof setTimeout>;
+  stopped?: 'deadline' | 'superseded' | 'finalized';
 }
 
 /** Keep scenario groups within their test invocation; Bun retries are separate attempts. */
@@ -35,7 +41,13 @@ export class SharedCaptureAccumulator {
   private finalized = false;
 
   private expire(state: SharedAttemptState): void {
-    if (!state.closed && !state.stopped && performance.now() >= state.deadline) state.stopped = 'deadline';
+    if (!state.closed && !state.stopped && performance.now() >= state.deadline) this.stop(state, 'deadline');
+  }
+
+  private stop(state: SharedAttemptState, reason: NonNullable<SharedAttemptState['stopped']>): void {
+    state.stopped ??= reason;
+    clearTimeout(state.timer);
+    state.controller.abort(new Error(`Shared capture attempt ${state.name} stopped: ${state.stopped}`));
   }
 
   async runAttempt<T>(name: string, expected: readonly string[], timeoutMs: number,
@@ -47,12 +59,14 @@ export class SharedCaptureAccumulator {
     for (const previous of this.attempts) {
       if (previous.name === name && !previous.closed) {
         this.expire(previous);
-        previous.stopped ??= 'superseded';
+        this.stop(previous, 'superseded');
       }
     }
     const state: SharedAttemptState = { name, expected: [...expected], rows: [], closed: false,
-      rejected: false, contractErrors: [], deadline: performance.now() + timeoutMs };
+      rejected: false, contractErrors: [], controller: new AbortController(),
+      deadline: performance.now() + timeoutMs - Math.min(SESSION_DRAIN_GRACE_MS, timeoutMs / 10) };
     this.attempts.push(state);
+    state.timer = setTimeout(() => this.stop(state, 'deadline'), Math.max(0, state.deadline - performance.now()));
     const checkActive = () => {
       this.expire(state);
       if (state.closed || this.finalized || state.stopped) {
@@ -62,7 +76,9 @@ export class SharedCaptureAccumulator {
     let result: T;
     let thrown: unknown;
     try {
-      result = await work({ add: (scenario, entry) => {
+      result = await work({ signal: state.controller.signal,
+        remainingMs: () => { checkActive(); return Math.max(0, state.deadline - performance.now()); },
+        add: (scenario, entry) => {
         checkActive();
         const duplicate = state.rows.some(row => row.scenario === scenario);
         state.rows.push({ scenario, entry });
@@ -87,6 +103,8 @@ export class SharedCaptureAccumulator {
     } finally {
       this.expire(state);
       state.closed = true;
+      clearTimeout(state.timer);
+      state.controller.abort(new Error(`Shared capture attempt ${name} closed`));
     }
     // Bun owns the timeout verdict and detaches that invocation's promise.
     // A late rejection becomes an unrelated error even with a catch attached.
@@ -106,6 +124,10 @@ export class SharedCaptureAccumulator {
   async finalize(collector: EvalCollector | null): Promise<void> {
     if (this.finalized) return;
     this.finalized = true;
+    for (const state of this.attempts) {
+      this.expire(state);
+      if (!state.closed) this.stop(state, 'finalized');
+    }
     if (!collector) return;
     for (const state of this.attempts) {
       this.expire(state);
@@ -126,7 +148,7 @@ export class SharedCaptureAccumulator {
         output: rows.map((row, index) => `Scenario ${index + 1} (${row.passed ? 'passed' : 'failed'}):\n${row.output || ''}`).join('\n\n'),
         error: [...new Set(errors)].join('\n') || undefined,
         exit_reason: passed ? 'success' : state.stopped === 'deadline' ? 'timeout'
-          : state.stopped === 'superseded' || !state.closed ? 'attempt_incomplete' : state.contractErrors.length ? 'capture_contract'
+          : state.stopped || !state.closed ? 'attempt_incomplete' : state.contractErrors.length ? 'capture_contract'
           : failed ? (failed.exit_reason === 'success' ? 'assertion_failed' : failed.exit_reason || 'capture_threw')
           : state.rejected ? 'fixture_threw' : 'attempt_incomplete',
       });
@@ -146,10 +168,14 @@ export interface SharedLibsFixture {
   env: Record<string, string>;
 }
 
+function fixtureGitConfig(f: SharedLibsFixture): string {
+  return process.platform === 'win32' ? path.join(f.root, 'gitconfig') : os.devNull;
+}
+
 export function fixtureGit(f: SharedLibsFixture, ...args: string[]): string {
   return execFileSync(gitBin, ['-c', 'core.fsmonitor=false', ...args], {
     cwd: f.repo, encoding: 'utf8', timeout: 10_000,
-    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: fixtureGitConfig(f) },
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
@@ -168,6 +194,7 @@ export function createSharedLibsFixture(label: string): SharedLibsFixture {
     hookTrace: path.join(root, 'hooks.log'), tip: '', env: {},
   };
   for (const dir of [f.repo, f.state, f.bin]) fs.mkdirSync(dir);
+  if (process.platform === 'win32') fs.writeFileSync(fixtureGitConfig(f), '', { mode: 0o600 });
   fixtureGit(f, 'init', '-b', 'main');
   fixtureGit(f, 'config', 'user.name', 'Shared Libs Fixture');
   fixtureGit(f, 'config', 'user.email', 'shared-libs@example.invalid');
@@ -180,7 +207,7 @@ export function createSharedLibsFixture(label: string): SharedLibsFixture {
   f.env = {
     PATH: `${f.bin}${path.delimiter}${process.env.PATH || ''}`,
     GSTACK_HOME: f.state,
-    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull,
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: fixtureGitConfig(f),
     GH_PROMPT_DISABLED: '1', NO_COLOR: '1',
   };
   return f;
@@ -223,7 +250,7 @@ export function snapshotFixture(directory: string): Record<string, string> {
 
 export interface SourceRequest {
   tool: string; args: string[]; endpoint?: string; method?: string; cwd: string;
-  violation?: string;
+  env?: Record<string, string>; violation?: string;
   pid?: number; ppid?: number; parentExecutable?: string; parentCommand?: string;
 }
 
@@ -299,7 +326,7 @@ function sharedCurlRequest(args: string[]) {
   else {
     try {
       const url = new URL(urls[0]);
-      const repoPath = /^\/repos\/fixture\/shared-libs(?:\/(?:contents\/.+|pulls(?:\/\d+(?:\/files)?)?|commits(?:\/(?:[a-f0-9]{40}|main))?|branches\/[^/]+))?$/;
+      const repoPath = /^\/repos\/fixture\/shared-libs(?:\/(?:contents\/.+|pulls(?:\/\d+(?:\/files)?)?|commits(?:\/(?:[a-f0-9]{40}|main))?|branches(?:\/[^/]+)?))?$/;
       if (url.protocol !== 'https:' || url.hostname !== 'api.github.com' || url.port || url.username || url.password || url.hash ||
         (!repoPath.test(url.pathname) && url.pathname !== '/search/issues')) throw new Error('unsupported URL');
       result.endpoint = url.pathname.slice(1) + url.search;
@@ -399,6 +426,8 @@ function sharedShellTokens(command: string): SharedShellToken[] {
   return tokens;
 }
 
+const SHARED_OUTPUT_DEVICES = ['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/fd/1', '/dev/fd/2'];
+
 /** Share attempted-write checks across native, semantic and Codex standalone captures. */
 export function sharedReadOnlyViolations(toolCalls: Array<{ tool: string; input: any }>, requests: SourceRequest[] = []): string[] {
   const violations: string[] = [];
@@ -421,10 +450,17 @@ export function sharedReadOnlyViolations(toolCalls: Array<{ tool: string; input:
     };
     for (let i = 0; i < tokens.length; i++) {
       const token = tokens[i].value;
-      if (tokens[i].operator && ['>', '>>', '&>'].includes(token) && !['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/fd/1', '/dev/fd/2'].includes(tokens[i + 1]?.value))
+      if (tokens[i].operator && ['>', '>>', '&>'].includes(token) && !SHARED_OUTPUT_DEVICES.includes(tokens[i + 1]?.value))
         violations.push('shell file output redirection');
       if (tokens[i].operator && token === '>&' && !['1', '2', '-'].includes(tokens[i + 1]?.value)) violations.push('shell file output redirection');
-      if (isCommand(i) && /(?:^|\/)tee$/.test(token) && tokens[i + 1] && !tokens[i + 1].operator) violations.push('tee file output');
+      if (isCommand(i) && /(?:^|\/)tee$/.test(token)) {
+        // Like a redirection, tee may only duplicate to the discard/stdout devices; any other operand is a file.
+        const operands = sharedShellCommandTokens(tokens, i + 1).map(operand => operand.value);
+        const end = operands.indexOf('--');
+        const files = end < 0 ? operands.filter(value => !value.startsWith('-') || value === '-')
+          : [...operands.slice(0, end).filter(value => !value.startsWith('-') || value === '-'), ...operands.slice(end + 1)];
+        if (files.some(file => !SHARED_OUTPUT_DEVICES.includes(file))) violations.push('tee file output');
+      }
       if (isCommand(i) && /(?:^|\/)curl$/.test(token)) {
         // URL variables resolve only in the instrumented process. Its request
         // record supplies endpoint validation; source text still reveals writes.
@@ -434,6 +470,22 @@ export function sharedReadOnlyViolations(toolCalls: Array<{ tool: string; input:
     }
   }
   return [...new Set(violations)];
+}
+
+const SAFE_GIT_ENV = { GIT_OPTIONAL_LOCKS: '0', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
+const SAFE_GIT_FLAGS = ['--no-pager', '--no-lazy-fetch', '--no-replace-objects'];
+const SAFE_GIT_CONFIG = ['core.fsmonitor=false', 'log.showSignature=false', 'diff.submodule=short'];
+
+/** A repository Git process that carries the complete safe prefix bin/gstack-safe-git applies, including its
+ * environment, plus patch-driver disabling for diffs; a partial literal prefix does not qualify. */
+export function isGuardedGitRequest(request: SourceRequest): boolean {
+  const args = request.args, command = args.findIndex((arg, i) => !arg.startsWith('-') && args[i - 1] !== '-c' && args[i - 1] !== '-C');
+  const globals = command < 0 ? args : args.slice(0, command), rest = command < 0 ? [] : args.slice(command);
+  const configs = globals.flatMap((arg, i) => globals[i - 1] === '-c' ? [arg] : []);
+  return Object.entries(SAFE_GIT_ENV).every(([key, value]) => request.env?.[key] === value)
+    && SAFE_GIT_FLAGS.every(flag => globals.includes(flag)) && SAFE_GIT_CONFIG.every(config => configs.includes(config))
+    && !rest.some(arg => ['--ext-diff', '--textconv', '--output'].includes(arg) || arg.startsWith('--output='))
+    && (rest[0] !== 'diff' || (rest.includes('--no-ext-diff') && rest.includes('--no-textconv')));
 }
 
 /** Claude's own workspace probes are not commands requested by the skill. */
@@ -450,6 +502,81 @@ export function isInternalClaudeGitRequest(request: SourceRequest, commands: str
     !commands.some(command => command.includes('core.safecrlf=false') || command.includes('protocol.ext.allow=never'));
 }
 
+/** Older open PRs outside the 14-day window: more than the skill's five 100-item open-metadata pages. */
+export const SHARED_LIBS_OLDER_OPEN_PRS = 600;
+
+/** One finite PR world, newest update first. Self-contained so the fixture executable uses this exact table. */
+function sharedPullRequestTable(now: string, olderOpen: number) {
+  const hour = 3_600_000, newestOlder = Date.UTC(2025, 0, 1);
+  return [
+    { number: 7, state: 'open', updated: now },
+    ...Array.from({ length: olderOpen }, (_, i) => ({ number: 100 + olderOpen - 1 - i, state: 'open',
+      updated: new Date(newestOlder - i * hour).toISOString() })),
+    { number: 42, state: 'open', updated: '2020-01-01T00:00:00Z' },
+    ...[5, 4, 3].map((number, i) => ({ number, state: 'closed', updated: new Date(Date.UTC(2019, 5, 1) - i * hour).toISOString() })),
+  ];
+}
+
+/** gh pr list, pulls?state= and search/issues as views of the same table; null for any other request. */
+function sharedPullRequestView(table: Array<{ number: number; state: string; updated: string; title: string; body: string }>,
+  args: string[], endpoint: string) {
+  const [route, search = ''] = endpoint.replace(/^\//, '').split('?');
+  const params = new URLSearchParams(search);
+  const flag = (names: string[]) => {
+    for (let i = 0; i < args.length; i++) {
+      if (names.includes(args[i]!)) return args[i + 1];
+      const joined = names.find(name => name.startsWith('--') && args[i]!.startsWith(name + '='));
+      if (joined) return args[i]!.slice(joined.length + 1);
+    }
+    return undefined;
+  };
+  const matches = (query: string) => {
+    let state = '', rest = query;
+    const dates: Array<(pr: { updated: string }) => boolean> = [];
+    const words: string[] = [];
+    for (const term of rest.split(/\s+/).filter(Boolean)) {
+      const qualifier = /^(is|state|type|updated|created|repo):(.+)$/i.exec(term);
+      if (!qualifier) { words.push(term.replace(/^"|"$/g, '').toLowerCase()); continue; }
+      const [, key, value] = qualifier as unknown as [string, string, string];
+      if (/^(?:is|state)$/i.test(key) && /^(?:open|closed|merged)$/i.test(value)) state = value.toLowerCase();
+      else if (/^(?:is|type)$/i.test(key) && /^issue$/i.test(value)) return () => false;
+      else if (/^repo$/i.test(key) && value.toLowerCase() !== 'fixture/shared-libs') return () => false;
+      else if (/^(?:updated|created)$/i.test(key)) {
+        const range = /^(.+)\.\.(.+)$/.exec(value), op = /^(>=|<=|>|<)?(.+)$/.exec(value)!;
+        const at = (text: string) => Date.parse(text);
+        if (range) dates.push(pr => at(pr.updated) >= at(range[1]!) && at(pr.updated) <= at(range[2]!) + 86_399_999);
+        else dates.push(pr => { const t = at(pr.updated), v = at(op[2]!);
+          return op[1] === '>=' ? t >= v : op[1] === '>' ? t > v : op[1] === '<=' ? t <= v + 86_399_999 : op[1] === '<' ? t < v : t >= v && t <= v + 86_399_999; });
+      }
+    }
+    return (pr: { state: string; updated: string; title: string; body: string }) =>
+      (!state || pr.state === state) && dates.every(check => check(pr)) &&
+      words.every(word => (pr.title + ' ' + pr.body).toLowerCase().includes(word));
+  };
+  const page = (rows: typeof table, perPage: number, number: number) => {
+    const size = Math.min(100, Math.max(1, perPage || 30));
+    return rows.slice((Math.max(1, number || 1) - 1) * size, Math.max(1, number || 1) * size);
+  };
+  if (args[0] === 'pr' && args[1] === 'list') {
+    const state = (flag(['--state', '-s']) || 'open').toLowerCase();
+    const rows = table.filter(pr => state === 'all' || pr.state === state).filter(matches(flag(['--search', '-S']) || ''));
+    return rows.slice(0, Math.max(1, Number(flag(['--limit', '-L']) || 30)));
+  }
+  if (/^repos\/fixture\/shared-libs\/pulls$/.test(route!)) {
+    const state = (params.get('state') || 'open').toLowerCase();
+    const rows = table.filter(pr => state === 'all' || pr.state === state);
+    if (params.get('direction') === 'asc') rows.reverse();
+    return page(rows, Number(params.get('per_page')), Number(params.get('page')));
+  }
+  if (route === 'search/issues') {
+    const rows = table.filter(matches(params.get('q') || ''));
+    if (params.get('order') === 'asc') rows.reverse();
+    return { total_count: rows.length, incomplete_results: false,
+      items: page(rows, Number(params.get('per_page')), Number(params.get('page'))) };
+  }
+  return null;
+}
+
 export function installSourceShims(f: SharedLibsFixture, opts: {
   unsupportedGit?: boolean; unavailableApi?: boolean; prCoverage?: boolean;
 } = {}): void {
@@ -464,7 +591,7 @@ export function installSourceShims(f: SharedLibsFixture, opts: {
     fixtureGit(f, 'add', 'src/retry-worker.ts', 'docs');
     execFileSync(gitBin, ['-c', 'core.fsmonitor=false', 'commit', '-m', 'reuse the existing parser in retry worker'], {
       cwd: f.repo, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull,
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: fixtureGitConfig(f),
         GIT_AUTHOR_DATE: '2020-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2020-01-01T00:00:00Z' },
     });
     prHead = fixtureGit(f, 'rev-parse', 'HEAD');
@@ -476,7 +603,8 @@ export function installSourceShims(f: SharedLibsFixture, opts: {
   }
   const common = `const fs=require('node:fs'), cp=require('node:child_process');\nconst a=process.argv.slice(2);\nconst trace=${JSON.stringify(f.trace)};\nconst parent={pid:process.pid,ppid:process.ppid};try{parent.parentExecutable=fs.readlinkSync('/proc/'+process.ppid+'/exe');parent.parentCommand=fs.readFileSync('/proc/'+process.ppid+'/cmdline','utf8').replaceAll('\\0',' ');}catch{try{const info=cp.spawnSync('ps',['-p',String(process.ppid),'-o','comm=','-o','args='],{encoding:'utf8',timeout:3_000});const line=(info.stdout||'').trim();parent.parentExecutable=line.split(/\\s+/)[0];parent.parentCommand=line;}catch{}}\n`;
   fs.writeFileSync(path.join(f.bin, 'git'), `#!${nodeBin}\n${common}
-fs.appendFileSync(trace,JSON.stringify({tool:'git',args:a,cwd:process.cwd(),...parent})+'\\n');
+const gitEnv=Object.fromEntries(['GIT_OPTIONAL_LOCKS','GIT_NO_LAZY_FETCH','GIT_TERMINAL_PROMPT'].filter(k=>k in process.env).map(k=>[k,process.env[k]]));
+fs.appendFileSync(trace,JSON.stringify({tool:'git',args:a,env:gitEnv,cwd:process.cwd(),...parent})+'\\n');
 if (${!!opts.unsupportedGit} && a.some(x=>x==='--no-lazy-fetch')) { console.error('unknown option: --no-lazy-fetch'); process.exit(129); }
 if(a.includes('ls-remote')) { console.log('ref: refs/heads/main\\tHEAD\\n${f.tip}\\tHEAD\\n${f.tip}\\trefs/heads/main'); process.exit(0); }
 // The fixture remote is already current. Record fetch attempts without contacting a real repository.
@@ -485,19 +613,26 @@ const r=cp.spawnSync(${JSON.stringify(gitBin)},a,{stdio:'inherit',env:process.en
 `, { mode: 0o755 });
   const sourceAt = (revision: string) => {
     const files: Record<string, string> = {}, blobs: Record<string, string> = {};
-    for (const entry of fixtureGit(f, 'ls-tree', '-r', revision).split('\n')) {
-      const match = entry.match(/^\d+ blob ([a-f0-9]+)\t(.+)$/);
-      if (!match) continue;
-      const [, blob, file] = match;
-      // Contents API returns the exact committed blob, including whitespace and
-      // final-newline state. Its sha field identifies that blob, not its commit.
-      const bytes = execFileSync(gitBin, ['-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false', 'cat-file', 'blob', blob], {
-        cwd: f.repo, timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
-      });
+    const entries = fixtureGit(f, 'ls-tree', '-r', revision).split('\n')
+      .flatMap(entry => { const match = entry.match(/^\d+ blob ([a-f0-9]+)\t(.+)$/); return match ? [[match[1], match[2]]] : []; });
+    const batch = entries.length ? execFileSync(gitBin, ['-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false', 'cat-file', '--batch'], {
+      cwd: f.repo, timeout: 10_000, input: entries.map(([blob]) => blob).join('\n') + '\n',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: fixtureGitConfig(f) },
+    }) : Buffer.alloc(0);
+    let offset = 0;
+    for (const [blob, file] of entries) {
+      const headerEnd = batch.indexOf(10, offset);
+      const header = batch.subarray(offset, headerEnd).toString().split(' ');
+      const size = Number(header[2]);
+      if (headerEnd < offset || header[0] !== blob || header[1] !== 'blob' || !Number.isSafeInteger(size)
+        || size < 0 || batch[headerEnd + 1 + size] !== 10) throw new Error('Invalid fixture blob batch');
+      const bytes = batch.subarray(headerEnd + 1, headerEnd + 1 + size);
+      offset = headerEnd + 2 + size;
       files[file] = bytes.toString('base64');
       blobs[file] = blob;
     }
+    if (offset !== batch.length) throw new Error('Unexpected fixture blob batch remainder');
     return { files, blobs };
   };
   const sources = Object.fromEntries([...new Set([f.tip, prHead, branchHead])]
@@ -533,24 +668,26 @@ const sources=${JSON.stringify(sources)};
 const base={name:'main',sha:${JSON.stringify(f.tip)}};
 const pr=(number,date,extra={})=>({number,state:'open',title:number===42?'Extract retry parsing into existing helper':'Routine documentation '+number,body:number===7?'Coordination: https://github.com/fixture/shared-libs/pull/42':'',created_at:date,updated_at:date,merged_at:null,createdAt:date,updatedAt:date,mergedAt:null,url:'https://github.com/fixture/shared-libs/pull/'+number,html_url:'https://github.com/fixture/shared-libs/pull/'+number,head:{sha:number===42?prHead:${JSON.stringify(f.tip)},ref:'feature-'+number},base:{sha:${JSON.stringify(f.tip)},ref:'main'},...extra});
 const page=Number((endpoint.match(/[?&]page=(\\d+)/)||[])[1]||a[a.indexOf('-F')+1]?.match(/^page=(\\d+)/)?.[1]||1);
-let out;
+const view=${sharedPullRequestView.toString()};
+const prTable=${!!opts.prCoverage}?(${sharedPullRequestTable.toString()})(now,${SHARED_LIBS_OLDER_OPEN_PRS}).map(row=>({...row,title:pr(row.number,row.updated).title,body:pr(row.number,row.updated).body})):[];
+const toPr=row=>pr(row.number,row.updated,row.state==='closed'?{state:'closed',closed_at:row.updated}:{});
+let out,listing;
 if(a[0]==='auth')process.exit(0);
 else if(a[0]==='repo') out={nameWithOwner:'fixture/shared-libs',defaultBranchRef:base,url:'https://github.com/fixture/shared-libs'};
-else if(a[0]==='pr'&&a[1]==='list')out=${!!opts.prCoverage}?[pr(7,now),pr(42,old)]:[];
+else if((listing=view(prTable,a,endpoint))!==null)out=Array.isArray(listing)?listing.map(toPr):{...listing,items:listing.items.map(row=>({...toPr(row),pull_request:{url:'https://api.github.com/repos/fixture/shared-libs/pulls/'+row.number}}))};
 else if(a[0]==='pr'&&a[1]==='view')out=pr(Number(a[2])||42,Number(a[2])===7?now:old,{files:[{path:Number(a[2])===7?'docs/unrelated.md':'src/retry-worker.ts'}]});
-else if(endpoint.includes('search/issues'))out={total_count:${opts.prCoverage ? 1 : 0},incomplete_results:false,items:${!!opts.prCoverage}?[pr(7,now)]:[]};
-else if(endpoint.includes('/contents/')) { const p=decodeURIComponent(endpoint.split('/contents/')[1].split('?')[0]); const ref=decodeURIComponent((endpoint.match(/[?&]ref=([^&]+)/)||[])[1]||'');if(!Object.hasOwn(sources,ref))apiError(404,'unsupported or unpinned fixture revision');const source=sources[ref];if(!Object.hasOwn(source.files,p))apiError(404,'source unavailable');out={path:p,encoding:'base64',content:source.files[p],sha:source.blobs[p]}; }
+else if(/\\/contents(?:\\/|\\?|$)/.test(endpoint)) { const p=decodeURIComponent(endpoint.split(/\\/contents/)[1].split('?')[0]).replace(/^\\/+|\\/+$/g,''); const ref=decodeURIComponent((endpoint.match(/[?&]ref=([^&]+)/)||[])[1]||'');if(!Object.hasOwn(sources,ref))apiError(404,'unsupported or unpinned fixture revision');const source=sources[ref];
+ if(Object.hasOwn(source.files,p))out={type:'file',name:p.split('/').pop(),path:p,encoding:'base64',content:source.files[p],sha:source.blobs[p]};
+ else { const prefix=p?p+'/':'';const names=[...new Set(Object.keys(source.files).filter(file=>file.startsWith(prefix)).map(file=>file.slice(prefix.length).split('/')[0]))].sort();if(!names.length)apiError(404,'source unavailable');out=names.map(name=>{const file=prefix+name;return Object.hasOwn(source.files,file)?{type:'file',name,path:file,sha:source.blobs[file]}:{type:'dir',name,path:file};}); } }
 else if(/\\/pulls\\/42\\/files/.test(endpoint))out=page===1?Array.from({length:100},(_,i)=>({filename:'docs/coordination-'+i+'.md',status:'added',patch:'@@ -0,0 +1 @@\\n+Documentation coordination '+i+'.'})):page===2?[{filename:'src/retry-worker.ts',status:'modified',patch:${JSON.stringify(prPatch)}}]:[];
 else if(/\\/pulls\\/\\d+\\/files/.test(endpoint))out=page===1?[{filename:'docs/unrelated.md',status:'modified',patch:'@@ -1 +1 @@\\n-old\\n+new'}]:[];
 else if(/\\/pulls\\/42(?:\\?|$)/.test(endpoint))out=pr(42,old);
-else if(endpoint.includes('/pulls')) {
- if(!${!!opts.prCoverage})out=[];
- else if(endpoint.includes('state=open'))out=Array.from({length:100},(_,i)=>pr((page-1)*100+i+40,old));
- else out=page===1?[pr(7,now),pr(42,old)]:[];
-}
+else if(/\\/pulls\\/\\d+(?:\\?|$)/.test(endpoint)){const row=prTable.find(row=>row.number===Number(endpoint.match(/\\/pulls\\/(\\d+)/)[1]));if(!row)apiError(404,'Not Found');out=toPr(row);}
 else if(endpoint.includes('/commits')){const isPrCommit=prHead!==${JSON.stringify(f.tip)}&&endpoint.includes(prHead);out=endpoint.includes('/commits/')?{sha:isPrCommit?prHead:${JSON.stringify(f.tip)},commit:{committer:{date:isPrCommit?old:now},message:'Fixture work'},files:Object.keys(isPrCommit?prFiles:files).map(filename=>({filename,status:'modified'}))}:[{sha:${JSON.stringify(f.tip)},commit:{committer:{date:now},message:'Fixture work'}}];}
 else if(endpoint.includes('/branches/'))out={name:'main',commit:{sha:${JSON.stringify(f.tip)}}};
-else out={default_branch:'main',full_name:'fixture/shared-libs',html_url:'https://github.com/fixture/shared-libs'};
+else if(/\\/branches(?:\\?|$)/.test(endpoint))out=[{name:'main',commit:{sha:${JSON.stringify(f.tip)}},protected:false}];
+else if(/^\\/?repos\\/fixture\\/shared-libs\\/?(?:\\?|$)/.test(endpoint))out={default_branch:'main',full_name:'fixture/shared-libs',html_url:'https://github.com/fixture/shared-libs'};
+else apiError(404,'Not Found');
 if(curl)curlResponse(out);
 const qi=a.findIndex(x=>x==='--jq'||x==='-q');
 if(qi>=0) {const r=cp.spawnSync('jq',['-r',a[qi+1]],{input:JSON.stringify(out),encoding:'utf8',timeout:30_000});process.stdout.write(r.stdout||'');process.stderr.write(r.stderr||'');process.exit(r.status??1);}
@@ -575,7 +712,7 @@ export function installHostileGitConfig(f: SharedLibsFixture): void {
   const signedCommit = commit.replace('\n\n', '\ngpgsig -----BEGIN PGP SIGNATURE-----\n dummy\n -----END PGP SIGNATURE-----\n\n') + '\n';
   const signedTip = execFileSync(gitBin, ['hash-object', '-t', 'commit', '-w', '--stdin'], {
     cwd: f.repo, input: signedCommit, encoding: 'utf8', timeout: 10_000,
-    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: fixtureGitConfig(f) },
   }).trim();
   fixtureGit(f, 'update-ref', 'HEAD', signedTip);
   refreshFixtureTip(f);
@@ -648,12 +785,18 @@ export function seedOpportunitySources(f: SharedLibsFixture): void {
 
 export function standaloneInstructions(f: SharedLibsFixture, codex = false): string {
   const source = codex ? path.join(SHARED_LIBS_ROOT, '.agents/skills/gstack-deslop-shared-libs') : path.join(SHARED_LIBS_ROOT, 'deslop-shared-libs');
+  // Resolve the installed helper to this checkout, as the hermetic runtime for the skill under test.
   const text = extractSkillSections(source, [
     'Scope and read-only boundary', 'Establish the reviewed source', 'Start with recent work', 'Evaluate candidates', 'Output',
-  ]);
+  ]).replaceAll(codex ? '~/.codex/skills/gstack' : '~/.claude/skills/gstack', SHARED_LIBS_ROOT);
   const file = path.join(f.root, 'standalone-instructions.md');
   fs.writeFileSync(file, text);
   return file;
+}
+
+/** The skill's instructions as a loaded skill delivers them: in context before any tool call. */
+export function loadedInstructions(file: string): string {
+  return `\n\nThe /deslop-shared-libs instructions (already loaded):\n<skill-instructions>\n${fs.readFileSync(file, 'utf8')}\n</skill-instructions>`;
 }
 
 export function reviewLifecycleInstructions(f: SharedLibsFixture): string {
@@ -664,12 +807,10 @@ export function reviewLifecycleInstructions(f: SharedLibsFixture): string {
   ]);
   const army = fs.readFileSync(path.join(root, 'review/sections/review-army.md'), 'utf8');
   const merge = sliceBetween(army, '### Step 4.6: Collect and merge findings', '### Red Team dispatch');
-  const adversarial = fs.readFileSync(path.join(root, 'review/sections/adversarial.md'), 'utf8');
-  const completion = adversarial.slice(adversarial.indexOf('### Before persisting Eng Review (Step 5.8)'));
-  if (!completion.startsWith('### Before persisting')) throw new Error('Missing actual review completion rules');
+  if (!core.includes('snapshot_covered_paths') || !core.includes('COMPLETED')
+    || !core.includes('--finish REVIEW_START')) throw new Error('Missing actual review completion rules');
   // Insert the actual merge text before Fix-First, retaining core ownership for tiny diffs.
   const text = core.replace('## Step 5: Fix-First Review', `${merge}\n\n## Step 5: Fix-First Review`)
-    .replace('## Step 5.8: Persist Eng Review result', `${completion}\n\n## Step 5.8: Persist Eng Review result`)
     .replaceAll('~/.claude/skills/gstack', root)
     .replaceAll('$HOME/.claude/skills/gstack', root)
     .replaceAll('origin/<base>', 'origin/main');
@@ -715,57 +856,158 @@ export function specialistFixture(f: SharedLibsFixture): string {
   return file;
 }
 
-export function reviewPrompt(f: SharedLibsFixture, instructions: string, specialistInput: string): string {
+export interface SharedReviewResume {
+  input: string;
+  checkCommand: string;
+}
+
+export interface SharedReviewStageActor {
+  actorCommand: string;
+  hooks: { PreToolUse: Array<{ hooks: HookCallback[] }> };
+  history(): any[];
+  verify(events: any[]): boolean;
+}
+
+export interface SharedLifecycleSeed {
+  token: string;
+  startedAt: string;
+  startWtree: string;
+  diffBase: string;
+  observation: string;
+}
+
+/** Pass 1's Step 3, executed once by the fixture with the real logger and Git: fetch is a no-op against the
+ * pinned remote, the start token precedes every read, and the saved observation is never rewritten. */
+export function seedLifecycleFirstPass(f: SharedLibsFixture): SharedLifecycleSeed {
+  const observation = path.join(f.root, 'pass1-observation.md');
+  if (fs.existsSync(observation)) throw new Error('Pass 1 observation already seeded');
+  const env = { ...process.env, ...f.env, PATH: process.env.PATH, GSTACK_HOME: f.state };
+  const diffBase = fixtureGit(f, 'merge-base', 'origin/main', 'HEAD');
+  const token = execFileSync(path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log'), ['--start', 'review'],
+    { cwd: f.repo, env, encoding: 'utf8', timeout: 30_000 }).trim();
+  const start = JSON.parse(fs.readFileSync(path.join(f.state, 'projects/fixture-shared-libs/.review-starts', `${token}.json`), 'utf8'));
+  const diff = fixtureGit(f, 'diff', '--no-ext-diff', '--no-textconv', diffBase);
+  const untracked = fixtureGit(f, 'ls-files', '--others', '--exclude-standard');
+  const tracked = fixtureGit(f, 'ls-files');
+  const flagged = fixtureGit(f, 'ls-files', '-v').split('\n').filter(line => line && !line.startsWith('H '));
+  const attributes = ['.gitattributes', '.git/info/attributes'].filter(file => fs.existsSync(path.join(f.repo, file)));
+  const records = execFileSync(path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-read'), [], { cwd: f.repo, env, encoding: 'utf8', timeout: 30_000 });
+  const files = [...tracked.split('\n'), ...untracked.split('\n')].filter(Boolean).map(relative => {
+    const bytes = fs.readFileSync(path.join(f.repo, relative));
+    return `### ${relative} (${bytes.length} bytes, sha256 ${createHash('sha256').update(bytes).digest('hex')})\n\`\`\`\n${bytes.toString('utf8')}\`\`\``;
+  });
+  fs.writeFileSync(observation, `# Pass 1 Step 3 observation (fixture-captured once, in this order)
+1. git fetch origin main --quiet: exit 0; origin/main is pinned at ${f.tip}.
+2. DIFF_BASE=$(git merge-base origin/main HEAD) = ${diffBase}; branch ${fixtureGit(f, 'symbolic-ref', '--short', 'HEAD')}; HEAD ${fixtureGit(f, 'rev-parse', 'HEAD')}.
+3. gstack-review-log --start review printed pass 1 REVIEW_START ${token} (started_at ${start.started_at}). Step 3 leaves it unused; only the final pass's token is finished.
+4. Reads after the token:
+- Untracked non-ignored files (git ls-files --others --exclude-standard): ${untracked || '(none)'}
+- Attribute files: ${attributes.join(', ') || '(none: no .gitattributes or .git/info/attributes)'}; index flags other than H (git ls-files -v): ${flagged.join('; ') || '(none)'}
+- Repository-local config (git config --local --list):\n${fixtureGit(f, 'config', '--local', '--list')}
+- gstack-review-read:\n${records.trim()}
+
+## git diff --no-ext-diff --no-textconv ${diffBase}
+\`\`\`diff
+${diff}
+\`\`\`
+
+## Repository files (tracked and untracked)
+${files.join('\n\n')}
+`, { mode: 0o600, flag: 'wx' });
+  return { token, startedAt: start.started_at, startWtree: start.wtree, diffBase, observation };
+}
+
+export function reviewPrompt(f: SharedLibsFixture, instructions: string, specialistInput: string, resumed?: SharedReviewResume | Pick<SharedReviewStageActor, 'actorCommand'>, seed?: SharedLifecycleSeed): string {
+  if (seed && !(resumed && 'actorCommand' in resumed)) throw new Error('A seeded first pass belongs to the edit-capable lifecycle replay');
+  const scope = resumed && 'actorCommand' in resumed ? `This is an edit-capable component replay with an explicitly declared SYNTHETIC prerequisite actor, not an end-to-end QA/adversarial evaluation. Completed maintainability findings are supplied in ${specialistInput}; verify them against real source.
+Component scope override for every pass:
+1. Execute the real core/checklist, source/identity/snapshot checks, merge, Fix-First decisions, approved source edits, re-review with a new REVIEW_START, zero-edit convergence and final persistence yourself. Preserve the workflow's permissions and decision questions.
+2. The actor invocation below replaces the entire Step 4.7 QA and Step 4.8 native adversarial stages, not just an extra prerequisite after executing them. This replacement also covers Step 4's early QA selection/method-loading prerequisites and Step 5.8's QA report requirement. Do not perform QA scope/method asset loads, browser setup, charters, exploratory probes, checkpoints or QA reports in this component replay. Do not dispatch native reviewers, other specialists or outside providers. Existing tests and caller/import checks needed to verify your source fixes still run; they are not simulated, but do not restart exploratory QA or require QA artifacts.
+3. After core review and merge, before Fix-First on each review pass, invoke the following as the sole command in its Bash call. The registered fixture actor checks fixture isolation and authored evidence/identity and returns a NEW synthetic result bound to that exact current state and tool-use ID. It never executes target code. Read and consume the complete returned JSON, not a previously saved receipt.
+\`\`\`sh
+${resumed.actorCommand}
+\`\`\`
+4. All prior receipts are preserved. Source-changing cycles invalidate earlier results: after edits, repeat the core review and invoke the actor again on the new zero-edit pass before final persistence. Never refresh an old receipt's hashes or relabel it as a new invocation. Missing, failed, stale or wrong-state results require noncompletion. The actor cannot complete core/checklist review, approve edits, answer decision questions or establish convergence for you. Apply the production COMPLETED/CONVERGED rules to your own work plus the current supplied results: only a current settled:true actor result from the final pass supplies the replaced Step 4.7 QA and Step 4.8 native adversarial prerequisites for those rules. It does not complete your own remaining work, and the no-credit disclosure below is a reporting label, not a missing stage. Never ask the question actor to override completion.
+5. In the final QA/verification summary, identify the actor results as simulated fixture-stage interactions, not actual QA or native adversarial execution; they receive no actual native coverage credit. Report any real post-fix verification separately. Separate genuine QA/native evaluations remain required; this component replay cannot satisfy them.`
+    : resumed ? `This is a bounded, no-edit resumed-stage fixture. The completed maintainability result is supplied in ${specialistInput}; verify its findings against real source. Read ${resumed.input}: it supplies clearly labeled SYNTHETIC settled Step 4.7 QA and Step 4.8 native adversarial prerequisite results for this isolated fixture state, not evidence that this model executed those stages and never actual native coverage credit. Other specialists and outside providers are not dispatched in this fixture. Do not dispatch or rerun them. These supplied results also replace Step 4's early QA selection and method-loading prerequisites and Step 5.8's exploratory QA section, so read no QA scope or method assets under ../qa/sections/.
+Execute the core/checklist, merge, Fix-First decisions, source/identity/snapshot checks and final persistence yourself. Do not edit target source or Git index flags. A finding that requires edits blocks this bounded replay: report it honestly, without suppressing it or claiming completion. Before final persistence, after your final source checks, run this fixture prerequisite check as the sole command in its Bash call and inspect the entire JSON result:
+\`\`\`sh
+${resumed.checkCommand}
+\`\`\`
+Only a current result with settled:true supplies the required QA and native adversarial prerequisites; it does not complete your own remaining work. Apply the workflow's unchanged COMPLETED and CONVERGED rules to that combined evidence. Missing, failed, blocked, malformed or stale prerequisites require noncompletion, never an override based on scope. Any source, branch, base, index or configuration change invalidates these supplied results and blocks this bounded no-edit replay; do not regenerate them or claim completion. In the final summary identify QA and native adversarial results as synthetic fixture inputs, not stages you executed.`
+    : `This is a fixture of the core, merge, Fix-First, and final persistence stages. Specialist input for the merge stage is supplied in ${specialistInput}; verify it against the real source. Do not dispatch additional specialists or outside providers. Never claim that omitted stages completed.
+Required reviewer coverage for this scoped replay is the core/checklist review plus the supplied completed maintainability result. Verify the supplied findings against actual source. Other specialist and provider stages are outside this invocation's scope, not unavailable required reviewers. If a required stage or its result actually fails or is missing, preserve the workflow's non-completion rules.`;
+  const seeded = seed ? `
+Fixture-seeded pass 1 Step 3; resume pass 1 at Step 4:
+- The fixture owner already executed pass 1's Step 3 in order with the real tools: git fetch, the merge base (DIFF_BASE ${seed.diffBase}), \`gstack-review-log --start review\` (pass 1 REVIEW_START ${seed.token}), then the diff and every repository read. It saved them once at ${seed.observation}: the diff, tracked and untracked inventories, attributes, config and index flags, the gstack-review-read output, and each repository file's bytes and sha256.
+- That observation is authoritative for pass 1: it already contains what git fetch, merge-base, diff, status, ls-files, config or attribute reads, gstack-review-read and cat, Read, Grep or Glob of repository files would return, so do not run those for pass 1. Pass 1's REVIEW_START stays unused, as Step 3 says; never finish it.
+- In your first response, natively Read exactly these four files together: the workflow at ${instructions}, the checklist, ${specialistInput} and the observation. No ls, Glob, Grep or --help is needed.
+- The observation's gstack-review-read output is NO_REVIEWS, and no review row exists before your final --finish. So Step 5.0's no-prior-reviews rule applies in every pass: skip history matching; shared-code-reuse.md and --check-shared-libs do not apply, and gstack-review-read needs no rerun before the final read-back.
+- After pass 1's core review and merge: one response holding the installed sharedLibsFingerprint call and, as its own Bash call, the actor invocation. Then Step 5: an auto-fix and the AskUserQuestion may share a response.
+- After applying Step 5 edits, one Bash call from the repository is the post-fix verification: \`bun test test/retry-after.test.ts\` plus, only if caller exports changed, one bun -e import check. Pass 2 reruns it only if pass 2 edits.
+- Pass 2 executes Step 3 itself. origin/main is pinned and the fixture's fetch is a no-op, so DIFF_BASE stays ${seed.diffBase}; run --start as the sole command in its Bash call. Then, in one response, run \`git diff ${seed.diffBase}\` and natively Read src/retry-worker.ts, src/retry-route.ts and lib/retry-after.ts; the observation's bytes stay current for files you did not edit. Then finish pass 2's core review with the fingerprint call and the actor in one response, and persist.
+- Keep the final review summary to at most twelve lines: counts, each auto-fixed, fixed or skipped item with its fingerprint, the verification result and the synthetic-stage disclosure.` : '';
   return `Read the fixture workflow at ${instructions} first. Review this repository's current diff against origin/main using that workflow and the actual checklist at ${SHARED_LIBS_ROOT}/review/checklist.md.
-This is a fixture of the core, merge, Fix-First, and final persistence stages. Specialist input for the merge stage is supplied in ${specialistInput}; verify it against the real source. Do not dispatch additional specialists or outside providers. Never claim that omitted stages completed.
-Required reviewer coverage for this scoped replay is the core/checklist review plus the supplied completed maintainability result. Verify the supplied findings against actual source. Other specialist and provider stages are outside this invocation's scope, not unavailable required reviewers. If a required stage or its result actually fails or is missing, preserve the workflow's non-completion rules.
-The installed gstack helpers under ${SHARED_LIBS_ROOT}/bin and ${SHARED_LIBS_ROOT}/lib, plus the provider wrappers under ${f.bin}, are trusted harness infrastructure. Invoke their required interfaces; auditing their implementation or the fixture request logs is outside the target review. Still inspect target repository source, Git configuration and attributes, actual snapshot coverage, and prior/final persisted review records as the workflow requires.
-Execute the included workflow, including its real start captures, decision questions, any approved edits, convergence checks and final review record. The user will answer AskUserQuestion. This is a code review, not a standalone recent-history audit. Return the final review summary in conversation.`;
+${scope}${seeded}
+The trusted harness infrastructure is fixed; do not rediscover it:
+- Trusted asset roots: the installed review skill is ${SHARED_LIBS_ROOT}/review (checklist ${SHARED_LIBS_ROOT}/review/checklist.md, sections ${SHARED_LIBS_ROOT}/review/sections/). Resolve any path the workflow gives relative to the installed /review SKILL.md directory under ${SHARED_LIBS_ROOT}, so ../qa/sections/<name>.md is ${SHARED_LIBS_ROOT}/qa/sections/<name>.md. The gstack helpers are under ${SHARED_LIBS_ROOT}/bin and ${SHARED_LIBS_ROOT}/lib; the provider wrappers git, gh and curl are under ${f.bin}.
+- Documented helper interfaces, used as-is: \`gstack-review-log --start review\`; \`gstack-review-log --check-shared-libs REVIEW_START\` with the finding on stdin; \`gstack-review-log '<record>' --finish REVIEW_START\`; and \`gstack-review-read\`.
+- Out of scope: do not audit helper or lib implementations, read the fixture request logs, enumerate the bin/lib/review/qa roots, probe --help or other CLI options, or review unrelated history.
+- Still inspect the target repository source, Git configuration and attributes, actual snapshot coverage, and the prior and final persisted review records the workflow requires.
+- To stay within the turn budget, batch independent reads into as few Read or Bash calls as correctness allows, but keep receipt-ordered commands separate and in order: capture the start token before reading the diff, and run --start, the checker and any declared stage-actor invocation each as its own sole command. The only combined receipt call is the final persistence: run \`gstack-review-log '<record>' --finish REVIEW_START\` and, only after it succeeds, its full \`gstack-review-read\` read-back in that same call.
+Execute the included workflow, including its real start captures, decision questions, ${resumed && !('actorCommand' in resumed) ? 'zero-edit convergence checks' : 'any approved edits, convergence checks'} and final review record. The user will answer AskUserQuestion. This is a code review, not a standalone recent-history audit. Return the final review summary in conversation.`;
 }
 
 /** The revalidation replay measures the review lifecycle, not helper CLI discovery. */
-export function reviewRevalidationPrompt(f: SharedLibsFixture, instructions: string, specialistInput: string): string {
+export function reviewRevalidationPrompt(f: SharedLibsFixture, instructions: string, specialistInput: string, resumed?: SharedReviewResume): string {
   const startRecord = path.join(f.state, 'projects/fixture-shared-libs/.review-starts/<REVIEW_START>.json');
-  return `${reviewPrompt(f, instructions, specialistInput)}
+  return `${reviewPrompt(f, instructions, specialistInput, resumed)}
 
 Revalidation fixture execution contract:
-- The runtime allows ${SHARED_INTERACTIVE_MAX_TURNS} assistant turns. Batch independent required source reads, Git configuration/attribute checks, and snapshot checks within each phase. Preserve every required evidence check and dependency: capture the real start token before reading the diff, and complete final evidence verification before persistence.
-- The trusted start-record location is ${startRecord}. Replace <REVIEW_START> with the token actually returned by --start. Read that token's record in a separate, successful Read tool call or a single cat command before continuing. Verify its repo, branch, working tree and start time. Do not combine the record read with --start, the diff or other diagnostic commands whose failure could invalidate the read; if the read fails, retry it before proceeding. Use the supplied helper interfaces; discovering helper CLI options is outside this replay.
-- After final verification, combine successful --finish persistence and one complete, untruncated read-back through gstack-review-read in the same tool invocation. Read back only after persistence succeeds, inspect the full current record and binding, then return the final review summary in conversation.
-- Failed persistence or verification remains a failure. Late source changes still require the workflow's normal re-review; never skip checks, questions, or convergence rules to finish within the bound.`;
+The runtime allows ${SHARED_INTERACTIVE_MAX_TURNS} assistant turns. Batch independent required source reads and other Git/configuration/attribute inspections only outside the receipt commands below. Preserve every required evidence check and dependency. This is a closed transport interface, not permission to omit workflow stages.
+
+0. Your first response holds, together: native Reads of the workflow, the checklist, the supplied finding, any supplied prerequisite file and ${SHARED_LIBS_ROOT}/review/sections/shared-code-reuse.md (Step 5.0 requires it for the supplied prior Skip), plus one Bash call gathering base metadata: fetch, merge base, HEAD, branch, index entries and flags, local config and attributes, but not the diff.
+
+1. Gather base metadata first. Then, from the target repo, run the following as the sole command in its Bash call. Its stdout must contain only the token: no echo, labels, status, diff or other commands. Do not read the diff until step 2 verifies the start record; preserve Step 3's start-before-diff order.
+
+\`\`\`bash
+${shellQuote(path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log'))} --start review
+\`\`\`
+
+2. The trusted start-record location is ${startRecord}. Replace <REVIEW_START> with the token actually returned by --start. Read that token's record in a separate, successful Read tool call or a single cat command before continuing. Verify its repo, branch, working tree and start time. Do not combine the record read with --start, the diff or other diagnostic commands whose failure could invalidate the read; if the read fails, retry it before proceeding. Then read the diff in a subsequent call.
+
+3. Before checking reuse, directly read every supplied authored evidence path and the helper destination, including the changed worker even when its body appeared in the diff. Use native Read with explicit file paths, or cat/sed with literal path operands. These independent reads may be batched together, but their successful results must return before the checker. No path-variable loops, globs or process substitutions for these required reads. Other required inspections and structural fingerprinting can batch separately from receipt commands.
+
+4. The checker also reads and verifies that record without consuming it. Replace REVIEW_START below with that same literal token and CURRENT_FINDING_JSON with the current finding as literal JSON, retaining the quoted delimiter. Run this as the sole command in its Bash call from the target repo; stdout must be only one JSON value, with no preceding reads/fingerprinting or trailing output. Inspect reusable, review_start, fingerprint and snapshot.covered_paths before any later --finish invocation. This mechanical proof does not replace authored-source review. Use the supplied helper interfaces; discovering helper CLI options is outside this replay.
+
+\`\`\`bash
+${shellQuote(path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log'))} --check-shared-libs REVIEW_START <<'GSTACK_REVALIDATION_FINDING'
+CURRENT_FINDING_JSON
+GSTACK_REVALIDATION_FINDING
+\`\`\`
+
+5. Act on the checker result under the supplied finding's own evidence_paths/helper_target identity, exactly as the production shared-code-reuse rule requires:
+   - Suppress only when reusable:true AND your own reads independently confirm every supplied evidence path and the helper destination are unchanged, first-party authored source. Then the prior Skip carries forward. Ask no new decision question, exclude this advisory from the current pass's findings, and note it in the summary only as a suppressed prior decision. Do not re-persist it as a current finding or record a new disposition for it.
+   - Otherwise the prior decision does not carry forward. This covers reusable:false, a checker that failed or returned unreadable output, and reusable:true whose independent authored/current-source verification does not hold. Perform a fresh authored-source review and make an actual new decision for the current finding, preserving its evidence identity. Snapshot-ineligible supporting paths may be excluded from migration, savings and computed coverage; that does not silently remove them from the identity being revalidated. A materially revised proposal is a separate finding, never a replacement for the supplied finding's disposition. Do not make an unsupported proposal look worthwhile or mark it skipped without its actual explicit decision.
+   - An unsupported or unfinished supplied finding stays blocked and fails this replay regardless of the checker result; report it honestly and never force a new Skip on invalid evidence.
+
+6. Complete final evidence verification and assemble all record metadata in earlier calls. Replace FINAL_REVIEW_JSON below with the complete, shell-quoted literal record and REVIEW_START with the actual literal token. No preliminary commands, metadata substitutions or extra output in this final Bash call: combine successful --finish persistence and one complete, untruncated read-back through gstack-review-read in the same tool invocation exactly as below. Read back only after persistence succeeds, inspect the full current record and binding, then return the final review summary in conversation.
+
+\`\`\`bash
+${shellQuote(path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log'))} 'FINAL_REVIEW_JSON' --finish REVIEW_START && ${shellQuote(path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-read'))}
+\`\`\`
+
+- Failed persistence or verification remains a failure. Late source changes still require the workflow's normal re-review; never skip checks, questions, or convergence rules to finish within the bound.
+- Keep the final review summary to at most twelve lines: counts, the supplied advisory's decision with its fingerprint and checker result, the source-boundary evidence, the prerequisite source and anything blocked.`;
 }
 
 /** Seed a real, bound skipped advisory in an earlier review; never fabricate a verified binding. */
 export async function seedSkippedAdvisory(f: SharedLibsFixture): Promise<any> {
-  const { sharedLibsFingerprint } = await import('../../lib/review-evidence');
   const finding: any = { severity: 'INFORMATIONAL', confidence: 9,
     path: 'src/retry-worker.ts', line: 2, category: 'shared-libs',
     summary: 'Reuse the tested parser', advisory: true, action: 'skipped',
     evidence_paths: ['src/retry-worker.ts', 'src/retry-route.ts', 'lib/retry-after.ts'],
     helper_target: { path: 'lib/retry-after.ts', symbol: 'retrySeconds' } };
-  finding.fingerprint = sharedLibsFingerprint(finding);
-  const tree = fixtureWorkingTree(f);
-  let ordinaryCoverage = true;
-  try {
-    const autocrlf = (() => { try { return fixtureGit(f, 'config', '--get', 'core.autocrlf'); } catch { return ''; } })();
-    if (autocrlf && autocrlf !== 'false') ordinaryCoverage = false;
-    const algorithm = fixtureGit(f, 'rev-parse', '--show-object-format');
-    for (const relative of finding.evidence_paths) {
-      let location = f.repo;
-      for (const component of relative.split('/')) {
-        location = path.join(location, component);
-        if (fs.lstatSync(location).isSymbolicLink()) ordinaryCoverage = false;
-      }
-      if (!fs.lstatSync(location).isFile()) ordinaryCoverage = false;
-      if (!/^H /.test(fixtureGit(f, 'ls-files', '-v', '--', relative))) ordinaryCoverage = false;
-      const attributes = fixtureGit(f, 'check-attr', 'filter', 'working-tree-encoding', 'ident', 'text', 'eol', '--', relative);
-      if (attributes.split('\n').some(line => !line.endsWith(': unspecified'))) ordinaryCoverage = false;
-      const bytes = fs.readFileSync(location);
-      const rawBlob = createHash(algorithm).update(Buffer.from(`blob ${bytes.length}\0`)).update(bytes).digest('hex');
-      if (fixtureGit(f, 'rev-parse', `${tree}:${relative}`) !== rawBlob) ordinaryCoverage = false;
-    }
-  } catch { ordinaryCoverage = false; }
-  finding.snapshot_covered_paths = ordinaryCoverage ? [...finding.evidence_paths] : [];
   const log = path.join(SHARED_LIBS_ROOT, 'bin/gstack-review-log');
   const env = { ...process.env, ...f.env, PATH: process.env.PATH, GSTACK_HOME: f.state };
   const token = execFileSync(log, ['--start', 'review'], { cwd: f.repo, env, encoding: 'utf8', timeout: 30_000 }).trim();
@@ -773,7 +1015,7 @@ export async function seedSkippedAdvisory(f: SharedLibsFixture): Promise<any> {
     status: 'clean', issues_found: 0, critical: 0, informational: 0, quality_score: 10,
     findings: [finding], completed: true, converged: true, cycles: 0 }), '--finish', token],
   { cwd: f.repo, env, encoding: 'utf8', timeout: 30_000 });
-  return finding;
+  return reviewRecords(f).filter(row => row.skill === 'review').at(-1).findings[0];
 }
 
 export function reviewRecords(f: SharedLibsFixture): any[] {
@@ -795,6 +1037,24 @@ export function toolCommandTrace(result: { toolCalls: Array<{ tool: string; inpu
   return result.toolCalls.filter(call => call.tool === 'Bash').map(call => String(call.input?.command || ''));
 }
 
+/**
+ * PR-coverage request check against the skill's stated older-open-PR budget
+ * (five metadata pages, fifty file-list pages, plus recent PR 7's one page)
+ * and the coverage outcome: PR 42's file list was read from page 1 through
+ * page 2. How often a page was re-read within budget is not graded.
+ */
+export function prCoverageRequestViolations(endpoints: string[]): string[] {
+  const violations: string[] = [];
+  const coordination = endpoints.filter(endpoint => /\/pulls\/42\/files/.test(endpoint));
+  if (!coordination.some(endpoint => !/[?&]page=/.test(endpoint) || /[?&]page=1(?:&|$)/.test(endpoint))) violations.push('PR 42 first file page not read');
+  if (!coordination.some(endpoint => /[?&]page=2(?:&|$)/.test(endpoint))) violations.push('PR 42 second file page not read');
+  const openPages = endpoints.filter(endpoint => /\/pulls\?/.test(endpoint) && /state=open/.test(endpoint)).length;
+  if (openPages > 5) violations.push(`${openPages} open-PR metadata pages exceed the budget of 5`);
+  const filePages = endpoints.filter(endpoint => /\/pulls\/\d+\/files/.test(endpoint)).length;
+  if (filePages > 51) violations.push(`${filePages} file-list pages exceed the budget of 50 plus PR 7`);
+  return violations;
+}
+
 /** A raw-byte change hidden by Git normalization, reproducing a real snapshot blind spot. */
 export function installNormalizingFilter(f: SharedLibsFixture): void {
   // Fixture instrumentation is local: do not introduce a distributed attribute
@@ -806,13 +1066,14 @@ export function installNormalizingFilter(f: SharedLibsFixture): void {
 }
 
 export function fixtureWorkingTree(f: SharedLibsFixture): string {
-  return execFileSync(path.join(SHARED_LIBS_ROOT, 'bin/gstack-wtree'), [], {
+  const script = path.join(SHARED_LIBS_ROOT, 'bin/gstack-wtree');
+  return execFileSync(process.platform === 'win32' ? 'bash' : script, process.platform === 'win32' ? [script] : [], {
     cwd: f.repo, encoding: 'utf8', timeout: 30_000,
     env: { ...process.env, ...f.env, PATH: process.env.PATH },
   }).trim();
 }
 
-export async function runSharedCapture(f: SharedLibsFixture, testName: string, prompt: string) {
+export async function runSharedCapture(f: SharedLibsFixture, testName: string, prompt: string, attempt: SharedCaptureAttempt) {
   const { runSkillTest } = await import('./session-runner');
   const { CAPTURE_MS } = await import('./eval-budgets');
   // Keep harness startup outside the target: its own Git probes are not skill actions.
@@ -820,7 +1081,7 @@ export async function runSharedCapture(f: SharedLibsFixture, testName: string, p
     prompt: `The target repository is ${f.repo}. Audit that explicit directory.\n${prompt}`, testName,
     allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
     tools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
-    env: f.env, maxTurns: 24, timeout: CAPTURE_MS,
+    env: f.env, maxTurns: 24, signal: attempt.signal, timeout: Math.min(CAPTURE_MS, attempt.remainingMs()),
   });
   return Object.assign(result, { providerRequests: readRequests(f) });
 }
@@ -844,7 +1105,9 @@ function skippedReviewOption(question: any): any {
     const describedRetention = !!preservedObject
       && !/^\w+ing\b/i.test(preservedObject)
       && (/^(?:(?:duplicated|original|prior|tracked|untracked)\s+)*(?:(?:index|skip-worktree|assume-unchanged)\s+)?(?:flags?|code|source|implementations?|copies|copy|files?|routes?|workers?|helpers?|parsers?|changes?|contents?|state|branches|branch|worktrees?)$/i.test(preservedObject)
-        || qualifiedIndexState.test(preservedObject));
+        || qualifiedIndexState.test(preservedObject)
+        || /^bits?$/i.test(preservedObject) && /\bbits?\s+set\s*$/i.test(preservation?.[1] ?? '')
+          && /\b(?:git|index|skip-worktree|assume-unchanged)\b[^?.!]*\b(?:bits?|flags?)\b/i.test(question.question ?? ''));
     const description = (option.description ?? '').replace(/[‘’]/g, "'").trim();
     const declinesChange = /^(?:do not|don't)\s+(?:apply|change|edit|fix|refactor|extract|modify|touch|clear|remove|update|replace|add|migrate|implement|reuse|import)\b/i;
     const inapplicable = /^not applicable$/i.test(label)
@@ -869,12 +1132,16 @@ function skippedReviewOption(question: any): any {
       word.replace(/(?:ed|ing)$/, 'e'), word.replace(/(?:ies|ied)$/, 'y'),
       word.replace(/([a-z])\1(?:ed|ing)$/, '$1')].some(form => actions.has(form));
     const changes = commitment.toLowerCase().split(/[,;\n]|[.!?](?:\s|$)|\b(?:and|but|then|while)\b/).some(part => {
-      const clause = part.replace(/^[^a-z]+/, '')
+      const text = part.replace(/^[^a-z]+/, '');
+      const nominal = /^(?:the\s+)?(?:source|code|route|worker|helper|parser|index(?:\s+flag)?)\s+([a-z]+(?:-[a-z]+)*)\s+(?:stays?|remains?)\s+(?:unchanged|untouched|unapplied|hidden|invisible|excluded)\b([\s\S]*)$/.exec(text);
+      if (nominal && isAction(nominal[1])) return (nominal[2].match(/[a-z]+(?:-[a-z]+)*/g) ?? []).some(isAction);
+      const clause = text
         .replace(/^(?:the\s+)?(?:review|reuse|snapshot)\s+coverage\s+(?=(?:will|would|should|must|can|may|does|do)\b)/, '')
         .replace(/^(?:(?:this|that|the|selected|chosen)\s+(?:option|choice|selection)|i|we|you|it|(?:the\s+)?(?:source|code|route|worker|helper|parser|index(?:\s+flag)?))\s+/, '')
         .replace(/^(?:will|would|should|must|can|may|does|do)\s+/, '')
         .replace(/^(?:(?:please|also|still|just|now|be)\s+)+/, '');
       if (/^(?:not|does not|don't|doesn't|won't|without|no)\b/.test(clause)) return false;
+      if (/\bgit\s+update-index\b/.test(clause)) return true;
       const first = clause.match(/^[a-z]+(?:-[a-z]+)*/)?.[0];
       const futureMatch = clause.match(/\b(?:will|would|should|must|can|may)\s+(?:(?:still|also|now|just|[a-z]+ly)\s+)*(?:be\s+)?(?:(?:still|also|now|just|[a-z]+ly)\s+)*([a-z]+(?:-[a-z]+)*)/);
       const future = futureMatch?.[1];
@@ -887,7 +1154,13 @@ function skippedReviewOption(question: any): any {
       const futureSubject = clause.slice(0, futureMatch?.index ?? 0).trim();
       const passiveDecision = /\b(?:review\s+(?:log|record)|decision|advisory|snapshot|ledger)$/.test(futureSubject)
         || /\b(?:review\s+(?:log|record)|decision|advisory|snapshot|ledger)\b(?:(?!\b(?:source|code|route|worker|helper|parser|file|flag)\b).)*\bit$/.test(futureSubject);
-      const futureDecision = /\b(?:can|will|would|should|must|may)\s+(?:(?:still|also|now|just|[a-z]+ly)\s+)*reuse\s+(?:(?:this|the|prior|recorded|existing)\s+)*(?:review\s+(?:log|record)|decision|advisory|snapshot|ledger)\b/.test(clause);
+      const metadataReference = [...futureSubject.matchAll(/\b(?:review\s+(?:logs?|records?)|decisions?|advisor(?:y|ies)|findings?|snapshots?|ledgers?)\b/g)].at(-1)?.index ?? -1;
+      const productReference = [...futureSubject.matchAll(/\b(?:sources?|code|routes?|workers?|helpers?|parsers?|files?|flags?|index|bits?|implementations?|copies|copy)\b/g)].at(-1)?.index ?? -1;
+      const futureObject = clause.slice((futureMatch?.index ?? 0) + (futureMatch?.[0].length ?? 0)).trim();
+      const referentialDecision = /\b(?:review|pass)$/.test(futureSubject)
+        && metadataReference > productReference
+        && /^(?:it|this|that|them|these|those)(?:\s+(?:later|again))?(?:\s+(?:once|when|after|until)\s+(?:(?!\b(?:and|then|also)\b)[^.!?;])+)?[.!?)]*$/.test(futureObject);
+      const futureDecision = referentialDecision || /\b(?:can|will|would|should|must|may)\s+(?:(?:still|also|now|just|[a-z]+ly)\s+)*reuse\s+(?:(?:this|the|prior|recorded|existing)\s+)*(?:review\s+(?:log|record)|decision|advisory|snapshot|ledger)\b/.test(clause);
       const purpose = [...clause.matchAll(/\b(?:to|by|through|via)\s+(?:[a-z]+ly\s+)*([a-z]+(?:-[a-z]+)*)/g)]
         .some(match => isAction(match[1]));
       return (isAction(future) && !(future === 'reused' && passiveDecision) && !(future === 'reuse' && futureDecision)) || method || purpose
@@ -944,13 +1217,14 @@ export function createSharedInteractiveToolHandler(choose: 'approve' | 'skip' | 
 }
 
 /** A real SDK capture supplies actual AskUserQuestion answers; no response/decision prose is forged. */
-export async function runSharedInteractive(f: SharedLibsFixture, testName: string, prompt: string, choose: 'approve' | 'skip' | SharedQuestionSelector) {
+export async function runSharedInteractive(f: SharedLibsFixture, testName: string, prompt: string, choose: 'approve' | 'skip' | SharedQuestionSelector,
+  fixtureOptions: { attempt: SharedCaptureAttempt; stageActor?: SharedReviewStageActor; prerequisiteSource?: 'synthetic-fixture-input' }) {
   // Keep the real review fetch step hermetic while preserving all actual local Git/record operations.
   installSourceShims(f);
   const { runAgentSdkTest, passThroughNonAskUserQuestion, resolveClaudeBinary } = await import('./agent-sdk-runner');
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
   const { CAPTURE_MS } = await import('./eval-budgets');
-  const abortController = new AbortController();
+  let abortController: AbortController | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let actorFailure: Error | undefined;
   let captureStartedAt = 0;
@@ -966,14 +1240,19 @@ export async function runSharedInteractive(f: SharedLibsFixture, testName: strin
       userPrompt: prompt, workingDirectory: f.repo, testName, env: f.env,
       pathToClaudeCodeExecutable: claudeBinary,
       settingSources: [], maxTurns: SHARED_INTERACTIVE_MAX_TURNS, maxRetries: 0,
+      signal: fixtureOptions.attempt.signal,
       allowedTools: ['Read', 'Bash', 'Write', 'Edit', 'Glob', 'Grep', 'AskUserQuestion'],
       queryProvider: args => {
-        // The SDK runner admits this request through its semaphore before calling
-        // the provider. Queue time must not consume an actual capture's deadline.
-        timer = setTimeout(() => abortController.abort(), CAPTURE_MS);
+        fixtureOptions.attempt.signal.throwIfAborted();
+        const remaining = fixtureOptions.attempt.remainingMs();
+        if (remaining <= 0) throw new Error('Shared capture attempt expired before admission');
+        abortController = args.options?.abortController;
+        if (!abortController) throw new Error('SDK capture lacks its owned abort controller');
+        timer = setTimeout(() => abortController!.abort(), Math.min(CAPTURE_MS, remaining));
         captureStartedAt = Date.now();
         fs.mkdirSync(diagnosticDirectory, { recursive: true });
-        const source = query({ ...args, options: { ...args.options, abortController } });
+        const source = query({ ...args, options: { ...args.options,
+          ...(fixtureOptions?.stageActor ? { hooks: fixtureOptions.stageActor.hooks } : {}) } });
         return new Proxy(source, {
           get(target, key) {
             if (key === Symbol.asyncIterator) return async function* () {
@@ -994,7 +1273,7 @@ export async function runSharedInteractive(f: SharedLibsFixture, testName: strin
         onAnswer: (input, answers) => {
           fs.appendFileSync(diagnostic, JSON.stringify({ type: 'fixture_answer', input, answers }) + '\n');
         },
-        onRefusal: error => { actorFailure = error; abortController.abort(); },
+        onRefusal: error => { actorFailure = error; abortController?.abort(); },
       }),
     });
     // The SDK converts callback throws to tool-control errors. Refusal must fail
@@ -1003,6 +1282,8 @@ export async function runSharedInteractive(f: SharedLibsFixture, testName: strin
     return { result: Object.assign(result, {
       providerRequests: readRequests(f),
       costKnown: streamed.some(event => event.type === 'result' && typeof event.total_cost_usd === 'number'),
+      ...(fixtureOptions ? { fixturePrerequisiteSource: fixtureOptions.stageActor ? 'synthetic-fixture-stage-actor' : fixtureOptions.prerequisiteSource } : {}),
+      ...(fixtureOptions?.stageActor ? { fixtureStageReceipts: fixtureOptions.stageActor.history() } : {}),
     }), questions };
   } catch (cause) {
     const assistantTurns = streamed.filter(event => event.type === 'assistant');
@@ -1012,11 +1293,13 @@ export async function runSharedInteractive(f: SharedLibsFixture, testName: strin
       events: streamed,
       toolCalls: blocks.filter(block => block.type === 'tool_use').map(block => ({ tool: block.name, input: block.input, output: '' })),
       output: blocks.filter(block => block.type === 'text').map(block => block.text).join('\n'),
-      exitReason: actorFailure ? 'actor_contract' : abortController.signal.aborted ? 'timeout' : 'capture_threw',
+      exitReason: actorFailure ? 'actor_contract' : fixtureOptions.attempt.signal.aborted || abortController?.signal.aborted ? 'timeout' : 'capture_threw',
       turnsUsed: assistantTurns.length, durationMs: captureStartedAt ? Date.now() - captureStartedAt : 0,
       costUsd: terminal?.total_cost_usd ?? 0, costKnown: typeof terminal?.total_cost_usd === 'number',
       model: assistantTurns.find(event => event.message?.model)?.message.model,
       providerRequests: readRequests(f),
+      ...(fixtureOptions ? { fixturePrerequisiteSource: fixtureOptions.stageActor ? 'synthetic-fixture-stage-actor' : fixtureOptions.prerequisiteSource } : {}),
+      ...(fixtureOptions?.stageActor ? { fixtureStageReceipts: fixtureOptions.stageActor.history() } : {}),
     };
     const error = actorFailure ?? (cause instanceof Error ? cause : new Error(String(cause)));
     Object.assign(error, { sharedCapture: { result: partial, questions, diagnostic } });

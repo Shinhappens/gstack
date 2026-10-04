@@ -58,6 +58,11 @@ beforeEach(() => {
     join(import.meta.dir, '..', '..', 'bin', 'gstack-egress-lib.sh'),
     join(binDir, 'gstack-egress-lib.sh'),
   );
+  // Same for the state-root twin every migrated bin sources (docs/state-root.md).
+  symlinkSync(
+    join(import.meta.dir, '..', '..', 'bin', 'gstack-state-root.sh'),
+    join(binDir, 'gstack-state-root.sh'),
+  );
 });
 
 afterEach(() => {
@@ -96,6 +101,7 @@ describe('gstack-update-check', () => {
   // ─── Path C: Just-upgraded marker ───────────────────────────
   test('outputs JUST_UPGRADED and deletes marker', () => {
     writeFileSync(join(gstackDir, 'VERSION'), '0.4.0\n');
+    writeFileSync(join(gstackDir, 'REMOTE_VERSION'), '0.4.0\n');
     writeFileSync(join(stateDir, 'just-upgraded-from'), '0.3.3\n');
 
     const { exitCode, stdout } = run();
@@ -210,7 +216,8 @@ describe('gstack-update-check', () => {
   });
 
   // ─── Path G: Invalid remote response ────────────────────────
-  test('treats invalid remote response as up to date', () => {
+  // #2786: an unreadable remote version is UNKNOWN, never cached as UP_TO_DATE.
+  test('caches an invalid remote response as CHECK_FAILED, silently', () => {
     writeFileSync(join(gstackDir, 'VERSION'), '0.3.3\n');
     writeFileSync(join(gstackDir, 'REMOTE_VERSION'), '<html>404 Not Found</html>\n');
 
@@ -218,11 +225,12 @@ describe('gstack-update-check', () => {
     expect(exitCode).toBe(0);
     expect(stdout).toBe('');
     const cache = readFileSync(join(stateDir, 'last-update-check'), 'utf-8');
-    expect(cache).toContain('UP_TO_DATE');
+    expect(cache).toStartWith('CHECK_FAILED 0.3.3 ');
+    expect(cache).not.toContain('UP_TO_DATE');
   });
 
   // ─── Path H: Curl fails (bad URL) ──────────────────────────
-  test('exits silently when remote URL is unreachable', () => {
+  test('caches CHECK_FAILED when the remote URL is unreachable, silently', () => {
     writeFileSync(join(gstackDir, 'VERSION'), '0.3.3\n');
 
     const { exitCode, stdout } = run({
@@ -231,7 +239,49 @@ describe('gstack-update-check', () => {
     expect(exitCode).toBe(0);
     expect(stdout).toBe('');
     const cache = readFileSync(join(stateDir, 'last-update-check'), 'utf-8');
-    expect(cache).toContain('UP_TO_DATE');
+    expect(cache).toBe('CHECK_FAILED 0.3.3 file:///nonexistent/path/VERSION\n');
+  });
+
+  test('a fresh CHECK_FAILED replays silently without re-fetching', () => {
+    writeFileSync(join(gstackDir, 'VERSION'), '0.3.3\n');
+    writeFileSync(join(stateDir, 'last-update-check'), 'CHECK_FAILED 0.3.3 file:///x/VERSION\n');
+    // A remote that WOULD report an upgrade proves no fetch happened.
+    writeFileSync(join(gstackDir, 'REMOTE_VERSION'), '0.4.0\n');
+
+    const { exitCode, stdout } = run();
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe('');
+    expect(readFileSync(join(stateDir, 'last-update-check'), 'utf-8')).toStartWith('CHECK_FAILED');
+  });
+
+  test('an expired CHECK_FAILED (short TTL) re-fetches and can surface an upgrade', () => {
+    writeFileSync(join(gstackDir, 'VERSION'), '0.3.3\n');
+    const cachePath = join(stateDir, 'last-update-check');
+    writeFileSync(cachePath, 'CHECK_FAILED 0.3.3 file:///x/VERSION\n');
+    const old = new Date(Date.now() - 11 * 60 * 1000);
+    utimesSync(cachePath, old, old);
+    writeFileSync(join(gstackDir, 'REMOTE_VERSION'), '0.4.0\n');
+
+    const { exitCode, stdout } = run();
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe('UPGRADE_AVAILABLE 0.3.3 0.4.0');
+  });
+
+  test('--force prints CHECK_FAILED with the failed URL, userinfo stripped', () => {
+    writeFileSync(join(gstackDir, 'VERSION'), '0.3.3\n');
+
+    const { exitCode, stdout } = run(
+      // Assembled at runtime so no credential-shaped URL literal is pushed.
+      { GSTACK_REMOTE_URL: ['https://bob', ':s3cr3t-token', '@127.0.0.1:9/VERSION'].join('') },
+      ['--force'],
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe(
+      'CHECK_FAILED could not read the remote gstack version from https://127.0.0.1:9/VERSION — update status UNKNOWN, not up-to-date',
+    );
+    const cache = readFileSync(join(stateDir, 'last-update-check'), 'utf-8');
+    expect(cache).not.toContain('s3cr3t-token');
+    expect(cache).not.toContain('bob');
   });
 
   // ─── Path I: Corrupt cache file ─────────────────────────────
@@ -279,9 +329,10 @@ describe('gstack-update-check', () => {
       GSTACK_REMOTE_URL: 'file:///nonexistent/path/VERSION',
     });
     expect(exitCode).toBe(0);
-    // Should write UP_TO_DATE cache (not crash)
+    expect(stdout).toBe('');
+    // Should cache an unknown result (not crash, and not claim up-to-date: #2786)
     const cache = readFileSync(join(stateDir, 'last-update-check'), 'utf-8');
-    expect(cache).toContain('UP_TO_DATE');
+    expect(cache).toStartWith(`CHECK_FAILED ${version} `);
   });
 
   test('exits 0 when up to date (not exit 1)', () => {

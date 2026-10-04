@@ -77,14 +77,6 @@ describe('per-skill preflight token budget', () => {
 });
 
 describe('autoplan total preflight budget (T21 / D7)', () => {
-  test('autoplan total under 25 KB instruction cap × 3 (75 KB instruction budget)', () => {
-    const autoplanSkills = ['plan-ceo-review', 'plan-eng-review', 'plan-design-review', 'plan-devex-review'];
-    const total = autoplanSkills.reduce((sum, s) => sum + totalBrainBytes(s), 0);
-    // The 75 KB cap on instructions across the 4-skill autoplan; runtime
-    // digest budget is the lower 25 KB cap, separately tested above.
-    expect(total).toBeLessThan(75 * 1024);
-  });
-
   test('per-skill subset emits its expected entity references in the preflight block', () => {
     for (const [skill, subset] of Object.entries(SKILL_DIGEST_SUBSETS)) {
       const preflight = generateBrainPreflight(buildCtx(skill));

@@ -110,11 +110,15 @@ test('optional browser research has one unavailable branch and reuses its readin
   expect(fallback).toContain('Do not offer or run a build');
   expect(fallback).toContain('skip Phase 2 Step 2; Step 1 still uses WebSearch');
   expect(fallback).not.toContain('OK to proceed?');
+  const qaFallback = generateBrowseFallback(context('claude', 'qa'));
+  expect(qaFallback).toContain('follow the **Browser access decision** above for ./setup authority');
+  expect(qaFallback).toContain('this fallback grants no setup or cookie-import authority');
+  expect(qaFallback).not.toContain('OK to proceed?');
+  expect(generateBrowseFallback(context('claude', 'browse'))).toContain('OK to proceed?');
   const root = readFileSync(new URL('../design-consultation/SKILL.md.tmpl', import.meta.url), 'utf8');
   expect(root).toContain('do not build or offer a build');
   expect(root).toContain('count its retained `sessions` entries');
   expect(root).toContain('Phase 2 findings with source URLs or an explicit declined/unavailable status');
-  expect(generateBrowseFallback(context('claude', 'qa'))).toContain('OK to proceed?');
   const research = generateAsideResearch(ctx);
   expect(research).toContain('Reuse the Phase 0 BROWSER SETUP result');
   expect((generateAsideSetup(ctx) + research).match(/console\.log\("ASIDE_READY /g)).toHaveLength(1);
@@ -189,7 +193,10 @@ test('taste context has defined count and bounded legacy and malformed-profile f
   expect(text).not.toContain('head -200');
   expect(text).toContain('Count retained sessions (at most 50, not lifetime)');
   expect(text).toContain('malformed/unreadable uses the legacy fallback');
-  expect(text).toContain('Glob `~/.gstack/projects/$SLUG/designs/**/approved.json`');
+  const legacy = text.slice(text.indexOf('**Legacy fallback:**'), text.indexOf('**Conflict handling:**'));
+  expect(legacy).toContain('$GSTACK_STATE_ROOT/projects/$SLUG/designs/');
+  expect(legacy).toContain('approved.json');
+  expect(legacy).not.toContain('~/.gstack');
   expect(text).toContain('Read the five newest');
   expect(text).toContain('No usable files: continue without a taste profile');
   expect(text).toContain('never infer fonts/colors from variant letters');

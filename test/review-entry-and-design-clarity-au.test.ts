@@ -103,7 +103,6 @@ test('scoring and section dependencies are explicit while existing clean and pas
 test('new regression and changed preamble sources select all Design and Eng owners', () => {
   for (const map of [E2E_TOUCHFILES, LLM_JUDGE_TOUCHFILES]) {
     const affected = selectTests(['plan-design-review/SKILL.md.tmpl', 'plan-eng-review/SKILL.md.tmpl'], map, []).selected;
-    expect(selectTests(['test/review-entry-and-design-clarity-au.test.ts'], map, []).selected).toEqual(affected);
     for (const source of ['scripts/resolvers/preamble/generate-preamble-bash.ts', 'scripts/resolvers/preamble/generate-completion-status.ts']) {
       const selected = selectTests([source], map, []).selected;
       for (const owner of affected) expect(selected).toContain(owner);

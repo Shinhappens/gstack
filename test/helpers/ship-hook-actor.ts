@@ -50,6 +50,7 @@ export function createShipHookFixture(id: ShipHookCase, root = fs.mkdtempSync(pa
   write(path.join(state, 'config.yaml'), 'redact_prepush_hook: true\n');
   write(path.join(installed, 'gstack-config'), `#!/bin/sh\nprintf 'CONFIG:%s\\n' "$*" >> ${quote(receipts)}\nexec bash ${quote(path.join(ROOT, 'bin/gstack-config'))} "$@"\n`, true);
   write(path.join(installed, 'gstack-redact'), `#!/bin/sh\nprintf 'INSTALL:%s\\n' "$*" >> ${quote(receipts)}\nexec ${quote(process.execPath)} ${quote(path.join(ROOT, 'bin/gstack-redact'))} "$@"\n`, true);
+  write(path.join(installed, 'gstack-paths'), `#!/bin/sh\nexec bash ${quote(path.join(ROOT, 'bin/gstack-paths'))} "$@"\n`, true);
   const workflow = readWorkflowExcerpt('ship/SKILL.md', '**Credential pre-push guard', '**Idempotency check');
   write(path.join(repo, 'workflow.md'), workflow);
   const guard = workflow.match(/```bash\n([\s\S]*?)```/)![1].trim();
