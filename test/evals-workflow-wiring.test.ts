@@ -22,7 +22,7 @@
 import { describe, test, expect } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { buildRunManifest, parseCliOptions, sliceExecutionOrder, sliceSupervisedWallMs, CI_SETUP_ALLOWANCE_MINUTES } from '../scripts/test-paid-shards';
+import { buildRunManifest, isCodexShard, isOverlayTestFile, parseCliOptions, resolvePaidShardTimeoutMs, sliceExecutionOrder, sliceSupervisedWallMs, CI_SETUP_ALLOWANCE_MINUTES } from '../scripts/test-paid-shards';
 
 const ROOT = path.join(import.meta.dir, '..');
 const read = (rel: string) => fs.readFileSync(path.join(ROOT, rel), 'utf-8');
@@ -38,14 +38,16 @@ function plannerSites(source: string): Array<{ manifest: string; budgetSeconds: 
     .map((m) => ({ manifest: m[1]!, budgetSeconds: Number(m[2]), jobs: Number(m[3]) }));
 }
 
-type Step = { id?: string; name?: string; run?: string; env?: Record<string, string>; with?: Record<string, string> };
+type Step = { id?: string; name?: string; run?: string; uses?: string; env?: Record<string, string>; with?: Record<string, string> };
 type Job = { needs?: string[]; env?: Record<string, string>; outputs?: Record<string, string>; 'timeout-minutes': string | number;
   strategy?: { 'max-parallel': number; matrix: { slice: string } }; steps: Step[] };
 
 /**
  * An executor's matrix and timeout must come from the planner step that wrote
  * the manifest it downloads: `slices` from `[range(1; .sliceCount + 1)]` and
- * `timeout-minutes` from `.plan.ciTimeoutMinutes`, never hand-written numbers.
+ * `timeout-minutes` from the plan, never hand-written numbers: per slice from
+ * `.plan.sliceCiTimeoutMinutes` (indexed by matrix.slice, W2c/ENG-2), or one
+ * `.plan.ciTimeoutMinutes` (the largest per-slice ceiling) for every slice.
  */
 function expectPlannedExecutor(source: string, executorName: string, prefix: string) {
   const workflow = Bun.YAML.parse(source) as { jobs: Record<string, Job> };
@@ -53,12 +55,18 @@ function expectPlannedExecutor(source: string, executorName: string, prefix: str
   const executor = workflow.jobs[executorName]!;
   expect(executor.needs).toContain('plan-slices');
   expect(executor.strategy!.matrix.slice).toBe(`\${{ fromJSON(needs.plan-slices.outputs.${prefix}slices) }}`);
-  expect(executor['timeout-minutes']).toBe(`\${{ fromJSON(needs.plan-slices.outputs.${prefix}timeout_minutes) }}`);
+  const perSlice = executor['timeout-minutes'] === `\${{ fromJSON(needs.plan-slices.outputs.${prefix}slice_timeouts)[matrix.slice] }}`;
+  if (!perSlice) expect(executor['timeout-minutes']).toBe(`\${{ fromJSON(needs.plan-slices.outputs.${prefix}timeout_minutes) }}`);
   const [stepId] = /^\$\{\{ steps\.([\w-]+)\.outputs\.slices \}\}$/.exec(planner.outputs![`${prefix}slices`]!)!.slice(1);
-  expect(planner.outputs![`${prefix}timeout_minutes`]).toBe(`\${{ steps.${stepId}.outputs.timeout_minutes }}`);
+  const output = perSlice ? 'slice_timeouts' : 'timeout_minutes';
+  expect(planner.outputs![`${prefix}${output}`]).toBe(`\${{ steps.${stepId}.outputs.${output} }}`);
   const matrixStep = planner.steps.find(step => step.id === stepId)!;
-  const manifest = /jq -c '\[range\(1; \.sliceCount \+ 1\)\]' (\S+)\)/.exec(matrixStep.run!)![1]!;
-  expect(matrixStep.run).toContain(`jq -e '.plan.ciTimeoutMinutes' ${manifest})`);
+  const manifest = /jq -c '\[range\(1; \.sliceCount \+ 1\)\](?: - \.plan\.codexSlices)?' (\S+)\)/.exec(matrixStep.run!)![1]!;
+  expect(matrixStep.run).toContain(perSlice ? `jq -ec '[0] + .plan.sliceCiTimeoutMinutes' ${manifest})` : `jq -e '.plan.ciTimeoutMinutes' ${manifest})`);
+  if (perSlice) {
+    // The deadline's clock: the executor's first step records the job start.
+    expect(executor.steps[0]!.run).toBe('echo "GSTACK_SLICE_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"');
+  }
   const emit = planner.steps.filter(step => step.run?.includes(`--emit-plan ${manifest} `));
   expect(emit).toHaveLength(1);
   const execute = executor.steps.filter(step => step.run?.includes('--plan '));
@@ -98,9 +106,7 @@ describe('evals.yml sliced-lane wiring (post-matrix)', () => {
   test('executor matrix and timeout come from the one budget planner', () => {
     expect(plannerSites(evalsYml), 'expected exactly one --emit-plan site in evals.yml').toHaveLength(1);
     const { site } = expectPlannedExecutor(evalsYml, 'eval-slices', '');
-    expect(site).toEqual({ manifest: '/tmp/paid-plan/manifest.json', budgetSeconds: 540, jobs: 2 });
-    // The validation-phase planner writes the same manifest with the same budget.
-    expect(evalsYml).toContain('sliceBudgetMs: 540000, jobs: 2');
+    expect(site).toEqual({ manifest: '/tmp/paid-plan/manifest.json', budgetSeconds: 420, jobs: 2 });
   });
 
   test('reconcile exit is captured via PIPESTATUS, never $? after a pipe', () => {
@@ -177,11 +183,16 @@ describe('evals-periodic.yml sliced-lane wiring', () => {
       expect(active.jobs).toBe(planned.jobs);
       const manifest = buildRunManifest({ tier: planned.tier, profile: 'full', sliceBudgetMs: planned.sliceBudgetMs!, jobs: planned.jobs,
         evalsAll: true, env: plannerEnv, rootDir: ROOT, skipJudges: planned.skipJudges });
-      const walls = Array.from({ length: manifest.sliceCount }, (_, i) => sliceSupervisedWallMs(sliceExecutionOrder(
-        manifest.entries.filter(entry => entry.status === 'planned' && entry.slice === i + 1)).map(entry => entry.file), planned.jobs));
-      const requiredMinutes = Math.ceil(Math.max(0, ...walls) / 60_000) + CI_SETUP_ALLOWANCE_MINUTES;
+      // W2c/ENG-2: each slice's ceiling is max(2x budget, its longest shard's supervised wall, the
+      // serialized overlay envelope) + setup; the executor's deadline turns the rest into not_run.
+      const sliceFiles = Array.from({ length: manifest.sliceCount }, (_, i) => sliceExecutionOrder(
+        manifest.entries.filter(entry => entry.status === 'planned' && entry.slice === i + 1)).map(entry => entry.file));
+      const ceilings = sliceFiles.map(files => Math.ceil(Math.max(2 * planned.sliceBudgetMs!,
+        ...files.map(file => resolvePaidShardTimeoutMs([file])),
+        files.some(isOverlayTestFile) ? sliceSupervisedWallMs(files, planned.jobs) : 0) / 60_000) + CI_SETUP_ALLOWANCE_MINUTES);
       expect(CI_SETUP_ALLOWANCE_MINUTES).toBe(20);
-      expect(manifest.plan!.ciTimeoutMinutes, `slice walls ${walls.join(', ')}ms`).toBe(requiredMinutes);
+      expect(manifest.plan!.sliceCiTimeoutMinutes).toEqual(ceilings);
+      expect(manifest.plan!.ciTimeoutMinutes).toBe(Math.max(...ceilings));
       // GitHub-hosted-style job ceiling: a plan past it must be split, not truncated.
       expect(manifest.plan!.ciTimeoutMinutes).toBeLessThanOrEqual(360);
       expect(manifest.sliceCount, `${lane.name}:${lane.executor} plans more slices than max-parallel starts at once`)
@@ -189,15 +200,83 @@ describe('evals-periodic.yml sliced-lane wiring', () => {
     });
   }
 
-  test('planner/executor/report tier=periodic agree and plan with the ~9-minute budget', () => {
+  test('planner/executor/report tier=periodic agree and plan with the ~7-minute budget (W5c)', () => {
     expect(periodicYml).toMatch(/EVALS_TIER=periodic bun --no-install run scripts\/test-paid-shards\.ts --tier periodic --emit-plan/);
     expect(periodicYml).toMatch(/EVALS_TIER=periodic bun run scripts\/test-paid-shards\.ts --tier periodic --plan .* --slice /);
     expect(periodicYml).toMatch(/EVALS_TIER=periodic bun --no-install run scripts\/test-paid-shards\.ts --tier periodic --report /);
     // Periodic work and the full gate census have distinct immutable plans.
     expect(plannerSites(periodicYml)).toEqual([
-      { manifest: '/tmp/paid-plan/manifest.json', budgetSeconds: 540, jobs: 2 },
-      { manifest: '/tmp/gate-census-plan/manifest.json', budgetSeconds: 540, jobs: 2 },
+      { manifest: '/tmp/paid-plan/manifest.json', budgetSeconds: 420, jobs: 2 },
+      { manifest: '/tmp/gate-census-plan/manifest.json', budgetSeconds: 420, jobs: 2 },
     ]);
+  });
+});
+
+describe('evals-periodic.yml host-run Codex slices', () => {
+  type HostJob = Job & { if?: string; container?: unknown; 'runs-on': string; permissions?: Record<string, string>;
+    steps: Array<Step & { uses?: string; shell?: string }> };
+  const jobs = (Bun.YAML.parse(periodicYml) as { jobs: Record<string, HostJob> }).jobs;
+  const codex = jobs['eval-codex-slices']!;
+  const container = jobs['eval-slices']!;
+  const planner = jobs['plan-slices']!;
+  const uploadNames = (job: HostJob) => job.steps.filter(step => step.uses?.startsWith('actions/upload-artifact@')).map(step => step.with!.name);
+
+  test('the planner gives Codex slices to the host job and every other slice to the container job', () => {
+    const matrixStep = planner.steps.find(step => step.id === 'periodic-matrix')!;
+    expect(matrixStep.run).toContain(`echo "slices=$(jq -c '[range(1; .sliceCount + 1)] - .plan.codexSlices' /tmp/paid-plan/manifest.json)"`);
+    expect(matrixStep.run).toContain(`echo "codex_slices=$(jq -c '.plan.codexSlices' /tmp/paid-plan/manifest.json)"`);
+    expect(matrixStep.run).toContain('} >> "$GITHUB_OUTPUT"');
+    expect(planner.outputs!.periodic_codex_slices).toBe('${{ steps.periodic-matrix.outputs.codex_slices }}');
+    expect(codex.needs).toEqual(['build-image', 'plan-slices']);
+    expect(codex.if).toBe("${{ needs.plan-slices.outputs.periodic_codex_slices != '[]' }}");
+    expect(codex.strategy!.matrix.slice).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_codex_slices) }}');
+    expect(codex['timeout-minutes']).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_slice_timeouts)[matrix.slice] }}');
+    expect(codex.steps[0]!.run).toBe('echo "GSTACK_SLICE_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"');
+    const manifest = buildRunManifest({ tier: 'periodic', profile: 'full', sliceBudgetMs: 540_000, jobs: 2, evalsAll: true, env: { EVALS_ALL: '1' }, rootDir: ROOT });
+    const codexSlices = manifest.plan!.codexSlices!;
+    expect(codexSlices.length).toBeGreaterThan(0);
+    expect(codex.strategy!['max-parallel']).toBeGreaterThanOrEqual(codexSlices.length);
+    for (const entry of manifest.entries.filter(entry => entry.status === 'planned')) {
+      expect(codexSlices.includes(entry.slice), entry.file).toBe(isCodexShard(entry.file, 'periodic'));
+    }
+    // Gate plans (evals.yml and the weekly gate census) never give a shard Codex, so they have no Codex slices.
+    expect(buildRunManifest({ tier: 'gate', profile: 'full', sliceBudgetMs: 540_000, jobs: 2, evalsAll: true, env: { EVALS_ALL: '1' }, rootDir: ROOT })
+      .plan!.codexSlices).toEqual([]);
+  });
+
+  test('runs on the runner VM, lifts the user-namespace restriction, then runs the CI image with seccomp and AppArmor unconfined', () => {
+    expect(codex.container).toBeUndefined();
+    expect(codex['runs-on']).toBe(container['runs-on']);
+    expect(codex.permissions).toEqual({ contents: 'read', packages: 'read' });
+    const sysctl = codex.steps.findIndex(step => step.run?.includes('sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0'));
+    const execute = codex.steps.findIndex(step => step.run?.includes('docker run '));
+    expect(sysctl).toBeGreaterThan(-1);
+    expect(execute).toBeGreaterThan(sysctl);
+    const step = codex.steps[execute]!;
+    expect(step.run).toContain('--security-opt seccomp=unconfined --security-opt apparmor=unconfined');
+    expect(step.run).toContain('--user "$(id -u):$(id -g)"');
+    expect(step.run).not.toMatch(/--privileged|--cap-add|--pid[ =]host|--network[ =]host|docker\.sock/);
+    expect(step.env!.EVAL_IMAGE).toBe('${{ needs.build-image.outputs.image-tag }}');
+    expect(step.run).toContain('"$EVAL_IMAGE" bash -c');
+    expect(step.env!.SLICE).toBe('${{ matrix.slice }}');
+    expect(step.run).toContain('EVALS_TIER=periodic bun run scripts/test-paid-shards.ts --tier periodic --plan /tmp/paid-plan/manifest.json --slice "$SLICE"');
+    expect(step.run).toContain('-v "$RUNNER_TEMP/paid-plan:/tmp/paid-plan:ro"');
+    expect(codex.steps.some(other => other.uses?.startsWith('actions/download-artifact@') && other.with?.name === 'paid-plan'
+      && other.with?.path === '${{ runner.temp }}/paid-plan')).toBe(true);
+    const containerRun = container.steps.find(other => other.run?.includes('--plan '))!;
+    expect(step.env!.EVALS_JOBS).toBe(containerRun.env!.EVALS_JOBS);
+    for (const name of ['EVALS_CONCURRENCY', 'GSTACK_EVAL_DIR', 'PLAYWRIGHT_BROWSERS_PATH']) {
+      expect(step.run, name).toContain(`-e ${name}=${containerRun.env![name]}`);
+    }
+  });
+
+  test('uploads under the container executor\'s artifact names, and the report waits for it and fails on it', () => {
+    expect(uploadNames(codex)).toEqual(uploadNames(container));
+    const report = jobs.report!;
+    expect(report.needs).toContain('eval-codex-slices');
+    const guards = (report.steps as Array<Step & { if?: string }>).filter(step => step.if?.includes('needs.eval-slices.result'));
+    expect(guards.length).toBeGreaterThanOrEqual(3);
+    for (const guard of guards) expect(guard.if, guard.name).toContain('needs.eval-codex-slices.result');
   });
 });
 
@@ -310,11 +389,11 @@ describe('panel verdict surfaces (eval reliability policy)', () => {
     const gate = report.steps.find(step => step.id === 'pass-rates')!;
     expect(gate.run).toContain('bun run eval:pass-rates --gate --runs 10');
     expect(gate.if).toBe('always()');
-    for (const name of ['Upsert tracking issue on failure', 'Fail the workflow when reconciliation failed']) {
+    for (const name of ['Write the census report', 'Upsert tracking issue on failure', 'Fail the workflow when reconciliation failed']) {
       expect(report.steps.find(step => step.name === name)!.if).toContain("steps.pass-rates.outputs.exit != '0'");
     }
-    const upsert = report.steps.find(step => step.name === 'Upsert tracking issue on failure')!;
-    expect(upsert.run).toContain('report-summary.md');
+    // The report body is written once on every ref; the main-only upsert posts it (test/evals-tracking-issue.test.ts).
+    expect(report.steps.find(step => step.name === 'Write the census report')!.run).toContain('report-summary.md');
     expect(report.steps.find(step => step.name === 'Close the tracking issue on a green run')!.run).toContain('gh issue close');
     expect(report.steps.filter(step => step.with?.name?.startsWith('trial-outcomes-')).length).toBe(2);
     const redispatch = jobs.redispatch!;
@@ -325,6 +404,35 @@ describe('panel verdict surfaces (eval reliability policy)', () => {
     const classify = report.steps.find(step => step.id === 'verdict')!;
     expect(classify.run).toContain('.verdict.redispatchEligible == true');
     expect(classify.run).toContain('[ -z "$REDISPATCH_OF" ]');
-    expect(periodicYml).toMatch(/group: evals-periodic\$\{\{ inputs\.redispatch_of/);
+    expect(periodicYml).toMatch(/group: evals-periodic-\$\{\{ github\.ref \}\}-\$\{\{ github\.event_name \}\}\$\{\{ inputs\.redispatch_of/);
+  });
+});
+
+describe('scheduled paid lanes: concurrency and branch dispatch scope', () => {
+  type Wf = { on: { workflow_dispatch?: { inputs?: Record<string, { type?: string; default?: unknown }> } };
+    concurrency: { group: string; 'cancel-in-progress': boolean }; jobs: Record<string, { if?: string; steps: Step[] }> };
+  const parse = (source: string) => Bun.YAML.parse(source) as Wf;
+
+  test('periodic and marathon groups key on ref and event, so a branch or manual dispatch never cancels the scheduled main run', () => {
+    for (const [name, source, prefix] of [['evals-periodic.yml', periodicYml, 'evals-periodic'], ['evals-marathon.yml', marathonYml, 'evals-marathon']] as const) {
+      const { concurrency } = parse(source);
+      expect(concurrency['cancel-in-progress'], name).toBe(true);
+      expect(concurrency.group.startsWith(`${prefix}-\${{ github.ref }}-\${{ github.event_name }}`), `${name}: ${concurrency.group}`).toBe(true);
+    }
+    // The re-dispatch keeps its own group so it never cancels its dispatcher.
+    expect(parse(periodicYml).concurrency.group).toContain("format('-redispatch-{0}', inputs.redispatch_of)");
+  });
+
+  test('a branch dispatch of evals-periodic runs the periodic lane only unless it opts into the gate census', () => {
+    const wf = parse(periodicYml);
+    expect(wf.on.workflow_dispatch!.inputs!.include_gate_census).toMatchObject({ type: 'boolean', default: false });
+    expect(wf.jobs['gate-census']!.if).toBe("${{ github.ref == 'refs/heads/main' || inputs.include_gate_census }}");
+    const report = wf.jobs.report!.steps;
+    const reconcile = report.find(step => step.name === 'Reconcile gate census against the manifest (fail-closed)')!;
+    expect(reconcile.env?.GATE_CENSUS).toBe('${{ needs.gate-census.result }}');
+    expect(reconcile.run).toContain('if [ "$GATE_CENSUS" = "skipped" ]');
+    // A skipped census is not a red lane; a failed or cancelled one still is.
+    const fail = report.find(step => step.name === 'Fail the workflow when reconciliation failed') as Step & { if?: string };
+    expect(fail.if).toContain(`!contains(fromJSON('["success","skipped"]'), needs.gate-census.result)`);
   });
 });

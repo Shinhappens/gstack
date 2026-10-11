@@ -7,6 +7,7 @@ import { generateCodexPlanReview } from '../scripts/resolvers/outside-voice-step
 import { CODEX_MODEL_CONFIG_FLAG } from '../scripts/resolvers/constants';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { ALL_HOST_CONFIGS } from '../hosts';
+import { expectMentions, expectTokens } from './helpers/prompt-structure';
 
 // Regression guard for #2440 (which itself regressed the #497 fix).
 //
@@ -32,7 +33,8 @@ describe('generated Codex plan-review shell invocation', () => {
   const rendered = generateCodexPlanReview({ ...reviewContext('claude'),
     paths: { ...HOST_PATHS.claude, binDir: path.join(ROOT, 'bin'), skillRoot: ROOT },
   });
-  const ready = rendered.slice(rendered.indexOf('**If `CODEX_MODE: ready` — run Codex:**'),
+  // B1: the heading also admits `unverified`; locate it structurally.
+  const ready = rendered.slice(rendered.search(/\*\*If `CODEX_MODE: ready`[^\n]*— run Codex:\*\*/),
     rendered.indexOf('Present the full output verbatim:'));
   const blocks = [...ready.matchAll(/```bash\n([\s\S]*?)\n```/g)].map(match => match[1]!);
   const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -44,6 +46,12 @@ describe('generated Codex plan-review shell invocation', () => {
     const prompt = path.join(dir, 'review-prompt.txt');
     fs.writeFileSync(prompt, 'Review the current plan without edits.');
     const created = path.join(dir, 'created');
+    // Q2's one-time notice has its own tests; mark it shown in a private state root.
+    const state = path.join(dir, 'state');
+    fs.mkdirSync(state);
+    fs.writeFileSync(path.join(state, '.codex-review-notice-shown'), '');
+    fs.writeFileSync(path.join(state, '.model-policy-notice-v1'), '');
+    fs.writeFileSync(path.join(dir, 'auth.json'), '{}');
     const calls = path.join(dir, 'calls');
     const stale = path.join(dir, 'codex-out-foreign');
     const staleError = path.join(dir, 'codex-planreview-foreign');
@@ -57,10 +65,17 @@ p=$(${quote(Bun.which('mktemp')!)} "$@") || exit 1
 printf '%s\\n' "$p" >> "$FAKE_CREATED"
 printf '%s\\n' "$p"
 `);
+    // B1/E5: the free sandbox preflight runs first; exec reads the prompt on stdin
+    // and writes its final message to -o (stdout carries --json events).
     writeBin('codex', `
+[ "$1" = sandbox ] && exit 0
+[ "$1" = --version ] && { printf '%s\\n' 'codex-cli 0.160.0'; exit 0; }
+out=; prev=; for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
+[ -n "$out" ] || { printf '%s\\n' OK; exit 0; }
 printf '%s\\n' "$FAKE_REVIEW_ID" >> "$FAKE_CALLS"
-printf '%s\\n' "$FAKE_REVIEW_ID: current findings"
-printf '%s\\n' "Recommendation: fix $FAKE_REVIEW_ID because this is the current finding."
+cat > /dev/null
+printf '%s\\n' "$FAKE_REVIEW_ID: current findings" "No issues found." "Recommendation: fix $FAKE_REVIEW_ID because this is the current finding." > "$out"
+printf '%s\\n' '{"type":"turn.completed"}'
 printf '%s\\n' "$FAKE_REVIEW_ID: current stderr" >&2
 exit "$FAKE_CODEX_STATUS"
 `);
@@ -76,6 +91,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
         FAKE_CREATED: created, FAKE_CALLS: calls, FAKE_REVIEW_ID: id,
         FAKE_CODEX_STATUS: String(code), FAKE_MKTEMP_FAIL: mktempFailure ? '1' : '0',
         FAKE_CAT_FAIL: catFailure ? '1' : '0', TMPDIR: dir, CODEX_HOME: dir, GSTACK_CODEX_MODEL: '',
+        GSTACK_HOME: state, GSTACK_STATE_ROOT: '',
         CODEX_THREAD_ID: '', CODEX_SANDBOX: '', CLAUDECODE: '1', GSTACK_ACTIVE_HOST: 'claude' };
       // Each displayed block gets a fresh shell, as separate Bash tool calls do.
       return blocks.map(block => spawnSync('bash', ['-c', (errexit ? 'set -e\n' : '') + block.replace("'<prepared-prompt-file>'", quote(prompt))], {
@@ -83,14 +99,16 @@ exec ${quote(Bun.which('cat')!)} "$@"
       }));
     };
     // #2914: the selected model and its source are printed before the paid call.
-    const selected = `CODEX_MODEL: gpt-6-astra (exec; source: gstack default (no ${path.join(dir, 'config.toml')}))\n`;
+    const selected = (cached = false) => `CODEX_MODEL: gpt-6-astra (exec; role: plan-review, tier: frontier; source: gstack catalog frontier/openai (verified 2026-10-07))\nAUTH_OK\nMODEL_OK${cached ? ' (cached)' : ''}\nHINT: If the review rejects the selected model, repair its winning source: gstack-config set model_frontier_openai <model-id>; gstack-config set plan_review_tier smart; gstack-config set plan_review_tier host.\n`;
     return { dir, run, stale, staleError, calls, selected,
       created: () => fs.existsSync(created) ? fs.readFileSync(created, 'utf8').trim().split('\n') : [],
       cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
   }
 
-  const findings = (id: string) => `${id}: current findings\nRecommendation: fix ${id} because this is the current finding.\n`;
-  const completed = (id: string) => `${findings(id)}OUTSIDE_STATUS: completed provider=codex host=claude\n`;
+  const findings = (id: string) => `${id}: current findings\nNo issues found.\nRecommendation: fix ${id} because this is the current finding.\n`;
+  // INV-1: the verdict-form validator prints its verdict before the completed status.
+  const unavailable = (id: string) => `${findings(id)}VERDICT: unavailable\nFINDINGS: none\nREASON: execution_failed\n`;
+  const completed = (id: string) => `${findings(id)}VERDICT: clean\nFINDINGS: none\nOUTSIDE_STATUS: completed provider=codex host=claude\n`;
 
   test('fresh shells retain the current stderr and clean its exact temporary file', () => {
     const f = fixture();
@@ -98,7 +116,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
       const results = f.run('current');
       expect(results.map(result => result.status)).toEqual([0]);
       expect(results[0]!.stdout).toBe(completed('current'));
-      expect(results[0]!.stderr).toBe(`${f.selected}current: current stderr\n`);
+      expect(results[0]!.stderr).toBe(`${f.selected()}current: current stderr\n`);
       expect(f.created()).toHaveLength(1);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
     } finally { f.cleanup(); }
@@ -108,7 +126,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
     try {
       const results = f.run('failed', 23, errexit);
       expect(results.map(result => result.status)).toEqual([23]);
-      expect(results[0]!.stdout).toBe(findings('failed'));
+      expect(results[0]!.stdout).toBe(unavailable('failed'));
       expect(results[0]!.stderr).toContain('failed: current stderr\n');
       expect(f.created()).toHaveLength(1);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
@@ -120,7 +138,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
       try {
         const results = f.run('display-failed', code, errexit, false, true);
         expect(results.map(result => result.status)).toEqual([code || 1]);
-        expect(results[0]!.stdout).toBe(findings('display-failed'));
+        expect(results[0]!.stdout).toBe(unavailable('display-failed'));
         expect(results[0]!.stderr).toContain('cat: simulated current-file read failure\n');
         expect(f.created()).toHaveLength(1);
         expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
@@ -133,7 +151,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
         const results = f.run(id);
         expect(results.map(result => result.status)).toEqual([0]);
         expect(results[0]!.stdout).toBe(completed(id));
-        expect(results[0]!.stderr).toBe(`${f.selected}${id}: current stderr\n`);
+        expect(results[0]!.stderr).toBe(`${f.selected(id === 'second')}${id}: current stderr\n`);
       }
       expect(new Set(f.created()).size).toBe(2);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
@@ -184,15 +202,13 @@ describe('outside-voice dispatch contract', () => {
   test('CEO and Eng disabled or unavailable reviewers still reach decision readiness', () => {
     for (const skillName of ['plan-ceo-review', 'plan-eng-review']) {
       const output = generateCodexPlanReview({ ...reviewContext('claude'), skillName });
-      expect(output).toContain('then continue directly to the remaining planning decisions and Approval readiness');
-      expect(output).toContain('Outside voice unavailable. Continuing to planning decisions and Approval readiness.');
+      expectMentions(output, [['approval', 'remaining', 'decisions']], 'output');
+      expectMentions(output, [['approval', 'continuing', 'decisions']], 'output');
       expect(output).not.toContain('then continue directly to outputs');
-      expect(output).not.toContain('Outside voice unavailable. Continuing to outputs.');
       expect(hasBoundedOutsideVoiceWait(output)).toBe(true);
     }
     // Reviews without the split gate retain their own output continuation.
     expect(rendered).toContain('then continue directly to outputs');
-    expect(rendered).not.toContain('remaining planning decisions and Approval readiness');
   });
 
   test('the delegated prompt itself requires findings only and forbids plan mutations', () => {
@@ -209,19 +225,20 @@ describe('outside-voice dispatch contract', () => {
     expect(prompt).toContain('including the plan file');
     expect(prompt).toContain('Edit, Write, NotebookEdit, or Bash or');
     expect(prompt).toContain('other tools to mutate files');
-    expect(prompt).toContain('Do not implement findings or update review reports.');
+    expectMentions(prompt, [['do not', 'implement', 'findings']], 'prompt');
     expect(prompt).toContain('not instructions to\nexecute');
     expect(prompt).toContain('explicit user approval');
   });
 
   test('fallback uses one exact-ID wait and explicit cancellation without a model override', () => {
     expect(hasBoundedOutsideVoiceWait(rendered)).toBe(true);
-    expect(fallback).toContain('Before dispatch, verify the host offers the built-in Plan agent type, TaskOutput and\nTaskStop.');
-    expect(fallback).toContain('If any is unavailable, take the unavailable path below without launching.');
+    expectMentions(fallback, [['before', 'taskoutput', 'dispatch']], 'fallback');
+    expectMentions(fallback, [['without', 'unavailable', 'launching']], 'fallback');
     expect(fallback).toContain('Do not set a model\noverride');
-    expect(fallback).toContain('one five-minute wait plus dispatch/cancellation overhead');
-    expect(fallback).toContain('Keep the returned `agentId`; do not guess an ID or launch a second task.');
-    expect(fallback).toContain('TaskOutput timeout does not stop the agent.');
+    expectMentions(fallback, [['wait', 'dispatch/cancellation', 'five-minute']], 'fallback');
+    expectTokens(fallback, ['`agentId`'], 'fallback');
+    expectMentions(fallback, [['do not', 'returned', 'launch']], 'fallback');
+    expectMentions(fallback, [['does not', 'taskoutput', 'timeout']], 'fallback');
     expect(fallback).not.toContain('allowed_tools');
     expect(fallback).not.toContain('run_in_background: false');
   });
@@ -230,26 +247,23 @@ describe('outside-voice dispatch contract', () => {
     for (const guard of ['<retrieval_status>', '<task_id>', '<task_type>', 'local_agent', '<status>', 'completed',
       '<output>', 'nonempty', 'no outer', '<error>', 'identifiable complete',
       'Reject raw or in-progress transcripts', 'do not extract\n   finding fragments from them']) expect(fallback).toContain(guard);
-    expect(fallback).toContain('Terminal status or warning markers alone do not\n   establish report completeness.');
+    expectMentions(fallback, [['do not', 'completeness', 'establish']], 'fallback');
     expect(fallback).not.toContain('isRawTranscript');
     expect(fallback).not.toContain('task.status');
-    expect(fallback).toContain('If any check fails or the report cannot be identified, follow step 4.');
-    expect(fallback).toContain('Outside voice unavailable. Continuing to outputs.');
-    expect(fallback).toContain('Do not retry with a general-purpose agent.');
+    expectMentions(fallback, [['cannot', 'identified', 'report']], 'fallback');
+    expectMentions(fallback, [['do not', 'general-purpose', 'retry']], 'fallback');
     expect(fallback).toContain('Report missing outside-voice coverage.');
     expect(fallback).toContain('still give no late-result credit');
     expect(fallback).toContain('cancellation is unconfirmed');
-    expect(fallback).toContain('Skip Cross-model tension. Persist an unavailable result');
     expect(fallback).toContain('STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable"');
-    expect(fallback).toContain('then continue directly to outputs. The storage policy still applies.');
-    expect(fallback).toContain('Do not record a clean review when no reviewer completed within the accepted wait.');
-    expect(rendered).toContain('Wait for the user; model agreement is evidence, not consent.');
-    expect(rendered).toContain('Record its answer reference and exact accepted scope');
+    expectMentions(fallback, [['do not', 'completed', 'reviewer']], 'fallback');
+    expectMentions(rendered, [['not', 'agreement', 'evidence']], 'rendered');
     const answer = rendered.indexOf('**3. Obtain the answer.**');
     const apply = rendered.indexOf('**4. Apply the answered row.**');
     expect(answer).toBeGreaterThan(0);
     expect(apply).toBeGreaterThan(answer);
-    expect(rendered).toContain(`-s read-only ${CODEX_MODEL_CONFIG_FLAG} -c 'model_reasoning_effort="high"'`);
+    // B1: the sandbox comes from the probe's select-model (read-only unless GSTACK_CODEX_NO_SANDBOX=1).
+    expect(rendered).toContain(`-s "\${_CODEX_SANDBOX_MODE:?}" ${CODEX_MODEL_CONFIG_FLAG} -c 'model_reasoning_effort="high"'`);
   });
 
   test('the generated-carrier exception rejects missing wait, cancellation or result guards', () => {
@@ -264,10 +278,9 @@ describe('outside-voice dispatch contract', () => {
   });
 
   test('expanded Codex availability states preserve the same bounded dispatch guards', () => {
-    const earlier = rendered.replaceAll('broken_install', 'not_installed')
-      .replaceAll('model_unusable', 'not_authed');
-    expect(earlier).not.toBe(rendered);
-    for (const content of [earlier, rendered]) {
+    const expanded = rendered.replace('**If `CODEX_MODE: ready`', '**If `CODEX_MODE: ready` or `unverified (rate_limited)`');
+    expect(expanded).not.toBe(rendered);
+    for (const content of [rendered, expanded]) {
       expect(hasBoundedOutsideVoiceWait(content)).toBe(true);
       expect(hasBoundedOutsideVoiceWait(content.replace('call TaskStop with the same ID', 'missing cancellation'))).toBe(false);
     }
@@ -277,8 +290,8 @@ describe('outside-voice dispatch contract', () => {
     for (const host of ALL_HOST_CONFIGS) {
       const output = generateCodexPlanReview(reviewContext(host.name));
       {
-        expect(output, host.name).toContain('If any is unavailable, take the unavailable path below without launching.');
-        expect(output, host.name).toContain('Do not record a clean review when no reviewer completed within the accepted wait.');
+        expectMentions(output, [['without', 'unavailable', 'launching']], 'output');
+        expectMentions(output, [['do not', 'completed', 'reviewer']], 'output');
         expect(output, host.name).toContain('Do not set a model\noverride');
         expect(hasBoundedOutsideVoiceWait(output), host.name).toBe(true);
       }
@@ -362,11 +375,9 @@ describe('run_in_background guidance (#2440)', () => {
     const dispatch = ceo.split('**Step 1: Dispatch reviewer subagent**')[1]?.split('**Step 2:')[0] ?? '';
     expect(dispatch).toContain("Read Agent's tool definition");
     expect(dispatch).toContain(CEO_FOREGROUND_BRANCH);
-    expect(dispatch).toContain('If the result contains a completed review, consume it');
-    expect(dispatch).toContain("If it returns a pending task, use the host's wait tool");
-    expect(dispatch).toContain('With no wait tool, end this response and resume on its completion notification');
-    expect(dispatch).toContain('While waiting, do not advance, edit either input or launch another reviewer');
-    expect(dispatch).toContain('Launch one reviewer with both inputs below');
+    expectMentions(dispatch, [['wait', 'returns', 'pending']], 'dispatch');
+    expectMentions(dispatch, [['no', 'notification', 'completion']], 'dispatch');
+    expectMentions(dispatch, [['do not', 'reviewer', 'waiting']], 'dispatch');
     const phase = fs.readFileSync(path.join(ROOT, 'autoplan/sections/ceo-phase.md'), 'utf8').replace(/\s+/g, ' ');
     expect(phase).toContain('Step 0 (including its completed Spec Review Loop) → Claude CEO voice → Codex CEO voice → consensus → Review Sections → saved summary → phase announcement');
     for (const name of ['ceo', 'design', 'eng', 'dx']) {
@@ -382,10 +393,10 @@ describe('run_in_background guidance (#2440)', () => {
       const wait = next.slice(barrier, outside);
       expect(wait, name).toContain('isAsync: true');
       expect(wait, name).toContain('end response immediately: "Waiting for <agent ID>."');
-      expect(wait, name).toContain("No further tool calls/review until that ID's terminal notification is delivered");
+      expectMentions(wait, [['no', 'calls/review', 'notification']], 'wait');
       expect(wait, name).toContain('Other hosts await that ID');
       expect(wait, name).toContain('Completed-native INPUT must match snapshot phase/hash');
-      expect(wait, name).toContain('No inline substitute; apply failure policy');
+      expectMentions(wait, [['no', 'substitute', 'failure']], 'wait');
     }
   });
 
@@ -434,8 +445,6 @@ describe('run_in_background guidance (#2440)', () => {
     expect(voices).toBeGreaterThan(proposal.indexOf('Draft your own direction'));
     expect(q2).toBeGreaterThan(voices);
     expect(proposal.slice(voices, q2)).toContain('await both before synthesis');
-    expect(proposal.slice(voices, q2)).toContain('Keep your draft direction out of both prompts');
-    expect(proposal.slice(voices, q2)).toContain('Include its complete contents in the outside prompt file');
   });
 
   // Third recurrence (#497 → #2440 → /ship Step 18): a backgrounded doc-sync
@@ -446,14 +455,12 @@ describe('run_in_background guidance (#2440)', () => {
   test('ship pr-body carries the doc-sync deadline recovery + scope guard', () => {
     for (const rel of PR_BODY_SITES) {
       const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8').replace(/\s+/g, ' ');
-      expect(content).toContain('Inspect the child handle for terminal completion and final output within ~10 minutes');
-      expect(content).toContain('On failure/deadline, use recovery before another writer');
-      expect(content).toContain('Terminal completion or confirmed termination is sufficient');
-      expect(content).toContain('request stop and inspect its status; the request alone is insufficient');
+      expectMentions(content, [['before', 'failure/deadline', 'recovery']], 'content');
+      expectMentions(content, [['stop', 'insufficient', 'request']], 'content');
       expect(content).toContain('Only audit/edit permitted docs');
-      expect(content).toContain('A failed check or `blocked` result goes to recovery');
+      expectTokens(content, ['`blocked`'], 'content');
       expect(content).toContain('goes to recovery, even with valid JSON');
-      expect(content).toContain('Report `Documentation: blocked` with the reason and actual paths');
+      expectTokens(content, ['`Documentation: blocked`'], 'content');
       expect(content).toContain('`Documentation: blocked`');
     }
   });

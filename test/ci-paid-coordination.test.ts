@@ -74,14 +74,26 @@ describe('paid CI coordination stays off the eval image', () => {
   for (const { name, jobs } of workflows) {
     test(`${name}: planning is independent of image startup and has no dependency install`, () => {
       const planner = jobs['plan-slices'];
-      expect(planner.needs).toBeUndefined();
+      if (name === 'evals.yml') {
+        // The PR lane plans after its two tiny coordination jobs (push-burst debounce, base-ref receipt recovery), never after the image.
+        expect(planner.needs).toEqual(['debounce', 'recover-receipts']);
+        for (const id of ['debounce', 'recover-receipts']) {
+          const job = jobs[id] as Job & { 'runs-on'?: string };
+          expect(job.container, id).toBeUndefined();
+          expect(job['runs-on'], id).toBe('ubuntu-24.04');
+          expect(job.needs ?? [], id).not.toContain('build-image');
+          expect(JSON.stringify(job.steps), id).not.toMatch(/secrets\.|restore-deps|bun install|bun run build/);
+        }
+      } else {
+        expect(planner.needs).toBeUndefined();
+      }
       expect(planner.container).toBeUndefined();
       expect(planner.permissions).toEqual({ contents: 'read' });
       const checkout = planner.steps.find(step => step.uses?.startsWith('actions/checkout@'))!;
       expect(checkout.with?.['persist-credentials']).toBe(false);
       if (name === 'evals.yml') expect(checkout.with?.['fetch-depth']).toBe(0);
       const setup = planner.steps.find(step => step.uses?.startsWith('oven-sh/setup-bun@'))!;
-      expect(setup.with?.['bun-version']).toBe('1.4.0');
+      expect(setup.with?.['bun-version']).toBe('1.4.2');
       expect(JSON.stringify(planner)).not.toMatch(/secrets\.|restore-deps|bun install|bun run build/);
       expect(planner.steps.find(step => step.run?.includes('--emit-plan'))?.run).toContain('bun --no-install run');
     });
@@ -129,22 +141,42 @@ describe('paid CI coordination stays off the eval image', () => {
       ]);
       const hiddenUploads = Object.values(jobs).flatMap(job => job.steps).filter(step => step.with?.['include-hidden-files']);
       const captures = hiddenUploads.filter(step => step.with?.name === 'native-captures-${{ env.EVALS_RUN_ID }}');
-      expect(captures).toHaveLength(name === 'evals.yml' ? 1 : 2);
+      // evals-periodic's host-run Codex job mounts $RUNNER_TEMP/eval-home as the container's HOME.
+      const hostHome = (pattern: string) => pattern.replace('${{ runner.temp }}/eval-home/', '~/');
+      expect(captures).toHaveLength(name === 'evals.yml' ? 1 : name === 'evals-periodic.yml' ? 3 : 2);
       for (const capture of captures) {
         expect(capture.if).toBe('always()');
-        expect(String(capture.with?.path).trim().split('\n')).toEqual([
+        expect(String(capture.with?.path).trim().split('\n').map(hostHome)).toEqual([
           '~/.gstack/projects/*/e2e-runs', '~/.gstack/projects/*/evals/qa-callers',
           '~/.gstack-dev/e2e-runs', '~/.gstack-dev/evals/qa-callers',
         ]);
       }
-      expect(hiddenUploads.filter(step => !captures.includes(step))).toEqual([logs]);
+      const codexLogs = name === 'evals-periodic.yml'
+        ? jobs['eval-codex-slices'].steps.find(step => step.with?.name === 'paid-logs-slice-${{ matrix.slice }}-a${{ github.run_attempt }}') : undefined;
+      if (codexLogs) {
+        expect(codexLogs.if).toBe('always()');
+        // The container sets TMPDIR under HOME, so shard logs land in the mounted HOME's cache.
+        expect(String(codexLogs.with?.path).trim().split('\n').map(hostHome)).toEqual(['~/.cache/gstack-paid-shard-*.log']);
+      }
+      expect(hiddenUploads.filter(step => !captures.includes(step))).toEqual(codexLogs ? [logs!, codexLogs] : [logs!]);
     });
   }
 
-  test('PR planning preserves the fork and Dependabot trust boundaries without the needs chain', () => {
-    expect(workflows[0].jobs['plan-slices'].if).toBe(
-      "github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)",
-    );
+  test('PR planning preserves the fork and Dependabot trust boundaries across the coordination jobs', () => {
+    const jobs = workflows[0].jobs;
+    const trust = "github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
+    // !cancelled() lets planning proceed when debounce/recovery were skipped or failed (reuse is then off); the trust clause still gates it.
+    expect(jobs['plan-slices'].if).toBe(`\${{ !cancelled() && needs.debounce.outputs.superseded != 'true' && ${trust} }}`);
+    // The coordination jobs never run for Dependabot or for a fork PR either (recovery also serves an explicit pr_receipts dispatch).
+    expect(jobs.debounce.if).toContain("github.actor != 'dependabot[bot]'");
+    expect(jobs.debounce.if).toContain("github.event_name == 'pull_request'");
+    expect(jobs.debounce.if).toContain('github.event.pull_request.head.repo.full_name == github.repository');
+    expect(jobs['recover-receipts'].if).toContain("github.actor != 'dependabot[bot]'");
+    expect(jobs['recover-receipts'].if).toContain("(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository");
+    expect(jobs['recover-receipts'].if).toContain("(github.event_name == 'workflow_dispatch' && inputs.pr_receipts != '')");
+    // Only recovery holds actions: read, and it runs base-ref code; the planner keeps contents: read.
+    expect(jobs['recover-receipts'].permissions).toEqual({ contents: 'read', actions: 'read' });
+    expect(jobs['plan-slices'].permissions).toEqual({ contents: 'read' });
   });
 });
 

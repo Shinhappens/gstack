@@ -1,9 +1,26 @@
 #!/usr/bin/env bash
 # gstack-session-update — auto-update gstack on session start (team mode)
 #
-# Called by Claude Code SessionStart hook. Must be fast, silent, non-fatal.
+# Called by Claude Code SessionStart hook. Must be fast and non-fatal.
 # The entire update runs in background (forked). The hook itself exits
 # immediately so session startup is never delayed.
+#
+# Before the live checkout moves, the updater fetches, reads the incoming
+# release's Bun floor (bin/gstack-bun-version.sh) and checks the `bun` setup
+# will run; below it the update is held with reason bun-too-old and nothing
+# changes (E1). Then it parse-checks every hook the incoming revision registers
+# (bin/gstack-hook-check on a `git archive` of that revision): Claude Code runs
+# hooks straight from this checkout, so an unparseable hook would block tool
+# calls the moment the checkout moved. A failure holds the update with reason
+# hook-does-not-parse and its file:line. Updaters older than a check cannot
+# protect their first pull.
+#
+# Stages (B11): pull, setup and migrations are tracked separately. The
+# "just upgraded" marker is written only when every stage succeeded. A failed
+# stage is persisted in $STATE_DIR/session-update-pending and retried even
+# when HEAD did not move, with backoff (the update-check interval, then 6h,
+# then 24h). While a stage is pending, each session start prints one line
+# naming it and the repair command; nothing else is ever printed.
 #
 # Exit 0 always — errors must never block a Claude Code session.
 
@@ -12,20 +29,48 @@ set +e
 GSTACK_DIR="${GSTACK_DIR:-$HOME/.claude/skills/gstack}"
 # Hook: source the state-root twin (never spawn gstack-paths); a broken
 # install exits 0 silently, like every other error here.
-. "$(cd "$(dirname "$0")" && pwd)/gstack-state-root.sh" 2>/dev/null || exit 0
+. "$(cd "$(dirname "$0")" && pwd)/gstack-state-root.sh" 2>/dev/null || exit 0  # best-effort: must never block a session start
 STATE_DIR="$(gstack_state_root; printf x)"; STATE_DIR="${STATE_DIR%x}"
 
 # Egress receipt helpers (_receipted_git): fail-open — an update pull must
 # never block a session over a receipt hiccup.
 . "$(cd "$(dirname "$0")" && pwd)/gstack-egress-lib.sh"
+# Bun floor comparison (E1): the incoming release's floor is applied before
+# the live checkout moves. Missing helper fails open, like every error here.
+. "$(cd "$(dirname "$0")" && pwd)/gstack-bun-version.sh" 2>/dev/null
 THROTTLE_FILE="$STATE_DIR/.last-session-update"
 LOCK_DIR="$STATE_DIR/.setup-lock"
 LOG_FILE="$STATE_DIR/analytics/session-update.log"
+PENDING_FILE="$STATE_DIR/session-update-pending"
+HOOK_CHECK="$(cd "$(dirname "$0")" && pwd)/gstack-hook-check"
 THROTTLE_SECONDS=3600  # 1 hour
 
 log_entry() {
   mkdir -p "$(dirname "$LOG_FILE")"
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" >> "$LOG_FILE" 2>/dev/null || true
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" >> "$LOG_FILE" 2>/dev/null || true  # best-effort: logging never blocks a session
+}
+# hook_incoming_hold <rev> — parse-check the hooks of <rev> (extracted with
+# git archive) before the live checkout moves. Prints the held reason and
+# returns 0 when a hook does not parse; otherwise prints nothing and returns 1
+# (an archive or bun failure fails open, like every other error here).
+hook_incoming_hold() {
+  _hc_dir=$(mktemp -d "${TMPDIR:-/tmp}/gstack-session-hooks-XXXXXX" 2>/dev/null) || return 1
+  _hc_out=""
+  if git -C "$GSTACK_DIR" archive --format=tar "$1" 2>/dev/null | tar -xf - -C "$_hc_dir" 2>/dev/null; then
+    _hc_out=$("$HOOK_CHECK" "$_hc_dir" 2>/dev/null)
+  fi
+  rm -rf "$_hc_dir"
+  _hc_fail=$(printf '%s\n' "$_hc_out" | sed -n 's/^fail [^ ]* //p' | head -1)
+  [ -n "$_hc_fail" ] || return 1
+  printf 'hook-does-not-parse: %s\n' "${_hc_fail#"$_hc_dir"/}" | head -c 300
+}
+pending_get() { sed -n "s/^$1=//p" "$PENDING_FILE" 2>/dev/null | head -1; }
+# pending_save — persist the P_* stage state; nothing pending removes the file.
+pending_save() {
+  if [ -z "$P_STAGES" ] && [ -z "$P_PULL" ]; then rm -f "$PENDING_FILE"; return 0; fi
+  printf 'stages=%s\nfrom=%s\nfailures=%s\nnext=%s\nreason=%s\npull=%s\n' \
+    "$P_STAGES" "$P_FROM" "$P_FAILURES" "$P_NEXT" "$P_REASON" "$P_PULL" > "$PENDING_FILE.tmp.$$" \
+    && mv -f "$PENDING_FILE.tmp.$$" "$PENDING_FILE"
 }
 
 # ── Guard: gstack must be a git repo ──
@@ -37,6 +82,25 @@ fi
 AUTO=$("$GSTACK_DIR/bin/gstack-config" get auto_upgrade 2>/dev/null || true)
 if [ "$AUTO" != "true" ]; then
   exit 0
+fi
+
+# ── A stage that did not finish: one line per session start, with the fix ──
+if [ -f "$PENDING_FILE" ]; then
+  _P_STAGES="$(pending_get stages)"; _P_REASON="$(pending_get reason)"; _P_PULL="$(pending_get pull)"
+  if [ -n "$_P_STAGES" ]; then
+    _P_FIX="cd $GSTACK_DIR && ./setup"
+    case "$_P_REASON" in bun*) _P_FIX="install Bun (https://bun.sh), then $_P_FIX" ;; esac
+    echo "gstack auto-update: ${_P_STAGES} did not finish (${_P_REASON:-unknown reason}); installed skills may be out of date. gstack retries automatically. Fix now: $_P_FIX"
+  elif [ -n "$_P_PULL" ]; then
+    case "$_P_PULL" in
+      bun-too-old*)
+        echo "gstack auto-update: update held ($_P_PULL); nothing was installed or changed. Fix now: bun upgrade && cd $GSTACK_DIR && git pull --ff-only && ./setup" ;;
+      hook-does-not-parse*)
+        echo "gstack auto-update: update held ($_P_PULL); nothing was installed or changed, and your current hooks keep running. This is a gstack bug; report ${_P_PULL#hook-does-not-parse: } at https://github.com/garrytan/gstack/issues. gstack retries at the next check. https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#auto-update-hook-does-not-parse" ;;
+      *)
+        echo "gstack auto-update: git pull did not finish ($_P_PULL); gstack is not updating. Fix now: cd $GSTACK_DIR && git pull --ff-only && ./setup" ;;
+    esac
+  fi
 fi
 
 # ── Throttle: skip if checked recently ──
@@ -130,7 +194,7 @@ fi
   # heartbeat.
   trap 'kill "$HB_PID" 2>/dev/null; [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$MYPID" ] && rm -rf "$LOCK_DIR" 2>/dev/null' EXIT
 
-  # ── Pull latest ──
+  # ── Fetch, check the incoming release's Bun floor, then fast-forward (E1) ──
   OLD_HEAD=$(git -C "$GSTACK_DIR" rev-parse HEAD 2>/dev/null)
   UPDATE_URL=$(git -C "$GSTACK_DIR" remote get-url origin 2>/dev/null || echo "")
   UPDATE_HOST="${UPDATE_URL#*://}"; UPDATE_HOST="${UPDATE_HOST#*@}"; UPDATE_HOST="${UPDATE_HOST%%[/:]*}"
@@ -142,8 +206,25 @@ fi
   # Capture stderr: the log must carry WHY a pull failed, never just the code.
   PULL_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/gstack-session-pull-XXXXXX" 2>/dev/null || echo "")
   GSTACK_HOME="$STATE_DIR" _receipted_git open session-update "${UPDATE_HOST:-unknown}" gstack-self-update-pull "auto_upgrade=true" \
-    bash -c 'git -C "$1" pull --ff-only --autostash -q 2>"${2:-/dev/null}"' _ "$GSTACK_DIR" "$PULL_ERR_FILE"
+    bash -c 'git -C "$1" fetch -q 2>"${2:-/dev/null}"' _ "$GSTACK_DIR" "$PULL_ERR_FILE"
   PULL_EXIT=$?
+  # The fast-forward targets the exact revision whose requirement was read.
+  # Setup runs `bun` from this PATH, so that is the binary checked; a
+  # malformed version passes here because setup only warns on it.
+  INCOMING="" HELD=""
+  if [ "$PULL_EXIT" -eq 0 ]; then
+    INCOMING=$(git -C "$GSTACK_DIR" rev-parse --verify '@{upstream}^{commit}' 2>"${PULL_ERR_FILE:-/dev/null}") || PULL_EXIT=1
+  fi
+  if [ "$PULL_EXIT" -eq 0 ] && [ "$INCOMING" != "$OLD_HEAD" ]; then
+    HELD=$(gstack_bun_incoming_hold "$GSTACK_DIR" "$INCOMING" 2>/dev/null) || HELD=""
+  fi
+  if [ "$PULL_EXIT" -eq 0 ] && [ -z "$HELD" ] && [ "$INCOMING" != "$OLD_HEAD" ]; then
+    HELD=$(hook_incoming_hold "$INCOMING") || HELD=""
+  fi
+  if [ "$PULL_EXIT" -eq 0 ] && [ -z "$HELD" ]; then
+    git -C "$GSTACK_DIR" merge --ff-only --autostash -q "$INCOMING" >/dev/null 2>"${PULL_ERR_FILE:-/dev/null}"
+    PULL_EXIT=$?
+  fi
   NEW_HEAD=$(git -C "$GSTACK_DIR" rev-parse HEAD 2>/dev/null)
 
   # Heartbeat: pull done — keep the TTL clock fresh for the setup step.
@@ -152,9 +233,23 @@ fi
   # Record check time regardless of outcome
   date +%s > "$THROTTLE_FILE" 2>/dev/null
 
+  P_STAGES="$(pending_get stages)"; P_FROM="$(pending_get from)"; P_REASON="$(pending_get reason)"
+  P_FAILURES="$(pending_get failures)"; P_NEXT="$(pending_get next)"; P_PULL=""
+  case "$P_FAILURES" in ''|*[!0-9]*) P_FAILURES=0 ;; esac
+  case "$P_NEXT" in ''|*[!0-9]*) P_NEXT=0 ;; esac
+
+  if [ -n "$HELD" ]; then
+    log_entry "HELD $HELD incoming=$INCOMING"
+    P_PULL="$HELD"
+    pending_save
+    rm -f "$PULL_ERR_FILE" 2>/dev/null
+    exit 0
+  fi
   if [ "$PULL_EXIT" -ne 0 ]; then
     PULL_REASON=$(head -c 300 "$PULL_ERR_FILE" 2>/dev/null | tr '\n' ' ' | tr -s ' ')
     log_entry "PULL_FAILED exit=$PULL_EXIT reason=${PULL_REASON:-unknown}"
+    P_PULL="exit $PULL_EXIT: $(printf '%s' "${PULL_REASON:-no error output}" | head -c 160)"
+    pending_save
     # Autostash pop conflict leaves the stash behind and the tree half-merged.
     # The local patches are REGENERABLE (prefix renames, gbrain blocks), so
     # recover to a clean upstream tree and re-render them below rather than
@@ -164,8 +259,8 @@ fi
       git -C "$GSTACK_DIR" stash drop -q 2>/dev/null
       log_entry "AUTOSTASH_CONFLICT_RECOVERED tree_reset=1"
       _PREFIX_CFG=$("$GSTACK_DIR/bin/gstack-config" get skill_prefix 2>/dev/null || echo false)
-      "$GSTACK_DIR/bin/gstack-patch-names" "$GSTACK_DIR" "$_PREFIX_CFG" >/dev/null 2>&1 || true
-      "$GSTACK_DIR/bin/gstack-config" gbrain-refresh >/dev/null 2>&1 || true
+      "$GSTACK_DIR/bin/gstack-patch-names" "$GSTACK_DIR" "$_PREFIX_CFG" >/dev/null 2>&1 || true  # best-effort: regenerable prefix rewrite
+      "$GSTACK_DIR/bin/gstack-config" gbrain-refresh >/dev/null 2>&1 || true  # best-effort: regenerable gbrain blocks
     fi
     rm -f "$PULL_ERR_FILE" 2>/dev/null
     exit 0
@@ -175,33 +270,69 @@ fi
   # no-ops when the feature is unconfigured); the autostash pop usually
   # preserves them, but a clean re-render costs nothing and self-heals.
   _PREFIX_CFG=$("$GSTACK_DIR/bin/gstack-config" get skill_prefix 2>/dev/null || echo false)
-  "$GSTACK_DIR/bin/gstack-patch-names" "$GSTACK_DIR" "$_PREFIX_CFG" >/dev/null 2>&1 || true
-  "$GSTACK_DIR/bin/gstack-config" gbrain-refresh >/dev/null 2>&1 || true
+  "$GSTACK_DIR/bin/gstack-patch-names" "$GSTACK_DIR" "$_PREFIX_CFG" >/dev/null 2>&1 || true  # best-effort: regenerable prefix rewrite
+  "$GSTACK_DIR/bin/gstack-config" gbrain-refresh >/dev/null 2>&1 || true  # best-effort: regenerable gbrain blocks
 
-  # ── If HEAD moved, run setup -q ──
+  # ── Run setup when HEAD moved, or retry a pending stage after its backoff ──
+  NOW=$(date +%s)
+  RUN_SETUP=0
   if [ "$OLD_HEAD" != "$NEW_HEAD" ]; then
     log_entry "UPDATING old=$OLD_HEAD new=$NEW_HEAD"
+    RUN_SETUP=1
+    P_FAILURES=0
+    [ -n "$P_FROM" ] || P_FROM=$(git -C "$GSTACK_DIR" show "$OLD_HEAD:VERSION" 2>/dev/null || echo "unknown")
+  elif [ -n "$P_STAGES" ]; then
+    if [ "$NOW" -ge "$P_NEXT" ]; then
+      log_entry "RETRY_PENDING stages=$P_STAGES attempt=$((P_FAILURES + 1))"
+      RUN_SETUP=1
+    else
+      log_entry "PENDING_BACKOFF stages=$P_STAGES next=$P_NEXT"
+    fi
+  fi
 
-    # bun must be available for setup
+  if [ "$RUN_SETUP" -eq 1 ]; then
+    FAILED_STAGE="" FAIL_REASON=""
     if command -v bun >/dev/null 2>&1; then
-      ( cd "$GSTACK_DIR" && ./setup -q --refresh-registered ) >/dev/null 2>&1 || {
-        log_entry "SETUP_FAILED"
-      }
+      SETUP_OUT=$(mktemp "${TMPDIR:-/tmp}/gstack-session-setup-XXXXXX" 2>/dev/null || echo /dev/null)
+      ( cd "$GSTACK_DIR" && ./setup -q --refresh-registered ) >"$SETUP_OUT" 2>&1
+      SETUP_EXIT=$?
       # Heartbeat: setup done (either way) — refresh the TTL clock.
       touch "$LOCK_DIR/pid" 2>/dev/null
+      if [ "$SETUP_EXIT" -ne 0 ]; then
+        _MIG="$(grep -o 'migration [^ ]* failed' "$SETUP_OUT" 2>/dev/null | head -1)"
+        if [ -n "$_MIG" ]; then
+          FAILED_STAGE="migrations" FAIL_REASON="$_MIG"
+        else
+          _LAST="$(grep -v '^[[:space:]]*$' "$SETUP_OUT" 2>/dev/null | tail -1 | head -c 160)"
+          FAILED_STAGE="setup" FAIL_REASON="./setup exited $SETUP_EXIT${_LAST:+: $_LAST}"
+        fi
+      fi
+      [ "$SETUP_OUT" = /dev/null ] || rm -f "$SETUP_OUT"
     else
+      FAILED_STAGE="setup" FAIL_REASON="bun not found on PATH"
       log_entry "SETUP_SKIPPED bun_missing"
     fi
 
-    # Write marker so next skill preamble shows "just upgraded"
-    OLD_VER=$(git -C "$GSTACK_DIR" show "$OLD_HEAD:VERSION" 2>/dev/null || echo "unknown")
-    echo "$OLD_VER" > "$STATE_DIR/just-upgraded-from" 2>/dev/null
-    rm -f "$STATE_DIR/last-update-check" 2>/dev/null
-    rm -f "$STATE_DIR/update-snoozed" 2>/dev/null
-
-    log_entry "UPDATED from=$OLD_VER to=$(cat "$GSTACK_DIR/VERSION" 2>/dev/null || echo unknown)"
+    if [ -z "$FAILED_STAGE" ]; then
+      # Every stage succeeded: now the next skill preamble may say "just upgraded".
+      echo "${P_FROM:-unknown}" > "$STATE_DIR/just-upgraded-from" 2>/dev/null
+      rm -f "$STATE_DIR/last-update-check" 2>/dev/null
+      rm -f "$STATE_DIR/update-snoozed" 2>/dev/null
+      log_entry "UPDATED from=${P_FROM:-unknown} to=$(cat "$GSTACK_DIR/VERSION" 2>/dev/null || echo unknown)"
+      P_STAGES="" P_FROM="" P_FAILURES=0 P_NEXT=0 P_REASON=""
+      pending_save
+    else
+      P_FAILURES=$((P_FAILURES + 1))
+      case "$P_FAILURES" in 1) _WAIT=$THROTTLE_SECONDS ;; 2) _WAIT=21600 ;; *) _WAIT=86400 ;; esac
+      P_STAGES="$FAILED_STAGE" P_NEXT=$((NOW + _WAIT)) P_REASON="$FAIL_REASON"
+      pending_save
+      [ "$FAILED_STAGE" = setup ] && [ "$FAIL_REASON" != "bun not found on PATH" ] && log_entry "SETUP_FAILED reason=$FAIL_REASON"
+      [ "$FAILED_STAGE" = migrations ] && log_entry "MIGRATIONS_FAILED reason=$FAIL_REASON"
+      log_entry "PENDING stages=$FAILED_STAGE attempt=$P_FAILURES next_retry_in=${_WAIT}s"
+    fi
   else
-    log_entry "UP_TO_DATE head=$OLD_HEAD"
+    pending_save
+    [ -n "$P_STAGES" ] || log_entry "UP_TO_DATE head=$OLD_HEAD"
   fi
 # The detached subshell must own its stdio: it inherits the session hook's
 # pipes, and once the hook exits and the caller closes them, any child that

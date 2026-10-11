@@ -158,7 +158,8 @@ only letters, digits or hyphens (e.g., `checkout-button`, `payment`), never a pa
 quotes, whitespace or other punctuation; simplify to an alphanumeric stem if needed.
 
 ```bash
-~/.claude/skills/gstack/bin/gstack-learnings-search --query "<your-keyword>" --limit 5 2>/dev/null || true
+{ _LE=$(~/.claude/skills/gstack/bin/gstack-learnings-search --query "<your-keyword>" --limit 5 2>&1 >&3 3>&-); _LR=$?; } 3>&1
+[ "$_LR" = 0 ] || { _LE=${_LE%%$'\n'*}; echo "LEARNINGS: unavailable (${_LE:-exit $_LR})"; }
 ```
 
 Name an applicable learning in one sentence, or continue if none applies.
@@ -207,7 +208,8 @@ Read the surrounding source and make the **minimal fix**. No unrelated refactors
 ### 8c. Re-test
 
 Re-run the regression, original failing probe and adjacent happy path. Inspect each
-final state; acceptance alone cannot verify a worker repair. Failed/unavailable rechecks stay unresolved.
+final state; acceptance alone cannot verify a worker repair. Failed/unavailable rechecks stay unresolved:
+try one revised minimal fix, else classify it reverted.
 
 For browser defects only:
 
@@ -227,7 +229,7 @@ repairs and valid red regressions/evidence uncommitted; tell the user what remai
 
 - **verified**: passed 8c (native regression when available); disclose missing test coverage
 - **best-effort**: fix applied but couldn't fully verify (e.g., needs auth state, external service)
-- **reverted**: regression detected → undo only this run's repair (revert its commit if already committed), retain the valid regression/evidence, and mark the issue "deferred". Never discard user changes.
+- **reverted**: regression detected or finding unresolved → undo only this run's repair (revert its commit if already committed), retain the valid regression/evidence, and mark the issue "deferred". Never discard user changes.
 
 ### 8e.5. Regression Test record
 
@@ -260,12 +262,12 @@ about a worse score or regressed contract; blocked/inconclusive rechecks never v
 ## Phase 10: Report
 
 Write the Output Structure report locally and copy the same content to project context:
-
-**Project-scoped:** Write test outcome artifact for cross-session context:
 ```bash
 {{SLUG_SETUP}}
 ```
 Write to `<PROJECT_DIR>/{user}-{branch}-test-outcome-{datetime}.md` (`PROJECT_DIR` printed above)
+from `git config user.name`, `git branch --show-current` (else `unknown-user`, `detached`;
+non-alphanumerics → `-`) and UTC `YYYYMMDDTHHMMSSZ`.
 
 **Per-issue additions:**
 - Fix Status: verified / best-effort / reverted / deferred
@@ -278,10 +280,8 @@ For browser coverage include the score delta. For functional coverage include
 passing/failing/blocked/not-run contracts, permanent regressions and remaining risks,
 never a score. Keep mixed results separate.
 
-**PR Summary:** Include one line:
-> "QA found N issues, fixed M, health score X → Y."
-
-For functional targets, use those contract outcomes instead of a score in the PR summary.
+**PR Summary:** one line, "QA found N issues, fixed M, health score X → Y."
+Functional targets: contract outcomes, not a score.
 
 ---
 

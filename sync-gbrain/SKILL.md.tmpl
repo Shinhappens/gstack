@@ -47,8 +47,8 @@ When the user types `/sync-gbrain`, run this skill. Argument modes (parsed by
 the skill itself, not a dispatcher binary):
 
 - `/sync-gbrain` — incremental sync (default; mtime fast-path; ~50ms steady-state)
-- `/sync-gbrain --full` — full code reindex via `gbrain reindex-code` (~25-35 min on a big repo). Auto-builds the call graph (`gbrain dream`) **only when it was never built**.
-- `/sync-gbrain --dream` — build this source's call graph (`gbrain code-callers`/`code-callees`) via a source-scoped `gbrain dream --source <id>` cycle; ~minutes; runs lock-free after the sync stages. Always forces, even if already built. Only produces a graph on a code-aware schema pack; otherwise the run reports a WARN explaining why the graph is still empty.
+- `/sync-gbrain --full` — full code reindex via `gbrain reindex-code` (~25-35 min on a big repo). Auto-builds the call graph (`gbrain dream --phase resolve_symbol_edges`) **only when it was never built**.
+- `/sync-gbrain --dream` — build this source's call graph (`gbrain code-callers`/`code-callees`) via `gbrain dream --source <id> --phase resolve_symbol_edges`; ~minutes; runs lock-free after the sync stages. Always forces, even if already built. Runs only that phase, never gbrain's full maintenance cycle (about 35 minutes with LLM phases); if the installed gbrain cannot scope the phase, the dream row says so and nothing runs. Only produces a graph on a code-aware schema pack; otherwise the run reports a WARN explaining why the graph is still empty.
 - `/sync-gbrain --no-dream` — skip the dream cycle that `--full` would otherwise auto-run.
 - `/sync-gbrain --code-only` — only run the code stage; skip memory + brain-sync
 - `/sync-gbrain --dry-run` — preview what would sync; no writes anywhere
@@ -166,6 +166,10 @@ BEFORE invoking the orchestrator:
   will run. Do NOT abort.
 - **`missing-config`** AND `gbrain_mcp_mode != "remote-http"`: STOP. "Local
   gbrain CLI is installed but no engine config. Run `/setup-gbrain` first."
+- **`db-unreachable`**: STOP. Print `gbrain_local_status_detail` from the
+  detect JSON verbatim (for example "database host unreachable (ENOTFOUND
+  db.example.com); your gbrain config is unchanged. Fix: check network or
+  VPN, then re-run /sync-gbrain."). Never suggest moving the config aside.
 - **`broken-config`** OR **`broken-db`**: STOP with a clear message:
   ```
   Local gbrain config at ~/.gbrain/config.json points at an unreachable
@@ -259,8 +263,13 @@ Other memory types sync whatever the answer. Details:
 
 ## Step 2: Run the orchestrator
 
-Pass user args to the orchestrator. Do not paraphrase them — pass through
-as-is.
+Pass the user's flags to the orchestrator as `<user-args>`, unchanged (empty for a
+plain run). Use them only when every word is one of `--incremental`, `--full`,
+`--dry-run`, `--quiet`, `--no-code`, `--no-memory`, `--no-brain-sync`,
+`--code-only`, `--dream`, `--no-dream`, `--allow-reclone`,
+`--prune-gone-worktrees`, or `--sources` followed by one comma-separated list of
+lowercase memory types (or `all`). Any other value is not used: do not run the
+command; tell the user which value was rejected.
 
 ```bash
 bun run ~/.claude/skills/gstack/bin/gstack-gbrain-sync.ts <user-args>
@@ -323,42 +332,68 @@ that doesn't declare it (e.g. `gbrain-base` / `gbrain-base-v2`), a `dream` cycle
 completes but `resolve_symbol_edges` matches nothing — the graph stays empty no
 matter how many times you run it. So "build the call graph" is only meaningful on
 a code-aware pack. The `--dream` stage detects this and reports it honestly
-(a WARN row) rather than claiming a build that didn't happen. gbrain exposes pack
-capability only at cycle runtime (no pre-flight query as of 0.41.x), so we can't
-detect it before running. `code-def` / `code-refs` need the same symbol
-extraction; they are NOT free "direct lookups" on a non-code-aware pack.
+(a WARN row) rather than claiming a build that didn't happen. `code-def` /
+`code-refs` need the same symbol extraction; they are NOT free "direct lookups"
+on a non-code-aware pack.
+
+A source can also hold no code pages at all while reporting a healthy page count
+(a source added outside gstack syncs with gbrain's default markdown strategy).
+On gbrain 0.60 or later, `code-def` for a symbol that cannot exist answers
+`.status`: `ready` (the source holds code), `out_of_scope` (it holds none, so
+`--dream` cannot help), or nothing usable on older gbrain or an error.
 
 Detect whether this source's call graph is built via doctor's `cycle_freshness`
-check, matching the cwd `SOURCE_ID` literally:
+check, matching the cwd `SOURCE_ID` literally. `doctor --fast` skips the DB
+checks that carry it, so this reads `--scope=brain` (DB checks, no skill walk):
 
 ```bash
 SOURCE_JSON=$(bun run ~/.claude/skills/gstack/bin/gstack-gbrain-read-capability.ts --source-only 2>/dev/null)
 SOURCE_ID=$(printf '%s' "$SOURCE_JSON" | jq -er 'if .status=="source" then .source_id else empty end' 2>/dev/null)
 CYCLE=unknown
+CYCLE_WHY=""
 if [ -n "$SOURCE_ID" ]; then
-  CYCLE=$(gbrain doctor --json --fast 2>/dev/null \
+  # doctor exits 1 when any check fails; its JSON report is still complete.
+  CYCLE=$(gbrain doctor --json --scope=brain 2>/dev/null \
     | jq -er --arg id "$SOURCE_ID" '
-        if type=="object" and has("error") then empty
-        else (.checks[]? | select(.name=="cycle_freshness")) as $c
-          | if $c.status=="ok" then "completed"
-            elif (($c.message // "") | index($id)) then "never"
-            else "unknown" end end' 2>/dev/null || echo unknown)
+        if type!="object" or has("error") then "unknown"
+        else ([.checks[]? | select(.name=="cycle_freshness")][0]) as $c
+          | if $c == null then "unexposed"
+            elif $c.status=="ok" then "completed"
+            else ((($c.message // "") / "; ") | map(select(index("\u0027" + $id + "\u0027"))) | .[0] // "") as $i
+              | if ($i | index("never completed")) then "never"
+                elif ($i | index("last cycled")) then "completed"
+                else "unknown" end end end' 2>/dev/null || echo unknown)
+  if [ "$CYCLE" = unexposed ]; then CYCLE=unknown; CYCLE_WHY="installed gbrain does not expose cycle_freshness"; fi
 fi
-# index($id) = literal substring (NOT test() regex), matching the lib reader in
-# cycleCompleted(). A fail/warn that doesn't name this source → "unknown" (don't
-# mask other-source failures).
-echo "call graph for $SOURCE_ID: $CYCLE"
+# index() = literal substring (NOT test() regex), matching the lib reader in
+# readCycleStatus(). A fail/warn that doesn't name this source → "unknown"
+# (don't mask other-source failures).
+echo "call graph for $SOURCE_ID: $CYCLE${CYCLE_WHY:+: $CYCLE_WHY}"
+CODE_SCOPE=unknown
+if [ -n "$SOURCE_ID" ]; then
+  CODE_SCOPE=$(gbrain code-def ZzzGstackProbeSymbolThatCannotExist --source "$SOURCE_ID" --limit 1 2>/dev/null \
+    | sed -n '/^[[:space:]]*{/,$p' | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)
+  case "$CODE_SCOPE" in ready|out_of_scope) ;; *) CODE_SCOPE=unknown ;; esac
+fi
+echo "code scope for $SOURCE_ID: $CODE_SCOPE"
 ```
 
-If `CYCLE == never` AND the user did NOT pass `--dream`/`--full` AND Step 3
-`PAGES > 0`, AskUserQuestion via the format in the preamble:
+If `CODE_SCOPE == out_of_scope`, do not offer a build: report "this source holds
+no code pages (it syncs with gbrain's markdown strategy), so a call-graph build
+cannot help; re-sync it with `gbrain sync --strategy code --source <id>` to index
+its code" and continue to Step 4.
+
+If `CYCLE == never` AND `CODE_SCOPE` is `ready` or `unknown` AND the user did NOT
+pass `--dream`/`--full` AND Step 3 `PAGES > 0`, AskUserQuestion via the format in
+the preamble:
 
 > D2 — This repo's call graph isn't built. Build it now?
 >
 > ELI10: `gbrain code-callers`/`code-callees` (who calls this function / what it
 > calls) return nothing until the `resolve_symbol_edges` phase runs for this
-> source. `gbrain dream --source <this source>` runs it (scoped to this
-> worktree's code, takes a few minutes). It only produces a graph if this
+> source. `gbrain dream --source <this source> --phase resolve_symbol_edges`
+> runs only that phase (scoped to this worktree's code, takes a few minutes,
+> not the full ~35-minute maintenance cycle). It only produces a graph if this
 > source's schema pack extracts code symbols; if it doesn't, the run completes
 > but the graph stays empty and the dream row will say so.
 >
@@ -393,8 +428,8 @@ Capability check:
 bun run ~/.claude/skills/gstack/bin/gstack-gbrain-read-capability.ts <user-args>
 ```
 
-`<user-args>` are the same flags this /sync-gbrain invocation passed to Step 2,
-unchanged (empty for a plain run). The helper needs no other input: run it once
+`<user-args>` are the same checked flags this /sync-gbrain invocation passed to
+Step 2, unchanged (empty for a plain run). The helper needs no other input: run it once
 and use its JSON result; do not inspect its source or the gbrain CLI first.
 
 The helper reports JSON `status: ready` only after the successful code sync's
@@ -437,10 +472,14 @@ of the same repo each have their own pin and their own indexed pages, so
 semantic results match the code on disk here.
 
 Call-graph queries (`code-callers`/`code-callees`) also need the graph to be
-built first — run `/sync-gbrain --dream` (or `--full`) if they return
-`count: 0`. This only works if this source's gbrain schema pack extracts code
-symbols; on a non-code-aware pack `--dream` completes but the graph stays empty
-and reports a WARN. `code-def`/`code-refs` need the same extraction.
+built first. A `count: 0` has several causes, and only one is fixed by
+`/sync-gbrain --dream` (or `--full`): the graph was never built. Check the others
+first: the source may hold no code at all (`gbrain code-def <any-symbol>
+--source <id>` answers `status: out_of_scope`), the symbol may be dotted (these
+verbs take a bare name), or `--all-sources` was used. `--dream` also needs a
+schema pack that extracts code symbols; on another pack it completes, the graph
+stays empty and it reports a WARN. `code-def`/`code-refs` need the same
+extraction.
 
 Two indexed corpora available via the `gbrain` CLI:
 - This worktree's code (auto-pinned via `.gbrain-source`).

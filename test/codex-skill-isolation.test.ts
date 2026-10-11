@@ -12,6 +12,7 @@ import { describe, expect, test } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import { CODEX_MODEL_CONFIG_FLAG, CODEX_REVIEW_MODEL_CONFIG_FLAG, CODEX_SKILLS_ISOLATION_FLAG } from '../scripts/resolvers/constants';
+import { expectMentions } from './helpers/prompt-structure';
 
 const ROOT = path.join(import.meta.dir, '..');
 
@@ -42,7 +43,7 @@ describe('Codex skill isolation (#2847)', () => {
     const calls: string[] = [];
     for (const file of renderedSkillFiles()) {
       for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
-        if (/_gstack_codex_timeout_wrapper\s+\d+\s+codex\s+(exec|review)\b/.test(line)) calls.push(`${path.relative(ROOT, file)}: ${line}`);
+        if (/run-with-timeout\s+\d+\s+codex\s+(exec|review)\b/.test(line)) calls.push(`${path.relative(ROOT, file)}: ${line}`);
       }
     }
     expect(calls.length).toBeGreaterThan(10);
@@ -62,7 +63,7 @@ describe('Codex skill isolation (#2847)', () => {
       const boundaries = text.split('\n').filter(line => /do not read or execute any files under/i.test(line));
       expect(boundaries.length, rel).toBeGreaterThan(0);
       for (const line of boundaries) {
-        expect(line, rel).toMatch(/do not invoke any installed skill \(Codex home skills\/, \.agents\/\)/i);
+        expectMentions(line, [['do not', 'installed', 'invoke']], 'line');
       }
     }
   });

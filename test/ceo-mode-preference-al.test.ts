@@ -31,14 +31,16 @@ function tuning(document:string){
  return document.split('## Question Tuning (skip entirely if')[1]!.split('\n## ')[0]!;
 }
 function renderedCheck(host:string,id:string){
- const match=tuning(rendered.get(host)!).match(/`(printf '%s' "<question summary>" \| ([^`]+)\/gstack-question-preference --check "<id>" --summary-stdin)`/)!;
+ // The mode id is registered, so the rendered check carries no summary file
+ // (that is only for ids outside the registry).
+ const match=tuning(rendered.get(host)!).match(/`(([^`]+)\/gstack-question-preference --check "<id>")`/)!;
  expect(match).not.toBeNull();
  expect(match[2]).toBe(host==='claude'?'~/.claude/skills/gstack/bin':'$GSTACK_BIN');
+ expect(tuning(rendered.get(host)!)).toContain('append `--summary-file .gstack/tmp/qt.txt`');
  const quote=(value:string)=>"'"+value.replace(/'/g,"'\\''")+"'";
  // Run the rendered command, substituting its documented fields and mapping
  // the host's installed executable location to this isolated checkout.
- return match[1]!.replace('<question summary>','Select the CEO review mode for the current plan.')
-  .replace('"<id>"',quote(id))
+ return match[1]!.replace('"<id>"',quote(id))
   .replace(match[2]!+'/gstack-question-preference',quote(path.join(root,'bin/gstack-question-preference')));
 }
 function checkWithPreference(host:string,preference?:string,writeId?:string){
@@ -73,7 +75,8 @@ test('source and both isolated host renders bind the shared check, marker and lo
   expect(s.indexOf('3. Resolve that recommendation')).toBeGreaterThanOrEqual(0);
   expect(s.indexOf('4. **Mode handoff:**')).toBeGreaterThan(s.indexOf('3. Resolve that recommendation'));
   expect(handoff).toContain('After selection');
-  expect(handoff).toContain('send brief chat before tools or further questions');
+  expect(handoff).toMatch(/before other tools or further questions, run `[^`]*\/bin\/gstack-ceo-mode-handoff /);
+  expect(handoff).toContain('Then send brief chat beginning with that line');
   expect(s.slice(0,s.indexOf('4. **Mode handoff:**'))).not.toMatch(/\blog (?:with|that ID)\b/);
   expect(handoff.indexOf('Record mode provenance after the handoff')).toBeGreaterThan(handoff.indexOf('- Other selections:'));
   expect(handoff.indexOf("Follow the selected mode's route:")).toBeGreaterThan(handoff.indexOf('Record mode provenance after the handoff'));

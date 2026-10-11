@@ -3,8 +3,10 @@
  *
  * A free test counts when none of its direct imports reaches a repo file outside
  * `test/` and it names no `bin/` path, SKILL.md or `.tmpl` template: it tests a
- * helper or a replayed capture, not product code. The 2026-09 audit left the
- * files below; a new one fails here with its path and a suggested owner test.
+ * helper or a replayed capture, not product code. It also counts when it reads a
+ * paid test file's source and slices it, whatever else it imports: that tests the
+ * paid harness's own code out of context. The 2026-09 audit left the files below;
+ * a new one fails here with its path and a suggested owner test.
  * AGENTS.md: "do not add one spelling or glyph per paid failure".
  */
 import { expect, test } from 'bun:test';
@@ -19,6 +21,7 @@ const ROOT = path.resolve(import.meta.dir, '..');
 const BASELINE = [
   'test/anthropic-preflight.test.ts',
   'test/artifacts-init-migration.test.ts',
+  'test/auq-substance-panel.test.ts', // C4 (approved 2026-10-04): the auq-matrix substance panel's gating rule lives in a paid-path helper
   'test/autoplan-artifact-recorder.test.ts',
   'test/autoplan-artifact-windows-argv.test.ts',
   'test/autoplan-edit-digests-al.test.ts',
@@ -43,6 +46,7 @@ const BASELINE = [
   'test/ceo-hold-posture-review.test.ts',
   'test/ceo-mode-expansion-disposition.test.ts',
   'test/ceo-mode-labels-native.test.ts',
+  'test/ceo-mode-option.test.ts', // slices test/skill-e2e-plan-ceo-mode-routing.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
   'test/ceo-mode-pending-submit.test.ts',
   'test/ceo-mode-posture-native.test.ts',
   'test/ceo-mode-prerequisite.test.ts',
@@ -50,22 +54,32 @@ const BASELINE = [
   'test/ceo-section-loading-fixture.test.ts',
   'test/ceo-split-collection.test.ts',
   'test/ceo-split-question-policy.test.ts',
+  'test/ceo-stale-fill-decision.test.ts', // replays census reports against the paid CEO section-loading case's structured checker
   'test/changed-files-union.test.ts',
   'test/claude-provider-keychain.test.ts',
   'test/codex-carve-fixture.test.ts',
   'test/codex-eval-recording.test.ts',
   'test/codex-resume-flag-semantics.test.ts',
+  'test/cookie-workflow-judge-input.test.ts', // slices test/skill-llm-eval.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
   'test/cso-ntfs-fixture.test.ts',
   'test/cso-windows-build-contract.test.ts',
   'test/dependency-security.test.ts',
   'test/deps-smoke.test.ts',
   'test/design-completion-handoff-scored.test.ts',
   'test/design-daemon-windows-identity.test.ts',
+  'test/design-detector-source-fixture.test.ts', // slices test/skill-e2e-design.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
   'test/design-html-section-completion.test.ts',
+  'test/detector-corpus-auto-decide-preserved.test.ts', // B1 replay corpus: census captures through the paid case's detectors (approved plan item)
+  'test/detector-corpus-plan-ceo-section-loading.test.ts', // B1 replay corpus: census captures through the paid case's detectors (approved plan item)
+  'test/detector-corpus-plan-design-review-plan-mode.test.ts', // B1 replay corpus: census captures through the paid case's checker; slices test/skill-e2e-design.test.ts source (flagged once the ratchet learned paid-source slicing)
+  'test/detector-corpus-plan-eng-multi-finding-batching.test.ts', // B1 replay corpus (GSTA-23 red 37228573062): census captures through the paid case's review-question counter
+  'test/detector-corpus-shared-libs-plan-callers.test.ts', // B1 replay corpus: census captures through the paid case's actor (approved plan item)
+  'test/detector-corpus-ship-docsync-late-result.test.ts', // B1 replay corpus: census captures through the paid case's detectors (approved plan item)
   'test/devex-peer-comparison-calibration.test.ts',
   'test/diagram-render-drift.test.ts',
   'test/disabled-dated-record-at.test.ts',
   'test/docsync-atomic-writes.test.ts', // landed in v1.91.7.0 before this ratchet: harness owner for its functional-QA/docsync paid evals
+  'test/docsync-child-marker.test.ts', // replays a PR-lane capture against the paid ship-docsync case's child-marker check
   'test/docsync-command-grammar.test.ts', // landed in v1.91.7.0 before this ratchet: harness owner for its functional-QA/docsync paid evals
   'test/docsync-nested-writes.test.ts', // landed in v1.91.7.0 before this ratchet: harness owner for its functional-QA/docsync paid evals
   'test/dx-selected-navigation-ap.test.ts',
@@ -103,6 +117,7 @@ const BASELINE = [
   'test/helpers/e2e-gate.unit.test.ts',
   'test/helpers/eval-store.test.ts',
   'test/helpers/hermetic-env.test.ts',
+  'test/helpers/observability.test.ts', // predates this ratchet; its only scripts/ import was the deleted eval-watch dashboard
   'test/helpers/run-bin.test.ts',
   'test/helpers/session-runner.test.ts',
   'test/helpers/sync-command-capture.test.ts',
@@ -149,14 +164,19 @@ const BASELINE = [
   'test/plan-create-combined-permission.test.ts',
   'test/plan-create-permission.test.ts',
   'test/plan-create-prepublication.test.ts',
+  'test/plan-design-sdk-fixture.test.ts', // slices test/skill-e2e-design.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
   'test/plan-edit-cropped-permission.test.ts',
+  'test/plan-eng-resume.test.ts', // harness owner for the plan-eng-review-artifact checkpoint: proves its resume point before paid spend
   'test/plan-floor-dx-actor.test.ts',
+  'test/plan-floor-edit-wrap.test.ts', // B3: replays PR run 37176835584's viewport through the floor runner's edit-preview parser
   'test/plan-floor-review.test.ts',
+  'test/plan-format-approach-prompt.test.ts', // D2: pins the refusal-free capture prompt of a paid fixture (provider refusal evidence in the commit)
   'test/plan-mode-evidence.test.ts',
   'test/plan-pending-question-pty.test.ts',
   'test/plan-seed-submission.test.ts',
   'test/plan-skill-read-permission.test.ts',
   'test/plan-skill-webfetch-permission.test.ts',
+  'test/prosons-neutral-posture.test.ts', // C3: replays the two census false reds through the prosons neutral-posture detector
   'test/pty-askuserquestion-single-line.test.ts',
   'test/pty-numbered-option-indent-native.test.ts',
   'test/pty-option-selection.test.ts',
@@ -175,13 +195,13 @@ const BASELINE = [
   'test/qa-functional-observer.test.ts', // landed in v1.91.7.0 before this ratchet: harness owner for its functional-QA/docsync paid evals
   'test/qa-supervision-selection.test.ts', // landed in v1.91.7.0 before this ratchet: harness owner for its functional-QA/docsync paid evals
   'test/question-log-hook.test.ts',
-  'test/readme-throughput.test.ts',
   'test/review-army-budget.test.ts',
   'test/review-consensus-lifecycle.test.ts',
   'test/review-count-markdown.test.ts',
   'test/review-enum-lifecycle.test.ts',
   'test/review-n-plus-one-contract.test.ts',
   'test/review-quality-provenance.test.ts', // landed in v1.91.7.0 before this ratchet: harness owner for its functional-QA/docsync paid evals
+  'test/session-runner-browse-errors.test.ts', // slices test/skill-e2e-review.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
   'test/session-runner-stream-lifecycle.test.ts',
   'test/session-runner-timeout.test.ts',
   'test/setup-browser-hint.test.ts',
@@ -190,14 +210,24 @@ const BASELINE = [
   'test/setup-playwright-platform.test.ts',
   'test/setup-sections-linking.test.ts',
   'test/shared-libs-cancellation.test.ts', // landed in v1.91.7.0 before this ratchet: harness owner for its functional-QA/docsync paid evals
+  'test/shared-libs-checker-interface-evidence.test.ts', // slices test/skill-e2e-shared-libs.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
+  'test/shared-libs-fixture.test.ts', // slices test/skill-e2e-shared-libs-periodic.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
   'test/shared-libs-plan-actor.test.ts',
+  'test/shared-libs-revalidation-prompt.test.ts', // slices test/skill-e2e-shared-libs.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
+  'test/shared-libs-review-start-evidence.test.ts', // slices test/skill-e2e-shared-libs.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
+  'test/shared-libs-source-reads.test.ts', // slices test/skill-e2e-shared-libs-paths.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
+  'test/shared-libs-stage-actor.test.ts', // slices test/skill-e2e-shared-libs.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
+  'test/ship-coverage-audit-af.test.ts', // slices test/skill-e2e-workflow.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
   'test/ship-section-fixture.test.ts',
   'test/skill-budget-regression.test.ts',
+  'test/skill-fixture.test.ts', // slices test/skill-routing-e2e.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
   'test/skill-parser.test.ts',
   'test/spawnsync-timeout-tripwire.test.ts',
   'test/tasks-section-jq.test.ts',
   'test/test-free-shards-capture.test.ts',
   'test/timeline.test.ts',
+  'test/workflow-judge-cache.test.ts', // slices test/skill-llm-eval.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
+  'test/workflow-judge-input.test.ts', // slices test/skill-llm-eval.test.ts source (recorded 2026-10 when the ratchet learned paid-source slicing)
 ];
 
 function freeTests(): string[] {
@@ -205,13 +235,24 @@ function freeTests(): string[] {
     .filter(file => file.endsWith('.test.ts') && !isPaidTestFile(file)).sort();
 }
 
+/** Variables bound to `readFileSync(<paid test file>)` that the file then cuts with `.slice(`. */
+function slicedPaidSources(source: string): string[] {
+  const bound = [...source.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=[^;\n]*\breadFileSync\([^;\n]*?(['"`])(?:\.\/|test\/)?([\w.-]+\.test\.ts)\2/g)]
+    .filter(match => isPaidTestFile(`test/${match[3]}`)).map(match => match[1]!);
+  return [...new Set(bound)].filter(name => new RegExp(`\\b${name}\\.slice\\(`).test(source));
+}
+
 function testsOnlyTestCode(file: string): { counted: boolean; helper?: string } {
   const source = fs.readFileSync(path.join(ROOT, file), 'utf8');
   const targets = directSpecifiers(source).map(specifier => resolveRepoSpecifier(ROOT, file, specifier)).filter(Boolean) as string[];
+  const helper = targets.find(target => target.startsWith('test/helpers/') && !target.endsWith('.test.ts'));
+  if (slicedPaidSources(source).length) return { counted: true, helper };
   if (targets.some(target => !target.startsWith('test/') && !target.startsWith('node_modules/'))) return { counted: false };
   if (/(['"`])[^'"`\n]*(?:\bbin\/|SKILL\.md|CLAUDE\.md|\.tmpl)[^'"`\n]*\1/.test(source)) return { counted: false };
-  if (/(['"`])(?:\.\/)?\.github\b[^'"`\n]*\1|(['"`])bin\2\s*,\s*(['"`])[\w.-]+\3/.test(source)) return { counted: false };
-  return { counted: true, helper: targets.find(target => target.startsWith('test/helpers/') && !target.endsWith('.test.ts')) };
+  if (/(['"`])(?:\.\/)?\.github\b[^'"`\n]*\1|(['"`])bin\2\s*,\s*(?:(['"`])[\w.-]+\3|[A-Za-z_$])/.test(source)) return { counted: false };
+  // A repo script run or read by path (`scripts/gen-skill-docs.ts`, `path.join(ROOT, 'setup')`) is product code too.
+  if (/(['"`])(?:\.\/)?scripts\/[\w./-]+\1|ROOT\s*,\s*(['"`])setup\2/.test(source)) return { counted: false };
+  return { counted: true, helper };
 }
 
 function suggestedOwner(helper?: string): string {
@@ -228,6 +269,7 @@ test('no new test exercises only test code', () => {
     `${added.length} test file(s) over the baseline: ${added.map(entry => entry.file).join(', ')}.`,
     'They import only test/ code, so they test a helper or a replayed capture rather than product code.',
     ...added.map(entry => `Fix: add the case as a row in ${suggestedOwner(entry.helper)}, or import the production module under test.`),
+    'A file that slices a paid test\'s source: export the code it needs from a test/helpers module both files import, and test that.',
     'If the file is genuinely needed, add its path to BASELINE in test/test-of-test-ratchet.test.ts with a one-line reason.',
     'AGENTS.md: do not add one spelling or glyph per paid failure.',
   ].join('\n') : '').toEqual([]);
@@ -236,4 +278,12 @@ test('no new test exercises only test code', () => {
 test('every baseline entry is still a test file', () => {
   const stale = BASELINE.filter(file => !fs.existsSync(path.join(ROOT, file)));
   expect(stale, stale.map(file => `remove ${file} from the baseline`).join('\n')).toEqual([]);
+});
+
+test('paid-source slicing counts; reading paths or importing the paid file does not', () => {
+  const read = (file: string) => `const source = fs.readFileSync(path.join(ROOT, '${file}.test.ts'), 'utf8');`;
+  expect(slicedPaidSources(`${read('skill-e2e-shared-libs')}\nconst body = source.slice(source.indexOf('async function'));`)).toEqual(['source']);
+  expect(slicedPaidSources(`${read('test/skill-llm-eval')}\nexpect(source).toContain('judge');`)).toEqual([]);
+  expect(slicedPaidSources(`${read('gen-skill-docs')}\nsource.slice(0, 10);`)).toEqual([]);
+  expect(slicedPaidSources("await import(path.join(root, 'test/skill-e2e-ship-docsync' + '.test.ts'));")).toEqual([]);
 });

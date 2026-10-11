@@ -1,22 +1,25 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { collectProducerReceipts, createEvalMatrix, createPortableSkillPayload, loadPortableSkillPayload, prepareEvalJobs, REQUIRED_CONTAINMENT, scoreCollectedEval, scoreEval, validateMatrix, validatePortableSkillPayload, type EvalCell, type EvalResult, type PreparedEvalSchedule } from '../scripts/cso-eval';
-import { PRODUCER_PROVIDER_POLICY, producerFailureMessage, producerInstallationIdentity, resolveProducerHelperBinding, runProducerCell, validateProductionProducerInstallation } from '../scripts/cso-eval-producer';
-import { producerArtifactInventoryHash, producerInstallationIdentityHash, producerProviderIdentityHash, producerReceiptHash, sha256, type ProducerArtifactInventory, type ProducerInstallationIdentity, type ProducerProviderIdentity, type ProducerReceipt } from '../scripts/cso-eval-protocol';
+import { collectProducerReceipts, createEvalBaseline, createEvalMatrix, createPortableSkillPayload, loadPortableSkillPayload, prepareEvalJobs, REQUIRED_CONTAINMENT, scoreCollectedEval, scoreEval, validateMatrix, validatePortableSkillPayload, type EvalBaseline, type EvalCell, type EvalMatrix, type EvalResult, type PreparedEvalSchedule } from '../scripts/cso-eval';
+import { assertProducerArtifactPath, PRODUCER_PROVIDER_POLICY, producerFailureMessage, producerProviderTimeoutMs, producerInstallationIdentity, resolveProducerHelperBinding, runProducerCell, sanitizeProducerRun, validateProductionProducerInstallation } from '../scripts/cso-eval-producer';
+import { producerArtifactInventoryHash, producerHostPlatform, producerInstallationIdentityHash, producerProviderIdentityHash, producerReceiptHash, sha256, type ProducerArtifactInventory, type ProducerInstallationIdentity, type ProducerProviderIdentity, type ProducerReceipt } from '../scripts/cso-eval-protocol';
 import type { Family, ProviderAdapter, RunOpts, RunResult } from './helpers/providers/types';
-import { CORPUS_VERSION, FAMILIES, STACKS, loadCorpusManifest, materializeCase, sourceFiles, sourceHash } from './fixtures/cso-eval/materialize';
+import { CORPUS_VERSION, FAMILIES, STACKS, defineEvalCorpus, loadCorpusManifest, materializeCase, sourceFiles, sourceHash, validateCorpusManifest, type CorpusManifest, type EvalVariant } from './fixtures/cso-eval/materialize';
 import { judgeRepair, oracleFor, type PrivateEvidence } from './helpers/cso-eval-oracles';
 import { inspectPreparation } from '../lib/cso/preparation';
 import { assertRuntimeCompatible, RUNTIME_CATALOG } from '../lib/cso/runtime-catalog';
 import { canonicalStartPlan, canonicalTestPlan } from '../lib/cso/verification';
 import { CsoError } from '../lib/cso/contracts';
+import { scan } from '../lib/redact-engine';
+import { redactProducerText, sourceCredentialValues } from '../scripts/cso-eval-output-redaction';
 import { geminiProducerPaths, geminiProducerSystemSettings } from './helpers/providers/gemini';
 
 const temporary: string[] = [];
+const randomHex = (bytes: number) => createHash('sha256').update(`${Math.random()}:${process.hrtime.bigint()}`).digest('hex').slice(0, bytes * 2);
 const root = () => { const path = mkdtempSync(join(tmpdir(), 'cso-eval-')); temporary.push(path); return path; };
 function unlockTemporary(path: string): void {
   if (!existsSync(path)) return;
@@ -41,7 +44,8 @@ function portableSkill(version: 'v2' | 'v3', sectionMarker: string): string {
 }
 
 /** Synthetic accounting records exercise the scorer. These are not measured agent results. */
-function syntheticResult(cell: EvalCell): EvalResult {
+const syntheticResult = (cell: EvalCell): EvalResult => syntheticResultFor(cell, corpus);
+function syntheticResultFor(cell: EvalCell, manifest: CorpusManifest<string>): EvalResult {
   const runtime = cell.mode === 'comprehensive';
   const positive = cell.variant === 'vulnerable';
   const repairEvidenceHash = 'c'.repeat(64), recheckEvidenceHash = 'd'.repeat(64);
@@ -50,12 +54,12 @@ function syntheticResult(cell: EvalCell): EvalResult {
     findings: positive ? [{ id: 'finding-1', evidence: cell.version === 'v2' ? 'legacy_review' : 'supported', claimedTested: runtime && cell.version === 'v3', judgment: 'correct', matchedCaseId: cell.caseId,
       ...(runtime && cell.version === 'v3' ? { trustedVerification: { repair: 'passed' as const, repairEvidenceHash, recheck: 'passed' as const, recheckEvidenceHash } } : {}) }] : [],
     setup: runtime ? 'passed' : 'not_attempted', reproduction: runtime && positive ? 'passed' : 'not_attempted', repair: runtime && positive ? 'passed' : 'not_attempted', recheck: runtime && positive ? 'passed' : 'not_attempted',
-    ...(runtime && positive ? { oracleEvidenceHash: repairEvidenceHash, oracleVersion: CORPUS_VERSION, currentSourceHash: corpus.cases.find(fixture => fixture.id === cell.caseId)!.filesHash.fixed, recheckEvidenceHash } : {}),
+    ...(runtime && positive ? { oracleEvidenceHash: repairEvidenceHash, oracleVersion: manifest.version, currentSourceHash: manifest.cases.find(fixture => fixture.id === cell.caseId)!.filesHash.fixed, recheckEvidenceHash } : {}),
     heldOutAssertionsPassed: runtime && positive, freshRecheck: runtime && positive, latencyMs: 1500, firstUsefulResultMs: positive ? 500 : null,
   };
 }
 const group = (score: ReturnType<typeof scoreEval>, version: string, mode: string) => score.groups.find(item => item.version === version && item.mode === mode)!;
-function syntheticInstallationIdentity(seed = '1'): ProducerInstallationIdentity {
+function syntheticInstallationIdentity(seed = '1', catalogSeed = seed): ProducerInstallationIdentity {
   const artifact = (offset: number) => ({ sha256: sha256(`${seed}:artifact:${offset}`), bytes: 100 + offset });
   const core = artifact(3);
   const withoutHash: Omit<ProducerInstallationIdentity, 'identityHash'> = {
@@ -63,8 +67,8 @@ function syntheticInstallationIdentity(seed = '1'): ProducerInstallationIdentity
     producer: artifact(1), launcher: artifact(2), core, watchdog: artifact(4),
     generation: { coreSha256: core.sha256, manifest: { sha256: sha256(`${core.sha256}\n`), bytes: 65 } },
     embeddedCatalogs: {
-      runtimeRevision: 'runtime-test', runtimeBuildRevision: 'runtime-build-test', runtimeSha256: sha256(`${seed}:runtime`),
-      scannerRevision: 'scanner-test', scannerSha256: sha256(`${seed}:scanner`),
+      runtimeRevision: 'runtime-test', runtimeBuildRevision: 'runtime-build-test', runtimeSha256: sha256(`${catalogSeed}:runtime`),
+      scannerRevision: 'scanner-test', scannerSha256: sha256(`${catalogSeed}:scanner`),
     },
   };
   return { ...withoutHash, identityHash: producerInstallationIdentityHash(withoutHash) };
@@ -80,12 +84,14 @@ function syntheticArtifactInventory(): ProducerArtifactInventory {
   const base = { schemaVersion: 1 as const, root: 'security/cso' as const, entries: [], totalBytes: 0 };
   return { ...base, identityHash: producerArtifactInventoryHash(base) };
 }
+/** Platform-pinned cells get one native installation and provider binary per platform, sharing catalogs and provider policy. */
 function syntheticReceipt(cell: EvalCell): ProducerReceipt {
-  const withoutHash: Omit<ProducerReceipt, 'receiptHash'> = { schemaVersion: 1, cell, inputHash: 'e'.repeat(64), installationIdentity: syntheticInstallationIdentity(), providerIdentity: syntheticProviderIdentity(cell.host === 'codex' ? 'gpt' : cell.host), artifacts: syntheticArtifactInventory(), startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:00:01.000Z', status: 'succeeded', requestedModel: cell.model, modelUsed: `resolved-${cell.model}`, modelIdentitySource: 'provider_reported', durationMs: 1000, firstUsefulResultMs: null, toolCalls: 1, output: 'synthetic producer transcript', outputHash: sha256('synthetic producer transcript'), usage: { inputTokens: 10, outputTokens: 5, cachedTokens: 0, estimatedCostUSD: 0.001 } };
+  const seed = cell.platform ?? '1';
+  const withoutHash: Omit<ProducerReceipt, 'receiptHash'> = { schemaVersion: 2, cellRef: cell.id, inputHash: 'e'.repeat(64), installationIdentity: syntheticInstallationIdentity(seed, '1'), providerIdentity: syntheticProviderIdentity(cell.host === 'codex' ? 'gpt' : cell.host, seed), artifacts: syntheticArtifactInventory(), startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:00:01.000Z', status: 'succeeded', requestedModel: cell.model, modelUsed: `resolved-${cell.model}`, modelIdentitySource: 'provider_reported', durationMs: 1000, firstUsefulResultMs: null, toolCalls: 1, output: 'synthetic producer transcript', outputHash: sha256('synthetic producer transcript'), usage: { inputTokens: 10, outputTokens: 5, cachedTokens: 0, estimatedCostUSD: 0.001 } };
   return { ...withoutHash, receiptHash: producerReceiptHash(withoutHash) };
 }
-function syntheticSchedule(): PreparedEvalSchedule {
-  return { schemaVersion: 1, matrixHash: createHash('sha256').update(JSON.stringify(matrix)).digest('hex'), scheduledCells: matrix.cells.length, preparedCells: matrix.cells.length, jobs: matrix.cells.map(cell => ({ cellId: cell.id, relativePath: `jobs/${cell.id}`, inputHash: 'e'.repeat(64) })) };
+function syntheticSchedule(target: EvalMatrix = matrix): PreparedEvalSchedule {
+  return { schemaVersion: 1, matrixHash: createHash('sha256').update(JSON.stringify(target)).digest('hex'), scheduledCells: target.cells.length, preparedCells: target.cells.length, jobs: target.cells.map(cell => ({ cellId: cell.id, relativePath: `jobs/${cell.id}`, inputHash: 'e'.repeat(64) })) };
 }
 function rehashReceipt(receipt: ProducerReceipt): ProducerReceipt {
   const { receiptHash: _receiptHash, ...withoutHash } = receipt;
@@ -240,6 +246,20 @@ describe('CSO matched evaluation accounting', () => {
     mixedProvider.providerIdentity = syntheticProviderIdentity('gpt', 'different-provider');
     expect(() => collectProducerReceipts(matrix, syntheticSchedule(), [first, rehashReceipt(mixedProvider)])).toThrow('UNMATCHED_PRODUCER_PROVIDERS');
   });
+  test('receipts name only an opaque cellRef that the trusted matrix resolves', () => {
+    const cell = matrix.cells.find(item => item.version === 'v3')!, receipt = syntheticReceipt(cell);
+    expect(Object.keys(receipt)).not.toContain('cell'); expect(JSON.stringify(receipt)).not.toMatch(/caseId|variant|vulnerable|"fixed"/);
+    expect(JSON.stringify(receipt)).not.toContain(cell.caseId);
+    const unknown = structuredClone(receipt); unknown.cellRef = 'f'.repeat(64);
+    expect(() => collectProducerReceipts(matrix, syntheticSchedule(), [rehashReceipt(unknown)])).toThrow('UNKNOWN_OR_DUPLICATE_PRODUCER_RECEIPT');
+    const smuggled = rehashReceipt({ ...structuredClone(receipt), cell } as ProducerReceipt);
+    expect(() => collectProducerReceipts(matrix, syntheticSchedule(), [smuggled])).toThrow('INVALID_PRODUCER_RECEIPT');
+    const batch = syntheticBatch();
+    expect(batch.receipts.every(index => index.cellRef === index.cell.id && JSON.stringify(index.cell) === JSON.stringify(matrix.cells.find(item => item.id === index.cellRef)))).toBe(true);
+    const relabeled = structuredClone(batch); relabeled.receipts[0].cellRef = relabeled.receipts[1].cellRef;
+    const { batchHash: _hash, ...rest } = relabeled; relabeled.batchHash = createHash('sha256').update(JSON.stringify(rest)).digest('hex');
+    expect(() => scoreCollectedEval(matrix, relabeled, [], qualification)).toThrow('INVALID_PRODUCER_BATCH');
+  });
   test('high/critical recall includes critical cases and detects a v3 regression',()=>{
     const criticalCorpus=structuredClone(corpus);criticalCorpus.cases.find(item=>item.severity==='medium')!.severity='critical';
     const criticalMatrix=createEvalMatrix({model:'matched-test-model',host:'codex',skillHashes:{v2:'a'.repeat(64),v3:'b'.repeat(64)}},criticalCorpus),complete=criticalMatrix.cells.map(syntheticResult);
@@ -333,6 +353,131 @@ describe('CSO matched evaluation accounting', () => {
   });
 });
 
+/** Synthetic stand-in with the private corpus layout. It is not held-out content. */
+const privateFiles = (id: string, variant: EvalVariant): Record<string, string> => ({ 'README.md': '# Synthetic service\n', 'src/app.txt': `synthetic ${id} ${variant}\n` });
+const privateManifest: CorpusManifest<string> = { schemaVersion: 1, version: 'synthetic-private-1', cases: STACKS.flatMap(stack => ['alpha-family', 'beta-family'].map((family, index) => {
+  const id = `${stack}-${family}`;
+  return { id, stack, family, severity: index === 0 ? 'high' as const : 'medium' as const, rootCause: family, location: { path: 'src/app.txt', symbol: 'action' },
+    coreColdStart: true as const, heldOut: true as const, filesHash: { vulnerable: sourceHash(privateFiles(id, 'vulnerable')), fixed: sourceHash(privateFiles(id, 'fixed')) } };
+})) };
+const privateCorpus = defineEvalCorpus(privateManifest, privateFiles);
+const releasePlatforms = { daily: 'linux/amd64' as const, comprehensive: Object.fromEntries(privateManifest.cases.map((fixture, index) => [fixture.id, index % 2 ? 'linux/arm64' as const : 'linux/amd64' as const])) };
+const releaseOptions = { profile: 'release' as const, model: 'matched-test-model', host: 'codex' as const, skillHashes: { v3: 'b'.repeat(64) }, platforms: releasePlatforms };
+function privateBaseline(mutate: (results: EvalResult[], cells: EvalCell[]) => void = () => {}): EvalBaseline {
+  const baselineMatrix = createEvalMatrix({ profile: 'baseline', model: 'matched-test-model', host: 'codex', skillHashes: { v2: 'a'.repeat(64) }, platforms: { comprehensive: releasePlatforms.comprehensive } }, privateManifest);
+  const batch = collectProducerReceipts(baselineMatrix, syntheticSchedule(baselineMatrix), baselineMatrix.cells.map(syntheticReceipt), privateManifest);
+  const results = baselineMatrix.cells.map(cell => ({ ...syntheticResultFor(cell, privateManifest), producerReceiptHash: batch.receipts.find(receipt => receipt.cell.id === cell.id)!.receiptHash }));
+  mutate(results, baselineMatrix.cells);
+  return createEvalBaseline(baselineMatrix, batch, results, privateManifest);
+}
+function releaseRun(baseline: EvalBaseline | null = privateBaseline()) {
+  const release = createEvalMatrix({ ...releaseOptions, ...(baseline ? { baseline } : {}) }, privateManifest);
+  const batch = collectProducerReceipts(release, syntheticSchedule(release), release.cells.map(syntheticReceipt), privateManifest);
+  const results = release.cells.map(cell => ({ ...syntheticResultFor(cell, privateManifest), producerReceiptHash: batch.receipts.find(receipt => receipt.cell.id === cell.id)!.receiptHash }));
+  return { release, batch, results };
+}
+
+describe('CSO release profile on an injected corpus', () => {
+  test('the full profile matrix is byte-identical to its pre-release-profile form', () => {
+    expect(createHash('sha256').update(JSON.stringify(matrix)).digest('hex')).toBe('a0f20a127c8c92c73bb2a277f740295c153ccf95901e92cffab34a4553ef976b');
+    expect('profile' in matrix).toBe(false); expect(matrix.cells.every(cell => !('platform' in cell))).toBe(true);
+  });
+  test('an injected corpus shares the public layout and binds every generated source', () => {
+    expect(validateCorpusManifest(structuredClone(corpus))).toEqual(corpus);
+    const destination = join(root(), 'case');
+    expect(materializeCase('rails-beta-family', 'fixed', destination, privateCorpus).sourceHash).toBe(privateManifest.cases.find(item => item.id === 'rails-beta-family')!.filesHash.fixed);
+    expect(readFileSync(join(destination, 'src/app.txt'), 'utf8')).toBe('synthetic rails-beta-family fixed\n');
+    expect(() => defineEvalCorpus({ ...privateManifest, version: CORPUS_VERSION }, privateFiles)).toThrow('INJECTED_CORPUS_REUSES_PUBLIC_VERSION');
+    expect(() => defineEvalCorpus(privateManifest, (id, variant) => ({ ...privateFiles(id, variant), extra: 'drift' }))).toThrow('CORPUS_INTEGRITY_MISMATCH');
+    expect(() => defineEvalCorpus(privateManifest, () => ({ '../escape.txt': 'x' }))).toThrow('INVALID_CORPUS_SOURCE');
+    const unknownStack = structuredClone(privateManifest); (unknownStack.cases[0] as any).stack = 'php';
+    expect(() => validateCorpusManifest(unknownStack)).toThrow('INVALID_CORPUS_MANIFEST');
+    const extraField = structuredClone(privateManifest); (extraField.cases[0] as any).answer = 'oracle';
+    expect(() => validateCorpusManifest(extraField)).toThrow('INVALID_CORPUS_MANIFEST');
+  });
+  test('release pins v3, one repetition, and one native platform per cell', () => {
+    const release = createEvalMatrix(releaseOptions, privateManifest);
+    expect(release.cells).toHaveLength(privateManifest.cases.length * 4); expect(release.repetitions).toBe(1); expect(release.baselineHash).toBeNull();
+    expect(release.cells.every(cell => cell.version === 'v3' && cell.repetition === 1)).toBe(true);
+    expect(release.cells.filter(cell => cell.mode === 'daily').every(cell => cell.platform === 'linux/amd64')).toBe(true);
+    for (const cell of release.cells.filter(item => item.mode === 'comprehensive')) expect(cell.platform).toBe(releasePlatforms.comprehensive[cell.caseId]);
+    expect(new Set(release.cells.filter(cell => cell.mode === 'comprehensive').map(cell => cell.platform))).toEqual(new Set(['linux/amd64', 'linux/arm64']));
+    validateMatrix(release, privateManifest);
+    const moved = structuredClone(release); moved.platforms.comprehensive[privateManifest.cases[0].id] = 'linux/arm64';
+    expect(() => validateMatrix(moved, privateManifest)).toThrow('UNMATCHED_OR_INCOMPLETE_EVAL_MATRIX');
+    const { [privateManifest.cases[0].id]: _omitted, ...partial } = releasePlatforms.comprehensive;
+    expect(() => createEvalMatrix({ ...releaseOptions, platforms: { daily: 'linux/amd64', comprehensive: partial } }, privateManifest)).toThrow('INVALID_EVAL_PLATFORMS');
+    expect(() => createEvalMatrix({ ...releaseOptions, platforms: { daily: 'linux/riscv64' as any, comprehensive: releasePlatforms.comprehensive } }, privateManifest)).toThrow('INVALID_EVAL_PLATFORMS');
+    expect(() => createEvalMatrix({ ...releaseOptions, skillHashes: { v2: 'a'.repeat(64), v3: 'b'.repeat(64) } as any }, privateManifest)).toThrow('INVALID_MATCHED_EVAL_INPUT');
+  });
+  test('a two-platform batch collects and scores qualified against a hash-bound v2 baseline', () => {
+    const { release, batch, results } = releaseRun();
+    expect(new Set(batch.receipts.map(receipt => receipt.installationIdentity.identityHash)).size).toBe(2);
+    expect(batch.summary.groups.map(group => `${group.version}:${group.mode}`)).toEqual(['v3:daily', 'v3:comprehensive']);
+    const baseline = privateBaseline();
+    const score = scoreCollectedEval(release, batch, results, qualification, privateManifest, baseline);
+    expect(score.status).toBe('qualified'); expect(Object.values(score.gates).every(value => value === 'pass')).toBe(true);
+    expect(score.profile).toBe('release'); expect(score.baseline).toEqual({ baselineHash: baseline.baselineHash, highCriticalRecall: { numerator: 4, denominator: 4, value: 1 } });
+    expect(score.groups.map(item => `${item.version}:${item.mode}`)).toEqual(['v3:daily', 'v3:comprehensive']);
+  });
+  test('a mixed-corpus batch is rejected', () => {
+    const { release, batch, results } = releaseRun();
+    expect(() => scoreCollectedEval(release, batch, results, qualification)).toThrow('UNMATCHED_OR_INCOMPLETE_EVAL_MATRIX');
+    expect(() => collectProducerReceipts(release, syntheticSchedule(release), release.cells.map(syntheticReceipt))).toThrow('UNMATCHED_OR_INCOMPLETE_EVAL_MATRIX');
+    const mixed = structuredClone(release); mixed.cells[0] = { ...matrix.cells.find(cell => cell.version === 'v3' && cell.repetition === 1)!, platform: 'linux/amd64' };
+    expect(() => validateMatrix(mixed, privateManifest)).toThrow('UNMATCHED_OR_INCOMPLETE_EVAL_MATRIX');
+    const publicCell = matrix.cells.find(cell => cell.version === 'v3')!;
+    expect(() => collectProducerReceipts(release, syntheticSchedule(release), [syntheticReceipt(publicCell)], privateManifest)).toThrow('UNKNOWN_OR_DUPLICATE_PRODUCER_RECEIPT');
+    expect(() => scoreCollectedEval(release, syntheticBatch(), results, qualification, privateManifest)).toThrow('INVALID_PRODUCER_BATCH');
+    expect(() => scoreEval(release, [syntheticResult(publicCell)], qualification, privateManifest)).toThrow('UNKNOWN_OR_DUPLICATE_EVAL_RESULT');
+  });
+  test('identity checks hold per platform and require shared catalogs and provider policy across platforms', () => {
+    const release = createEvalMatrix(releaseOptions, privateManifest), schedule = syntheticSchedule(release);
+    const amd = release.cells.filter(cell => cell.platform === 'linux/amd64'), arm = release.cells.find(cell => cell.platform === 'linux/arm64')!;
+    const relabel = (cell: EvalCell, change: (receipt: ProducerReceipt) => void) => { const receipt = syntheticReceipt(cell); change(receipt); return rehashReceipt(receipt); };
+    expect(() => collectProducerReceipts(release, schedule, [syntheticReceipt(amd[0]), relabel(amd[1], receipt => { receipt.installationIdentity = syntheticInstallationIdentity('second-amd64', '1'); })], privateManifest)).toThrow('UNMATCHED_PRODUCER_INSTALLATIONS');
+    expect(() => collectProducerReceipts(release, schedule, [syntheticReceipt(amd[0]), relabel(amd[1], receipt => { receipt.providerIdentity = syntheticProviderIdentity('gpt', 'second-amd64'); })], privateManifest)).toThrow('UNMATCHED_PRODUCER_PROVIDERS');
+    expect(() => collectProducerReceipts(release, schedule, [syntheticReceipt(amd[0]), relabel(arm, receipt => { receipt.installationIdentity = syntheticInstallationIdentity('linux/amd64', '1'); })], privateManifest)).toThrow('UNMATCHED_PRODUCER_PLATFORMS');
+    expect(() => collectProducerReceipts(release, schedule, [syntheticReceipt(amd[0]), relabel(arm, receipt => { receipt.installationIdentity = syntheticInstallationIdentity('linux/arm64', 'other-catalog'); })], privateManifest)).toThrow('UNMATCHED_PRODUCER_INSTALLATIONS');
+    const otherPolicy = (() => { const { identityHash: _hash, ...base } = syntheticProviderIdentity('gpt', 'linux/arm64'); const changed = { ...base, policyRevision: 'gpt-other-policy' }; return { ...changed, identityHash: producerProviderIdentityHash(changed) }; })();
+    expect(() => collectProducerReceipts(release, schedule, [syntheticReceipt(amd[0]), relabel(arm, receipt => { receipt.providerIdentity = otherPolicy; })], privateManifest)).toThrow('UNMATCHED_PRODUCER_PROVIDERS');
+    expect(() => collectProducerReceipts(release, schedule, [syntheticReceipt(amd[0]), relabel(amd[1], receipt => { receipt.modelUsed = 'resolved-other-model'; })], privateManifest)).toThrow('UNMATCHED_EFFECTIVE_MODELS');
+  });
+  test('the external v2 baseline is pre-registered, complete, and bound to the release inputs', () => {
+    const unpinned = releaseRun(null);
+    const unmeasured = scoreCollectedEval(unpinned.release, unpinned.batch, unpinned.results, qualification, privateManifest);
+    expect(unmeasured.gates.noHighCriticalRecallRegression).toBe('unmeasured'); expect(unmeasured.status).toBe('partial'); expect(unmeasured.baseline).toBeNull();
+    const baseline = privateBaseline();
+    expect(() => scoreCollectedEval(unpinned.release, unpinned.batch, unpinned.results, qualification, privateManifest, baseline)).toThrow('UNBOUND_EVAL_BASELINE');
+    const { release, batch, results } = releaseRun(baseline);
+    const forged = structuredClone(baseline); forged.cases[0].found = false;
+    expect(() => scoreCollectedEval(release, batch, results, qualification, privateManifest, forged)).toThrow('UNBOUND_EVAL_BASELINE');
+    const weaker = privateBaseline(found => { found.forEach(result => { result.findings = []; }); });
+    expect(() => scoreCollectedEval(release, batch, results, qualification, privateManifest, weaker)).toThrow('UNBOUND_EVAL_BASELINE');
+    expect(() => createEvalMatrix({ ...releaseOptions, model: 'other-model', baseline }, privateManifest)).toThrow('UNBOUND_EVAL_BASELINE');
+    expect(() => createEvalMatrix({ ...releaseOptions, budgets: { daily: 600, comprehensive: 1200 }, baseline }, privateManifest)).toThrow('UNBOUND_EVAL_BASELINE');
+    const otherProvider = structuredClone(baseline); otherProvider.provider.version = 'gpt-other-version';
+    const { baselineHash: _hash, ...record } = otherProvider; otherProvider.baselineHash = createHash('sha256').update(JSON.stringify(record)).digest('hex');
+    const rebound = releaseRun(otherProvider);
+    expect(() => scoreCollectedEval(rebound.release, rebound.batch, rebound.results, qualification, privateManifest, otherProvider)).toThrow('UNBOUND_EVAL_BASELINE');
+    const highId = privateManifest.cases.find(item => item.severity === 'high')!.id;
+    for (let index = 0; index < release.cells.length; index++) {
+      const cell = release.cells[index];
+      if (cell.mode === 'comprehensive' && cell.variant === 'vulnerable' && cell.caseId === highId) results[index].findings = [];
+    }
+    const regressed = scoreCollectedEval(release, batch, results, qualification, privateManifest, baseline);
+    expect(regressed.gates.noHighCriticalRecallRegression).toBe('fail'); expect(regressed.baseline!.highCriticalRecall.value).toBe(1);
+  });
+  test('baseline records refuse incomplete or unadjudicated runs and baseline matrices never qualify', () => {
+    expect(() => privateBaseline(results => { results.pop(); })).toThrow('INCOMPLETE_EVAL_BASELINE');
+    expect(() => privateBaseline((results, cells) => { results[cells.findIndex(cell => cell.variant === 'vulnerable')].findings[0].judgment = 'unadjudicated'; })).toThrow('UNADJUDICATED_EVAL_BASELINE');
+    const baselineMatrix = createEvalMatrix({ profile: 'baseline', model: 'matched-test-model', host: 'codex', skillHashes: { v2: 'a'.repeat(64) }, platforms: { comprehensive: releasePlatforms.comprehensive } }, privateManifest);
+    expect(baselineMatrix.cells.every(cell => cell.version === 'v2' && cell.mode === 'comprehensive')).toBe(true);
+    expect(() => scoreEval(baselineMatrix, [], qualification, privateManifest)).toThrow('BASELINE_PROFILE_NOT_QUALIFIABLE');
+    expect(() => scoreEval(matrix, [], qualification, corpus, privateBaseline())).toThrow('UNBOUND_EVAL_BASELINE');
+  });
+});
+
 describe('CSO matched producer orchestration', () => {
   const skills = { v2: portableSkill('v2', 'V2_SECTION_ONLY'), v3: portableSkill('v3', 'V3_SECTION_ONLY') };
   const producerMatrix = createEvalMatrix({ model: 'exact-eval-model', host: 'codex', skillHashes: { v2: sha256(skills.v2), v3: sha256(skills.v3) } });
@@ -384,6 +529,8 @@ describe('CSO matched producer orchestration', () => {
     testProviderCommand: providerCommandFor(launcher),
   });
 
+  // The helper's real layout: `<repoId>/<epoch ms>-<hex>`; the secret redactor reads that epoch as a phone number.
+  const helperRun = `${'e'.repeat(24)}/${Date.now()}-${'0123456789abcdef'}`;
   class FakeAdapter implements ProviderAdapter {
     readonly name = 'fake';
     constructor(
@@ -422,7 +569,8 @@ describe('CSO matched producer orchestration', () => {
       expect(existsSync(join(destination, 'jobs', cell.id, 'producer-input.json'))).toBe(true);
       const input = JSON.parse(readFileSync(join(destination, 'jobs', cell.id, 'producer-input.json'), 'utf8'));
       expect(input.skill).toBe(skills[cell.version]);
-      expect(input.cell.skillHash).toBe(sha256(input.skill));
+      expect(input.execution.skillHash).toBe(sha256(input.skill));
+      expect(input.cellRef).toBe(cell.id);
       expect(input.skill).toContain(`${cell.version.toUpperCase()}_SECTION_ONLY`);
       expect(input.skill).not.toContain(cell.version === 'v2' ? 'V3_SECTION_ONLY' : 'V2_SECTION_ONLY');
       expect(validatePortableSkillPayload(input.skill, cell.version).files.map(file => file.path)).toEqual(['SKILL.md', 'sections/manifest.json', 'sections/audit-phases.md']);
@@ -586,7 +734,7 @@ describe('CSO matched producer orchestration', () => {
       expect(existsSync(input)).toBe(false);
       expect(opts).toMatchObject({
         model: cell.model,
-        timeoutMs: cell.budgetSeconds * 1000,
+        timeoutMs: (cell.budgetSeconds + 300) * 1000,
         workdir: join(isolated.job, 'state'),
         csoProducer: {
           stateDirectory: join(isolated.job, 'state'),
@@ -608,7 +756,7 @@ describe('CSO matched producer orchestration', () => {
       expect(opts.prompt).not.toContain(cell.caseId);
       expect(opts.prompt).not.toContain(cell.variant);
       expect(opts.prompt).not.toContain('ORACLE_SQL_MARKER');
-      const artifactRoot = join(process.env.GSTACK_HOME!, 'security', 'cso', 'run-1');
+      const artifactRoot = join(process.env.GSTACK_HOME!, 'security', 'cso', helperRun);
       mkdirSync(artifactRoot, { recursive: true });
       writeFileSync(join(artifactRoot, 'report.json'), '{"status":"complete"}\n');
       writeFileSync(join(artifactRoot, 'repair.patch'), 'diff --git a/app.mjs b/app.mjs\n');
@@ -637,10 +785,10 @@ describe('CSO matched producer orchestration', () => {
     expect(receipt.providerIdentity).toEqual(providerIdentityFor('gpt', launcher));
     expect(receipt.artifacts).toMatchObject({ schemaVersion: 1, root: 'security/cso' });
     expect(receipt.artifacts.totalBytes).toBe(receipt.artifacts.entries.reduce((sum, entry) => sum + entry.bytes, 0));
-    expect(receipt.artifacts.entries.map(entry => entry.path)).toEqual(['run-1/repair.patch', 'run-1/report.json']);
+    expect(receipt.artifacts.entries.map(entry => entry.path)).toEqual([`${helperRun}/repair.patch`, `${helperRun}/report.json`]);
     expect(receipt.artifacts.identityHash).toBe(producerArtifactInventoryHash({ schemaVersion: 1, root: 'security/cso', entries: receipt.artifacts.entries, totalBytes: receipt.artifacts.totalBytes }));
     const retainedHome = join(isolated.job, 'state', 'cso-home');
-    expect(readFileSync(join(retainedHome, 'security', 'cso', 'run-1', 'report.json'), 'utf8')).toContain('complete');
+    expect(readFileSync(join(retainedHome, 'security', 'cso', helperRun, 'report.json'), 'utf8')).toContain('complete');
     expect(receipt.artifacts.entries.every(entry => !/provider|credential|session/i.test(entry.path))).toBe(true);
     expect(JSON.parse(readFileSync(output, 'utf8'))).toEqual(receipt);
     const { receiptHash, ...receiptWithoutHash } = receipt;
@@ -749,25 +897,76 @@ describe('CSO matched producer orchestration', () => {
       expect(receipt.status).toBe('failed');
       expect(receipt.output).toBe('[sensitive producer output redacted]');
       expect(receipt.outputHash).toBe(sha256(receipt.output));
-      expect(receipt.error).toEqual({ code: 'unknown', reason: 'Sensitive producer output or error withheld' });
+      expect(receipt.error).toEqual({ code: 'unknown', reason: 'Sensitive producer output or error withheld: credential-class rule openai.key×1' });
       const stored = readFileSync(receiptPath, 'utf8');
       expect(stored).not.toContain('sk-proj-');
       expect(stored).not.toContain('b'.repeat(40));
     }
   });
 
-  test('withholds the receipt when the bound provider executable changes during a cell', async () => {
+  test('withholds a source canary quoted without its credential name, whole or split across output and error', () => {
+    const source = join(root(), 'canary-source'), canary = `cso_${randomHex(10)}_${randomHex(10)}`;
+    mkdirSync(join(source, 'test'), { recursive: true });
+    writeFileSync(join(source, '.env'), `API_TOKEN=${canary}\nNODE_ENV=production\n`);
+    writeFileSync(join(source, 'test', 'canary.txt'), `${canary}\n`);
+    const credentials = sourceCredentialValues(source, ['.env', 'test/canary.txt']);
+    expect(credentials).toEqual([canary]);
+    const base = { output: '', modelUsed: 'm', durationMs: 1, toolCalls: 1, tokens: { input: 1, output: 1 } } as RunResult;
+    expect(sanitizeProducerRun({ ...base, output: `The token is ${canary}` }, [])).toMatchObject({ output: `The token is ${canary}` });
+    for (const run of [{ ...base, output: `The token is ${canary}.` }, { ...base, output: canary.slice(0, 12), error: { code: 'unknown', reason: canary.slice(12) } }] as RunResult[]) {
+      const sanitized = sanitizeProducerRun(run, credentials);
+      expect(sanitized).toMatchObject({ output: '[sensitive producer output redacted]', error: { reason: 'Sensitive producer output or error withheld: credential-class rule source.env.kv×1' } });
+      expect(JSON.stringify(sanitized)).not.toContain(canary);
+    }
+  });
+
+  test('keeps a succeeded run that quotes helper identifiers, span-redacts PII shapes, and fails credential-class output by rule', async () => {
+    const runId = `${Date.now()}-${randomHex(8)}`;
+    let walletShaped = '';
+    while (!walletShaped) { const id = randomHex(16); if (redactProducerText(`review ${id}`).text === `review ${id}` && scan(id).findings.some(finding => finding.id === 'pii.wallet')) walletShaped = id; }
+    expect(scan(runId).findings.map(finding => finding.id)).toContain('pii.phone.e164');
+    const report = [
+      `complete — run ${runId}, catalog cso-eval-38078005392-${randomHex(6)}, scanner artifact gitleaks-${randomHex(8)}-${randomHex(8)}.`,
+      `Finding ${randomHex(16)} reviewed by ${walletShaped}; snapshot ${randomHex(32)}.`,
+      'The /health-hooks route connects to 169.254.169.254:80.',
+    ].join('\n');
+    const run = async (name: string, output: string) => {
+      const destination = join(root(), `${name}-prepared`), cell = selected[0];
+      prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+      const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+      return runProducerCell(isolated.input, receiptPath, withHelper({ adapter: new FakeAdapter(() => {}, 'gpt-5.4', 'gpt', { output }), paidExecutionAuthorized: true }));
+    };
+    const kept = await run('helper-ids', report);
+    expect(kept.status).toBe('succeeded');
+    expect(kept.error).toBeUndefined();
+    expect(kept.output).toBe(report.replace('169.254.169.254', '<REDACTED-pii.phone.e164>'));
+    const envLine = `API_TOKEN=cso_${randomHex(12)}_${randomHex(12)}`;
+    const key = `sk-ant-api03-${randomHex(40)}`;
+    for (const [name, leak, rule] of [['env-line', envLine, 'env.kv×1'], ['credential', key, 'anthropic.key×1']] as const) {
+      const failed = await run(name, `${report}\n${leak}`);
+      expect(failed).toMatchObject({ status: 'failed', output: '[sensitive producer output redacted]', error: { code: 'unknown', reason: `Sensitive producer output or error withheld: credential-class rule ${rule}` }, usage: { inputTokens: 120 } });
+      expect(JSON.stringify(failed)).not.toContain(leak);
+    }
+  });
+
+  const expectIntegrityReceipt = (receipt: ProducerReceipt, receiptPath: string, error: { code: string; reason: string }) => {
+    expect(receipt).toMatchObject({ status: 'failed', error, output: '', outputHash: sha256(''), durationMs: 1234, toolCalls: 4, usage: { inputTokens: 120, outputTokens: 30, cachedTokens: 10, estimatedCostUSD: 0.0042 } });
+    expect(receipt.artifacts.entries).toEqual([]);
+    expect(JSON.parse(readFileSync(receiptPath, 'utf8'))).toEqual(receipt);
+  };
+
+  test('records a failed receipt with usage when the bound provider executable changes during a cell', async () => {
     const destination = join(root(), 'provider-race-prepared'), cell = selected[0];
     prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
     const isolated = isolate(destination, cell), launcher = helperBundle();
     const outputRoot = join(root(), 'provider-race-receipts'); mkdirSync(outputRoot);
     const receiptPath = join(outputRoot, `${cell.id}.json`);
     const adapter = new FakeAdapter(opts => writeFileSync(opts.csoProducer!.providerCommand.executable, '#!/bin/sh\nexit 1\n'));
-    await expect(runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }, launcher))).rejects.toThrow('PRODUCER_PROVIDER_INSTALLATION_RACE');
-    expect(existsSync(receiptPath)).toBe(false);
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }, launcher));
+    expectIntegrityReceipt(receipt, receiptPath, { code: 'PRODUCER_PROVIDER_INSTALLATION_RACE', reason: 'provider installation check: provider executable changed during the run' });
   });
 
-  test('withholds the receipt when the helper generation changes during a cell', async () => {
+  test('records a failed receipt with usage when the helper generation changes during a cell', async () => {
     const destination = join(root(), 'helper-generation-race-prepared'), cell = selected[0];
     prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
     const isolated = isolate(destination, cell), launcher = helperBundle();
@@ -778,8 +977,83 @@ describe('CSO matched producer orchestration', () => {
       writeFileSync(core, process.platform === 'win32' ? 'new test executable\n' : '#!/bin/sh\nexit 1\n', { mode: 0o755 });
       writeFileSync(opts.csoProducer!.helperGeneration, `${sha256(readFileSync(core))}\n`);
     });
-    await expect(runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }, launcher))).rejects.toThrow('PRODUCER_HELPER_GENERATION_CHANGED');
-    expect(existsSync(receiptPath)).toBe(false);
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }, launcher));
+    expectIntegrityReceipt(receipt, receiptPath, { code: 'PRODUCER_HELPER_GENERATION_CHANGED', reason: 'helper installation check: installed helper identity changed during the run' });
+  });
+
+  test('records a failed receipt with usage when the provider output exceeds the limit', async () => {
+    const destination = join(root(), 'output-limit-prepared'), cell = selected[0];
+    prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+    const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+    const output = 'x'.repeat(32 * 1024 * 1024 + 1);
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter: new FakeAdapter(() => {}, 'gpt-5.4', 'gpt', { output }), paidExecutionAuthorized: true }));
+    expectIntegrityReceipt(receipt, receiptPath, { code: 'PRODUCER_OUTPUT_TOO_LARGE', reason: `output size check: output is ${output.length} bytes; the limit is ${32 * 1024 * 1024}` });
+  });
+
+  test('accepts real helper artifact names the secret redactor misreads, and names the check that rejects the rest', async () => {
+    const { redact } = await import('../lib/cso/process');
+    const runId = `${Date.now()}-${'0123456789abcdef'}`;
+    let walletShaped = '';
+    while (!walletShaped) { const id = randomHex(16); if (redact(id) !== id) walletShaped = id; }
+    expect(redact(runId)).not.toBe(runId);
+    const repo = 'e'.repeat(24);
+    const accepted = [`${repo}/${runId}/report.json`, `${repo}/${runId}/reviews/${walletShaped}.json`, `${repo}/${runId}/scanner-outcomes/gitleaks-${randomHex(8)}-${randomHex(8)}.json`,
+      `${repo}/${runId}/snapshot/test/fixtures/cso-canary-token.txt`, 'public-cache/osv/index.json'];
+    for (const path of accepted) expect(() => assertProducerArtifactPath(path)).not.toThrow();
+    for (const [path, message] of [
+      [`run-1/report.json`, 'INVALID_PRODUCER_ARTIFACTS: an artifact lies outside'],
+      [`${repo}/report.json`, 'INVALID_PRODUCER_ARTIFACTS: an artifact lies outside'],
+      [`${repo}/${runId}/bad name.json`, 'INVALID_PRODUCER_ARTIFACTS: an artifact path has a component outside'],
+    ] as const) expect(() => assertProducerArtifactPath(path)).toThrow(message);
+    const planted = `sk-ant-api03-${randomHex(24)}`;
+    expect(redact(planted)).not.toBe(planted);
+    let failure: unknown;
+    try { assertProducerArtifactPath(`${repo}/${runId}/notes/${planted}.txt`); } catch (error) { failure = error; }
+    expect((failure as CsoError).code).toBe('REDACTION_FAILED');
+    expect((failure as Error).message).toBe('artifact path component 4 under "ID/ID/notes" looks like a secret; the component is withheld');
+    const destination = join(root(), 'planted-artifact-prepared'), cell = selected[0];
+    prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+    const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+    const adapter = new FakeAdapter(() => {
+      const directory = join(process.env.GSTACK_HOME!, 'security', 'cso', repo, runId, 'notes');
+      mkdirSync(directory, { recursive: true }); writeFileSync(join(directory, `${planted}.txt`), 'x');
+    }, 'gpt-5.4', 'gpt', { error: { code: 'timeout', reason: 'exceeded 1ms' } });
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }));
+    expectIntegrityReceipt(receipt, receiptPath, { code: 'REDACTION_FAILED', reason: 'artifact inventory check: artifact path component 4 under "ID/ID/notes" looks like a secret; the component is withheld; the provider run also failed (timeout)' });
+    expect(readFileSync(receiptPath, 'utf8')).not.toContain(planted);
+  });
+
+  test('gives the provider the budget plus the reporting grace and keeps a timed-out run\'s usage and last result', async () => {
+    expect(producerProviderTimeoutMs(1800)).toBe(2100 * 1000);
+    const destination = join(root(), 'timeout-prepared'), cell = selected[0];
+    prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+    const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+    const adapter = new FakeAdapter(() => {}, 'gpt-5.4', 'gpt', { output: 'last assistant text before the kill', error: { code: 'timeout', reason: 'exceeded 2100000ms' } });
+    const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter, paidExecutionAuthorized: true }));
+    expect(receipt).toMatchObject({ status: 'failed', error: { code: 'timeout', reason: 'exceeded 2100000ms' }, output: 'last assistant text before the kill', toolCalls: 4, usage: { inputTokens: 120, outputTokens: 30, cachedTokens: 10, estimatedCostUSD: 0.0042 } });
+  });
+
+  test('names the first offending source path and rule in a failed receipt that keeps usage', async () => {
+    if (process.platform === 'win32') return;
+    const writable = (directory: string, change: () => void) => { chmodSync(directory, 0o755); try { change(); } finally { chmodSync(directory, 0o555); } };
+    const cases: Array<[string, (source: string, outside: string) => void, string]> = [
+      ['mount-point', source => writable(source, () => writeFileSync(join(source, '.mcp.json'), '', { mode: 0o444 })), '".mcp.json" is not in the expected source listing'],
+      ['missing', source => writable(source, () => rmSync(join(source, 'app.mjs'))), '"app.mjs" is missing from the source'],
+      ['hard-link', (source, outside) => linkSync(join(source, 'app.mjs'), join(outside, 'app.mjs')), '"app.mjs" has 2 hard links; expected 1'],
+      ['content', source => {
+        const file = join(source, 'app.mjs'), size = statSync(file).size;
+        chmodSync(file, 0o644); writeFileSync(file, 'y'.repeat(size)); chmodSync(file, 0o444);
+      }, '"app.mjs" does not match its expected sha256'],
+    ];
+    for (const [name, mutate, reason] of cases) {
+      const destination = join(root(), `${name}-prepared`), cell = selected[0], outside = root();
+      const schedule = prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
+      const isolated = isolate(destination, cell), receiptPath = join(root(), `${cell.id}.json`);
+      const receipt = await runProducerCell(isolated.input, receiptPath, withHelper({ adapter: new FakeAdapter(opts => mutate(opts.csoProducer!.sourceDirectory, outside)), paidExecutionAuthorized: true }));
+      expectIntegrityReceipt(receipt, receiptPath, { code: 'INVALID_PRODUCER_SOURCE', reason: `source content check: ${reason}` });
+      const group = collectProducerReceipts(producerMatrix, schedule, [receipt]).summary.groups.find(item => item.version === cell.version && item.mode === cell.mode);
+      expect(group).toMatchObject({ submitted: 1, succeeded: 0, failed: 1, estimatedCost: { measured: 1, totalUSD: 0.0042 } });
+    }
   });
 
   test('fails closed without a receipt or raw console reason when redaction cannot inspect output', async () => {
@@ -815,7 +1089,35 @@ describe('CSO matched producer orchestration', () => {
     expect(() => collectProducerReceipts(producerMatrix, schedule, [tampered])).toThrow('INVALID_PRODUCER_RECEIPT');
   });
 
-  test('seals source read-only and withholds a receipt after a mode/content mutation', async () => {
+  test('a platform-pinned release cell runs only on its native producer platform', async () => {
+    const release = createEvalMatrix({ ...releaseOptions, skillHashes: { v3: sha256(skills.v3) } }, privateManifest);
+    const host = producerHostPlatform(), foreign = host === 'linux/amd64' ? 'linux/arm64' : 'linux/amd64';
+    const native = release.cells.find(cell => cell.mode === 'comprehensive' && cell.platform === host);
+    const other = release.cells.find(cell => cell.mode === 'comprehensive' && cell.platform === foreign)!;
+    const destination = join(root(), 'prepared');
+    expect(() => prepareEvalJobs(release, skills, join(root(), 'both'), [other.id], privateCorpus)).toThrow('EVAL_SKILL_HASH_MISMATCH');
+    prepareEvalJobs(release, { v3: skills.v3 }, destination, [other.id, ...(native ? [native.id] : [])], privateCorpus);
+    const receipts = join(root(), 'receipts'); mkdirSync(receipts);
+    const isolatedOther = isolate(destination, other);
+    const opaque = readFileSync(isolatedOther.input, 'utf8'), parsed = JSON.parse(opaque);
+    expect(Object.keys(parsed).sort()).toEqual(['cellRef', 'execution', 'schemaVersion', 'skill', 'source']);
+    expect(parsed).toMatchObject({ schemaVersion: 2, cellRef: other.id, execution: { mode: 'comprehensive', platform: other.platform, sourceHash: other.sourceHash } });
+    expect(opaque).not.toMatch(/caseId|variant|vulnerable|"fixed"|"version"|repetition/); expect(opaque).not.toContain(other.caseId);
+    const smuggled = isolate(destination, other);
+    writeFileSync(smuggled.input, JSON.stringify({ ...parsed, caseId: other.caseId }));
+    await expect(runProducerCell(smuggled.input, join(receipts, `${other.id}.json`), withHelper({ adapter: new FakeAdapter(() => {}), paidExecutionAuthorized: true }))).rejects.toThrow('INVALID_PRODUCER_INPUT');
+    expect(readFileSync(join(isolatedOther.source, 'src/app.txt'), 'utf8')).toBe(`synthetic ${other.caseId} ${other.variant}\n`);
+    await expect(runProducerCell(isolatedOther.input, join(receipts, `${other.id}.json`), withHelper({ adapter: new FakeAdapter(() => {}), paidExecutionAuthorized: true }))).rejects.toThrow('UNMATCHED_PRODUCER_PLATFORM');
+    if (!native) return;
+    const isolatedNative = isolate(destination, native);
+    const receipt = await runProducerCell(isolatedNative.input, join(receipts, `${native.id}.json`), withHelper({ adapter: new FakeAdapter(() => {}), paidExecutionAuthorized: true }));
+    expect(receipt.cellRef).toBe(native.id);
+    const written = readFileSync(join(receipts, `${native.id}.json`), 'utf8');
+    expect(JSON.parse(written)).not.toHaveProperty('cell');
+    expect(written).not.toMatch(/caseId|variant|vulnerable|"fixed"/); expect(written).not.toContain(native.caseId);
+  });
+
+  test('seals source read-only and records a failed receipt after a mode/content mutation', async () => {
     const destination = join(root(), 'prepared');
     const cell = selected[0];
     prepareEvalJobs(producerMatrix, skills, destination, [cell.id]);
@@ -833,8 +1135,10 @@ describe('CSO matched producer orchestration', () => {
       }
       writeFileSync(join(source, 'app.mjs'), 'changed by producer\n');
     });
-    await expect(runProducerCell(isolated.input, receipt, withHelper({ adapter, paidExecutionAuthorized: true }))).rejects.toThrow(process.platform === 'win32' ? 'INVALID_PRODUCER_SOURCE' : 'PRODUCER_CHANGED_SOURCE_MODE');
+    const written = await runProducerCell(isolated.input, receipt, withHelper({ adapter, paidExecutionAuthorized: true }));
+    expectIntegrityReceipt(written, receipt, process.platform === 'win32'
+      ? { code: 'INVALID_PRODUCER_SOURCE', reason: `source content check: "app.mjs" is ${'changed by producer\n'.length} bytes; expected ${Buffer.byteLength(original)}` }
+      : { code: 'PRODUCER_CHANGED_SOURCE_MODE', reason: 'source modes check: "app.mjs" has mode 644; expected 444' });
     expect(readFileSync(join(isolated.source, 'app.mjs'), 'utf8')).not.toBe(original);
-    expect(existsSync(receipt)).toBe(false);
   });
 });

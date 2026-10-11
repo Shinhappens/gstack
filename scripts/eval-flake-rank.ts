@@ -4,16 +4,24 @@
  *
  * Reads trial records (one JSONL line per trial: case, kind, trial, outcome,
  * exit_reason, duration, cost, model, CLI version, series identity, run id,
- * sha, policy_version) from the last N completed `evals-periodic.yml` runs on
- * the current branch and `main` (downloading only each run's small
- * `trial-outcomes` artifact through `gh`), plus any local eval dirs, and
+ * sha, policy_version) from the last N completed `evals-periodic.yml` runs of
+ * the weekly history: scheduled runs on `main` plus `main` dispatches
+ * (`--branch <name>` reads one branch's runs for inspection). Trials from
+ * branch census runs in the same window pool into a series main has also
+ * run, never into a new one; weeks for quarantine expiry count main only,
+ * downloading only each run's small `trial-outcomes` artifact through `gh`,
+ * plus any local eval dirs, and
  * prints per-case per-trial pass rates with 95% Wilson intervals.
  *
- * A series is one case under one input identity: the case's own touchfiles
- * minus GLOBAL_TOUCHFILES (`caseSeriesIdentities`), grouped by model and CLI
- * version, per policy_version. A new identity starts a new series; earlier
- * series stay visible. Only post-policy trials of the current series feed the
- * labels and alarms. Legacy eval-store records (`--backfill`, `--dir`) are
+ * A series is one case under one input identity (EVAL_POLICY v2: the bytes
+ * the case owns plus HARNESS_VERSION, stamped by scripts/eval-trial-series.ts
+ * caseSeriesIdentitiesV2), grouped by model and CLI version, per
+ * policy_version. A new identity starts a new series; earlier
+ * series stay visible. Only trials of the current series under the reader's
+ * own EVAL_POLICY.version feed the labels and alarms: an older policy's
+ * trials are display-only, and a newer policy's trials (written by a later
+ * checkout) are ignored with a printed count, so a reader rolled back past a
+ * policy bump never pools records it cannot interpret. Legacy eval-store records (`--backfill`, `--dir`) are
  * imported as pre-policy trials (first attempt only; a missing attempt means
  * 1) and are display-only.
  *
@@ -31,26 +39,27 @@
  * fetched fails the gate closed.
  *
  * Usage:
- *   bun run eval:pass-rates                       # last 10 weekly runs, this branch + main
+ *   bun run eval:pass-rates                       # last 10 weekly runs (main: scheduled + dispatched)
  *   bun run eval:pass-rates --case <id> --runs 20
  *   bun run eval:pass-rates --dir <path>          # local eval dirs / downloaded artifacts (repeatable)
  *   bun run eval:pass-rates --backfill            # also import legacy slice artifacts, labeled pre-policy
  *   bun run eval:pass-rates --json | --gate
+ *   bun run eval:pass-rates --headroom | --reds | --run <id>   # report views (scripts/lib/eval-history.ts)
+ *   bun run eval:pass-rates --help                # every flag, no network
  */
 
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { isPartialEval, isFinalizedEvalResultFile, evalEntryOutcome, failureClassOf, parseTrialOutcomes, sanitizeTrialError,
   TRIAL_OUTCOME_SCHEMA, type EvalCaseKind, type EvalResult, type TrialOutcomeRecord } from '../test/helpers/eval-store';
 import { flakeLedgerPath, type FlakeLedgerEntry } from './test-free-shards';
 import { E2E_KINDS, E2E_TIERS, E2E_TOUCHFILES, GLOBAL_TOUCHFILES, LLM_JUDGE_TOUCHFILES } from '../test/helpers/touchfiles-data';
 import { CASE_QUARANTINE, EVAL_POLICY } from '../test/helpers/periodic-exclude-data';
-import { matchGlob } from '../test/helpers/test-selection';
 import { CASE_TEST_NAMES } from './test-paid-shards';
 import { resolveStateRoot } from '../lib/state-root';
+import { GH_JOBS, PASS_RATES_USAGE, criticalPath, formatCriticalPath, formatHeadroom, formatRedLedger, headroom, headroomAlarms, parsePassRatesArgs,
+  redLedger, triageRun, CENSUS_RED_GUIDE, type CriticalPath } from './lib/eval-history';
+import { downloadRunArtifacts, GH_HISTORY, isPooledTrialRun, isWeeklyHistoryRun, listWeeklyRuns, parseFlakeLedger, repoSlug, TRIAL_OUTCOMES_MAX_BYTES, type WeeklyRun } from './lib/ci-history';
 
 interface TestSeries {
   name: string;
@@ -123,32 +132,23 @@ export function collectEvalFiles(dir: string, sinceDays = 60): string[] {
   return out;
 }
 
+/** The local free-suite flake ledger (CI ledgers are read by test:health through scripts/lib/ci-history.ts). */
 function readFreeLedger(): FlakeLedgerEntry[] {
-  // Per-LINE parse: one malformed JSONL line (torn write, manual edit) must
-  // drop that line, never vanish the whole series (codex adversarial finding).
-  let raw: string;
   try {
-    raw = fs.readFileSync(flakeLedgerPath(), 'utf-8');
+    return parseFlakeLedger(fs.readFileSync(flakeLedgerPath(), 'utf-8'));
   } catch { return []; }
-  const out: FlakeLedgerEntry[] = [];
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* torn line — skip */ }
-  }
-  return out;
 }
 
 // --- Trial records ---
 
 /**
  * A trial record as pass-rates reads it: eval-store's trial-outcomes schema
- * plus the series identity the report job stamps (caseSeriesIdentities).
- * policy_version 0 marks a pre-policy (backfilled) record.
+ * plus what the report job stamps (scripts/eval-trial-series.ts): the series
+ * identity, the full consumed-input fingerprint and HARNESS_VERSION, both
+ * provenance only. policy_version 0 marks a pre-policy (backfilled) record.
  */
-export type TrialRecord = TrialOutcomeRecord & { series_identity?: string };
+export type TrialRecord = TrialOutcomeRecord & { series_identity?: string; series_fingerprint?: string; harness_version?: number };
 
-/** Per-file cap for downloaded artifacts: pass-rates parses data only, never executes it. */
-export const TRIAL_OUTCOMES_MAX_BYTES = 8 * 1024 * 1024;
 
 /** Every `trial-outcomes*.jsonl` file under a directory, size-capped, schema-validated by eval-store. */
 export function readTrialOutcomeDir(dir: string): { records: TrialRecord[]; errors: string[] } {
@@ -212,26 +212,6 @@ export function attributeLegacyRecord(name: string, shard: string | undefined, r
 }
 
 /**
- * Series identity per case: a hash of the git blob ids of the files matching
- * the case's own touchfiles, excluding GLOBAL_TOUCHFILES (harness edits are
- * markers, not new series). The report job stamps this on every trial record.
- */
-export function caseSeriesIdentities(ids: string[], root: string, registry: Registry = LIVE_REGISTRY): Record<string, string> {
-  const listed = spawnSync('git', ['ls-files', '-s'], { cwd: root, encoding: 'utf8', timeout: 20_000, maxBuffer: 64 * 1024 * 1024 });
-  if (listed.status !== 0) throw new Error(`git ls-files failed: ${listed.stderr}`);
-  const blobs = listed.stdout.split('\n').filter(Boolean).map(line => {
-    const [meta, file] = line.split('\t');
-    return { file: file!, blob: meta!.split(' ')[1]! };
-  }).filter(entry => !registry.globals.some(pattern => matchGlob(entry.file, pattern)));
-  return Object.fromEntries(ids.map(id => {
-    const patterns = registry.touchfiles[id] ?? registry.judgeTouchfiles[id] ?? [];
-    const lines = blobs.filter(entry => patterns.some(pattern => matchGlob(entry.file, pattern)))
-      .map(entry => `${entry.file} ${entry.blob}`).sort();
-    return [id, createHash('sha256').update(`${id}\n${lines.join('\n')}`).digest('hex').slice(0, 16)];
-  }));
-}
-
-/**
  * Import legacy eval-store result files as pre-policy trials (policy_version
  * 0, source 'backfill'): first attempt only (a missing attempt means 1),
  * attributed by registry id, never guessed. A manual-review acceptance carries
@@ -261,7 +241,7 @@ export function backfillEvalFiles(files: string[], run?: { run_id: string; sha?:
         tier: caseTier(id, registry), kind: registry.kinds[id]!, trial: 1, panel: { n: 1, k: 1 }, attempt: 1,
         outcome, ...(outcome === 'failed' ? { failure_class: failureClassOf(entry) } : {}),
         exit_reason: entry.exit_reason, error: sanitizeTrialError(entry.error),
-        duration_ms: Math.max(0, entry.duration_ms || 0), cost_usd: Math.max(0, entry.cost_usd || 0),
+        duration_ms: Math.max(0, entry.duration_ms || 0), cost_usd: Math.max(0, entry.cost_usd || 0), ...(entry.cost_known === false ? { cost_known: false } : {}),
         model: entry.model, cli_version: result.claude_cli_version, policy_version: 0, quarantined: false,
         execution: entry.execution === 'reused' ? 'reused' : 'executed', source: 'backfill',
         run_id: run?.run_id ?? `local:${file}`, sha: run?.sha ?? result.git_sha, recorded_at: run?.timestamp ?? result.timestamp,
@@ -316,7 +296,7 @@ export function holmRejections(pValues: number[], alpha: number): Set<number> {
 
 export type PassRateLabel = 'INCONCLUSIVE' | 'BROKEN' | 'FLAKY' | 'FAILING' | 'PASSING';
 export type AlarmKind = 'drift' | 'rule-as-behavior' | 'regression' | 'quarantine-exit' | 'quarantine-expired'
-  | 'quarantine-cap' | 'quarantine-invalid';
+  | 'quarantine-cap' | 'quarantine-invalid' | 'headroom';
 
 /** The EVAL_POLICY fields pass-rates reads (structural, so tests can vary them). */
 export interface PassRatePolicy {
@@ -368,8 +348,14 @@ export interface PassRateReport {
   policyVersion: number;
   cases: CasePassRate[];
   alarms: Alarm[];
+  /** Trials under this reader's EVAL_POLICY.version: the only ones scored. */
   postPolicyTrials: number;
+  /** Backfilled pre-policy trials (policy_version 0): display only. */
   prePolicyTrials: number;
+  /** Trials under an earlier policy version: display only, never scored. */
+  olderPolicyTrials: number;
+  /** Trials under a later policy version than this reader: ignored entirely. */
+  newerPolicyTrials: number;
   unattributed: string[];
   errors: string[];
 }
@@ -380,6 +366,12 @@ export interface AnalyzeOptions {
   policy?: PassRatePolicy;
   /** Completed weekly-run timestamps in the window, for quarantine expiry. */
   weeklyRuns?: string[];
+  /**
+   * Run ids of branch census runs (isPooledTrialRun). Their trials count only
+   * toward a series that a non-pooled record also has, so a branch can extend
+   * main's history but never start, or become, a case's current series.
+   */
+  pooledRunIds?: ReadonlySet<string>;
   now?: number;
   unattributed?: string[];
   errors?: string[];
@@ -453,8 +445,10 @@ export function analyzePassRates(records: TrialRecord[], options: AnalyzeOptions
   const quarantine = options.quarantine ?? CASE_QUARANTINE;
   const policy = options.policy ?? EVAL_POLICY;
   const now = options.now ?? Date.now();
+  const newerPolicyTrials = records.filter(record => record.policy_version > policy.version).length;
   const byCase = new Map<string, TrialRecord[]>();
   for (const record of records) {
+    if (record.policy_version > policy.version) continue;
     const list = byCase.get(record.case) ?? [];
     list.push(record);
     byCase.set(record.case, list);
@@ -464,16 +458,20 @@ export function analyzePassRates(records: TrialRecord[], options: AnalyzeOptions
   for (const [id, list] of [...byCase].sort(([a], [b]) => a.localeCompare(b))) {
     list.sort((a, b) => at(a).localeCompare(at(b)) || runOf(a).localeCompare(runOf(b)) || a.trial - b.trial);
     const groups = new Map<string, TrialRecord[]>();
+    const keyOf = (record: TrialRecord) => record.policy_version === 0 ? 'pre-policy'
+      : [record.series_identity ?? 'unknown', record.model ?? 'unknown', record.cli_version ?? 'unknown', `v${record.policy_version}`].join('|');
+    const pooled = (record: TrialRecord) => !!options.pooledRunIds?.has(record.run_id ?? '');
+    const mainKeys = new Set(list.filter(record => !pooled(record)).map(keyOf));
     for (const record of list) {
-      const key = record.policy_version === 0 ? 'pre-policy'
-        : [record.series_identity ?? 'unknown', record.model ?? 'unknown', record.cli_version ?? 'unknown', `v${record.policy_version}`].join('|');
+      const key = keyOf(record);
+      if (pooled(record) && !mainKeys.has(key)) continue;
       const group = groups.get(key) ?? [];
       group.push(record);
       groups.set(key, group);
     }
     const series = [...groups].map(([key, group]) => seriesStats(key, group))
       .sort((a, b) => a.lastSeen.localeCompare(b.lastSeen));
-    const post = series.filter(entry => entry.policyVersion !== 0);
+    const post = series.filter(entry => entry.policyVersion === policy.version);
     const current = post[post.length - 1] ?? null;
     const previous = post[post.length - 2] ?? null;
     const scored = current ? groups.get(current.key)!.filter(record => record.outcome !== 'skipped') : [];
@@ -528,9 +526,10 @@ export function analyzePassRates(records: TrialRecord[], options: AnalyzeOptions
   }
   alarms.push(...quarantinePolicyProblems(quarantine, registry, policy, now));
 
-  const post = records.filter(record => record.policy_version !== 0).length;
-  return { policyVersion: policy.version, cases, alarms, postPolicyTrials: post, prePolicyTrials: records.length - post,
-    unattributed: options.unattributed ?? [], errors: options.errors ?? [] };
+  const count = (match: (version: number) => boolean) => records.filter(record => match(record.policy_version)).length;
+  return { policyVersion: policy.version, cases, alarms, postPolicyTrials: count(version => version === policy.version),
+    prePolicyTrials: count(version => version === 0), olderPolicyTrials: count(version => version > 0 && version < policy.version),
+    newerPolicyTrials, unattributed: options.unattributed ?? [], errors: options.errors ?? [] };
 }
 
 function pct(value: number): string { return `${Math.round(value * 1000) / 10}%`; }
@@ -542,7 +541,12 @@ function formatStats(stats: SeriesStats | null): string {
 
 export function formatPassRates(report: PassRateReport, options: { caseFilter?: string } = {}): string {
   const lines: string[] = [];
-  lines.push(`pass-rates: policy v${report.policyVersion}, ${report.postPolicyTrials} post-policy trial(s), ${report.prePolicyTrials} pre-policy (display only)`);
+  lines.push(`pass-rates: policy v${report.policyVersion}, ${report.postPolicyTrials} post-policy trial(s), ${report.prePolicyTrials} pre-policy (display only)`
+    + (report.olderPolicyTrials ? `, ${report.olderPolicyTrials} under an older policy (display only)` : ''));
+  if (report.newerPolicyTrials) {
+    lines.push(`  ignored ${report.newerPolicyTrials} trial(s) recorded under a policy newer than v${report.policyVersion}: this checkout predates them. `
+      + 'Fix: run pass-rates from a checkout at or after the commit that bumped EVAL_POLICY.version (docs/TESTING_INTERNALS.md#pass-rate-policy-versions).');
+  }
   if (report.postPolicyTrials === 0) lines.push('  no post-policy trials yet: every series starts INCONCLUSIVE');
   const cases = report.cases.filter(entry => !options.caseFilter || entry.case === options.caseFilter);
   lines.push('  label         kind      tier      current series                 pre-policy          manual  case');
@@ -561,104 +565,35 @@ export function formatPassRates(report: PassRateReport, options: { caseFilter?: 
   return lines.join('\n');
 }
 
-// --- GitHub history ---
-
-export interface WeeklyRun { id: number; attempt: number; sha: string; branch: string; createdAt: string }
-export interface RunArtifact { id: number; name: string; size: number }
-
-/** The GitHub calls pass-rates makes; injectable so the free tests never touch the network. */
-export interface HistoryFetcher {
-  listRuns(repo: string, workflow: string, branch: string, limit: number): WeeklyRun[];
-  listArtifacts(repo: string, runId: number): RunArtifact[];
-  downloadZip(repo: string, artifactId: number, destination: string): void;
-}
-
-function gh(args: string[]): Buffer {
-  const result = spawnSync('gh', args, { timeout: 300_000, maxBuffer: 256 * 1024 * 1024 });
-  if (result.status !== 0) throw new Error(`gh ${args.slice(0, 2).join(' ')} failed: ${String(result.stderr || result.error || '').trim()}`);
-  return result.stdout;
-}
-
-function jsonLines<T>(buffer: Buffer): T[] {
-  return buffer.toString('utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as T);
-}
-
-export const GH_HISTORY: HistoryFetcher = {
-  listRuns: (repo, workflow, branch, limit): WeeklyRun[] => jsonLines(gh(['api',
-    `repos/${repo}/actions/workflows/${workflow}/runs?branch=${encodeURIComponent(branch)}&status=completed&per_page=${limit}`,
-    '--jq', '.workflow_runs[] | {id, attempt: .run_attempt, sha: .head_sha, branch: .head_branch, createdAt: .created_at}'])),
-  listArtifacts: (repo, runId): RunArtifact[] => jsonLines(gh(['api', `repos/${repo}/actions/runs/${runId}/artifacts?per_page=100`,
-    '--paginate', '--jq', '.artifacts[] | select(.expired | not) | {id, name, size: .size_in_bytes}'])),
-  downloadZip: (repo, artifactId, destination) => fs.writeFileSync(destination, gh(['api', `repos/${repo}/actions/artifacts/${artifactId}/zip`])),
-};
-
-/** The last `limit` completed runs of `workflow` on each branch, newest first, deduplicated. */
-export function listWeeklyRuns(opts: { repo: string; workflow: string; branches: string[]; limit: number; fetcher?: HistoryFetcher }): WeeklyRun[] {
-  const fetcher = opts.fetcher ?? GH_HISTORY;
-  const runs = new Map<number, WeeklyRun>();
-  for (const branch of opts.branches) for (const run of fetcher.listRuns(opts.repo, opts.workflow, branch, opts.limit)) runs.set(run.id, run);
-  return [...runs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+export interface PassRateHistory {
+  records: TrialRecord[];
+  unattributed: string[];
+  errors: string[];
+  manualReviews: string[];
+  weeklyRuns?: string[];
+  fetched: WeeklyRun[];
+  pooledRunIds?: Set<string>;
+  historyError: string | null;
+  scope: string;
+  cacheDir: string;
 }
 
 /**
- * Download the artifacts of one run whose names match into a per-run cache
- * directory (reused on later calls) and return the extracted directories.
- * Oversized or oddly named artifacts are skipped: downloads are data only.
+ * The trial history every eval:pass-rates view reads (and the ship-measure
+ * sweep ranks from): local dirs, or the trial-outcomes artifacts of the last
+ * N weekly runs on the branch plus the branch census runs that pool into
+ * main's series. A fetch failure is returned as historyError, never thrown.
  */
-export function downloadRunArtifacts(opts: { repo: string; run: WeeklyRun; match: (name: string) => boolean; cacheDir: string;
-  fetcher?: HistoryFetcher; maxBytes?: number }): string[] {
-  const fetcher = opts.fetcher ?? GH_HISTORY;
-  const dirs: string[] = [];
-  for (const artifact of fetcher.listArtifacts(opts.repo, opts.run.id)) {
-    if (!opts.match(artifact.name) || !/^[A-Za-z0-9._-]+$/.test(artifact.name)) continue;
-    if (artifact.size > (opts.maxBytes ?? TRIAL_OUTCOMES_MAX_BYTES)) continue;
-    const dir = path.join(opts.cacheDir, `${opts.run.id}`, artifact.name);
-    if (!fs.existsSync(path.join(dir, '.complete'))) {
-      fs.rmSync(dir, { recursive: true, force: true });
-      fs.mkdirSync(dir, { recursive: true });
-      const zip = path.join(dir, 'artifact.zip');
-      fetcher.downloadZip(opts.repo, artifact.id, zip);
-      const unzip = spawnSync('unzip', ['-o', '-q', zip, '-d', dir], { timeout: 120_000 });
-      if (unzip.status !== 0) throw new Error(`unzip failed for ${artifact.name}: ${String(unzip.stderr || unzip.error || '')}`);
-      fs.rmSync(zip, { force: true });
-      fs.writeFileSync(path.join(dir, '.complete'), '');
-    }
-    dirs.push(dir);
-  }
-  return dirs;
-}
-
-function gitOutput(args: string[]): string | null {
-  const result = spawnSync('git', args, { encoding: 'utf8', timeout: 5_000 });
-  return result.status === 0 ? result.stdout.trim() : null;
-}
-
-function repoSlug(): string {
-  const url = gitOutput(['remote', 'get-url', 'origin']) ?? '';
-  return url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/)?.[1] ?? 'garrytan/gstack';
-}
-
-if (import.meta.main) {
-  const argv = process.argv.slice(2);
-  const flag = (name: string) => { const index = argv.indexOf(name); return index === -1 ? undefined : argv[index + 1]; };
-  const dirs = argv.flatMap((arg, index) => arg === '--dir' && argv[index + 1] ? [argv[index + 1]!] : []);
-  const asJson = argv.includes('--json');
-  const gate = argv.includes('--gate');
-  const backfill = argv.includes('--backfill');
-  const caseFilter = flag('--case');
-  const runsLimit = Number(flag('--runs')) || 10;
-  const sinceDays = Number(flag('--since-days')) || 60;
-  const repo = flag('--repo') ?? repoSlug();
-  const workflow = flag('--workflow') ?? 'evals-periodic.yml';
-  const branch = flag('--branch') ?? gitOutput(['rev-parse', '--abbrev-ref', 'HEAD']) ?? 'main';
-
+export function loadPassRateHistory(o: { repo: string; workflow: string; branch: string; runsLimit: number; dirs: string[]; sinceDays: number; backfill?: boolean; runId?: number }): PassRateHistory {
   const records: TrialRecord[] = [];
   const unattributed = new Set<string>();
   const errors: string[] = [];
+  const manualReviews: string[] = [];
   let historyError: string | null = null;
   let weeklyRuns: string[] | undefined;
-
-  const manualReviews: string[] = [];
+  let fetched: WeeklyRun[] = [];
+  let pooledRunIds: Set<string> | undefined;
+  const cacheDir = path.join(path.resolve(resolveStateRoot()), 'eval-pass-rates-cache', o.repo.replace('/', '-'));
   const importDir = (dir: string, run: { run_id: string; sha?: string; timestamp?: string } | undefined, legacyDays: number) => {
     const trials = readTrialOutcomeDir(dir);
     records.push(...trials.records);
@@ -668,31 +603,84 @@ if (import.meta.main) {
     manualReviews.push(...legacy.manualReviews);
     legacy.unattributed.forEach(name => unattributed.add(name));
   };
-
-  if (dirs.length) {
-    for (const dir of dirs) importDir(dir, undefined, sinceDays);
+  if (o.dirs.length) {
+    for (const dir of o.dirs) importDir(dir, undefined, o.sinceDays);
   } else {
     try {
-      const runs = listWeeklyRuns({ repo, workflow, branches: [...new Set([branch, 'main'])], limit: runsLimit });
-      weeklyRuns = runs.map(run => run.createdAt);
-      const cacheDir = path.join(path.resolve(resolveStateRoot()), 'eval-pass-rates-cache', repo.replace('/', '-'));
-      const match = backfill
+      const weekly = listWeeklyRuns({ repo: o.repo, workflow: o.workflow, branches: [o.branch], limit: o.runsLimit }).filter(run => o.branch !== 'main' || isWeeklyHistoryRun(run));
+      weeklyRuns = weekly.map(run => run.createdAt);
+      // Branch census trials pool into main's matching series over the same window (isPooledTrialRun).
+      const oldest = weekly[weekly.length - 1]?.createdAt;
+      const pooledRuns = o.branch === 'main' && oldest
+        ? listWeeklyRuns({ repo: o.repo, workflow: o.workflow, branches: [''], limit: 100 }).filter(run => isPooledTrialRun(run) && run.createdAt >= oldest)
+        : [];
+      pooledRunIds = new Set(pooledRuns.map(run => `${run.id}`));
+      const runs = [...weekly, ...pooledRuns];
+      if (o.runId !== undefined && !runs.some(run => run.id === o.runId)) runs.push(GH_JOBS.getRun(o.repo, o.runId));
+      fetched = runs;
+      const match = o.backfill
         ? (name: string) => name.startsWith('trial-outcomes') || /^(paid-slice-\d+|gate-census-\d+)(-a\d+)?$/.test(name)
         : (name: string) => name.startsWith('trial-outcomes');
       for (const run of runs) {
-        const dirsForRun = downloadRunArtifacts({ repo, run, match, cacheDir, maxBytes: backfill ? 64 * 1024 * 1024 : undefined });
+        const dirsForRun = downloadRunArtifacts({ repo: o.repo, run, match, cacheDir, maxBytes: o.backfill ? 64 * 1024 * 1024 : undefined });
         for (const dir of dirsForRun) importDir(dir, { run_id: `${run.id}`, sha: run.sha, timestamp: run.createdAt }, 3650);
       }
     } catch (error) {
       historyError = error instanceof Error ? error.message : String(error);
     }
   }
+  const scope = o.dirs.length ? `local dirs ${o.dirs.join(', ')}` : `${o.repo} ${o.workflow} on ${o.branch}${pooledRunIds?.size ? ` + ${pooledRunIds.size} pooled branch census run(s)` : ''}, `
+    + `last ${o.runsLimit} completed run(s): ${fetched.map(run => run.id).join(', ') || 'none'}`;
+  return { records, unattributed: [...unattributed].sort(), errors, manualReviews, weeklyRuns, fetched, pooledRunIds, historyError, scope, cacheDir };
+}
 
-  const report = analyzePassRates(records, { weeklyRuns, unattributed: [...unattributed].sort(), errors, manualReviews });
+// --- GitHub history (shared reader: scripts/lib/ci-history.ts) ---
+
+export { downloadRunArtifacts, GH_HISTORY, listWeeklyRuns, TRIAL_OUTCOMES_MAX_BYTES,
+  type HistoryFetcher, type RunArtifact, type WeeklyRun } from './lib/ci-history';
+
+if (import.meta.main) {
+  const parsed = parsePassRatesArgs(process.argv.slice(2), id => Object.hasOwn(E2E_TIERS, id) || Object.hasOwn(LLM_JUDGE_TOUCHFILES, id)
+    || (/^test\/[\w./-]+\.test\.ts$/.test(id) && fs.existsSync(id)));
+  if ('help' in parsed) { console.log(PASS_RATES_USAGE); process.exit(0); }
+  if ('error' in parsed) { console.error(`eval:pass-rates: ${parsed.error}\n${PASS_RATES_USAGE}`); process.exit(2); }
+  const { dirs, json: asJson, gate, backfill, caseFilter, runs: runsLimit, sinceDays, view } = parsed;
+  const repo = parsed.repo ?? repoSlug();
+  const workflow = parsed.workflow ?? 'evals-periodic.yml';
+  const branch = parsed.branch ?? 'main';
+
+  const history = loadPassRateHistory({ repo, workflow, branch, runsLimit, dirs, sinceDays, backfill, runId: parsed.runId });
+  const { records, errors, manualReviews, weeklyRuns, fetched, pooledRunIds, historyError, scope, cacheDir } = history;
+  const unattributed = new Set(history.unattributed);
+  const scoped = caseFilter ? records.filter(record => record.case === caseFilter) : records;
+  const caseHeadroom = headroom(scoped);
+  if (view !== 'rates') {
+    const critical: CriticalPath[] = [];
+    if (view !== 'reds' && !dirs.length) {
+      for (const run of fetched.filter(run => view === 'headroom' || run.id === parsed.runId)) {
+        try { critical.push(criticalPath(String(run.id), GH_JOBS.listJobs(repo, run.id))); } catch { critical.push({ run: String(run.id), jobs: 0, slowest: null, wallMs: null }); }
+      }
+    }
+    const lines = view === 'headroom' ? formatHeadroom(caseHeadroom, critical) : view === 'reds' ? formatRedLedger(redLedger(scoped))
+      : historyError ? [] : triageRun({ repo, run: fetched.find(run => run.id === parsed.runId)!, records, caseFilter, cacheDir, fetcher: GH_HISTORY,
+        download: (match, maxBytes) => downloadRunArtifacts({ repo, run: fetched.find(run => run.id === parsed.runId)!, match, cacheDir, maxBytes }) })
+        .concat(formatCriticalPath(critical), historyError ? [] : [`guide: ${CENSUS_RED_GUIDE}`]);
+    if (asJson) console.log(JSON.stringify({ scope, historyError, view, lines }, null, 2));
+    else {
+      console.log(`scope: ${scope}`);
+      if (historyError) console.log(`history unavailable (${historyError})`);
+      for (const line of lines) console.log(line);
+    }
+    process.exit(historyError ? 1 : 0);
+  }
+  const full = analyzePassRates(records, { weeklyRuns, pooledRunIds, unattributed: [...unattributed].sort(), errors, manualReviews });
+  const alarms = [...full.alarms, ...(gate ? headroomAlarms(caseHeadroom) : [])].filter(alarm => !caseFilter || alarm.case === caseFilter);
+  const report = { ...full, cases: full.cases.filter(entry => !caseFilter || entry.case === caseFilter), alarms };
   const ledger = readFreeLedger();
   if (asJson) {
-    console.log(JSON.stringify({ repo, workflow, branch, dirs, historyError, ...report, freeLedger: ledger }, null, 2));
+    console.log(JSON.stringify({ repo, workflow, branch, scope, dirs, historyError, ...report, freeLedger: ledger }, null, 2));
   } else {
+    console.log(`scope: ${scope}`);
     if (historyError) console.log(`pass-rates: history unavailable (${historyError}); every label below is INCONCLUSIVE`);
     console.log(formatPassRates(report, { caseFilter }));
     if (ledger.length > 0) {

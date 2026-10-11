@@ -96,9 +96,13 @@ against the previous finalized run (in-flight `_partial` files are never used as
 a baseline, so a run can't compare against itself).
 
 The periodic overlay fixtures use a versioned behavior gate with efficacy
-reported separately. See [Overlay benchmark contract v2](OVERLAY_BENCHMARK_CONTRACT.md)
+reported separately. See [Overlay benchmark contract v4](OVERLAY_BENCHMARK_CONTRACT.md)
 for exact correctness requirements, retired fanout cases, immutable evidence,
-and the limits of a passing result.
+and the limits of a passing result. Under v4 a completed wrong answer is a
+measured correctness result in either arm (`taskCorrect: false` with
+`answerError`); only an overlay-ON wrong answer fails the case, so an
+overlay-OFF wrong answer stays in the comparison. v3 verdicts keep their
+original meaning.
 
 ## Coverage ownership
 
@@ -184,10 +188,9 @@ This does not change the separate CI machine count. Full-suite shards are packed
 DURATIONS (LPT, `packShardsByDuration`) when the committed seed
 `scripts/free-test-durations.json` exists — refresh it with
 `bun run test:ubicloud --record-durations`, which times each file in its own
-child on a VM with the CI lane's environment and copies the seed back (CI never
-records; a seed recorded where browser or display tests skip underestimates
-them). Missing seed → silent hash-shard fallback; corrupt seed → one warning +
-fallback; unknown files get 75th-percentile pessimism, and both full-suite and
+child on a VM with the CI lane's environment and copies the seed back; see
+[Free suite duration seed](#free-suite-duration-seed). Missing seed → silent hash-shard fallback; corrupt seed → one warning +
+fallback; unknown files get 99th-percentile pessimism, and both full-suite and
 `--ci-plan` runs name them on stderr so a new slow file cannot silently become
 the long pole. Packed
 shards get duration-aware walls (`max(base, predicted × 3, files × 5s)`). The
@@ -257,15 +260,17 @@ never retry; each case's kind fixes its trials before the run (see "Eval verdict
 policy" below). Files in `CASE_SHARDED_FILES` run one registered case per
 process (`<file>#<case id>`, an exact `--test-name-pattern`, exactly one executed
 case), so a long file of short cases spreads across runners and each case gets
-its own SDK semaphore.
+its own SDK semaphore. `test/carve-section-loading.test.ts` is one of them: it registers
+one periodic case per carved skill (`carve-section-loading-<skill>`, each with
+its own touchfiles and history). Run one case with
+`bun run scripts/test-paid-shards.ts --tier periodic --case carve-section-loading-<skill>`.
 Trial telemetry rides the store: every recorded test carries its 1-based
 `attempt` plus, on an isolated trial shard, its `case_id`, `kind`, `trial`,
 `panel` and `policy_version`, and each lane's report uploads one
 `trial-outcomes` JSONL line per trial. `bun run eval:pass-rates`
-(`eval:flake-rank` is an alias) turns that history into per-case pass rates
-(see "Pass-rate history" below; the free lane's flake ledger is folded in from
-`flakeLedgerPath()` — override with `GSTACK_FLAKE_LEDGER`, the same env var the
-CI free lane sets before uploading the ledger as the `flake-ledger` artifact). Census integrity is
+turns that history into per-case pass rates
+(see "Pass-rate history" below; free-suite flakes are a separate record, see
+[Flake ledger](#flake-ledger)). Census integrity is
 enforced from the free suite: every `E2E_TOUCHFILES` / `LLM_JUDGE_TOUCHFILES`
 key must name a living paid test (`test/touchfiles.test.ts`'s reverse
 invariant), and `git show <sha>:path` fixtures are banned — vendor the bytes
@@ -291,7 +296,8 @@ are not collector results and do not establish that an unfinished test passed.
 retains the broad census; no case IDs or tier assignments are removed. The plan
 records both E2E and judge selections and lists deferred coverage. Executors
 receive those selections separately and the report checks actual executed case
-counts. Unknown source dependencies restore the broad gate; unmapped prompts
+counts. Unknown source dependencies restore the broad gate (see
+[PR paid lane fallback](#pr-paid-lane-fallback)); unmapped prompts
 without registered coverage require full validation. Known broad-only prompt
 changes are explicitly deferred, not counted as PR passes. Weekly/manual runs of
 `evals-periodic.yml` execute both complete censuses fresh; manual `evals.yml`
@@ -342,10 +348,22 @@ into the fullest slice whose estimated wall on J FIFO workers stays within S
 seconds, else a new slice; a shard with no recorded wall weighs the whole budget
 (its own runner), a shard longer than the budget runs alone, and overlays keep
 one final one-at-a-time slice. The manifest's `plan` records each slice estimate
-and `ciTimeoutMinutes` (every slice's supervised worst case plus 20 minutes
-setup); CI derives the matrix (`[range(1; .sliceCount + 1)]`) and job timeout
-from it, and executors refuse an `EVALS_JOBS` other than the planned J and run
-their shards longest first. `--slices K` keeps the supervised round-robin
+and its own CI job ceiling in `sliceCiTimeoutMinutes`: max(2 × slice budget, the
+slice's longest shard supervised wall, the serialized overlay envelope) + 20
+minutes setup (`CI_SETUP_ALLOWANCE_MINUTES`); `ciTimeoutMinutes` is the largest of
+them. CI derives the matrix (`[range(1; .sliceCount + 1)]`) from the manifest and
+indexes each slice's ceiling as its job timeout
+(`fromJSON(needs.plan-slices.outputs.slice_timeouts)[matrix.slice]`). Executors
+refuse an `EVALS_JOBS` other than the planned J and run their shards longest first.
+
+Each executor's first step records its job start (`GSTACK_SLICE_JOB_STARTED_AT`).
+The slice deadline is that start + the slice ceiling − a 5-minute upload reserve:
+after it the executor starts no more shards. A shard that never started reports
+`not_run` (INFRA, `never-started`); a shard still running is killed and reports
+`hung` (TIMEOUT, `timed-out`). The executor checkpoints `slice-N.json` after every
+shard start and finish, so a job killed before its final write reports from the
+checkpoint (`slice N/M ended before its final result …: TIMEOUT`), never as a
+missing slice. `--slices K` keeps the supervised round-robin
 baseline re-packed by recorded times for local runs. Durations are recorded per
 tier (a file's gate and periodic cases differ); refresh one tier from a
 downloaded report directory with `--report <dir> --write-durations`. Under `EVALS_ALL` the hollow-shard guard marks exit-0 shards with
@@ -365,7 +383,22 @@ report and tracking issue, and nothing requires it. evals-periodic.yml runs ALL
 periodic-tier files weekly (the coverage contract) minus the reasoned
 exclusions in `test/helpers/periodic-exclude-data.ts` (reason + tracking
 required per entry; removal re-activates the file), plus a weekly
-`EVALS_ALL` gate census, plus a tracking-issue UPSERT on red weeks. The CI
+`EVALS_ALL` gate census. A red census writes one report on every ref, to the
+step summary and the `census-report-a<attempt>` artifact: the run's branch, sha
+and event, both lanes' summaries, every pass-rate alarm line, the red ledger
+and session headroom (`eval:pass-rates --reds` / `--headroom --runs 10 --branch
+<ref>`), the all-green estimate and a link to the red-census guide, with
+report-derived text passed through `scripts/lib/published-text.ts`. Only a run
+on `refs/heads/main` comments on (or opens) the one tracking issue and closes it
+on the next green run; the marathon lane does the same with its own issue and
+`marathon-report-a<attempt>` artifact. `test/evals-tracking-issue.test.ts`
+pins the main-only guard and runs both report scripts. The host-run Codex job
+also carries the live Codex multi-block case (`codex-multiblock-live`: `./setup
+--host codex` from the job's checkout into a fresh `CODEX_HOME`, the router in
+`codex debug prompt-input`, and a later /learn block rooted by its own
+prelude), and the periodic lane runs the design default-model smoke
+(`design-model-smoke`), a visible SKIPPED with no coverage credit when
+`OPENAI_API_KEY` is absent. The CI
 image pins the claude CLI to an exact version (`.github/docker/Dockerfile.ci`,
 enforced by `test/ci-image-cli-pin.test.ts` — bumps ride PRs that run the PTY
 gate), and every eval-store run records `claude --version`, resolved once in
@@ -373,8 +406,11 @@ the runner parent and handed to shard children as `GSTACK_CLAUDE_CLI_VERSION`
 (never spawned on a test thread), so a TUI-drift flake hunt is a grep, not
 archaeology.
 
-**Eval verdict policy** (`EVAL_POLICY` version 1 in
-`test/helpers/periodic-exclude-data.ts`, pre-registered 2026-09-29). Paid evals
+<a id="eval-verdict-policy"></a>
+**Eval verdict policy** (`EVAL_POLICY` version 2 in
+`test/helpers/periodic-exclude-data.ts`; version 1 pre-registered 2026-09-29,
+version 2 approved 2026-10-04 with the decision memo in
+[test-audit-2026-10.md](test-audit-2026-10.md)). Paid evals
 never retry. Each live case has exactly one kind in `E2E_KINDS`
 (`test/helpers/touchfiles-data.ts`; `test/eval-kinds.test.ts` enforces coverage),
 and the kind fixes its trials before the run:
@@ -391,12 +427,20 @@ and the kind fixes its trials before the run:
 - `judge`: an LLM judge scoring a fixed input. `judgePanel()`
   (`test/helpers/llm-judge.ts`) draws 3 samples of the same prompt concurrently
   inside the unchanged `JUDGE_MS`; numeric dimensions gate on the per-dimension
-  mean against the unchanged threshold (no dimension compensates for another),
-  booleans on a strict majority. A sample that errors (refusal, truncation,
+  median of exactly 3 samples, so at least 2 of 3 must meet the unchanged
+  threshold (`judgePanelMedian()`; no dimension compensates for another, and
+  any other sample count fails closed), booleans on a strict majority. Panel
+  logs show every sample and the mean for information; the median is the gate
+  (EVAL_POLICY v3, approved 2026-10-06). A sample that errors (refusal, truncation,
   non-JSON, a malformed field) fails the panel and is never resampled; a
   refusal counts as an unscored panel only when every sample refused.
   `callJudge`'s 429 backoff happens before any model output and is transport,
   not a verdict retry. The workflow-judge cache stores whole panels only.
+  The `rule` case auq-matrix uses the same panel inside its one execution: each
+  skill's single native capture has its recommendation substance scored by 3
+  judge samples, gated on their median against the unchanged minimum of 4, and a
+  failed sample fails the panel without resampling (approved 2026-10-04 for
+  censuses after the change).
 
 `panelVerdict()` (`test/helpers/eval-store.ts`) is the single verdict
 function the report, `collector-outcomes.json`, the PR comment and pass-rates
@@ -414,6 +458,154 @@ reported. Changing any `EVAL_POLICY` constant after seeing census results needs
 Garry's re-approval, a `version` bump and a fresh census;
 `test/periodic-exclude-policy.test.ts` pins the approved values.
 
+### Ship measure
+
+**Measure-then-fix: diagnostic trials are not verdicts** (`scripts/ship-measure.ts`).
+When a paid case goes red during /ship, /ship measures that case alone before it
+reruns the full gate: classify the red line, measure, fix at the cause,
+re-measure, then run the gate once (`ship/sections/measure.md`). The repeated
+runs are **diagnostic measurement, not verdict retries**, so they fit the
+no-retry rule above: they never change the recorded verdict of the run that
+failed, every trial and measurement file says `"label": "diagnostic"` and
+`"verdict": null`, and they are written under `.context/ship-measure/<case>/<round>/t<NN>/`
+(one directory per baseline, repair round and trial; an existing round is never
+overwritten). The runner refuses an output directory inside the project eval
+dir, so pass-rate history and CI uploads never read a diagnostic trial as a
+verdict. The lane verdict still comes only from the full gate run. Each trial
+runs through gstack's single-case runner (`scripts/test-paid-shards.ts --tier
+<tier> --case <id> --trials 1`; a standalone judge id runs its file with only
+that judge selected and needs its own passing record) or through the project's
+documented single-case command (`--command '<command> {case}'`, split on
+whitespace, no shell).
+
+Counts per kind come from gstack config (`bin/gstack-config`), so a measurement
+is pre-registered before it runs. Each measurement is decided by the
+measurement bar (`scripts/lib/measure-bar.ts`, approved 2026-10-06), applied in
+this order:
+
+| Kind | Trials per batch (config key, default) | MEETS | MEETS-qualified | EXTEND, then the pooled decision |
+|---|---|---|---|---|
+| `rule` | `ship_measure_rule_trials`, 10 | at least 9 of 10 | 8 of 10, every red qualifying | 7 of 10, or 8 that does not qualify: 10 more trials, then 18 of 20 strict or 16 of 20 qualified |
+| `behavior` | `ship_measure_behavior_panels`, 4 panels of 3 (12 trials) | at least 11 of 12 | 10 of 12, every red qualifying | 9 of 12, or 10 that does not qualify: 12 more trials, then 22 of 24 strict or 20 of 24 qualified |
+| `judge` | `ship_measure_judge_outputs`, 10 outputs | at least 9 of 10 outputs | 8 of 10, every red qualifying | 7 of 10, or 8 that does not qualify: 10 more outputs, then 18 of 20 or 16 of 20 qualified |
+
+A judge output passes when the median of its 3 samples passes (EVAL_POLICY v3,
+so at least 2 of 3). Everything below the EXTEND row is **BELOW**: a fix round.
+
+- **Qualifying reds** (the only reds MEETS-qualified accepts): `provider`, which
+  is mechanical: the trial's own `failure_cause` is `api_error`, or
+  `pre_turn_infra` whose evidence names a 429 or 5xx, a rate limit, an overload
+  or a connection reset (`ship-measure classify` refuses `provider` otherwise);
+  `judge-noise`, a judge sample at the threshold; and `model-miss`, which counts
+  only with a `path:line` citation of the deviation. Never qualifying: a timeout
+  or hang (`session_timeout`, `observer_timeout` and `provider_stall` are
+  classified so without review and cannot be reclassified into a qualifying
+  class), a regression, a contract violation (BELOW at any count), or any red
+  with a known fixable cause (`fixable`): each goes to a fix round.
+- **needs-classify.** A batch below the strict bar but at or above the EXTEND
+  floor, with a failed trial nobody classified, returns needs-classify (exit 5)
+  with the trials to classify. `ship-measure classify --trials 2,5 --class <c>
+  --evidence <text>` appends one immutable record per trial to the round's
+  `classifications.jsonl` (a later record supersedes an earlier one) and
+  re-decides. `unclassified` records "reviewed, no route"; it allows EXTEND but
+  never qualifies.
+- **EXTEND** (exit 6). `ship-measure extend` runs N more trials only when the
+  round decided EXTEND and only on identical inputs: the measurement's identity
+  (the working tree's frozen git tree, kind, trials, runner, Claude CLI, model,
+  CI image `GSTACK_CI_IMAGE`, Bun, EVAL_POLICY and HARNESS_VERSION) must match
+  field for field, and the refusal names the field that changed. The pooled 2N
+  is decided once and is never extended again: there is no third batch.
+- **Void batches.** A batch where more than 30% of trials fail with affirmative
+  provider or transport evidence is void (an outage, not a measurement); the
+  runner redispatches it once, both batches are reported, and a second void
+  batch stops with a named red. A crash or module-load failure without provider
+  evidence never voids a batch.
+
+`ship_measure_budget_usd` (default 25) is an estimated admission budget per red
+case across the baseline, an extension or redispatch, every repair round and
+judge scoring: before each
+batch the runner reserves the estimated cost of every concurrent trial and
+admits only what fits beside what was already spent, then reconciles actual
+costs after the batch. When the next trial no longer fits it stops with a named
+red. A case with no per-trial estimate, or one above
+`ship_measure_ask_per_trial_usd` (default 2), asks once before any trial runs;
+with no estimate it then runs one calibration trial alone. `ship_measure_max_rounds`
+(default 3) limits repair rounds; an extension or a redispatch is not a round.
+`ship-measure report` prints the PR-body table: each measurement as "observed
+k/n" (after the named fix for a repair round, with every batch), the bar, the
+decision, estimated and actual spend, and qualified MEETS under their own
+heading. A red the user declares infrastructure is
+recorded with `ship-measure skip` and shows as `unmeasured`, never as a pass. A
+case is called fixed only with a named causal change and every failure in the
+closing measurement explained; the weekly census, not the loop, reports
+long-term reliability.
+
+The same rule covers a failed free-suite shard: `ship-measure free` reruns that
+shard's exact file list 10 times (rerun 1 alone as the baseline, the rest in
+parallel at `max(1, floor(cores / shard concurrency))`), each with its own HOME,
+state root and flake ledger and with `GSTACK_FREE_RETRY_FLAKY=0`, under a
+10-minute wall cap that reports a partial count. Browse daemons in a rerun pick
+free random ports, as in the normal suite. `ship_rerun_backend=ubicloud` runs the
+reruns on one Ubicloud VM through `bun run test:ubicloud --diagnostic`, which
+also sets the flaky retry off. The seeded paid case `ship-measure-seeded-flake`
+(periodic, `behavior`) drives /ship through this loop against a stub eval
+command that fails trial slots 2, 5 and 9 until its list is sorted. The weekly
+[off-ship sweep](#ship-measure-sweep) measures main's flakiest gate cases with
+the same runner and bar.
+
+<a id="failure-causes"></a>
+**Failure causes and details** (diagnostic only; verdicts unchanged under v1).
+Every failed trial record keeps `failure_class` (`assertion`, `contract`,
+`timeout`, `infra`: the field verdicts, INFRA re-dispatch and pass rates read)
+and its 300-character `error` exactly as before. `failureCauseOf()`
+(`test/helpers/eval-store.ts`, called by both record builders, including the
+JUnit census for PTY and JUnit-only cases) adds an optional `failure_cause`
+with a one-line `failure_cause_evidence`. It never changes `failure_class`.
+The highest-precedence cause with evidence wins:
+
+| `failure_cause` | Recorded when | First step |
+|---|---|---|
+| `contract` | `expectContract()` stamped a contract violation | fix the product; a violation fails a behavior panel outright |
+| `pre_turn_infra` | the trial failed before the first model turn (`failure_class: 'infra'`) | check the runner and API status; an all-INFRA census is re-dispatched once |
+| `api_error` | a session ended on an API error (for PTY, the `API Error:` panel on an idle turn) or the runner's exit reason was `error_api` | read the evidence line; a provider outage is a named red |
+| `refusal` | the structured stop reason was a refusal (phrases only as a last resort; quoted refusal text in a tool result does not count) | check whether the fixture prompt invites the refusal |
+| `provider_stall` | a session that streamed partial messages saw no event of any kind, thinking deltas included, for `STALL_WINDOW_MS` (120 s) while a model request was in flight and no tool, permission prompt, hook or subagent was outstanding; sessions without partial messages are never stalls | read the session ledger row; still a failed trial under v1 |
+| `session_timeout` | a runner's armed session timeout fired | `eval:pass-rates --headroom`; cut work, never raise the budget |
+| `observer_timeout` | the test's observer gave up waiting for an outcome (`outcome=timeout`) | read the transcript tail: a missed detector or a product that never answered |
+| `assertion` | a check failed after the session ran (`session completed; check failed` when it ended normally) | the Expected/Received values or judge dimensions |
+| `unknown` | the trial failed with no evidence for any cause above | inspect the shard directory |
+
+A detector, harness or product fault is a human diagnosis, never a cause.
+Readers before this field accept the new records (a frozen v1 reader runs over
+them in `test/eval-store.test.ts`); an unknown cause from a newer gstack is
+rejected with `unknown failure_cause "<x>" (written by a newer gstack; update
+this checkout to read it)`.
+
+`failure_detail` carries the values `error` cannot hold: a failed Bun matcher's
+`{expected, received}`, or for a judge one `{dimension, mean, threshold,
+samples, rationale}` entry per failing dimension (since EVAL_POLICY v3 `mean`
+holds the panel's gating median), each part capped at 200
+characters. `sessions[]` (at most 32) summarizes the trial's session-ledger
+rows. `cost_known: false` marks a record or trial whose harness captured no
+billing: PTY and Codex sessions never bill, and an SDK session bills only with a
+terminal `total_cost_usd`. An absent field means known. Census and marathon
+cost lines print the known sum and `N of M trial(s) cost unknown`, never a bare
+total over unknowns.
+
+<a id="session-ledger"></a>
+**Session ledger.** Every runner (session-runner, the Agent SDK runner
+including `runSharedInteractive`, the PTY session and `runRecordedCodexEval`)
+appends one best-effort line per armed session to
+`$GSTACK_EVAL_DIR/session-ledger.jsonl` (`test/helpers/session-ledger.ts`):
+a stable key `<runner>:<label>#n`, the exact `budget_ms` it armed, monotonic
+`elapsed_ms`, the `end` reason, sanitized evidence, `billed`, and a compact
+liveness summary (longest in-request silence, the last event kind, any tool open
+at the end). `claude -p` sessions stream partial messages for this summary;
+transcripts keep their shape and size (full stream diagnostics only with
+`publicStreamDiagnostics`). A failed ledger write never fails a trial; a trial
+without ledger rows has no `sessions` and its headroom is `unknown`, never
+scored. The ledger rides in each slice artifact beside the shard results.
+
 **Quarantine** (`CASE_QUARANTINE`, same file). An entry needs: a per-trial rate
 below 95% over at least 10 post-policy trials of the case's current input
 identity (pre-policy backfill may justify only an initial entry, labeled as
@@ -429,14 +621,21 @@ least 97% over at least 10 trials) without being removed, when an entry is 8
 weekly runs old, or when a tier is over its cap.
 
 **Pass-rate history** (`bun run eval:pass-rates`, `scripts/eval-flake-rank.ts`).
-It reads the `trial-outcomes` artifact of the last N completed
-`evals-periodic.yml` runs on the current branch and `main` (flags: `--case`,
-`--runs N`, `--branch`, `--dir`, `--backfill`, `--json`, `--gate`) and prints
+It reads the `trial-outcomes` artifact of the last N completed weekly
+`evals-periodic.yml` runs, meaning scheduled runs on `main` plus `main`
+dispatches, plus completed branch census runs in the same window (flags:
+`--case`, `--runs N`, `--branch` to inspect one branch, `--dir`, `--backfill`,
+`--json`, `--gate`, and the views `--headroom`, `--reds`,
+`--run <id>`; `--help` works offline, and an unknown flag or case id exits 2
+before anything is fetched; every view prints its `scope:` line). A branch trial counts only toward a series `main` has also
+run (same case-owned bytes, `HARNESS_VERSION`, model and CLI); a branch never
+starts or becomes a case's current series, and weeks for quarantine expiry
+count `main` runs only. It prints
 per-case per-trial pass rates with 95% Wilson intervals. A series is one case
-under one input identity, the hash of its own touchfiles minus
-`GLOBAL_TOUCHFILES` (harness edits do not restart it), per model, Claude CLI
-version and policy version; a change starts a new series and older ones stay
-visible. Labels: INCONCLUSIVE below 10 trials, BROKEN when the latest run is
+under one input identity ([Harness version](#harness-version)), per model,
+Claude CLI version and policy version
+([Pass-rate policy versions](#pass-rate-policy-versions)); a change starts a
+new series and older ones stay visible. Labels: INCONCLUSIVE below 10 trials, BROKEN when the latest run is
 0/n after a prior interval at or above 95%, FLAKY when failures leave the
 interval straddling 95%, FAILING when the whole interval is below it, PASSING
 otherwise. `--backfill` imports legacy slice artifacts as pre-policy trials
@@ -447,8 +646,26 @@ only, when a non-quarantined blocking case meets the entry rule (proposing an
 entry), when a `rule` case does (rule case behaving like behavior: fix or
 reclassify), when a blocking case's current identity is significantly below its
 previous one (one-sided Fisher exact, α = 0.05, at least 6 trials each side,
-Holm-controlled across the cases tested), and on the quarantine rules above.
-History that cannot be fetched fails the gate closed.
+Holm-controlled across the cases tested), on the quarantine rules above, and
+with a `[headroom]` alarm when a case's slowest session ran above
+`HEADROOM_FAIL` (85%) of the budget it armed. History that cannot be fetched
+fails the gate closed.
+
+The views (`scripts/lib/eval-history.ts`): `--headroom` lists each case's
+slowest armed session against its budget (warn above `HEADROOM_WARN`, 75%;
+`insufficient` below 3 samples; timed-out samples marked censored; `unknown`
+without a session ledger, with the case wall beside it as a labelled upper
+bound) and the census critical path from the slice job timings. `--reds` lists
+verdict reds per census lane by failure class and cause, pooled and shrunk
+per-case red rates, and the all-green probability Π(1 − p_i) over the latest
+census's cases with an interval, labelled an approximation because verdicts are
+not proven independent. `--run <id>` is one census's triage: each red with its
+values and history, and the transcript evidence it downloads from only the
+slices its reds name (a slice artifact over 64 MB is reported, not fetched).
+The three thresholds `HEADROOM_WARN`, `HEADROOM_FAIL` and `STALL_WINDOW_MS`
+live in `test/helpers/eval-budgets.ts`, outside `EVAL_POLICY`; a slow case gets
+less work, never a larger budget. The red-census walkthrough is
+[docs/evals/census-red.md](evals/census-red.md).
 
 **The arithmetic.** With per-trial pass rate p, the chance a single case goes
 red (a false red while the product works, the catch rate once it has
@@ -483,7 +700,8 @@ and judge verdicts at p_rule:
 The rule term dominates: a green lane on a working product needs rule cases to
 be near-deterministic (0.999), which is why failing detectors are converted to
 outcome checks and product defects are fixed or named, and why each census
-reports its expected lane false-red from the measured rates.
+reports its all-green probability from the measured rates (`eval:pass-rates
+--reds`, carried into the census report).
 
 **Timeout policy.** Paid tests use the tiers in
 `test/helpers/eval-budgets.ts` (JUDGE/CAPTURE/CAPTURE_LONG/PTY/PTY_LONG);
@@ -530,19 +748,20 @@ its source and policy identifier. Custom drivers must resolve each job instead
 of passing their ordinary 1800-second default as an explicit cap;
 their outer controller/detach wall must also cover the allocated work and cleanup.
 The paid census counts are printed by `--list` for each tier.
-`eval:bg:pr` and `eval:bg:periodic` have 92820/67380-second outer caps, above their recomputed floors (PR fallback 78,425 s, periodic 33,821 s including the trial shards); the PR
-wrapper covers a full-gate fallback at its default two workers. The broad gate
-wrapper reserves 49320 seconds (floor 21,725 s), and release reserves 116700 seconds for both
-tiers; free tests recompute each floor from the live shard census, case shards
-included. Legacy monolithic
-`eval:bg`/`eval:bg:all` retain their shorter 5400/7200-second caps; use the
-sharded periodic path for complete coverage.
+`eval:bg:<pr|gate|periodic|release>` runs `scripts/eval-bg.ts`. On the local
+backend its outer cap is ceil(1.5 × planned serial seconds / `EVALS_JOBS`) + 20
+minutes, at most 4 hours, computed from `scripts/paid-test-durations.json` for
+the lane's current plan (`--timeout SECS` overrides). On the dispatch backend the
+CI job ceilings above bound the run, and the local follower stops after 4 hours.
+`test/eval-detach-timeout-floor.test.ts` pins the cap formula, the 4-hour
+ceiling, the backend choice, the sentinel on both backends, the conclusion
+mapping and dispatch dedupe.
 
-CI plans with `--slice-budget 540 --jobs 2` for the PR gate, the periodic census
+CI plans with `--slice-budget 420 --jobs 2` for the PR gate, the periodic census
 and the weekly gate census (the gate census also `--skip-judges`), and
 `--slice-budget 1 --jobs 1` (one file per runner) for marathon. The live plans
-must fit their workflow's `max-parallel` so every slice starts at once, and
-`ciTimeoutMinutes` must stay within 360; `test/evals-workflow-wiring.test.ts`
+must fit their workflow's `max-parallel` so every slice starts at once, and every
+per-slice ceiling must stay within 360 minutes; `test/evals-workflow-wiring.test.ts`
 recomputes both from the complete census. Reconciliation rejects missing,
 duplicated or misplaced registered work, absent budget records, case shards that
 did not execute exactly their case, and reused results outside the PR profile.
@@ -588,7 +807,77 @@ two anchors: every binary and source set flips it, Windows `.exe` suffixes).
 against a temp `GSTACK_INSTALL_DIR` / `GSTACK_SKILLS_DIR`, and
 `test/hook-scripts.test.ts` runs the real `careful/bin/check-careful.sh` and
 `freeze/bin/check-freeze.sh` with JSON payloads on stdin (including the
-`GSTACK_HOME` state-root parity against `bin/gstack-paths`).
+`GSTACK_HOME` state-root parity against `bin/gstack-paths`, PowerShell tool and
+NotebookEdit payloads); it is named Windows coverage in the curated
+`windows-free-tests` lane.
+
+### Ship measure sweep
+
+**Weekly off-ship qualification sweep** (`ship-measure sweep`,
+`scripts/ship-measure-sweep.ts`, `.github/workflows/eval-sweep.yml`; approved
+2026-10-06). With about 130 gate verdicts, an all-green gate is unlikely even
+when every case is healthy (26.8% at 99% per verdict), so flaky cases are
+measured on main before any ship hits them. The sweep reads `eval:pass-rates`
+history (`evals-periodic.yml` on main plus pooled branch census runs), takes the
+latest gate census, and ranks every live, non-quarantined gate case with a
+failed trial or red verdict by its cost to the all-green probability
+Π(1 − p_i) (the shrunk red-verdict rate from `--reds`; ties go to the lower
+per-trial pass rate). It measures the top K (`ship_measure_sweep_cases`,
+default 5; `--k`) at their kind's N on the checked-out head with /ship's runner
+and bar, in rank order. The report (`sweep-report.md` and `.json` under
+`.context/ship-measure/sweep-<time>/`, rewritten after every case) has one row
+per case (history rate, measured count, decision, estimated and actual cost,
+captures path) and the predicted gate all-green probability before (history)
+and after (each measured case's measured failure fraction, shrunk toward the
+pooled rate and converted to panel red risk for behavior cases). Spend is
+capped by `ship_measure_sweep_budget_usd` (default $150 per 7 days, `--cap-usd`)
+through the same admission budget: the cap is shared by the sweep's cases and
+every non-dry-run sweep report of the last 7 days under `--prior` and the local
+sweep root, so a dispatch after the weekly run spends only what is left. When
+the cap is exhausted the sweep stops and lists every skipped case. `--dry-run`
+plans and estimates at $0; `--history-dir` reads local `trial-outcomes`
+directories; `--command '<cmd> {case}'` swaps in another single-case runner.
+History that cannot be read fails closed with nothing measured.
+
+The workflow runs Mondays at 12:00 UTC (after the 06:00 periodic census) and on
+`workflow_dispatch` (inputs `k`, `cap_usd`, `dry_run`), in the CI image with the
+paid-eval secrets setup the census uses. It downloads the last 7 days of sweep
+reports first, uploads the report and captures as the `ship-measure-sweep`
+artifact, and writes the job summary. It holds `contents: read`, never pushes
+or opens a pull request, and runs one sweep at a time repository-wide
+(concurrency group `eval-sweep`, not cancelled) so two runs never spend the
+same weekly cap. Fixing is done by an agent from the report, through /ship's
+measure loop. Sweep trials are diagnostic like every ship-measure trial: they
+never become verdicts and never enter EVAL_POLICY pooling or series history.
+
+### Pass-rate policy versions
+
+Readers score only trials recorded under their own `EVAL_POLICY.version`.
+Trials from an older policy are shown display-only. Trials from a newer policy
+are ignored with a printed count ("ignored N trial(s) recorded under a policy
+newer than vX"). When you see that line, run pass-rates from a checkout at or
+after the commit that bumped the version. The supported rollback of a policy
+change is reverting its writer commit; the reader-compatibility commit before it
+stays.
+
+### Harness version
+
+Under `EVAL_POLICY` v2 a case's series identity is the bytes the case owns (its
+paid test file, its fixtures and its skills' prompt files, including the
+generated SKILL.md) plus `HARNESS_VERSION`, keyed with model, Claude CLI version
+and policy version (`scripts/eval-trial-series.ts`). Each trial also records the
+full consumed-input fingerprint as provenance. `scripts/harness-version.json`
+pins every shared-harness file (`GLOBAL_TOUCHFILES` plus the session runners, the
+PTY harness, the e2e gate and the LLM judge) by blob hash. When
+`test/harness-version.test.ts` fails, run one of:
+
+```bash
+bun run scripts/bump-harness-version.ts --non-behavioral "<why no verdict can change>"  # no series reset
+bun run scripts/bump-harness-version.ts --bump "<what behavior changed>"                # new series for every case
+```
+
+On a merge conflict in the manifest, take the higher version, then rerun the
+script.
 
 ## Ubicloud VMs (`bun run test:ubicloud`)
 
@@ -605,11 +894,13 @@ checkout to it: tracked files, untracked files that are not ignored, and
 `.git`, so uncommitted edits are tested. It then runs
 `scripts/ubicloud/setup-free-suite.sh`, which mirrors the `free-suite` CI job
 (same Bun pin, Playwright Chromium with its setuid sandbox helper, Xvfb,
-poppler, emoji fonts, generated host outputs, gate binaries, and the CSO
-helper), and runs `xvfb-run -a bun run test:free` with `GSTACK_EXPECT_BINARIES=1`
+poppler, emoji fonts, zsh for the bash+zsh portability arms (#2669), generated
+host outputs, gate binaries, and the CSO helper), and runs `xvfb-run -a bun run test:free` with `GSTACK_EXPECT_BINARIES=1`
 and `GSTACK_FREE_RETRY_FLAKY=1`. Shard logs are copied to
 `.context/ubicloud/<timestamp>/`, and the VM is destroyed on every exit path.
-The exit status is the suite's.
+The exit status is the suite's. `--diagnostic` instead runs /ship's free-shard
+measurement (`scripts/ship-measure.ts free`, see [ship-measure](#ship-measure))
+with `GSTACK_FREE_RETRY_FLAKY=0`.
 
 A stock Ubuntu 24.04 VM differs from a GitHub-hosted runner in three ways that
 the scripts correct: the login umask is `002` (group-writable directories fail
@@ -617,11 +908,39 @@ the CSO private-state checks), AppArmor blocks the unprivileged user
 namespaces Chromium's sandbox needs, and `clang` and `python3-venv` are absent
 (required by the Dia readiness and Python runner tests).
 
-VMs are named `ubirun-<epoch>-<hex>`. Every new VM first destroys `ubirun-*`
-VMs older than `UBI_GC_HOURS` (default 12), so an interrupted client cannot
-leak one for long. For other commands, use the runner directly:
-`scripts/ubicloud/ubi-runner.sh run --setup <script> -- '<command>'`, or its
-`up` / `ssh` / `sync` / `pull` / `down` steps (`--help` lists them).
+VMs are named `ubirun-<owner>-<epoch>-<hex>`; `<owner>` is `UBI_OWNER` (set it
+to the thread id on a Capy machine), else a stable per-machine id. Every exit
+path destroys the client's own VM (`trap` on EXIT, INT, TERM, HUP and QUIT), and
+`down` fails loudly (`FAILED to destroy <location>/<name> (HTTP <code>)`) unless
+the VM is confirmed gone. `list --mine` shows this owner's VMs, `usage` the
+project's, and `records` the VM-id scratch file (`UBI_VM_RECORD`, default
+`~/.capy/work/ubi-runner/vms.tsv`, else `<state root>/vms.tsv`): every VM is
+recorded there before the create call and forgotten only after a confirmed
+destroy, so a killed runner leaves a name to clean up. Nothing sweeps stale VMs
+by default, because the project quota is shared with other agents' runners; set
+`UBI_GC_HOURS` to a positive number (or run `gc HOURS`; `gc 0` is a no-op) to
+sweep only this owner's VMs older than that. For other commands, use the runner
+directly: `scripts/ubicloud/ubi-runner.sh run --setup <script> -- '<command>'`,
+or its `up` / `ssh` / `sync` / `pull` / `down` steps (`--help` lists them).
+
+Under 8 cores (`gstack-doctor`'s `cores` row says so), run the full unit and
+E2E tiers on a remote gate: `gstack-config set test_backend ubicloud` records
+the choice and the row names the runner. Resume checklist after a wake or a
+machine swap, in this order:
+
+1. `scripts/ubicloud/ubi-runner.sh records` and `list --mine`: a VM listed in
+   the record but absent from the project is already gone (forget it); a VM
+   in the project but not in the record belongs to another owner, leave it.
+2. Watched background operations: a runner started under `gstack-detach` keeps
+   its `### gstack-detach EXIT=<code> ###` sentinel in its log; a log without
+   the sentinel after the VM is gone is an interrupted run, not a pass.
+3. One before/after pair per machine: the measurement a change claims is taken
+   on the base and on the candidate from the same VM size and location, never
+   one side local and the other remote.
+4. Profiling very large imports (a whole-repo ingest, the full free suite under
+   a profiler) is warned about before it starts: it holds the VM past
+   `UBI_GC_HOURS` and the sentinel arrives hours later; name the expected
+   duration in the thread before launching.
 
 ## Cloud sandboxes (Vercel / Conductor cloud workspaces)
 
@@ -646,17 +965,19 @@ serially, downgrading a clean retry to a loud FLAKY-PASS (capped at 5 files so
 a broken tree can't masquerade as flaky). The required CI free lane and the
 Windows lane set the retry knob too, appending every flaky pass to the JSONL ledger it uploads
 (`GSTACK_FLAKE_LEDGER`) — a flaky pass never reds the lane, but it never
-disappears either.
+disappears either ([Flake ledger](#flake-ledger)).
 
 ## Test selection and tiers
 
 Moved verbatim from CLAUDE.md (#2096 size limit).
 
-**Diff-based test selection:** `test:evals` and `test:e2e` auto-select tests based
-on `git diff` against the base branch. Each test declares its file dependencies in
-`test/helpers/touchfiles.ts`. Changes to global touchfiles (session-runner, eval-store,
-touchfiles.ts itself) trigger all tests. Use `EVALS_ALL=1` or the `:all` script
-variants to force all tests. Run `eval:select` to preview which tests would run.
+**Diff-based test selection:** the sharded paid runner (`test:pr`, `eval:bg:pr`,
+`test:gate:sharded`) selects tests based on `git diff` against the base branch.
+Each test declares its file dependencies in `test/helpers/touchfiles.ts`. Changes
+to global touchfiles (session-runner, eval-store, touchfiles.ts itself) trigger
+all tests. Use `EVALS_ALL=1` to force all tests. Run `eval:select` to preview
+which tests would run; it applies the PR profile by default, and
+`--profile full` shows the plain touchfile selection. Commands by task: [CONTRIBUTING.md](../CONTRIBUTING.md#which-command-do-i-run).
 
 **Two-tier system:** Tests are classified as `gate` or `periodic` in `E2E_TIERS`
 (in `test/helpers/touchfiles.ts` — a facade over `touchfiles-data.ts` +
@@ -680,14 +1001,61 @@ in `bun test`): a `skill-e2e-*` file named in a touchfiles dep list whose
 suite. Files not named in any dep list are reported, not enforced — keep both
 in sync.
 
+### PR paid lane fallback
+
+PR selection (`scripts/test-pr-profile.ts`) classifies every changed file. A file
+mapped by a paid case's touchfiles selects that case. These files are exempt and
+select nothing: docs, any non-paid `*.test.ts(x)`, `FREE_ONLY_PR_FILES` (the
+free and paid duration seeds, `scripts/ubicloud/**`, every workflow that runs no
+paid evals, and free-only tools), and the fixtures in `FREE_FIXTURES`
+(`test/helpers/free-fixtures-data.ts`, each fixture with its free consumers).
+`PAID_WORKFLOW_FILES` (`evals.yml`, `evals-periodic.yml`, `evals-marathon.yml`)
+and any other unknown file restore the full gate (`prCoverage.mode =
+full-fallback`). The job summary and PR comment list each file that caused a
+fallback with one of three labels:
+
+- **needs touchfile entry**: a paid test, helper or fixture no case maps; add it
+  to the owning case in `E2E_TOUCHFILES` (`test/helpers/touchfiles-data.ts`).
+- **add to FREE_ONLY_PR_FILES**: a file only free lanes read; add it to the list
+  in `scripts/test-pr-profile.ts` (or a fixture to `FREE_FIXTURES`).
+- **real unknown dependency**: shared code (bin/, lib/, resolvers, hosts, setup)
+  whose dependents are not mapped; the full gate is the correct result.
+
+`test/free-fixtures.test.ts` holds the inventory: each `test/fixtures/**` path
+belongs to a paid touchfile or `FREE_FIXTURES`, and each workflow to the paid or
+free-only list. Editing a paid test file runs its own gate cases on the PR when
+their Bun test is named by the case id; the file's other cases stay deferred with
+a reason that says to name the test by its case id.
+
+### PR receipts, recovery and debounce
+
+Passes and failures of single-trial shards are written as receipts at the
+execution boundary, so a cancelled run's finished work survives. The
+`recover-receipts` job runs `scripts/recover-receipts.ts` from the base ref with
+`actions: read`: it merges the receipts of at most 5 completed, cancelled
+`evals.yml` runs of the same PR (oldest first, negatives before passes, so a newer
+FAIL blocks an older PASS) and hands the store to `plan-slices`, which keeps
+`contents: read` only. Its `recovery.json` checkpoint never advances past an
+unresolved run. `plan-slices` turns reuse off when recovery degraded, the
+checkpoint is missing or a cancelled run is still unresolved; recovery itself
+never fails the run, and the job summary names the reason (rate limit with its
+reset time, `gh auth status`, the 60-second budget). The whole store is saved by
+`slices-report`.
+
+On a `synchronize` push, when another run for the same PR started in the last 15
+minutes, the debounce job waits 90 seconds before planning; a run that outlives
+the wait reports "superseded by <sha>". PR labels: `evals-no-debounce` skips the
+wait and `evals-fresh` turns receipt reuse off. Labels apply from the next push,
+because adding a label does not start `evals.yml`.
+
 ## Free suite runner, judge reuse and engine skips
 
 Moved verbatim from CLAUDE.md (#2096 size limit).
 
 `bun run test` routes through `scripts/test-free-shards.ts` (N concurrent
 shard processes, serial within each, packed by recorded per-file durations
-when `scripts/free-test-durations.json` exists — refresh occasionally with
-`bun run test:free --record-durations`; strict-output classification per
+when `scripts/free-test-durations.json` exists — refresh it with
+`bun run test:ubicloud --record-durations`; strict-output classification per
 shard: a shard without bun's terminal summary line FAILS — silent truncation
 cannot report green). `TREE_MUTATING` lists the files that still run in their
 own trailing serial shard (today only `test/bootstrap-retention.test.ts`, for
@@ -707,7 +1075,7 @@ runtime match; records preserve original provenance. The cookie workflow's custo
 input, the other 11 judge cases, dynamic agent tests, and local runs without
 scoped cache configuration stay fresh.
 Scheduled/manual full coverage and `test:release` always run fresh.
-See [testing policy](CONTRIBUTING.md#test-tiers) for commands and measured targets.
+See [testing policy](../CONTRIBUTING.md#test-tiers) for commands and measured targets.
 Anything that needs Aside
 itself (`test/skill-e2e-aside.test.ts`, the Aside qa/design E2E cases, the
 live render in `test/aside-render.test.ts`) runs only on a Mac with the Aside
@@ -736,6 +1104,105 @@ Fix a writer with `usePrivateStateRoot()` (`test/helpers/private-state-root.ts`)
 or a child HOME/GSTACK_HOME, and resolve product state paths at write time,
 never at import.
 
+### Flake ledger
+
+`GSTACK_FREE_RETRY_FLAKY=1` reruns a failing free test file once, serially. A
+clean retry turns the shard green as a flaky pass and appends an entry to that
+shard's flake ledger, uploaded as `flake-ledger-<shard>` (90-day retention). The
+Monday "Weekly test health" workflow (`bun run test:health --enforce`) reads
+main's ledgers through `scripts/lib/ci-history.ts` and fails when a file flakes
+in more than 5% of main free-tests runs over a window of at least 20 runs; a
+window thinner than 20 runs in the last 7 days widens to the newest 20 runs, and
+fewer than 20 runs is report-only. `bun run test:health flake-summary <dir>`
+prints a run's ledgers as a table. A flaky file is fixed at source; the retry
+never masks it. `bun run eval:pass-rates` lists only the local ledger
+(`flakeLedgerPath()`, overridden by `GSTACK_FLAKE_LEDGER`).
+
+The aggregate job of `free-tests.yml` downloads every `flake-ledger-*` artifact
+of the run and appends `bun run scripts/test-health-report.ts flake-summary <dir>`
+to its job summary. The Windows lane uploads `flake-ledger-windows-<shard>`.
+
+Free-suite flake rules:
+
+- Bun gives a child `stdio: 'pipe'` a unix socketpair. A test that must hold a
+  write blocked uses a FIFO the test never reads (`test/qa-evidence.test.ts`,
+  `test/qa-deadline.test.ts`), not a paused child stream: socket capacity follows
+  `net.core.{w,r}mem_default` and the parent's reader.
+- A test that rewrites CI provenance variables (`CI`, `GITHUB_*`, `CI_*`)
+  restores them. Free shards run many files in one process, and a later browse
+  daemon without `CI=true` launches Chromium sandboxed.
+- Handshakes with a runner wait for the runner's own observable effect (its
+  progress line, a coalesced read count), not for a fixture side file or a timer.
+
+### Free suite duration seed
+
+`scripts/free-test-durations.json` drives shard packing; files missing from it
+pack at the seed's 99th percentile. Acceptable seeds come from
+`bun run test:ubicloud --record-durations` (each file timed in its own child on a
+VM with the CI lane's environment) or a CI recording. A 4-core laptop or
+small-sandbox recording is not acceptable: browser and display tests skip or slow
+down there, so the seed misstates them.
+
+- `--ci-plan` warns in the job summary, with the refresh command, when more than 5
+  files are unseeded; it never fails a PR. `--ci-verify` lists shards that ran
+  longer than 1.5× their prediction and at least 30 seconds over.
+- The weekly test-health run fails its enforced `unseeded-free-files` check
+  ("stale seed: N unseeded file(s) > 5") when more than 5 free test files are
+  missing from the seed, so contributors without Ubicloud access learn within a
+  week that it needs a refresh.
+- `test/free-seed-ratchet.test.ts` (run with full history in `free-tests.yml`'s
+  `free-plan` job, `GSTACK_FREE_SEED_BASE=$(git merge-base HEAD origin/main)`)
+  fails when a seeded file over 60 seconds is missing from
+  `scripts/free-test-seed-allowlist.json`, when an allowlist entry is stale (gone,
+  or no longer over 60 seconds), or when an entry is added relative to the
+  merge-base copy without a `todo`. An annotated exception is
+  `{file, reason, todo}` and the test prints it. A merge-base without the
+  allowlist file counts as the first allowlist. Fix a failure by splitting the
+  file, then rerun `bun run test:ubicloud --record-durations`.
+
+### Windows free lane
+
+`windows-free-tests.yml` plans on Linux (`--windows-only --ci-plan --shards 6`),
+runs one strict serial shard per `windows-latest` job
+(`bun run test:windows --ci-run`), and verifies every shard receipt on Linux
+(`--windows-only --ci-verify`). Packing uses Windows-measured durations from
+`scripts/free-test-durations-windows.json`; refresh them with
+`gh workflow run windows-free-tests.yml --ref <branch> -f record_durations=true`,
+then download the `free-test-durations-windows` artifact and commit it.
+
+Curation lives in `scripts/lib/windows-curation.ts`. Every Windows plan and
+`--list` prints the curated count and the top exclusion reasons (also in the job
+summary). Files a probe proved safe despite a `/tmp` literal are force-included
+(`WINDOWS_PROBE_SAFE`). `test/windows-native-workflows.test.ts` holds
+`WINDOWS_CURATED_FLOOR`; when Windows-safe tests are deleted on purpose, lower it
+in the same PR with a reason.
+
+Native qualification campaigns (Windows cookie extraction, Windows launch
+diagnostics, Dia on macOS) run only on dispatch of `native-qualification.yml`:
+
+```bash
+gh workflow run native-qualification.yml --ref <branch> -f mode=<cookie-native|windows-native-diagnostics|dia-native|dia-launch-comparison|dia-gui-readiness>
+```
+
+### Real-setup install fixture
+
+Tests that run the real `setup` use `test/helpers/install-fixture.ts`. Each test
+file builds one read-only seed checkout and clones it per test with
+copy-on-write file copies (plain copy fallback), never hard links. Writes go
+through `put`, `setVersion` and the `fixture*Sync` helpers; files register
+`afterEach(cleanupFixtures)` and `afterAll(cleanupSeed)`.
+`test/install-fixture.test.ts` is the isolation tripwire: writes in one clone
+leave the seed and sibling clones unchanged.
+
+### Test-only timing knobs
+
+Defaults are the product's; tests shrink them instead of waiting real time:
+`GSTACK_RENDER_SLACK_MS` (`lib/aside-render.ts`, default 10000),
+`GSTACK_MEMORABLE_LOCK_TRIES` (`bin/gstack-memorable`, default 50 tries of 0.1 s),
+the `recordGraceMs` option of `test/helpers/office-hours-attempt.ts` (default
+5000) and the `timeoutMs` argument of `clearCookieTargetStorage(page, origin,
+timeoutMs)` (default 15000).
+
 ## Running evals as an agent: detach
 
 Moved verbatim from CLAUDE.md (#2096 size limit). The short rule stays in
@@ -745,36 +1212,51 @@ When **you (an agent/harness)** launch a long eval/benchmark run, run it through
 `bin/gstack-detach` — NEVER as a plain backgrounded Bash task. A plain background
 task lives in the harness's process group, so a SIGTERM ("polite quit") on a turn
 boundary, a stopped Monitor, or an interruption kills the run mid-flight (observed:
-`script "test:gate" was terminated by signal SIGTERM` ~40 min into a run). On macOS
+`script "test:gate" was terminated by signal SIGTERM` ~40 min into a run of the
+since-retired single-process runner). On macOS
 the run can also die to idle-sleep. `gstack-detach` fixes both: a fresh session
 (escapes the group SIGTERM) wrapped in `caffeinate -i` (blocks idle-sleep).
 
-- Use the `eval:bg*` scripts (`eval:bg`, `eval:bg:all`, `eval:bg:gate`,
-  `eval:bg:periodic`) — they wrap the eval command in `gstack-detach` with the
-  machine-wide `gstack-evals` lock (concurrent worktrees serialize instead of
-  saturating the shared model API), a per-tier watchdog, and a **run-scoped** log
-  under `~/.gstack-dev/eval-runs/` (no shared-`/tmp` collision). Each prints its
-  log path. `eval:bg:gate` / `eval:bg:periodic` run their tier through the
-  sharded paid runner (`scripts/test-paid-shards.ts`, also exposed as
-  `test:gate:sharded` / `test:periodic:sharded`): one Bun process per test
-  file, an external wall-clock timeout that kills the shard's process GROUP
-  (stray `claude`/`codex` grandchildren included), a per-shard
-  `GSTACK_EVAL_DIR=<evalDir>/shards/<slug>/` honored by the `EvalCollector`
-  constructor, and an aggregate that separates failed vs timed-out vs
-  never-started shards — the detach timeouts (the `--timeout` values on
-  package.json's `eval:bg:gate` / `eval:bg:periodic`;
-  floor enforced against the live shard census by
-  test/eval-detach-timeout-floor.test.ts)
-  are sized against worst-case shard wall clock. `EVALS_JOBS` sets the shard
-  process count (default 8); `EVALS_CONCURRENCY` is bun's --max-concurrency
-  WITHIN a shard (default 2) — they are deliberately separate knobs. `eval:list` / `eval:compare` /
-  `eval:summary` / `eval:flake-rank` read the shard dirs too. Or call
-  `gstack-detach [--lock NAME] [--timeout SECS] [--label LBL] --
-  <cmd>` directly for any long agent job. Export `ANTHROPIC_API_KEY` first (never
-  pass keys in argv).
+- Use `bun run eval:bg:<pr|gate|periodic|release>` (`scripts/eval-bg.ts`). It
+  prints `[eval-bg] backend=<dispatch|local> …` and `gstack-detach LOG <path>` and
+  returns at once. Both backends run under `gstack-detach` with the machine-wide
+  `gstack-evals` lock (concurrent worktrees serialize instead of saturating the
+  shared model API) and a **run-scoped** log under `~/.gstack-dev/eval-runs/`
+  whose first line names the backend, the run and the tested revision.
+  - **Dispatch** (default when HEAD is clean and equal to its pushed branch on
+    `garrytan/gstack`, checked with `gh api`, and `gh` can dispatch): `pr` and
+    `gate` dispatch `evals.yml` (`evals_all=false` with `base_ref`/`base_sha` for
+    `pr`, `evals_all=true` for `gate`), `periodic` dispatches `evals-periodic.yml`,
+    `release` dispatches both. Every dispatch passes `expected_sha` (the workflow
+    fails fast when the checked-out revision differs) and a `nonce` that appears
+    in the run name (`E2E Evals [eval-bg <nonce>]`), which is how the log finds
+    and follows its run. A queued, running or green dispatch with the same
+    revision and inputs is followed instead of dispatched again. Dispatched runs
+    are validation runs: fresh and never writing PR receipts, except that a `pr`
+    dispatch on a branch with an open same-repo PR passes `pr_receipts=<PR>` and
+    reads that PR's receipts read-only.
+  - **Local** (dirty tree, unpushed commits, a fork, no `gh`, or `--local` /
+    `GSTACK_EVAL_BG_MODE=local`): the sharded paid runner
+    (`scripts/test-paid-shards.ts`) on this machine, capped at
+    ceil(1.5 × planned serial seconds / `EVALS_JOBS`) + 20 minutes, at most 4 hours
+    (`--timeout SECS` overrides). One Bun process per test file, an external
+    wall-clock timeout that kills the shard's process GROUP (stray
+    `claude`/`codex` grandchildren included), a per-shard
+    `GSTACK_EVAL_DIR=<evalDir>/shards/<slug>/` honored by the `EvalCollector`
+    constructor, and an aggregate that separates failed vs timed-out vs
+    never-started shards. `EVALS_JOBS` sets the shard process count (default 8,
+    2 for `pr`); `EVALS_CONCURRENCY` is bun's --max-concurrency WITHIN a shard
+    (default 2). Export `ANTHROPIC_API_KEY` first (never pass keys in argv).
+  - `--dispatch` refuses with the fix ("commit and push, or rerun with --local")
+    instead of falling back.
+  `eval:list` / `eval:compare` / `eval:summary` / `eval:pass-rates` read the shard
+  dirs too. For any other long agent job, call
+  `gstack-detach [--lock NAME] [--timeout SECS] [--label LBL] -- <cmd>` directly.
 - Then **poll the printed logfile** with a death-aware watcher: break on the
-  guaranteed `### gstack-detach EXIT=<code> ###` sentinel (success AND failure are
-  both marked, so silence is never mistaken for success). The detached run survives
+  guaranteed `### gstack-detach EXIT=<code> ###` sentinel (0 passed, 1 failed,
+  130 cancelled, 2 other on both backends; silence is never mistaken for success).
+  `bun run scripts/eval-bg.ts status <log-or-run-id>` reconnects and prints
+  running, passed, failed, cancelled or incomplete (died without a sentinel). The detached run survives
   even if your watcher gets reaped, so re-checking the log always works. Keep
   checking until the sentinel appears or the user tells you to stop; a long run is
   expected, and a promise to check later is not a result. At each check, report
@@ -782,5 +1264,5 @@ the run can also die to idle-sleep. `gstack-detach` fixes both: a fresh session
 - Why the lock: a shared dev box with several Conductor worktrees will rate-limit
   the model API if two eval suites run at once (15-way concurrency each), which
   mass-times-out E2E tests. The lock makes the second run WAIT, not collide.
-- Humans running `bun run test:evals` foreground in their own terminal don't need
+- Humans running `bun run test:pr` foreground in their own terminal don't need
   this — Ctrl-C is intended there. Detachment is for agent-launched runs only.

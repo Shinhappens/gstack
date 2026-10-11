@@ -45,9 +45,26 @@ test('captured parent tree read is accepted without granting the captured child 
   expect(docsToolFailures(remote, fixture, [], true)).toEqual(['command outside declared docs observation interface']);
 });
 
+// Run 37166586458 slice 2 (dfaf154): the parent verified the prompt's claim that
+// .qa-state/ is Git-excluded. check-ignore is a declared Git read; composition is not.
+test('captured check-ignore read is declared, executes without changing the repository', () => {
+  const command = 'git check-ignore -v .qa-state';
+  expect(docsNativeInterface(fixture)).toContain('ls-tree, check-ignore, rev-parse');
+  expect(docsCommandAllowed(command, fixture)).toBe(true);
+  const before = repoSnapshot(fixture.repo);
+  const result = spawnSync('bash', ['-c', command], { cwd: fixture.repo, encoding: 'utf8', timeout: 10000 });
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain('.qa-state');
+  expect(docsToolFailures(nativeResult(command, result.stdout), fixture, [], true)).toEqual([]);
+  expect(repoSnapshot(fixture.repo)).toEqual(before);
+  for (const denied of ['git check-ignore -v .qa-state; ls', 'git check-ignore -v .qa-state > out.txt']) {
+    expect(docsCommandAllowed(denied, fixture)).toBe(false);
+  }
+});
+
 // ci-37165022930 eval-slices-2 ship-docsync-store: the docs child listed tracked files with git ls-tree -r HEAD.
 test('captured tracked-file listing is a declared read and leaves the repository unchanged', () => {
-  expect(docsNativeInterface(fixture)).toContain('ls-files, ls-tree, rev-parse');
+  expect(docsNativeInterface(fixture)).toContain('ls-files, ls-tree, check-ignore');
   const before = repoSnapshot(fixture.repo);
   const command = 'git ls-tree -r HEAD';
   expect(docsCommandAllowed(command, fixture)).toBe(true);
@@ -100,8 +117,13 @@ test.each([
 });
 
 test('harmless read wrappers do not fail a docs run', () => {
-  for (const command of ['git rev-parse HEAD || true', 'git rev-parse HEAD 2>/dev/null', 'git -c core.pager=cat show HEAD']) {
+  // Run 37170610789 slice 2 (feaa28d): the parent listed fixture directories with 2>&1.
+  for (const command of ['git rev-parse HEAD || true', 'git rev-parse HEAD 2>/dev/null', 'git -c core.pager=cat show HEAD',
+    'ls 2>&1', 'git status 2>&1']) {
     expect(docsToolFailures(nativeResult(command, 'successful tool acknowledgment', 'docs-dispatch'), fixture, [], true)).toEqual([]);
+  }
+  for (const command of ['git status 2>&1 > out.txt', 'ls 2>&1 | head', `bun ${path.join(fixture.home, 'publish.ts')} 2>&1`, 'ls 2>out.txt']) {
+    expect(docsCommandAllowed(command, fixture, [path.join(fixture.home, 'publish.ts')])).toBe(false);
   }
 });
 
@@ -126,6 +148,14 @@ test('parent and child receive resolved local platform and base without new prob
     report: path.join(fixture.home, 'report.md'), publish: path.join(fixture.home, 'publish.ts'),
     scenario: 'current', testName: 'docsync-command-grammar', runId: 'free-control', timeout: 10000 });
   expect(options.prompt).toContain('Platform: local/git-native. Base: main.');
+  // A1: the parent points children at the saved interface instead of retyping it into their prompts.
+  const interfaceFile = path.join(fixture.home, 'fixture-interface.md');
+  expect(options.prompt).toContain(`saved at ${interfaceFile}: each child prompt tells the child to Read that file first`);
+  expect(options.prompt).not.toContain('include this interface in child prompts');
+  const saved = fs.readFileSync(interfaceFile, 'utf8');
+  expect(saved.startsWith('Fixture observation interface')).toBe(true);
+  expect(options.prompt.endsWith(saved.trimEnd())).toBe(true);
+  expect(fs.statSync(interfaceFile).mode & 0o777).toBe(0o600);
 });
 
 // The observer polices bash commands from the POSIX-only paid ship evals and refuses backslashes
@@ -176,4 +206,30 @@ test('only the native ship parent interface declares the section insert', () => 
   expect(options.prompt).toContain('cat SOURCE.md >> TARGET.md');
   expect(options.prompt).toContain('.qa-state/ directory is the fixture owner');
   for (const transport of [false, true]) expect(docsNativeInterface(fixture, [], transport)).not.toContain('>> TARGET.md');
+});
+
+test('the installed docs-candidate helper is admitted only with a private .json record, or for its own --help', () => {
+  const helper = path.join(fixture.skills, 'bin/gstack-docs-candidate');
+  const record = path.join(fixture.home, 'audit-1-candidate.json');
+  for (const command of [
+    `${helper} snapshot --out ${record} --audit-id audit-1 --mode edit --base main --docs handbook`,
+    `${helper} snapshot --out ${record} --audit-id audit-1 --mode read-only --base main --select app.ts --docs handbook`,
+    `${helper} compare ${record}`,
+    `${helper} --help`,
+  ]) expect(docsCommandAllowed(command, fixture), command).toBe(true);
+  for (const command of [
+    `${helper} snapshot --out ${path.join(fixture.repo, 'candidate.json')} --audit-id a --mode edit --base main`,
+    `${helper} snapshot --out ${path.join(fixture.home, 'candidate.txt')} --audit-id a --mode edit --base main`,
+    `${helper} snapshot --out ${record} --out ${record} --audit-id a --mode edit --base main`,
+    `${helper} snapshot --audit-id a --mode edit --base main`,
+    `${helper} snapshot --out ${record} --audit-id a --mode edit --base main --exec rm`,
+    `${helper} compare ${path.join(fixture.skills, 'bin/x.json')}`,
+    `${helper} compare ${record} extra`,
+    `${helper} install`,
+    `${helper} --help snapshot`,
+    `${helper} --version`,
+    `~/.claude/skills/gstack/bin/gstack-docs-candidate compare ${record}`,
+  ]) expect(docsCommandAllowed(command, fixture), command).toBe(false);
+  expect(docsNativeInterface(fixture)).toContain(`${fixture.skills.split(path.sep).join('/')}/bin/gstack-docs-candidate snapshot`);
+  expect(docsNativeInterface(fixture)).toContain('compare <that .json> and --help commands');
 });

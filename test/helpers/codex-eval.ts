@@ -3,6 +3,8 @@ import { CODEX_DRAIN_GRACE_MS, CodexHarnessError, type CodexResult } from './cod
 import { EvalCollector, getProjectEvalDir, shardSlugOfEvalDir, type EvalTestEntry } from './eval-store';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { classifyOutsideReview } from '../../lib/outside-review-result';
+import { appendSessionLedger, sessionKey } from './session-ledger';
 
 // The process keeps its existing work budget. Its pipes may need the existing
 // five-second drain grace; Bun must then allow another five seconds to record.
@@ -25,15 +27,42 @@ function requireCondition(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
 }
 
+/**
+ * Codex 0.160's skill-loader diagnostics ("invalid skill metadata at",
+ * "failed to load skill", "Skipped loading N skill(s) due to invalid SKILL.md
+ * files"). Tool errors such as "apply_patch verification failed: invalid hunk"
+ * also say "invalid" and are not skill loading.
+ */
+const INVALID_SKILL = /\binvalid skills? (?:metadata|config)\b|\bfailed to load skills?\b|\binvalid SKILL\.md\b/i;
+const SKIPPED_SKILL = /\bSkipped loading\b/;
+
 /** The real paid cases and free fixtures use these same content predicates. */
 export function validateCodexDiscovery(result: CodexResult): void {
   requireCondition(result.output.length > 0, 'Codex discovery produced no output');
-  requireCondition(!result.stderr.includes('invalid'), 'Codex reported an invalid skill');
-  requireCondition(!result.stderr.includes('Skipped loading'), 'Codex skipped loading the skill');
+  requireCondition(!INVALID_SKILL.test(result.stderr), 'Codex reported an invalid skill');
+  requireCondition(!SKIPPED_SKILL.test(result.stderr), 'Codex skipped loading the skill');
   requireCondition(/review|gstack|skill/.test(result.output.toLowerCase()), 'Codex discovery did not reference the skill');
 }
 
+/** Commands Codex reported as completed with exit 0 in its `exec --json` events. */
+function succeededCommands(rawLines: string[]): number {
+  return rawLines.filter(line => {
+    try {
+      const event = JSON.parse(line);
+      return event?.type === 'item.completed' && event.item?.type === 'command_execution'
+        && event.item.status === 'completed' && event.item.exit_code === 0;
+    } catch { return false; }
+  }).length;
+}
+
 export function validateCodexReview(result: CodexResult): void {
+  // A review whose commands never ran (sandbox could not start) is not a review:
+  // it must show a completed command, and nothing may classify it unavailable.
+  const ran = classifyOutsideReview({ text: result.output, gate: 'execution', stderr: result.stderr,
+    exit: result.exitCode, events: result.rawLines.join('\n') });
+  requireCondition(ran.execution.state === 'ran',
+    `Codex review did not execute: ${ran.reason}${ran.detail ? ` (${ran.detail})` : ''}`);
+  requireCondition(succeededCommands(result.rawLines) > 0, 'Codex review did not execute: no command completed (exec --json events)');
   requireCondition(result.output.length > 50, 'Codex review output must contain more than 50 characters');
   requireCondition(/finding|issue|review|change|diff|clean|no issues|p1|p2/.test(result.output.toLowerCase()),
     'Codex output did not contain review findings or a clean-review result');
@@ -83,7 +112,7 @@ export function validateCodexSolScope(result: CodexResult, evidence: CodexSolSco
   const maxToolCalls = 30;
   const allowedChangedFiles = ['src/parse-limit.ts', 'test/parse-limit.test.ts'];
   const outOfBounds = evidence.changed.filter(file => !allowedChangedFiles.includes(file));
-  requireCondition(!result.stderr.includes('invalid') && !result.stderr.includes('Skipped loading'),
+  requireCondition(!INVALID_SKILL.test(result.stderr) && !SKIPPED_SKILL.test(result.stderr),
     `skill load problem in stderr:\n${result.stderr}`);
   requireCondition(result.toolCalls.length <= maxToolCalls, `tool calls: ${result.toolCalls.length} > ${maxToolCalls}`);
   requireCondition(evidence.targeted.status === 0,
@@ -115,6 +144,7 @@ export interface CodexEvalOptions {
 
 export async function runRecordedCodexEval(opts: CodexEvalOptions): Promise<CodexResult> {
   const started = Date.now();
+  const startMono = performance.now();
   const drainGraceMs = opts.drainGraceMs ?? CODEX_DRAIN_GRACE_MS;
   const timeoutMs = opts.budgetMs + drainGraceMs;
   const deadlineAt = started + timeoutMs;
@@ -168,6 +198,10 @@ export async function runRecordedCodexEval(opts: CodexEvalOptions): Promise<Code
       : 'validation_failed';
     const message = failure instanceof Error ? failure.message : String(failure);
     const diagnostic = result?.stderr && !message.includes(result.stderr) ? `${message}\n${result.stderr}` : message;
+    appendSessionLedger({ key: sessionKey('codex', opts.name), test_name: opts.name, runner: 'codex', started_at: new Date(started).toISOString(),
+      budget_ms: opts.budgetMs, elapsed_ms: performance.now() - startMono,
+      end: exitReason === 'timeout' ? 'session_timeout' : passed || exitReason === 'validation_failed' ? 'completed' : 'error',
+      ...(exitReason === 'timeout' ? { evidence: `armed ${opts.budgetMs}ms Codex budget expired` } : {}), billed: false });
 
     // addTest appends retry attempts. Never pre-record a failure and then
     // overwrite it: that would manufacture two attempts from one execution.
@@ -177,7 +211,7 @@ export async function runRecordedCodexEval(opts: CodexEvalOptions): Promise<Code
       tier: 'e2e',
       passed,
       duration_ms: failure instanceof CodexEvalTimeout ? Date.now() - started : result?.durationMs ?? Date.now() - started,
-      cost_usd: 0,
+      cost_usd: 0, cost_known: false,
       ...(result ? {
         output: result.output.slice(0, opts.outputLimit ?? 2000),
         turns_used: result.toolCalls.length,

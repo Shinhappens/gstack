@@ -1,7 +1,7 @@
 import { toShellPath, type TemplateContext } from './types';
-import { outsideVoiceRuntime } from './outside-voice';
 import * as path from 'path';
 import { getHostConfig } from '../../hosts';
+import { runtimeRootPrelude } from './runtime-root';
 
 /** Claude's scoped hook enforces the parent publication boundary during /autoplan. */
 export function generateAutoplanPublicationHook(ctx: TemplateContext, args?: string[]): string {
@@ -30,6 +30,28 @@ printf '%s\\n' ${shellWord(unavailable)}`;
           command: ${JSON.stringify(command)}
           statusMessage: "Checking Autoplan phase publication..."`).join('\n');
   return `hooks:\n  PreToolUse:\n${entries}`;
+}
+
+/**
+ * {{CEO_MODE_HANDOFF_HOOK}}: /plan-ceo-review's PostToolUse hook that shows the
+ * Step 0E mode handoff line to the user as a system message (Claude only), so
+ * the line is visible even when the model paraphrases it in chat.
+ */
+export function generateCeoModeHandoffHook(ctx: TemplateContext, args?: string[]): string {
+  if (ctx.skillName !== 'plan-ceo-review' || args?.length) {
+    throw new Error('CEO_MODE_HANDOFF_HOOK is only valid in plan-ceo-review without arguments');
+  }
+  if (ctx.host !== 'claude') return '';
+  const shellWord = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  const script = `S="${toShellPath(ctx.paths.skillRoot)}/plan-ceo-review/bin/mode-handoff-hook"
+if [ -f "$S" ]; then exec bash "$S"; fi
+exit 0`;
+  return `hooks:
+  PostToolUse:
+    - matcher: "Bash"
+      hooks:
+        - type: command
+          command: ${JSON.stringify(`bash -c ${shellWord(script)}`)}`;
 }
 
 /**
@@ -111,7 +133,7 @@ export function generateAutoplanReviewFile(ctx: TemplateContext, args?: string[]
 /** Resolve once to a literal path; later phase commands run in fresh shells. */
 export function generateAutoplanSnapshotTool(ctx: TemplateContext): string {
   return `\`\`\`bash
-${outsideVoiceRuntime(ctx)}
+${runtimeRootPrelude(ctx)}
 bun -e 'console.log(require("fs").realpathSync(process.argv[1]))' "${toShellPath(ctx.paths.binDir)}/gstack-autoplan-snapshot.ts"
 \`\`\``;
 }

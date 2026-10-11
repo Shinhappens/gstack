@@ -44,7 +44,7 @@ Fork it. Improve it. Make it yours. And if you want to hate on free open source 
 
 `./setup` took 31 seconds after the clone on a 4-vCPU Linux cloud machine (v1.91.13.0, clean HOME, including the binary build and the Chromium download). Slower networks and laptops take longer.
 
-**Requirements:** [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Git](https://git-scm.com/), [Bun](https://bun.sh/) v1.0+, [Node.js](https://nodejs.org/) (Windows only). **Recommended on macOS:** the [Aside](https://aside.com) browser (macOS 15+) — browser skills, `/make-pdf`, and `/diagram` drive it first, with your real logged-in sessions. Without it, `./setup` builds gstack's own bundled browser and the same skills use that. `/cso` additionally needs a Bun release with all four `--no-compile-autoload-*` build flags plus a native toolchain: a static-capable C compiler on Linux, Xcode command-line tools on macOS, or Visual Studio 2022 Build Tools with Desktop development with C++ on Windows. If those are absent, setup installs everything else, removes stale CSO helpers, and `/cso` reports `not assessed` with the prerequisite.
+**Requirements:** [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Git](https://git-scm.com/), [Bun](https://bun.sh/) v1.4.2+ (the tested version; setup refuses Bun older than 1.3.3, which would let compiled tools read a project's `.env`, and warns in between), [Node.js](https://nodejs.org/) (Windows only). **Recommended on macOS:** the [Aside](https://aside.com) browser (macOS 15+) — browser skills, `/make-pdf`, and `/diagram` drive it first, with your real logged-in sessions. Without it, `./setup` builds gstack's own bundled browser and the same skills use that. `/cso` additionally needs a Bun release with all four `--no-compile-autoload-*` build flags plus a native toolchain: a static-capable C compiler on Linux, Xcode command-line tools on macOS, or Visual Studio 2022 Build Tools with Desktop development with C++ on Windows. If those are absent, setup installs everything else, removes stale CSO helpers, and `/cso` reports `not assessed` with the prerequisite.
 
 When qualified CSO runtime images are published, setup gives each automatic preload a 30-second window plus a bounded setup allowance for the declared catalog. For slower registries, set an integer such as `GSTACK_CSO_IMAGE_PULL_TIMEOUT_SECONDS=120` (accepted range: 5–300 seconds). One image timing out does not consume the remaining images' windows; setup reports partial progress and a later run resumes from exact digests already present in local Docker. The complete preload is capped at one hour.
 
@@ -52,7 +52,7 @@ When qualified CSO runtime images are published, setup gives each automatic prel
 
 Open Claude Code and paste this. Claude does the rest.
 
-> Install gstack: run **`git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup`** then add a "gstack" section to CLAUDE.md that says to use the /browse skill from gstack for all web browsing, never use mcp\_\_claude-in-chrome\_\_\* tools, and lists the available skills: /office-hours, /plan-ceo-review, /plan-eng-review, /plan-design-review, /design-consultation, /design-shotgun, /design-html, /review, /deslop-shared-libs, /test-audit, /ship, /land-and-deploy, /canary, /benchmark, /browse, /connect-chrome, /qa, /qa-only, /design-review, /scrape, /setup-browser-cookies, /setup-deploy, /setup-gbrain, /retro, /investigate, /document-release, /document-generate, /codex, /cso, /autoplan, /plan-devex-review, /devex-review, /careful, /freeze, /guard, /unfreeze, /gstack-upgrade, /learn. Then ask the user if they also want to add gstack to the current project so teammates get it.
+> Install gstack: run **`git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup`** then add a "gstack" section to CLAUDE.md that says to use the /browse skill from gstack for all web browsing, never use mcp\_\_claude-in-chrome\_\_\* tools, and lists the available skills: /office-hours, /plan-ceo-review, /plan-eng-review, /plan-design-review, /design-consultation, /design-shotgun, /design-html, /review, /deslop-shared-libs, /test-audit, /ship, /eval-plan, /land-and-deploy, /canary, /benchmark, /browse, /connect-chrome, /qa, /qa-only, /design-review, /scrape, /setup-browser-cookies, /setup-deploy, /setup-gbrain, /retro, /investigate, /document-release, /document-generate, /codex, /cso, /autoplan, /plan-devex-review, /devex-review, /careful, /freeze, /guard, /unfreeze, /gstack-upgrade, /learn. Then ask the user if they also want to add gstack to the current project so teammates get it.
 
 ### Step 2: Team mode — auto-update for shared repos (recommended)
 
@@ -119,6 +119,16 @@ An explicit `--host X` installs for X only and never changes another agent's
 install. `/gstack-upgrade` refreshes every install it registered, one row per
 host, and says which ones failed.
 
+A checkout carries skills only for the agents installed from it. Setup records
+them in `.gstack-installed-hosts` and never drops one, so adding an agent later
+is just `./setup --host <name>`. Copies rendered for other agents are pruned:
+generated files move to `~/.gstack/backups/host-renders/`, and files gstack
+can't prove it generated stay where they are. A global Claude install went
+from 632 `SKILL.md` files (34.7 MB) to its own 63 (2.5 MB), which keeps Cursor-agent
+from freezing on the skills tree (#1694). In a development checkout,
+`bun run build` still renders every agent; inside an install it renders the
+recorded ones, and `GSTACK_RENDER_HOSTS=all bun run build` renders them all.
+
 Tiers: **full** is certified by a real workflow run (see
 [Certify your host](docs/ADDING_A_HOST.md#certify-your-host)); **experimental**
 installs and passes the conformance tests but has no certification run yet;
@@ -133,6 +143,7 @@ installs and passes the conformance tests but has no certification run yet;
 | Factory Droid | experimental | `--host factory` → `~/.factory/skills/gstack-*/` | ask for `gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host factory` |
 | Kiro | experimental | `--host kiro` → `~/.kiro/skills/gstack-*/` | ask for `gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host kiro` |
 | GitHub Copilot CLI | experimental | `--host copilot` → `~/.copilot/skills/gstack-*/` | `/gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host copilot` |
+| Antigravity CLI | experimental | `--host agy` (or `--host antigravity`) → `~/.gemini/antigravity-cli/skills/gstack-*/` | `/gstack-office-hours` | advisory, not blocked | Codex CLI, signed in | `./setup --host agy` |
 | Slate | instruction-only | `--host slate` (points at the Claude install; Slate reads `.claude/skills`) | `/office-hours` via the Claude install | advisory, not blocked | — | `./setup --host claude` |
 | OpenClaw | instruction-only | `--host openclaw` (prints the digest path; ACP spawns Claude Code — [docs/OPENCLAW.md](docs/OPENCLAW.md)) | "Load gstack. Run /review" | advisory, not blocked | — | re-copy the digest after upgrades |
 | Hermes | instruction-only | `--host hermes` (prints the digest path and `gen:skill-docs --host hermes`) | copy the digest, or render skills yourself | advisory, not blocked | — | re-copy the digest after upgrades |
@@ -142,6 +153,13 @@ Copilot invokes gstack skills by their prefixed names (`/gstack-review`) because
 `/review` is a Copilot built-in. Copilot ignores skill hooks, so `/careful` and
 `/freeze` only advise there, and `COPILOT_HOME` other than `~/.copilot` is not
 supported yet (setup refuses and changes nothing).
+
+Antigravity CLI also invokes skills by prefixed name (`/gstack-review`). Setup
+writes only `~/.gemini/antigravity-cli/skills/gstack*`: Gemini CLI's
+`~/.gemini/skills` and settings are never touched, and `--host auto` selects
+Antigravity only when `agy` is on `PATH` or `~/.gemini/antigravity-cli` exists,
+never for a Gemini-CLI-only `~/.gemini`. The Antigravity 2.0 app and IDE read
+`~/.gemini/config/skills`, which this host does not install.
 
 Outside reviews require the selected CLI to be installed and authenticated: Claude Code when using gstack in Codex, or Codex on other harnesses. External harnesses discover these commands as `/gstack-claude-code` and `/gstack-codex`; each harness omits its own wrapper. Explicit provider requests keep that provider. The existing `codex_reviews` setting controls automatic outside reviews where supported, regardless of the provider selected.
 
@@ -165,8 +183,18 @@ override applies to that run only; set `model` in your Codex `config.toml` to
 make it stick across upgrades. After changing your Codex model, rerun
 `./setup --host codex` to regenerate the skills.
 
-**Which Codex model gstack uses.** For every Codex call (outside voices,
-`/codex`, review and ship adversarial passes), gstack picks the model in this
+**Plan-review and implementation tiers.** Plan workflows use an independent
+`frontier` reviewer: Fable 5.1 from Codex, or GPT-6 Astra from Claude Code.
+Implementation handoffs recommend the `smart` tier: Opus 5.5 or GPT-6.1 Sol.
+Choose a different tier, pin either provider's model, or use `host` mode to
+preserve native model settings. The read-only `gstack-models` command explains
+the effective choices; changing these settings does not require regenerating
+skills or switch your running session. A weekly maintenance check flags changed
+official recommendations and retirement notices without automatically changing
+models. See [model policy: setup, overrides and freshness](docs/model-policy.md).
+
+**Other Codex calls keep their existing selection.** Without the explicit
+`plan-review` role (including ordinary review and ship adversarial passes), gstack picks the model in this
 order: a model you name for that request, then `GSTACK_CODEX_MODEL`, then
 `model` in your Codex `config.toml` (for native `codex review`, `review_model`
 first; a custom `CODEX_HOME` is honored), and only then gstack's default,
@@ -177,7 +205,7 @@ repair message and reports the outside review as unavailable. It never silently
 switches to its default. Nested Codex reviews also run with installed skills
 hidden (`-c skills.include_instructions=false`), so a review cannot turn into a
 whole nested skill run. Runtime model selection is separate from the setup-time
-behavioral profile above. `/claude-code` (`gstack-claude-code`
+behavioral profile above. Without the plan-review role, `/claude-code` (`gstack-claude-code`
 on Codex) preserves Claude's configured model. Set `GSTACK_CLAUDE_MODEL=<model>`
 or name a model in your request to override it for the invocation, including
 resumed consultations. See [eval defaults and overrides](CONTRIBUTING.md#testing--evals)
@@ -186,8 +214,16 @@ for capture, judge, and benchmark model selection.
 The design binary (`$D`) uses OpenAI's `gpt-5.5` by default, with image
 generation through `gpt-image-2`. Set `GSTACK_DESIGN_MODEL=<model>` to use
 another gpt-5-class model for both image generation and screenshot analysis;
-if OpenAI rejects it, the error names `GSTACK_DESIGN_MODEL`. Check a key
-against the defaults with `bun run design/scripts/live-model-check.ts`.
+if OpenAI rejects it, the error names `GSTACK_DESIGN_MODEL`. Set
+`GSTACK_DESIGN_IMAGE_MODEL=<gpt-image model>` to change the image tool model; a
+value that is not a gpt-image model name is refused before any request. Check a
+key against the defaults with `bun run design/scripts/live-model-check.ts`,
+which always tests the default models and ignores both overrides; the weekly
+periodic census runs the same check. Set `OPENAI_BASE_URL` to send every `$D`
+call to an OpenAI-compatible gateway instead of `api.openai.com`; egress
+receipts record the gateway host. On Codex, `/design-shotgun` generates mockups
+with Codex's built-in `$imagegen` skill instead, so it needs no
+`OPENAI_API_KEY`; `$D` still builds and serves the comparison board.
 
 **Want to add support for another agent?** See [docs/ADDING_A_HOST.md](docs/ADDING_A_HOST.md).
 Rendering a new agent is one TypeScript config file; installing it also needs a
@@ -252,7 +288,7 @@ Each skill feeds into the next. `/office-hours` writes a design doc that `/plan-
 | `/plan-design-review` | **Senior Designer** | Rates each design dimension 0-10, explains what a 10 looks like, then edits the plan to get there. AI Slop detection. Interactive — one AskUserQuestion per design choice. |
 | `/plan-devex-review` | **Developer Experience Lead** | Interactive DX review: explores developer personas, benchmarks against competitors' TTHW, designs your magical moment, traces friction points step by step. Three modes: DX EXPANSION, DX POLISH, DX TRIAGE. 20-45 forcing questions. |
 | `/design-consultation` | **Design Partner** | Build a complete design system from scratch. Researches the landscape, proposes creative risks, generates realistic product mockups. Writes `DESIGN.md` in the open DESIGN.md format, so impeccable, Google Stitch, and any tool that reads it share one file. |
-| `/review` | **Staff Engineer** | Find the bugs that pass CI but blow up in production. Auto-fixes the obvious ones. Flags completeness gaps. Advisory simplification lens flags over-built code — never blocks, never auto-applies. |
+| `/review` | **Staff Engineer** | Find the bugs that pass CI but blow up in production. Auto-fixes the obvious ones. Flags completeness gaps and gate integrity: every weakened test, timeout, snapshot or suppression reaches a human by name. Advisory simplification lens flags over-built code — never blocks, never auto-applies. |
 | `/deslop-shared-libs` | **Shared Code Reviewer** | Find worthwhile shared-code extractions in recent work. Compares up to five opportunities and recommends the best three, with source evidence, reliability gains, and total code savings. Recommendations only. |
 | `/test-audit` | **Test Auditor** | Sweep existing tests for ones that cost more than they protect: source greps, duplicates, assertion-free probes, test-only exports. Every candidate carries an evidence card; report-only unless you approve a batch. |
 | `/investigate` | **Debugger** | Systematic root-cause debugging. Iron Law: no fixes without investigation. Traces data flow, tests hypotheses, stops after 3 failed fixes. |
@@ -263,11 +299,12 @@ Each skill feeds into the next. `/office-hours` writes a design doc that `/plan-
 | `/qa` | **QA Lead** | Explore browser, API, CLI, job and webhook behavior. Reproduce bugs, write failing regressions, fix the cause and re-verify before committing. |
 | `/qa-only` | **QA Reporter** | Explore and report with replayable evidence. Suggest regression cases without changing product code or tests. |
 | `/pair-agent` | **Multi-Agent Coordinator** | Share gstack's own browser with any AI agent. One command, one paste, connected. Works with OpenClaw, Hermes, Codex, Cursor, or anything that can curl. Each agent gets its own tab. Auto-launches headed mode so you watch everything. Auto-starts ngrok tunnel for remote agents. Scoped tokens, tab isolation, rate limiting, activity attribution. (Runs on the bundled browser — the fallback engine; agents driving Aside just open their own tabs.) |
-| `/cso` | **Chief Security Officer** | Security audit with an application model, supported findings, independent challenge, and explicit coverage. Static assessment remains available without catalog profiles. With matching qualified profiles, comprehensive mode adds contained runtime/scanner execution and reviewable repair candidates for Node/Bun, Python, and Rails. Runtime-tested bundles authenticate separate external assertions. Project-test completion remains `self_reported` because target code controls the test process; `tested` is reserved for a future target-independent completion witness. |
-| `/ship` | **Release Engineer** | Sync main, run tests, explore changed behavior, audit coverage and docs, then verify, push and open a PR. |
+| `/cso` | **Chief Security Officer** | Security audit with an application model, supported findings, independent challenge, and explicit coverage. Static assessment remains available without catalog profiles. With matching qualified profiles, comprehensive mode adds contained runtime/scanner execution and reviewable repair candidates for Node/Bun, Python, and Rails; no qualified runtime or scanner profile is published yet, so audits run static assessment only. Runtime-tested bundles authenticate separate external assertions. Project-test completion remains `self_reported` because target code controls the test process; `tested` is reserved for a future target-independent completion witness. |
+| `/ship` | **Release Engineer** | Sync main, run tests, explore changed behavior, audit coverage, gate integrity and docs, then verify, push and open a PR. |
 | `/land-and-deploy` | **Release Engineer** | Merge the PR, wait for CI and deploy, verify production health. One command from "approved" to "verified in production." |
 | `/canary` | **SRE** | Post-deploy monitoring loop. Watches for console errors, performance regressions, and page failures. |
 | `/benchmark` | **Performance Engineer** | Baseline page load times, Core Web Vitals, and resource sizes. Compare before/after on every PR. |
+| `/eval-plan` | **Eval Planner** | Preregister a paid eval before the first priced call: bars, arms, decoys and stop rules, a $0 stub-model dry run over the real inputs, and a three-item priced pilot whose extrapolation and spend table gate the approval. |
 | `/document-release` | **Technical Writer** | Audit changed behavior against project docs on every ship, before final verification and publication. Also runs standalone. Shows updated, reviewed/current or blocked docs and any remaining gaps. |
 | `/document-generate` | **Documentation Author** | Generate missing docs from scratch using the Diataxis framework. Researches the codebase first, then writes reference / how-to / tutorial / explanation docs that actually match the code. Invokable standalone or chained from `/document-release` when the coverage map finds gaps. Learn more: [tutorial](docs/tutorial-document-generate.md) • [how-to](docs/howto-document-a-shipped-feature.md) • [why Diataxis](docs/explanation-diataxis-in-gstack.md). |
 | `/retro` | **Eng Manager** | Team-aware weekly retro. Per-person breakdowns, shipping streaks, test health trends, growth opportunities. `/retro global` runs across all your projects and AI tools (Claude Code, Codex, Gemini). |
@@ -349,7 +386,7 @@ and PR publication; the docs helper does not commit or push independently.
 | `/setup-gbrain` | **GBrain Onboarding** — from zero to running gbrain in under 5 minutes. PGLite local, Supabase existing URL, or auto-provision a new Supabase project via Management API. MCP registration for Claude Code + per-repo trust triad (read-write/read-only/deny). [Full guide](USING_GBRAIN_WITH_GSTACK.md). |
 | `/sync-gbrain` | **Keep Brain Current** — re-index this repo's code into gbrain via `gbrain sources add` + `gbrain sync --strategy code`, refresh the `## GBrain Search Guidance` block in CLAUDE.md, and auto-remove guidance when the capability check fails. `--incremental` (default), `--full`, `--dry-run`. Idempotent; safe to re-run. |
 | `/gstack-upgrade` | **Self-Updater** — upgrade gstack to latest. Detects global vs vendored install, syncs both, shows what changed. |
-| `/ios-qa` | **iOS Live-Device QA (v1.43.0.0+)** — drive a real iPhone over USB CoreDevice via an embedded `StateServer` in the app. Read Swift source, codegen typed `@Observable` accessors, run the agent loop. Optional `--tailnet` flag exposes the device to OpenClaw or any HTTP-capable agent on your Tailscale tailnet so remote agents can run iOS QA without ever touching the hardware. Capability-tier allowlist (observe/interact/mutate/restore), per-device session lock, audit log. |
+| `/ios-qa` | **iOS Live-Device QA (v1.43.0.0+)** — drive a real iPhone or iPad over USB CoreDevice via an embedded `StateServer` in the app. Read Swift source, codegen typed `@Observable` accessors, run the agent loop. Optional `--tailnet` flag exposes the device to OpenClaw or any HTTP-capable agent on your Tailscale tailnet so remote agents can run iOS QA without ever touching the hardware. Capability-tier allowlist (observe/interact/mutate/restore), per-device session lock, audit log. |
 | `/ios-fix`, `/ios-design-review`, `/ios-clean`, `/ios-sync` | iOS bug-fix loop, designer's-eye HIG audit, debug-bridge cleanup, and accessor resync. See `docs/skills.md`. End-to-end walkthrough: [docs/howto-ios-testing-with-gstack.md](docs/howto-ios-testing-with-gstack.md). |
 
 ### Standalone binaries
@@ -370,13 +407,13 @@ Beyond the slash-command skills, gstack ships standalone CLIs for workflows that
 | `gstack-review-read` | **Review freshness** — emits review records with computed `review_freshness.status` and `reason`: CURRENT, STALE, or UNVERIFIED for diff reviews. `/ship` and `/land-and-deploy` use the same grade; a matching commit alone never certifies a diff review. [Dashboard rules](docs/skills.md#review-readiness-dashboard). |
 | `gstack-evidence` | **Verification-evidence ledger** — `run --label <lane> -- <cmd>` transparently wraps any test command (the child's exit code always passes through) and records what ran against which working-tree fingerprint; `check` grades each label FRESH/STALE/MISSING with `--expect-cmd`, `--max-age`, and `--allow-paths` binding. /ship and /land-and-deploy cite fresh evidence instead of re-running suites. Per-run logs are 0600, capped at 2MB, pruned after 30 days; the ledger and logs stay machine-local by design. |
 | `gstack-issue-guard` | **Tracker-text trust envelope** — fetches GitHub issue/PR text (`issue <n>`, `pr-body`, `pr-comments`, or `--stdin`) and wraps it in a labeled envelope so agents treat it as data: injection-shaped lines get labeled even through fullwidth and invisible-character evasion, and forged envelope banners are defused. Every tracker-text ingress in gstack routes through it, enforced by a CI scanner. |
-| `gstack-ios-qa-daemon` | **iOS QA daemon** — Mac-side broker between an agent and a connected iPhone over USB CoreDevice. Loopback by default; `--tailnet` opens a Tailscale-facing listener with identity-gated capability tiers. Single-instance via flock on `~/.gstack/ios-qa-daemon.pid`. See [docs/howto-ios-testing-with-gstack.md](docs/howto-ios-testing-with-gstack.md). |
+| `gstack-ios-qa-daemon` | **iOS QA daemon** — Mac-side broker between an agent and a connected iPhone or iPad over USB CoreDevice. Loopback by default; `--tailnet` opens a Tailscale-facing listener with identity-gated capability tiers. Single-instance via flock on `~/.gstack/ios-qa-daemon.pid`. See [docs/howto-ios-testing-with-gstack.md](docs/howto-ios-testing-with-gstack.md). |
 | `gstack-ios-qa-mint` | **iOS allowlist manager** — owner-grant CLI for the tailnet allowlist. `grant`/`revoke`/`list` against `~/.gstack/ios-qa-allowlist.json` (mode 0600). Remote agents never auto-allowlist; this is the explicit-intent path. |
 | `gstack-ios-qa-regen` | **iOS bridge regenerator** — deterministically installs the canonical DebugBridge package, generates typed state accessors, and records the installed gstack version. Safe to rerun after source changes or upgrades. |
 
 The private paid CSO evaluation producer is a packaging contract, not an ordinary `bun run build` artifact. On macOS or Linux, a release operator compiles `cso-eval-producer` with the documented hardened Bun flags in the same clean build session as `bun run build:cso`, then installs it beside `gstack-cso-launcher`, `gstack-cso-core`, `gstack-cso-watchdog`, and the hidden `.gstack-cso-generation` manifest as one root-owned, nonwritable five-artifact unit. The producer rejects root execution, writable/symlinked/incomplete installations, and unreviewed provider CLI versions; each receipt binds all five artifact hashes, and collection rejects receipts from different unit identities. See the [clean producer procedure](test/fixtures/cso-eval/README.md#trusted-five-artifact-producer-unit). Paid producer evaluation remains unavailable on Windows because the detached watchdog has no Windows build.
 
-Each producer gets a curated one-cell source copy with directories sealed to `0555` and files to `0444`, plus pre/post content, Git, and mode checks. Claude receives that exact copy as a restricted read-only add-directory so its constrained launcher command can reach it. Gemini receives no source working directory or include-directory. Codex technically receives read-only filesystem access to the exact curated source root because the trusted helper inherits the Codex permission profile; its private provider work directory and exact `cso-home` artifact directory are the only write roots, every other root path remains denied, and the producer prompt requires source access through the helper. This is evaluation containment for an immutable public fixture, not a claim that Codex cannot directly read that fixture.
+Each producer gets a curated one-cell source copy with directories sealed to `0555` and files to `0444`, plus pre/post content, Git, and mode checks. Claude receives no source add-directory, because an add-directory is a sandbox write root where Claude Code's bubblewrap leaves an empty `.mcp.json` mount point. Its Bash runs inside Claude Code's sandbox with one exception: the exact absolute launcher path that `--allowed-tools` names, which runs outside it as it does for users. The launcher is the boundary there. It replaces its environment with a fixed allowlist, uses only the local Docker Unix socket, and runs every target in hardened containers. The producer passes that policy through `--settings` (sandbox enabled, fail if unavailable, no unsandboxed fallback, no auto-allow, and `excludedCommands` naming only the launcher). It refuses to start the agent (`CLAUDE_PRODUCER_SANDBOX_POLICY_MISMATCH`) unless the generated arguments and environment carry exactly that policy. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` stays unset, because it would force the launcher back into the sandbox. Every other Bash command is denied by `--allowed-tools`, and Write is confined to the provider work directory and `cso-home`. Gemini receives no source working directory or include-directory. Codex technically receives read-only filesystem access to the exact curated source root because the trusted helper inherits the Codex permission profile; its private provider work directory and exact `cso-home` artifact directory are the only write roots, every other root path remains denied, and the producer prompt requires source access through the helper. This is evaluation containment for an immutable public fixture, not a claim that Codex cannot directly read that fixture.
 
 Copy each completed cell's receipt together with `state/cso-home/security/cso/` to the trusted adjudication host. Receipt entries are sorted paths relative to that directory and bind every retained file's size and SHA-256 plus an aggregate inventory hash. Provider homes, settings, sessions, and credentials live under separate disposable directories and are removed after the cell; they are never part of the retained artifact tree. The adjudicator must re-hash the transported tree against the receipt before trusting reports or repair bundles.
 
@@ -534,6 +571,7 @@ rm -rf ~/.kiro/skills/gstack* 2>/dev/null
 rm -rf ~/.openclaw/skills/gstack* 2>/dev/null
 rm -rf ~/.cursor/skills/gstack* 2>/dev/null
 rm -rf ~/.config/opencode/skills/gstack* 2>/dev/null
+rm -rf ~/.gemini/antigravity-cli/skills/gstack* 2>/dev/null
 
 # 6. Remove temp files
 rm -f /tmp/gstack-* 2>/dev/null
@@ -625,6 +663,7 @@ Other references: [docs/gbrain-sync.md](docs/gbrain-sync.md) (sync-specific guid
 | [Browser](BROWSER.md) | How gstack drives Aside first (the contract, the cookbook, rendering, research), when the fallback engine kicks in, and the fallback's full `$B` command reference |
 | [Contributing](CONTRIBUTING.md) | Dev setup, testing, contributor mode, and dev mode |
 | [Memorable recall bridge](docs/memorable-workflow-memory.md) | Opt-in third-party workflow memory through gstack: two consents, what gstack hands over and can attest, removal, troubleshooting |
+| [Troubleshooting](docs/troubleshooting.md) | Every `not run` / `unavailable` message, what it means, and the fix |
 | [Changelog](CHANGELOG.md) | What's new in every version |
 
 ## Privacy & Telemetry
@@ -645,6 +684,21 @@ Data is stored in [Supabase](https://supabase.com) (open source Firebase alterna
 
 ## Troubleshooting
 
+**Not sure what's wrong?** Run the doctor: `~/.claude/skills/gstack/bin/gstack-doctor`
+(on other hosts, `./setup --status` in your gstack checkout ends with the
+doctor's absolute path). Without starting a skill or spending anything, it
+prints one row per check (install, state root, Bun, hooks, Codex and its cached
+model probe, artifacts sync, the browse bundle, the other compiled binaries,
+the /cso native helper, Claude Code, your largest session journal and recent
+/autoplan guard codes), each `ok`, `warn`,
+`not configured` or `fail` with the command that fixes it. It exits non-zero
+only on `fail`. `--live` also runs the paid Codex model check (one short call).
+Paste its output into bug reports.
+
+**A message says `not run`, `unavailable` or names a fix?** Look it up in
+[docs/troubleshooting.md](docs/troubleshooting.md): every gate message gstack
+prints, what it means, what was kept, and the command that fixes it.
+
 **Skill not showing up?** Run `./setup --status` from your gstack checkout. It
 prints every install (host, scope, version, skills directory, source checkout)
 and, for a `stale`, `missing` or `unregistered` row, the exact command that fixes
@@ -653,13 +707,21 @@ it. The usual fix is to re-run setup from that row's source for that host, e.g.
 A project install lives in the project's `.claude/skills/gstack` or
 `.agents/skills/gstack`; run its `setup` from inside the project.
 
-**`/browse` (or `/qa`, `/design-review`) says `NEEDS_ASIDE` or `ASIDE_NOT_RUNNING`?** That's the probe telling you it's about to use the fallback browser. Want Aside? Open the app and sign in — `aside --version` should print a version and `aside repl 'console.log("ok")'` should print `ok` — then re-run. gstack never installs it for you. Want the fallback on purpose while Aside is open? `GSTACK_SKIP_ASIDE=1` makes every skill, the renderer, and `./setup` treat Aside as absent.
+**Cursor freezes on load, or an agent's gstack skills went missing after an upgrade?** Each checkout now renders skills only for the agents installed from it (#1694). `./setup --status` lists them; `./setup --host <name>` adds one back. Pruned copies are in `~/.gstack/backups/host-renders/<time>-<id>/`, with every path in its `prune.log` ([troubleshooting](docs/troubleshooting.md#host-renders-pruned)).
+
+**`/browse` (or `/qa`, `/design-review`) says `NEEDS_ASIDE` or `ASIDE_NOT_RUNNING`?** That's the probe telling you it's about to use the fallback browser. Want Aside? Open the app and sign in — `aside --version` should print a version and `aside repl 'console.log("ok")'` should print `ok` — then re-run. gstack never installs it for you. Want the fallback on purpose while Aside is open? `GSTACK_SKIP_ASIDE=1` makes every skill, the renderer, and `./setup` treat Aside as absent. When Aside is absent the probe prints `NEEDS_ASIDE: <OS>` and skills trust that line for the macOS-only download pitch; `GSTACK_PLATFORM` overrides the OS it names, for tests and unusual hosts (set it in your shell — gstack never reads it from a project `.env`).
 
 **`/browse` fails on the fallback browser?** `cd ~/.claude/skills/gstack && bun install && bun run build`
 
 **`/make-pdf` or `/diagram` can't render?** Same two paths: with Aside open they print through Aside (`bun run ~/.claude/skills/gstack/bin/gstack-render.ts some.html --screenshot /tmp/out.png` tests it directly, and its first line, `ENGINE=aside` or `ENGINE=browse`, names the browser that actually rendered); without it they use the bundled browser, so `bun run build` is the fix.
 
-**Stale install?** Run `/gstack-upgrade` — or set `auto_upgrade: true` in `~/.gstack/config.yaml`
+**Stale install?** Run `/gstack-upgrade` — or set `auto_upgrade: true` in `~/.gstack/config.yaml`.
+On Codex and the other non-Claude hosts, upgrade from a terminal: find the
+checkout in the `source` column of `./setup --status`, then
+`cd <source> && git pull && ./setup --host <host>`, and start a new session.
+
+**Typing into a specific field with the fallback browser?** `browse type --selector '<css>' <text>`
+types into that element; bare `browse type <text>` types into whatever has focus.
 
 **State in the wrong place, or a setting that won't stick?** `~/.claude/skills/gstack/bin/gstack-paths --explain` shows which directory gstack uses for its state and why. See [docs/state-root.md](docs/state-root.md).
 
@@ -671,7 +733,11 @@ A project install lives in the project's `.claude/skills/gstack` or
 
 **Codex says "Skipped loading skill(s) due to invalid SKILL.md"?** Your Codex skill descriptions are stale. `${CODEX_HOME:-~/.codex}/skills/gstack` is a runtime directory, not the checkout: `./setup --status` shows the Codex row's source checkout. Fix: `cd <that source> && git pull && ./setup --host codex` — for a repo-local install, run it from inside the project.
 
-**Windows users:** gstack works on Windows 11 via Git Bash or WSL. Aside is macOS-only, so on Windows (and Linux) the browser skills, `/make-pdf`, and `/diagram` always use gstack's bundled browser. Node.js is required in addition to Bun — Bun has a known bug with Playwright's pipe transport on Windows ([bun#4253](https://github.com/oven-sh/bun/issues/4253)). The browse server automatically falls back to Node.js. Make sure both `bun` and `node` are on your PATH. Native `/cso` additionally requires Windows PowerShell and Visual Studio 2022 Build Tools with the Desktop development with C++ workload; setup leaves that skill explicitly unavailable when they are absent.
+**Windows users:** gstack works on Windows 11 via Git Bash or WSL. Aside is macOS-only, so on Windows (and Linux) the browser skills, `/make-pdf`, and `/diagram` always use gstack's bundled browser. Node.js is required in addition to Bun — Bun has a known bug with Playwright's pipe transport on Windows ([bun#4253](https://github.com/oven-sh/bun/issues/4253)). The browse server automatically falls back to Node.js. Make sure both `bun` and `node` are on your PATH. Native `/cso` additionally requires PowerShell (PowerShell 7 `pwsh` is preferred; Windows PowerShell 5.1 is the fallback) and Visual Studio 2022 Build Tools with the Desktop development with C++ workload; setup leaves that skill explicitly unavailable when they are absent. /cso is optional: if its native helper fails to build or publish, setup still finishes, says which step failed with the log path and retry command, and keeps an earlier helper when it has one (`GSTACK_STRICT_BUILD=1` makes that failure fatal, as CI does).
+
+**Known issue: Windows Smart App Control** ([#2595](https://github.com/garrytan/gstack/issues/2595)). gstack's compiled binaries (`browse`, `find-browse`, `design`, `pdf`, `gstack-global-discover`) are built on your machine and unsigned, so Windows 11 with Smart App Control on refuses to start them; Git Bash shows `Permission denied`. setup detects this, names the blocked binaries and the skills that need them, and `gstack-doctor` reports them as `blocked`. Today's workarounds are running gstack inside WSL, or turning Smart App Control off. Details: [troubleshooting](docs/troubleshooting.md#windows-smart-app-control). The sidebar terminal uses Consolas on Windows, so its text no longer renders spaced out.
+
+From PowerShell, `.\setup.ps1` (same arguments as `./setup`) checks that Git for Windows, Bun and Node.js are on PATH, prints the `winget` command for any that are missing, and otherwise runs `./setup` in Git Bash.
 
 On Windows without Developer Mode (MSYS2 / Git Bash), `setup` falls back to file copies instead of symlinks because `ln -snf` produces frozen copies that don't refresh on `git pull`. **Re-run `cd ~/.claude/skills/gstack && ./setup` after every `git pull`** so your skill files match the repo. `setup` prints a one-line note reminding you. Unix and WSL keep symlinks and don't need the re-run.
 
@@ -707,7 +773,7 @@ linked in, never deleted.
 ## gstack
 Use /browse from gstack for all web browsing. Never use mcp__claude-in-chrome__* tools.
 Available skills: /office-hours, /plan-ceo-review, /plan-eng-review, /plan-design-review,
-/design-consultation, /design-shotgun, /design-html, /review, /deslop-shared-libs, /test-audit, /ship, /land-and-deploy,
+/design-consultation, /design-shotgun, /design-html, /review, /deslop-shared-libs, /test-audit, /ship, /eval-plan, /land-and-deploy,
 /canary, /benchmark, /browse, /open-gstack-browser, /qa, /qa-only, /design-review, /scrape,
 /setup-browser-cookies, /setup-deploy, /setup-gbrain, /sync-gbrain, /retro, /investigate,
 /document-release, /document-generate, /codex, /cso, /autoplan, /pair-agent, /careful, /freeze,

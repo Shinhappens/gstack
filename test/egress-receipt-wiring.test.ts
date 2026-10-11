@@ -82,6 +82,9 @@ const MODULE_SINKS = [
   // their writeReceipt calls fails CI, not just the tree-sweep scanner.
   'lib/code-intelligence/gbrain-adapter.ts',
   'lib/code-intelligence/sourcebot-adapter.ts',
+  // Multi-agent wave B3: the api outside-voice runner POSTs a review prompt
+  // (plan text, sensitive-class) to OpenAI or Anthropic; sink 'outside-voice-api'.
+  'lib/outside-voice-api.ts',
   // Unconditional: context-bill ships in the same tree as this tripwire. A
   // missing file must fail loudly (a rename/move that drops its receipt wiring
   // is exactly what this pins), not silently soften the assertion.
@@ -91,6 +94,10 @@ const MODULE_SINKS = [
   'lib/gbrain-supabase-provision.ts',
   // consent-gated engine download (install verb): receipt before the fetch, fail-closed
   'bin/gstack-design-detect.ts',
+  // Multi-agent wave E3: contributor-mode asks GitHub for the PR author's
+  // repository permission (`gh api .../collaborators/<user>/permission`); the
+  // author login and repo slug leave the machine, sink 'contributor-mode'.
+  'lib/contributor-mode.ts',
   // The Memorable bridge hook: gstack-owned code that hands each prompt to a
   // vendor CLI. hosts/ has no curl/fetch for the scanner to see, so the
   // receipt wiring is pinned here explicitly.
@@ -131,6 +138,10 @@ const SCANNER_EXEMPT: Record<string, string> = {
     'every git clone is inside an echoed instruction string (install docs); the script executes no network ops',
   'bin/gstack-gbrain-install':
     'user-invoked installer: bodyless HEAD reachability probe to github.com + clone of the public gbrain repo (user-directed install; no gstack state leaves the machine)',
+  'bin/gstack-capy-install':
+    'user-invoked installer that runs before any gstack checkout exists (so the egress lib is not yet available): clone of the public gstack repo and a download of the pinned Bun release archive from GitHub, SHA-256 verified before anything is installed; no gstack state leaves the machine',
+  'bin/gstack-doctor-check.sh':
+    'git fetch appears only in the revision row\'s fix string (the command the user runs to move the checkout)',
   'bin/gstack-next-version':
     'fetches the user\'s own repo\'s base branch for version-claim freshness — a user-repo dev-workflow op, not gstack-state egress',
   'bin/gstack-version-bump':

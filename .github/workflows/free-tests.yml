@@ -47,14 +47,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          # Full history: the seed ratchet compares the allowlist with its
+          # merge-base copy, which a depth-1 checkout cannot read.
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - id: plan
         name: Inventory and balance the complete free suite
+        # Warns in the job summary when more than 5 files are unseeded.
         run: |
           matrix=$(bun run scripts/test-free-shards.ts --ci-plan "$RUNNER_TEMP/free-plan.json" --shards 20)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+      - name: Seed growth ratchet (60 s ceiling, shrink-only allowlist)
+        run: |
+          GSTACK_FREE_SEED_BASE="$(git merge-base HEAD origin/main)" bun test test/free-seed-ratchet.test.ts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: free-plan
@@ -70,7 +77,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Install helper dependencies
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Build and sign the native macOS startup boundary
@@ -80,6 +87,8 @@ jobs:
         env:
           GSTACK_CSO_MACOS_TESTS: "1"
       - name: Build browser lifecycle prerequisites
+        env:
+          GSTACK_STRICT_BUILD: '1'
         run: |
           bunx playwright install chromium
           bun run build
@@ -95,7 +104,8 @@ jobs:
   # $TMPDIR sits under /var/folders and /var is a symlink to /private/var, so
   # code that compares a realpath with an unresolved path passes on Linux's
   # /tmp and fails here (#2982). TMPDIR is deliberately left at the runner's
-  # default, and the job fails if that layout is not symlinked.
+  # default, and the job fails if that layout is not symlinked. It also sources
+  # the Codex probe from zsh, macOS's default shell (#3024; no paid call).
   macos-named-regressions:
     runs-on: macos-latest
     timeout-minutes: 20
@@ -105,10 +115,12 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Install dependencies
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Build browser prerequisites
+        env:
+          GSTACK_STRICT_BUILD: '1'
         run: |
           bunx playwright install chromium
           bun run build
@@ -117,6 +129,16 @@ jobs:
           git config --global user.email "free-tests-ci@gstack.test"
           git config --global user.name "Free Tests CI"
           git config --global init.defaultBranch main
+      - name: Codex probe selects a model from zsh, run as a command and sourced (macOS default shell, no paid call)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          run="$(zsh -c '"$GITHUB_WORKSPACE/bin/gstack-codex-probe" select-model exec' 2>&1)"
+          printf '%s\n' "$run"
+          printf '%s\n' "$run" | grep -E '^CODEX_SEL: [A-Za-z0-9._:/-]+$'
+          out="$(zsh -c 'source "$GITHUB_WORKSPACE/bin/gstack-codex-probe" && _gstack_codex_select_model exec' 2>&1)"
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -E '^CODEX_MODEL: [A-Za-z0-9._:/-]+ \(exec; source: '
       - name: Run the named macOS regressions on the default temp root
         run: |
           set -euo pipefail
@@ -124,7 +146,7 @@ jobs:
           resolved="$(realpath "$tmp")"
           echo "temp root: $tmp -> $resolved"
           test "$resolved" != "${tmp%/}"
-          files=(test/gstack-design-detect.test.ts browse/test/chromium-profile-isolation.test.ts test/cso-git-hardening.test.ts test/plan-count-file-permission.test.ts test/spec-quality-gate-secret-sink.test.ts test/gstack-memory-ingest.test.ts)
+          files=(test/gstack-design-detect.test.ts browse/test/chromium-profile-isolation.test.ts test/cso-git-hardening.test.ts test/plan-count-file-permission.test.ts test/spec-quality-gate-secret-sink.test.ts test/gstack-memory-ingest.test.ts test/regression-issue3024-zsh-sourced-helpers.test.ts test/codex-probe-subcommands.test.ts)
           for file in "${files[@]}"; do test -f "$file"; done
           bun test "${files[@]}"
 
@@ -137,7 +159,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Install helper dependencies
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Build the native Windows startup boundary from Git Bash
@@ -165,7 +187,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Require local Docker containment prerequisites
         # A missing daemon is a failed gate, never a skipped integration test.
         run: |
@@ -176,8 +198,12 @@ jobs:
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Compile trusted CSO helper and watchdog
         run: bun run build:cso
+      # Only the file that can run here: the node-lifecycle and stack-cold
+      # files need GSTACK_CSO_TEST_STACK images and run in the CSO runtime
+      # workflows (test:cso:docker), so in this job they always skipped.
       - name: Run CSO Docker integration gate
-        run: bun run test:cso:docker
+        run: |
+          bun test --max-concurrency 1 test/cso-docker-integration.test.ts
         env:
           GSTACK_CSO_DOCKER_TESTS: "1"
           DOCKER_HOST: unix:///var/run/docker.sock
@@ -191,7 +217,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - name: Install dependencies
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Typecheck product code (zero errors)
@@ -216,7 +242,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -269,9 +295,11 @@ jobs:
       # fonts-noto-color-emoji is the emoji-gate's render font (playwright
       # --with-deps usually installs it, but the gate must not depend on a
       # transitive package list). Fonts must land BEFORE the first browse
-      # daemon launch — Chromium snapshots fontconfig at startup.
+      # daemon launch — Chromium snapshots fontconfig at startup. zsh is not
+      # in the runner image; without it the bash+zsh portability arms (#2669)
+      # skip instead of running.
       - name: Install Xvfb + X11 utilities + gate tools
-        run: sudo apt-get install -y --no-install-recommends xvfb x11-utils poppler-utils fonts-noto-color-emoji
+        run: sudo apt-get install -y --no-install-recommends xvfb x11-utils poppler-utils fonts-noto-color-emoji zsh
 
       - name: Configure git identity (tests init temp repos)
         run: |
@@ -393,7 +421,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: free-plan
@@ -403,5 +431,14 @@ jobs:
           pattern: free-result-*
           merge-multiple: true
           path: ${{ runner.temp }}/free-results
+      # Per-shard ledgers land in their own subdirectories (all are named
+      # flake-ledger.jsonl). A green run is where a retried flake hides, so the
+      # summary runs before strict verification.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: flake-ledger-*
+          path: ${{ runner.temp }}/flake-ledgers
+      - name: Summarize flaky passes absorbed by the serial retry
+        run: bun run scripts/test-health-report.ts flake-summary "$RUNNER_TEMP/flake-ledgers" >> "$GITHUB_STEP_SUMMARY"
       - name: Require exact coverage and complete strict results
         run: bun run scripts/test-free-shards.ts --ci-verify "$RUNNER_TEMP/free-plan.json" --results "$RUNNER_TEMP/free-results"

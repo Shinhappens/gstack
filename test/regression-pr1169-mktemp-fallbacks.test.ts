@@ -64,31 +64,31 @@ describe("PR #1169 bug #4: gstack-telemetry-sync mktemp fallback", () => {
 // must also restore the backup when the swap fails (same failure class:
 // backup deletion after a failed mv).
 describe("#2679: skill-content mktemp guards", () => {
-  test("redact-doc resolver guards REDACT_FILE=$(mktemp) with a loud exit", () => {
-    // The guard line contains a ${sink.noun} interpolation in the resolver
-    // source, so match to end-of-line rather than [^}]* (which stops at the
-    // interpolation's closing brace).
-    const body = readScript("scripts/resolvers/redact-doc.ts");
-    expect(body).toMatch(/REDACT_FILE=\$\(mktemp\)\s*\|\|\s*\{.*exit 1/);
-    // And the rendered output (interpolation resolved) carries the guard too.
+  test("the shared free-text block guards each mktemp with a loud exit (it creates /spec's REDACT_FILE)", () => {
+    // CEO-12 moved REDACT_FILE's creation from the redact-doc resolver into the
+    // shared free-text block (scripts/resolvers/free-text-file.ts).
+    const body = readScript("scripts/resolvers/free-text-file.ts");
+    expect(body).toMatch(/=\$\(mktemp "\\\$\{_GT:\?\}\/\$\{f\.stem\}\.XXXXXX"\) \|\| \{ echo "Not sent: [^"]*" >&2; exit 1; \}/);
     const rendered = readScript("spec/sections/gate-and-file.md");
-    expect(rendered).toMatch(/REDACT_FILE=\$\(mktemp\)\s*\|\|\s*\{[^}]*exit 1/);
+    expect(rendered).toMatch(/REDACT_FILE=\$\(mktemp "\$\{_GT:\?\}\/spec\.XXXXXX"\)\s*\|\|\s*\{[^}]*exit 1/);
   });
 
-  test("ship pr-body template guards PR_BODY_FILE=$(mktemp) with a loud exit", () => {
+  test("ship pr-body template guards PR_BODY_FILE=$(mktemp ...) with a loud exit", () => {
     const body = readScript("ship/sections/pr-body.md.tmpl");
-    expect(body).toMatch(/PR_BODY_FILE=\$\(mktemp\)\s*\|\|\s*\{[^}]*exit 1/);
+    // G3 (#2952): the mktemp now carries a ${TMPDIR:-/tmp} template.
+    expect(body).toMatch(/PR_BODY_FILE=\$\(mktemp "\$\{TMPDIR:-\/tmp\}\/[^"]+"\)\s*\|\|\s*\{[^}]*exit 1/);
   });
 
-  test("ship pr-body GitLab path sends the SCANNED file, never a re-rendered heredoc", () => {
+  test("ship pr-body GitLab path sends the SCANNED file through gstack-post, never a re-rendered heredoc", () => {
     const body = readScript("ship/sections/pr-body.md.tmpl");
-    expect(body).toContain('-d "$(cat "$PR_BODY_FILE")"');
-    expect(body).not.toMatch(/glab mr create[^\n]*-d "\$\(cat <<'EOF'/);
+    expect(body).toContain('gstack-post pr-create --base <base> --title-file "$TITLE_FILE" --body-file "${PR_BODY_FILE:?restore the composed body path}"');
+    expect(body).not.toMatch(/glab mr (?:create|update)/);
+    expect(body).not.toMatch(/cat <<'EOF'/);
   });
 
   test("gstack-upgrade vendored block guards mktemp -d and clone with loud aborts", () => {
     const body = readScript("gstack-upgrade/SKILL.md.tmpl");
-    expect(body).toMatch(/TMP_DIR=\$\(mktemp -d\)\s*\|\|\s*\{[^}]*exit 1/);
+    expect(body).toMatch(/TMP_DIR=\$\(mktemp -d "\$\{TMPDIR:-\/tmp\}\/[^"]+"\)\s*\|\|\s*\{[^}]*exit 1/);
     expect(body).toMatch(/git clone[^\n]*\|\|\s*\{[^}]*exit 1/);
   });
 
@@ -150,4 +150,33 @@ describe("PR #1169 bug #5: supabase/verify-rls.sh mktemp fallback", () => {
     );
     expect(guard).not.toBeNull();
   });
+});
+
+// G3 (#2952): bare `mktemp`, `mktemp -t` and literal `/tmp/` templates ignore
+// the TMPDIR a sandboxed agent shell sets, and a failed mktemp under `set -e`
+// silently dropped the learning or question being logged.
+describe("G3: mktemp honors TMPDIR in logging bins and lane-owned skill bash", () => {
+  const FILES = [
+    "bin/gstack-learnings-log",
+    "bin/gstack-question-log",
+    "bin/gstack-question-preference",
+    "bin/gstack-jsonl-merge",
+    "bin/gstack-distill-free-text",
+    "bin/gstack-community-dashboard",
+    "bin/gstack-security-dashboard",
+    "ship/sections/pr-body.md.tmpl",
+    "document-release/sections/release-body.md.tmpl",
+  ];
+  for (const rel of FILES) {
+    test(`${rel}: every temp-dir mktemp uses a \${TMPDIR:-/tmp} template`, () => {
+      const calls = [...readScript(rel).matchAll(/(?:\$\(|^[ \t]*)(mktemp\b[^\n)]*)/gm)].map((m) => m[1]);
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        expect(call).not.toMatch(/^mktemp\s*$/);
+        expect(call).not.toMatch(/^mktemp\s+(-d\s+)?-t\b/);
+        expect(call).not.toMatch(/^mktemp\s+(-d\s+)?["']?\/tmp\//);
+        expect(call).toMatch(/\$\{TMPDIR:-\/tmp\}\//);
+      }
+    });
+  }
 });

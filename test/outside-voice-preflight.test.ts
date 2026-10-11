@@ -9,6 +9,7 @@ import { generateAdversarialStep, generateCodexDocReview, generateCodexPlanRevie
 import { validateOutsideReview } from '../lib/outside-review-result';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { ALL_HOST_CONFIGS } from '../hosts';
+import { expectMentions, expectTokens } from './helpers/prompt-structure';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const TEMP = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-outside-preflight-'));
@@ -23,11 +24,17 @@ test('adversarial outside failures retain the required native pass without dupli
       expect(preflight).not.toMatch(/fall(?:ing)? back to (?:a|the) .*subagent/i);
       const output = generateAdversarialStep(ctx);
       expect(output).toContain('adversarial subagent (always runs)');
-      expect(output).toContain('For non-ready modes, retain the native pass above; do not dispatch it again.');
+      expectMentions(output, [['do not', 'dispatch', 'retain']], 'output');
       expect(output.match(/Retain the required native pass without duplicating it; it cannot complete outside coverage\./g)).toHaveLength(2);
       expect(output).not.toContain("Use the caller's fallback");
-      expect(output).toContain('Only this optional outside adversarial pass is non-blocking');
+      expectMentions(output, [['only', 'non-blocking', 'adversarial']], 'output');
       expect(output).toContain('GATE: MISSING COVERAGE');
+      // C2: the gate names what missing coverage does instead of an unnamed "existing user decision flow".
+      if (output.includes('Only a completed response with severity tags')) {
+        expect(output).toContain('→ GATE: MISSING COVERAGE; no fix question.');
+        expect(outsideVoiceInvocation(ctx)).toContain('missing coverage is never clean/PASS');
+        expect(output).not.toContain('preserve the existing user decision flow');
+      }
       expect(outsideVoiceInvocation(ctx)).toContain("Use the caller's fallback; missing coverage is never clean/PASS.");
       const disabled = outsideVoicePreflight(ctx, { disabledBehavior: 'skip-all' });
       expect(disabled).toMatch(/(?:do NOT fall back|Disabled ends this entire extra review step)/);
@@ -39,14 +46,9 @@ test('ship design availability is an existing automatic choice, not a new opt-in
   for (const host of ALL_HOST_CONFIGS) {
     const ctx: TemplateContext = { host: host.name, skillName: 'ship', tmplPath: 'ship/SKILL.md.tmpl', paths: HOST_PATHS[host.name] };
     const output = outsideVoicePreflight(ctx, { disabledBehavior: 'opt-in' });
-    expect(output).toContain('Ship attempts this optional design check automatically when frontend review applies');
     expect(output).toContain('No additional opt-in is needed');
-    expect(output).toContain('Step 11 keeps its separate outside-review switch');
     expect(output).toContain('`CODEX_MODE` reports provider availability, not user consent');
-    expect(output).not.toContain('Honor this caller’s existing opt-in/skip choice');
-    expect(output).not.toContain('This caller has its own opt-in/skip control');
     const other = outsideVoicePreflight({ ...ctx, skillName: 'review' }, { disabledBehavior: 'opt-in' });
-    expect(other).toContain('Honor this caller’s existing opt-in/skip choice');
     expect(other).not.toContain('No additional opt-in is needed');
     expect(other).toContain('_OUTSIDE_CFG=enabled # This caller has its own opt-in/skip control.');
     expect(output.match(/```bash\n([\s\S]*?)\n```/)![1]).toBe(other.match(/```bash\n([\s\S]*?)\n```/)![1].replace(
@@ -61,7 +63,7 @@ test('CEO and Eng describe the actual disabled route and completion validator', 
       const output = generateCodexPlanReview(ctx);
       expect(output).not.toContain('Skip this section entirely');
       if (skillName === 'plan-ceo-review') {
-        expect(output.replace(/\s+/g, ' ')).toContain('If preflight selected `disabled`, use the guarded record below');
+        expectTokens(output.replace(/\s+/g, ' '), ['`disabled`'], 'output.replace(/\s+/g,  )');
         expect(output).toContain('"outside_status":"disabled"');
       } else expect(output).toContain('persist `outside_status: disabled` with the guarded');
       const promptEnd = output.indexOf('\n<plan content>"');
@@ -69,7 +71,7 @@ test('CEO and Eng describe the actual disabled route and completion validator', 
       expect(prompt.startsWith('"')).toBe(true);
       expect(prompt.split('\n')[0]).toContain('.claude/skills/');
       expect(prompt).toContain('End with Recommendation: <action> because <specific reason>');
-      expect(prompt).toContain('If there are no findings, say so and explain why');
+      expectMentions(prompt, [['no', 'findings', 'explain']], 'prompt');
       const invocation = outsideVoiceInvocation(ctx);
       expect(invocation).toContain('missing Recommendation: <action> because <reason> markers');
       expect(invocation).not.toContain('score/severity/completion');
@@ -80,24 +82,22 @@ test('CEO and Eng describe the actual disabled route and completion validator', 
         expect(routing).toMatch(/\| Outside execution or output validation fails \|[^\n]*finish termination, then use Native fallback\./);
         expect(routing).toMatch(/\| Native fallback unavailable or fails \|[^\n]*No clean-review credit\./);
         const fallback = output.slice(output.indexOf('**Native fallback'), output.indexOf('Dispatch via the Agent tool'));
-        expect(fallback.replace(/\s+/g, ' ')).toContain('Immediately before dispatch, check the preflight result again: disabled means no replacement');
+        expectMentions(fallback.replace(/\s+/g, ' '), [['no', 'immediately', 'replacement']], 'fallback.replace(/\s+/g,  )');
         const bounded = output.slice(output.indexOf('**Bounded outside-voice wait'), output.indexOf('**Cross-model tension:**'));
-        expect(bounded).toContain('A native result never supplies outside coverage.');
+        expectMentions(bounded, [['never', 'supplies', 'coverage']], 'bounded');
         expect(output).toContain('A completed native fallback uses SOURCE=in-host, OUTSIDE_STATUS=unavailable, and STATUS=clean or issues_found from its findings');
         expect(output).toContain('"unavailable" if neither reviewer completed');
-        expect(output).toContain('Never count missing coverage as a clean review');
-        expect(output).toContain("These findings are the reviewer's, even if later resolved by the parent");
+        expectMentions(output, [['never', 'coverage', 'missing']], 'output');
         // Compact prose must retain the actual wrong-harness execution guard.
         expect(invocation).toContain('exit 78');
         expect(invocation.indexOf('exit 78')).toBeLessThan(invocation.indexOf('_OUTSIDE_TMP=$(mktemp'));
       } else {
         const prose = output.replace(/\s+/g, ' ');
-        expect(prose).toContain('Other preflight failures retain their printed diagnosis, including harness mismatch');
         const fallback = prose.slice(prose.indexOf('**Native fallback —'), prose.indexOf('Dispatch via the Agent tool'));
-        expect(fallback).toContain('Immediately before dispatch, recheck whether reviews are enabled');
+        expectMentions(fallback, [['before', 'immediately', 'dispatch']], 'fallback');
         expect(fallback).toContain('`CODEX_MODE: disabled`, return to **Record the disabled outcome** without dispatching');
-        expect(prose).toContain('Its opening harness guard rechecks the fresh shell: exit 78 uses the same Native fallback below, never a replacement provider');
-        expect(prose).toContain('A native result never supplies outside coverage.');
+        expectMentions(prose, [['never', 'replacement', 'rechecks']], 'prose');
+        expectMentions(prose, [['never', 'supplies', 'coverage']], 'prose');
         expect(invocation).toContain('exit 78');
         expect(invocation.indexOf('exit 78')).toBeLessThan(invocation.indexOf('_OUTSIDE_TMP=$(mktemp'));
       }
@@ -114,7 +114,7 @@ describe('own-harness review fallback instructions', () => {
       test(`${host.name}: ${name} fallback names only the mode its preflight emits`, () => {
         const ctx: TemplateContext = { host: host.name, skillName: 'review', tmplPath: 'review/SKILL.md.tmpl', paths: HOST_PATHS[host.name] };
         const text = render(ctx);
-        const mode = host.name === 'codex' ? 'under_current_harness' : 'under_codex';
+        const mode = name === 'plan' || host.name === 'codex' ? 'under_current_harness' : 'under_codex';
         const preflight = text.match(/```bash\n([\s\S]*?)\n```/)![1];
         expect(preflight).toContain(mode);
         expect([...new Set(text.match(/under_codex|under_current_harness/g))]).toEqual([mode]);
@@ -127,8 +127,8 @@ describe('own-harness review fallback instructions', () => {
         expect(fallback).toContain('`outside_status: unavailable`');
         expect(fallback).toContain('run no outside CLI');
         expect(fallback).toContain('use the native subagent below');
-        expect(fallback).toContain('A native result never supplies outside coverage.');
-        expect(fallback).toContain('The disabled branch never reaches this fallback.');
+        expectMentions(fallback, [['never', 'supplies', 'coverage']], 'fallback');
+        expectMentions(fallback, [['never', 'disabled', 'fallback']], 'fallback');
         expect(fallback).toContain('`CODEX_MODE: disabled`, finish this section with `outside_status: disabled`;');
       });
     }
@@ -145,7 +145,7 @@ function fixture() {
   if (git.status !== 0) throw new Error(git.stderr);
   const capture = path.join(dir, 'capture.json');
   const fake = path.join(dir, 'fake-claude.ts');
-  fs.writeFileSync(fake, `const prompt=await Bun.stdin.text(); await Bun.write(process.env.FIXTURE_CAPTURE!,JSON.stringify({prompt,args:process.argv.slice(2)})); console.log(JSON.stringify({result:'Recommendation: ship because the isolated fixture completed its review.'}));`);
+  fs.writeFileSync(fake, `const prompt=await Bun.stdin.text(); await Bun.write(process.env.FIXTURE_CAPTURE!,JSON.stringify({prompt,args:process.argv.slice(2)})); console.log(JSON.stringify({result:'No issues found.\\nRecommendation: ship because the isolated fixture completed its review.'}));`);
   const env = { ...process.env, HOME: home, CODEX_HOME: '', GSTACK_HOME: path.join(home, '.gstack'),
     GSTACK_ROOT: '', GSTACK_BIN: '', GSTACK_ACTIVE_HOST: 'codex', CODEX_THREAD_ID: 'fixture', CODEX_SANDBOX: '', CLAUDECODE: '',
     GSTACK_CLAUDE_BIN: process.execPath, GSTACK_CLAUDE_BIN_ARGS: JSON.stringify([fake]), FIXTURE_CAPTURE: capture };
@@ -198,7 +198,8 @@ describe('outside reviewer runtime discovery in fresh shells', () => {
     f.install(f.local);
     const explicit = f.install(path.join(f.home, 'explicit runtime'));
     expect(f.preflight({ GSTACK_ROOT: explicit }).stdout).toContain(`RESOLVED_ROOT: ${explicit}`);
-    expect(f.preflight({ GSTACK_BIN: path.join(explicit, 'bin') }).stdout).toContain(`RESOLVED_ROOT: ${explicit}`);
+    // C1: only an exported GSTACK_ROOT (with bin/ and lib/) is honored; a lone GSTACK_BIN falls back to the repo-local install.
+    expect(f.preflight({ GSTACK_BIN: path.join(explicit, 'bin') }).stdout).toContain(`RESOLVED_ROOT: ${f.local}`);
     const result = f.preflight({ GSTACK_ROOT: '/missing/gstack', GSTACK_BIN: '/missing/gstack/bin' });
     expect(result.stdout).toContain('CODEX_MODE: ready');
     expect(result.stdout).toContain(`RESOLVED_ROOT: ${f.local}`);

@@ -10,7 +10,12 @@
 #   --identity                 also print PROJECT_REMOTE, PROJECT_ROOT, LEGACY_SLUG
 #   --stamp-checkpoint <file>  write remote:/project_root: into a checkpoint's frontmatter
 #   --classify-checkpoints     read checkpoint paths on stdin, print "<status>\t<path>"
+#   --checkpoints-below        list other buckets' checkpoints saved below the cwd, plus pointers
+#   --point-from <dir> <file>  leave a pointer to <file> in <dir>'s bucket (nested-repo saves)
+#   --newer-task <branch>      read restore candidates on stdin, name a newer same-task checkpoint
 #   --adopt-legacy [--copy <relpath>...]  review/copy files from the pre-#3003 bucket
+#   --adopt-legacy --from <slug>  merge a former bucket (e.g. a worktree's) into this one
+#   --adopt-legacy --dismiss <slug>  stop naming a former bucket at skill start
 #
 # Nested-group remotes (#3003): a hosted remote with 3+ path segments
 # (gitlab.com/a/product/repo) files under "<last-two>-<16 hex>" instead of the
@@ -21,6 +26,17 @@
 # copies it with --adopt-legacy; nothing moves automatically. ssh host aliases
 # (git@work-gitlab:…) are a different canonical host than the https spelling;
 # pin those with GSTACK_PROJECT_SLUG.
+#
+# Cache key (#2767): inside a git repository the entry is keyed on the git
+# common dir, which the main checkout, its subdirectories and every linked
+# worktree share, so a worktree can no longer resolve a different slug than
+# the main checkout. It is read from .git files without spawning git. Entries
+# written before this keyed on pwd; on a miss the main checkout's old entry
+# wins over the current directory's own old entry (deterministic: the main
+# checkout holds the project's original, possibly pre-remote, identity). When
+# a worktree's own old entry named a different, non-empty bucket, that slug is
+# recorded in projects/<slug>/.former-slugs until --adopt-legacy --from merges
+# it or --dismiss drops it. Both keys are written, so pwd-keyed readers agree.
 #
 # Cache format: entries are versioned ("v2:<slug>"). An unversioned entry from
 # an older gstack is recomputed once (one git spawn) and rewritten as v2; it
@@ -86,24 +102,33 @@ gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
 
 MODE=default
 MODE_ARG=""
+MODE_ARG2=""
 COPY_PATHS=()
 case "${1:-}" in
   "") ;;
   --identity) MODE=identity ;;
   --get) MODE=get; MODE_ARG="${2:-}"
-    case "$MODE_ARG" in SLUG|BRANCH|PROJECT_REMOTE|PROJECT_ROOT|LEGACY_SLUG) ;;
-      *) echo "usage: gstack-slug --get SLUG|BRANCH|PROJECT_REMOTE|PROJECT_ROOT|LEGACY_SLUG" >&2; exit 2 ;;
+    case "$MODE_ARG" in SLUG|BRANCH|PROJECT_REMOTE|PROJECT_ROOT|LEGACY_SLUG|FORMER_SLUGS) ;;
+      *) echo "usage: gstack-slug --get SLUG|BRANCH|PROJECT_REMOTE|PROJECT_ROOT|LEGACY_SLUG|FORMER_SLUGS" >&2; exit 2 ;;
     esac ;;
   --stamp-checkpoint) MODE=stamp; MODE_ARG="${2:-}"
     [[ -n "$MODE_ARG" ]] || { echo "usage: gstack-slug --stamp-checkpoint <file>" >&2; exit 2; } ;;
   --classify-checkpoints) MODE=classify ;;
+  --checkpoints-below) MODE=below ;;
+  --newer-task) MODE=newer-task; MODE_ARG="${2:-}" ;;
+  --point-from) MODE=point; MODE_ARG="${2:-}"; MODE_ARG2="${3:-}"
+    [[ -n "$MODE_ARG" && -n "$MODE_ARG2" ]] || { echo "usage: gstack-slug --point-from <start dir> <checkpoint file>" >&2; exit 2; } ;;
   --adopt-legacy) MODE=adopt; shift
     if [[ "${1:-}" == "--copy" ]]; then
       shift
       [[ $# -gt 0 ]] || { echo "usage: gstack-slug --adopt-legacy --copy <relpath>..." >&2; exit 2; }
       COPY_PATHS=("$@")
+    elif [[ "${1:-}" == "--from" || "${1:-}" == "--dismiss" ]]; then
+      MODE=$([[ "$1" == "--from" ]] && echo adopt-from || echo adopt-dismiss)
+      MODE_ARG=$(printf '%s' "${2:-}" | tr -cd 'a-zA-Z0-9._-')
+      case "$MODE_ARG" in ""|.|..) echo "usage: gstack-slug --adopt-legacy $1 <slug>" >&2; exit 2 ;; esac
     elif [[ -n "${1:-}" ]]; then
-      echo "usage: gstack-slug --adopt-legacy [--copy <relpath>...]" >&2; exit 2
+      echo "usage: gstack-slug --adopt-legacy [--copy <relpath>... | --from <slug> | --dismiss <slug>]" >&2; exit 2
     fi ;;
   -h|--help)
     cat <<'USAGE'
@@ -116,9 +141,19 @@ gstack-slug — print SLUG=<project slug> and BRANCH=<branch> for the current di
   gstack-slug --stamp-checkpoint FILE   write remote:/project_root: into FILE's frontmatter
   gstack-slug --classify-checkpoints    read checkpoint paths on stdin; print "<status><TAB><path>",
                                         status = match | match-root | foreign | unstamped
+  gstack-slug --checkpoints-below       outside git: other buckets' checkpoints whose project_root
+                                        is below the cwd (newest 200 read); always: this bucket's
+                                        pointers. Prints "BELOW_CWD <path>" / "POINTER <path>"
+  gstack-slug --point-from DIR FILE     record FILE in DIR's bucket when DIR files elsewhere
+  gstack-slug --newer-task BRANCH       read restore candidates on stdin (BRANCH's first); print
+                                        "NEWER_TASK <path>" for a newer same-task other-branch save
   gstack-slug --adopt-legacy            list the old bucket's files (checkpoints marked
                                         matching/foreign/unknown); asks per file on a terminal
   gstack-slug --adopt-legacy --copy P…  copy the named files (paths relative to the old bucket)
+  gstack-slug --adopt-legacy --from S   merge bucket S into this project's: JSONL logs merge with
+                                        de-duplication, missing files copy, differing files are
+                                        listed as conflicts and never overwritten; S is kept
+  gstack-slug --adopt-legacy --dismiss S  stop naming former bucket S at skill start
 Env: GSTACK_PROJECT_SLUG pins the slug (ssh host aliases, vendored sub-repos); never cached.
 USAGE
     exit 0 ;;
@@ -129,6 +164,41 @@ PROJECT_DIR="$(pwd)"
 # Encode absolute path as cache key: /Users/j/foo → _Users_j_foo
 CACHE_KEY=$(printf '%s' "$PROJECT_DIR" | tr '/' '_')
 CACHE_FILE="${CACHE_DIR}/${CACHE_KEY}"
+
+# Physical git common dir of the repository holding $1 (nearest .git entry),
+# or nothing outside git. A worktree's .git file names its gitdir, whose
+# `commondir` file points at the shared dir. No git spawn.
+_git_common_dir() {
+  local dir="$1" parent="" gitdir="" common="" depth=0
+  while [[ -n "$dir" && $depth -lt 64 ]]; do
+    if [[ -d "$dir/.git" ]]; then (cd "$dir/.git" 2>/dev/null && pwd -P); return 0; fi
+    if [[ -f "$dir/.git" ]]; then
+      gitdir=$(sed -n 's/^gitdir: *//p' "$dir/.git" 2>/dev/null | head -1)
+      [[ -n "$gitdir" ]] || return 0
+      [[ "$gitdir" == /* || "$gitdir" =~ ^[A-Za-z]: ]] || gitdir="$dir/$gitdir"
+      common="$gitdir"
+      if [[ -f "$gitdir/commondir" ]]; then
+        common=$(head -1 "$gitdir/commondir" 2>/dev/null)
+        [[ "$common" == /* || "$common" =~ ^[A-Za-z]: ]] || common="$gitdir/$common"
+      fi
+      (cd "$common" 2>/dev/null && pwd -P); return 0
+    fi
+    parent=$(dirname "$dir")
+    [[ "$parent" == "$dir" ]] && break
+    dir="$parent"
+    depth=$((depth + 1))
+  done
+  return 0
+}
+LEGACY_CACHE_FILE="$CACHE_FILE"
+MAIN_CACHE_FILE=""
+GIT_COMMON_DIR=$(_git_common_dir "$PROJECT_DIR")
+if [[ -n "$GIT_COMMON_DIR" ]]; then
+  CACHE_FILE="${CACHE_DIR}/$(printf '%s' "$GIT_COMMON_DIR" | tr '/' '_')"
+  if [[ "$(basename "$GIT_COMMON_DIR")" == .git ]]; then
+    MAIN_CACHE_FILE="${CACHE_DIR}/$(dirname "$GIT_COMMON_DIR" | tr '/' '_')"
+  fi
+fi
 
 SLUG=""
 
@@ -276,8 +346,12 @@ _resolve_remote() {
 #       so the heal never fires.
 _CACHE_V2=0
 LEGACY_NOTICE_SLUG=""
-if [[ -z "$SLUG" && -f "$CACHE_FILE" ]]; then
-  _RAW_CACHE=$(cat "$CACHE_FILE" 2>/dev/null || true)
+_ENTRY_FILE=""
+for _f in "$CACHE_FILE" "$MAIN_CACHE_FILE" "$LEGACY_CACHE_FILE"; do
+  if [[ -n "$_f" && -f "$_f" ]]; then _ENTRY_FILE="$_f"; break; fi
+done
+if [[ -z "$SLUG" && -n "$_ENTRY_FILE" ]]; then
+  _RAW_CACHE=$(cat "$_ENTRY_FILE" 2>/dev/null || true)
   if [[ "$_RAW_CACHE" == v2:* ]]; then
     _CACHE_V2=1
     _RAW_CACHE="${_RAW_CACHE#v2:}"
@@ -356,18 +430,33 @@ SLUG="${SLUG:-$(basename "$PROJECT_DIR" | tr -cd 'a-zA-Z0-9._-')}"
 #     injection, but the invariant should not depend on that reasoning).
 SLUG=$(printf '%s' "$SLUG" | tr -cd 'a-zA-Z0-9._-')
 
+# A worktree whose own pre-#2767 entry named a different bucket that still
+# holds data: remember it so skill start can name the merge command.
+if [[ -n "$SLUG" && "$SLUG_FROM_ENV" -eq 0 && "$_ENTRY_FILE" != "$LEGACY_CACHE_FILE" && -f "$LEGACY_CACHE_FILE" ]]; then
+  _OWN=$(cat "$LEGACY_CACHE_FILE" 2>/dev/null || true)
+  _OWN=$(printf '%s' "${_OWN#v2:}" | tr -cd 'a-zA-Z0-9._-')
+  _FORMER_FILE="$GSTACK_STATE_ROOT/projects/$SLUG/.former-slugs"
+  if [[ -n "$_OWN" && "$_OWN" != "$SLUG" && "$_OWN" != . && "$_OWN" != .. && -n "$(ls -A "$GSTACK_STATE_ROOT/projects/$_OWN" 2>/dev/null)" ]] \
+    && ! grep -qxF -- "$_OWN" "$_FORMER_FILE" 2>/dev/null; then
+    mkdir -p "$(dirname "$_FORMER_FILE")" 2>/dev/null && printf '%s\n' "$_OWN" >> "$_FORMER_FILE" 2>/dev/null || true
+  fi
+fi
+
 if [[ -n "$SLUG" && "$SLUG_FROM_ENV" -eq 0 ]]; then
-  CURRENT_CACHE=""
-  if [[ -f "$CACHE_FILE" ]]; then
-    CURRENT_CACHE=$(cat "$CACHE_FILE" 2>/dev/null || true)
-  fi
-  if [[ "$CURRENT_CACHE" != "v2:$SLUG" ]]; then
-    mkdir -p "$CACHE_DIR" 2>/dev/null || true
-    CACHE_TMP=$(mktemp "$CACHE_DIR/.slug-XXXXXX" 2>/dev/null) || CACHE_TMP=""
-    if [[ -n "$CACHE_TMP" ]]; then
-      printf 'v2:%s' "$SLUG" > "$CACHE_TMP" && mv "$CACHE_TMP" "$CACHE_FILE" 2>/dev/null || rm -f "$CACHE_TMP" 2>/dev/null
+  for _f in "$CACHE_FILE" "$LEGACY_CACHE_FILE"; do
+    CURRENT_CACHE=""
+    if [[ -f "$_f" ]]; then
+      CURRENT_CACHE=$(cat "$_f" 2>/dev/null || true)
     fi
-  fi
+    if [[ "$CURRENT_CACHE" != "v2:$SLUG" ]]; then
+      mkdir -p "$CACHE_DIR" 2>/dev/null || true
+      CACHE_TMP=$(mktemp "$CACHE_DIR/.slug-XXXXXX" 2>/dev/null) || CACHE_TMP=""
+      if [[ -n "$CACHE_TMP" ]]; then
+        printf 'v2:%s' "$SLUG" > "$CACHE_TMP" && mv "$CACHE_TMP" "$_f" 2>/dev/null || rm -f "$CACHE_TMP" 2>/dev/null
+      fi
+    fi
+    [[ "$CACHE_FILE" == "$LEGACY_CACHE_FILE" ]] && break
+  done
 fi
 
 # One notice on the resolve that first files this project under its new
@@ -384,6 +473,65 @@ BRANCH="${BRANCH:-unknown}"
 if [[ "$MODE" == "get" && ( "$MODE_ARG" == SLUG || "$MODE_ARG" == BRANCH ) ]]; then
   if [[ "$MODE_ARG" == SLUG ]]; then printf '%s\n' "$SLUG"; else printf '%s\n' "$BRANCH"; fi
   exit 0
+fi
+FORMER_FILE="$GSTACK_STATE_ROOT/projects/$SLUG/.former-slugs"
+if [[ "$MODE" == "get" && "$MODE_ARG" == FORMER_SLUGS ]]; then
+  # Former buckets still holding data and not yet adopted or dismissed.
+  while IFS= read -r _former || [[ -n "$_former" ]]; do
+    _former=$(printf '%s' "$_former" | tr -cd 'a-zA-Z0-9._-')
+    case "$_former" in ""|.|..) continue ;; esac
+    [[ -n "$(ls -A "$GSTACK_STATE_ROOT/projects/$_former" 2>/dev/null)" ]] && printf '%s\n' "$_former"
+  done < <(cat "$FORMER_FILE" 2>/dev/null || true)
+  exit 0
+fi
+_forget_former() {
+  [[ -f "$FORMER_FILE" ]] || return 0
+  local tmp
+  tmp=$(mktemp "$FORMER_FILE.XXXXXX") || return 1
+  grep -vxF -- "$1" "$FORMER_FILE" > "$tmp" || true
+  mv "$tmp" "$FORMER_FILE"
+}
+if [[ "$MODE" == "adopt-dismiss" ]]; then
+  _forget_former "$MODE_ARG" && echo "Dismissed projects/$MODE_ARG; its files are kept and skill start no longer names it."
+  exit $?
+fi
+if [[ "$MODE" == "adopt-from" ]]; then
+  FROM_BUCKET="$GSTACK_STATE_ROOT/projects/$MODE_ARG"
+  TO_BUCKET="$GSTACK_STATE_ROOT/projects/$SLUG"
+  [[ "$MODE_ARG" != "$SLUG" ]] || { echo "gstack-slug: projects/$MODE_ARG is this project's own bucket." >&2; exit 2; }
+  [[ -d "$FROM_BUCKET" && ! -L "$FROM_BUCKET" ]] || { echo "gstack-slug: no bucket at $FROM_BUCKET." >&2; exit 1; }
+  mkdir -p "$TO_BUCKET" || exit 1
+  MIGRATED=0; PENDING=0; CONFLICTING=0; UNCHANGED=0; CONFLICTS=""; PENDINGS=""
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    src="$FROM_BUCKET/$rel"; dst="$TO_BUCKET/$rel"
+    if [[ -L "$src" || ! -f "$src" ]]; then
+      PENDING=$((PENDING + 1)); PENDINGS="$PENDINGS  $rel (not a regular file; review by hand)"$'\n'; continue
+    fi
+    if [[ ! -e "$dst" ]]; then
+      mkdir -p "$(dirname "$dst")" && cp -p "$src" "$dst" && MIGRATED=$((MIGRATED + 1)) && continue
+      PENDING=$((PENDING + 1)); PENDINGS="$PENDINGS  $rel (copy failed)"$'\n'; continue
+    fi
+    if cmp -s "$src" "$dst"; then UNCHANGED=$((UNCHANGED + 1)); continue; fi
+    if [[ "$rel" == *.jsonl && -f "$dst" && ! -L "$dst" ]]; then
+      # Append-only logs: add the lines this bucket lacks, keeping its order.
+      tmp=$(mktemp "$dst.XXXXXX") || { PENDING=$((PENDING + 1)); continue; }
+      if { cat "$dst"; awk 'FNR == NR { seen[$0] = 1; next } !($0 in seen) { seen[$0] = 1; print }' "$dst" "$src"; } > "$tmp"; then
+        if cmp -s "$tmp" "$dst"; then rm -f "$tmp"; UNCHANGED=$((UNCHANGED + 1)); else mv "$tmp" "$dst"; MIGRATED=$((MIGRATED + 1)); fi
+      else
+        rm -f "$tmp"; PENDING=$((PENDING + 1)); PENDINGS="$PENDINGS  $rel (merge failed)"$'\n'
+      fi
+      continue
+    fi
+    CONFLICTING=$((CONFLICTING + 1)); CONFLICTS="$CONFLICTS  $rel"$'\n'
+  done < <(cd "$FROM_BUCKET" && find . \( -type f -o -type l \) ! -name .former-slugs -print0 2>/dev/null)
+  echo "adopt-legacy --from $MODE_ARG into projects/$SLUG: migrated $MIGRATED, pending $PENDING, conflicting $CONFLICTING, unchanged $UNCHANGED"
+  [[ -z "$PENDINGS" ]] || printf 'Pending (left in projects/%s):\n%s' "$MODE_ARG" "$PENDINGS"
+  [[ -z "$CONFLICTS" ]] || printf 'Conflicting (both differ; nothing overwritten, compare by hand):\n%s' "$CONFLICTS"
+  echo "projects/$MODE_ARG is kept; delete it yourself once you are satisfied."
+  _forget_former "$MODE_ARG" || true
+  [[ "$PENDING" -eq 0 ]]
+  exit $?
 fi
 if [[ "$MODE" == "default" ]]; then
   echo "SLUG=$SLUG"
@@ -443,7 +591,74 @@ _classify_checkpoint() {
   fi
 }
 
+# Physical root of the checkout holding $1 (nearest .git entry), or nothing.
+_git_toplevel() {
+  local dir="$1" parent="" depth=0
+  while [[ -n "$dir" && $depth -lt 64 ]]; do
+    if [[ -e "$dir/.git" ]]; then (cd "$dir" 2>/dev/null && pwd -P); return 0; fi
+    parent=$(dirname "$dir")
+    [[ "$parent" == "$dir" ]] && break
+    dir="$parent"
+    depth=$((depth + 1))
+  done
+  return 0
+}
+
+# Prints "<branch>\037<project_root>\037<worktree>\037<title>": frontmatter
+# fields and the "## Working on:" heading (the filename's title part without it).
+_checkpoint_meta() {
+  local name
+  name=$(basename "$1" .md)
+  awk -v fallback="$name" '
+    function val(key) { v = $0; sub("^" key ":[ \t]*", "", v); sub(/[ \t\r]+$/, "", v); return v }
+    NR == 1 && $0 == "---" { fm = 1; next }
+    fm && $0 == "---" { fm = 0; next }
+    fm && /^branch:/ && !hb { b = val("branch"); hb = 1 }
+    fm && /^project_root:/ && !hr { r = val("project_root"); hr = 1 }
+    fm && /^worktree:/ && !hw { w = val("worktree"); hw = 1 }
+    !fm && /^## Working on:/ { t = val("## Working on"); exit }
+    END {
+      if (t == "") { t = fallback; sub(/^[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-?/, "", t) }
+      printf "%s\037%s\037%s\037%s\n", b, r, w, t
+    }' "$1" 2>/dev/null || true
+}
+
+# Task-title form: lowercased, a leading date removed, punctuation and
+# whitespace collapsed to single spaces. Generic titles normalize to nothing.
+_norm_title() {
+  local t
+  t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/^[[:space:]]*[0-9]{4}-?[0-9]{2}-?[0-9]{2}([-_t ]?[0-9]{2}:?[0-9]{2}(:?[0-9]{2})?)?//; s/[[:punct:][:space:]]+/ /g; s/^ //; s/ $//')
+  case "$t" in wip|checkpoint|save|notes|todo) t="" ;; esac
+  printf '%s' "$t"
+}
+
+# Ticket tokens (#123, ABC-123), one per line.
+_ticket_tokens() {
+  printf '%s\n' "$@" | grep -oE '#[0-9]+|[A-Z][A-Z0-9]+-[0-9]+' 2>/dev/null | sort -u || true
+}
+
+_json_str() {
+  local v="${1//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  printf '"%s"' "$v"
+}
+
+# Prints the checkpoint path recorded in pointer $1 when it names a regular
+# file inside a bucket's checkpoints directory; nothing otherwise.
+_pointer_target() {
+  local v dir
+  v=$(sed -n 's/^  "checkpoint": "\(.*\)",$/\1/p' "$1" 2>/dev/null | head -1)
+  v="${v//\\\"/\"}"
+  v="${v//\\\\/\\}"
+  [[ -n "$v" && -f "$v" && ! -L "$v" ]] || return 0
+  dir=$(cd "$(dirname "$v")" 2>/dev/null && pwd -P) || return 0
+  [[ "$(basename "$dir")" == checkpoints && "$(dirname "$(dirname "$dir")")" == "$STATE_PHYS/projects" ]] || return 0
+  printf '%s\n' "$v"
+}
+
 _resolve_identity
+STATE_PHYS=$(cd "$GSTACK_STATE_ROOT" 2>/dev/null && pwd -P) || STATE_PHYS="$GSTACK_STATE_ROOT"
 
 case "$MODE" in
   get)
@@ -465,11 +680,17 @@ case "$MODE" in
   stamp)
     [[ -f "$MODE_ARG" ]] || { echo "gstack-slug: no such checkpoint file: $MODE_ARG" >&2; exit 1; }
     STAMP_TMP=$(mktemp "${MODE_ARG}.stamp-XXXXXX") || exit 1
-    if GRI_REMOTE="$ID_REMOTE" GRI_ROOT="$ID_ROOT" awk '
-      function ids() { if (ENVIRON["GRI_REMOTE"] != "") print "remote: " ENVIRON["GRI_REMOTE"]; print "project_root: " ENVIRON["GRI_ROOT"] }
+    STAMP_WORKTREE=$(_git_toplevel "$PROJECT_DIR")
+    [[ "$STAMP_WORKTREE" != "$ID_ROOT" ]] || STAMP_WORKTREE=""
+    if GRI_REMOTE="$ID_REMOTE" GRI_ROOT="$ID_ROOT" GRI_WORKTREE="$STAMP_WORKTREE" awk '
+      function ids() {
+        if (ENVIRON["GRI_REMOTE"] != "") print "remote: " ENVIRON["GRI_REMOTE"]
+        print "project_root: " ENVIRON["GRI_ROOT"]
+        if (ENVIRON["GRI_WORKTREE"] != "") print "worktree: " ENVIRON["GRI_WORKTREE"]
+      }
       NR == 1 { if ($0 == "---") { infm = 1; print; next } print "---"; ids(); print "---" }
       infm && $0 == "---" { ids(); print; infm = 0; next }
-      infm && (/^remote:/ || /^project_root:/) { next }
+      infm && (/^remote:/ || /^project_root:/ || /^worktree:/) { next }
       { print }
       END { if (NR == 0) { print "---"; ids(); print "---" } }' "$MODE_ARG" > "$STAMP_TMP"; then
       mv "$STAMP_TMP" "$MODE_ARG"
@@ -484,6 +705,94 @@ case "$MODE" in
       [[ -n "$ck_file" ]] || continue
       _classify_checkpoint "$ck_file"
       printf '%s\t%s\n' "$_ck_status" "$ck_file"
+    done
+    ;;
+
+  below)
+    # Checkpoints a session saved in a repository below this directory: the
+    # pointers a /context-save started here left, and (outside git) other
+    # buckets' checkpoints whose project_root lies below the cwd. Only the 200
+    # newest are read; from $HOME each project shows only its newest.
+    BELOW_CWD=$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P) || BELOW_CWD="$PROJECT_DIR"
+    BELOW_HOME=$(cd "${HOME:-/nonexistent}" 2>/dev/null && pwd -P) || BELOW_HOME=""
+    BELOW_SEEN=$'\n'; BELOW_ROOTS=$'\n'; BELOW_OUT=""
+    while IFS= read -r ptr; do
+      [[ -n "$ptr" ]] || continue
+      target=$(_pointer_target "$ptr")
+      [[ -n "$target" && "$BELOW_SEEN" != *$'\n'"$target"$'\n'* ]] || continue
+      BELOW_SEEN="$BELOW_SEEN$target"$'\n'
+      BELOW_OUT="$BELOW_OUT$(basename "$target")"$'\t'"POINTER $target"$'\n'
+    done < <(find "$STATE_PHYS/projects/$SLUG/checkpoint-pointers" -maxdepth 1 -name '*.json' -type f 2>/dev/null | LC_ALL=C sort -r | head -200)
+    if [[ -z "$GIT_COMMON_DIR" ]]; then
+      while IFS= read -r f; do
+        [[ -n "$f" && "$BELOW_SEEN" != *$'\n'"$f"$'\n'* ]] || continue
+        meta=$(_checkpoint_meta "$f")
+        IFS=$'\037' read -r _b root _w _t <<<"$meta"
+        [[ -n "$root" && "$root" == "$BELOW_CWD"/* ]] || continue
+        if [[ "$BELOW_CWD" == "$BELOW_HOME" ]]; then
+          [[ "$BELOW_ROOTS" != *$'\n'"$root"$'\n'* ]] || continue
+          BELOW_ROOTS="$BELOW_ROOTS$root"$'\n'
+        fi
+        BELOW_OUT="$BELOW_OUT$(basename "$f")"$'\t'"BELOW_CWD $f"$'\n'
+      done < <(find "$STATE_PHYS/projects" -mindepth 3 -maxdepth 3 -path '*/checkpoints/*.md' -type f \
+        ! -path "$STATE_PHYS/projects/$SLUG/*" 2>/dev/null \
+        | awk -F/ '{ print $NF "\t" $0 }' | LC_ALL=C sort -r | head -200 | cut -f2-)
+    fi
+    printf '%s' "$BELOW_OUT" | LC_ALL=C sort -r | head -20 | cut -f2-
+    ;;
+
+  point)
+    # A /context-save that started in DIR but filed elsewhere (a nested repo)
+    # leaves a JSON pointer in DIR's bucket so /context-restore there finds it.
+    [[ -d "$MODE_ARG" ]] || { echo "gstack-slug: no such start directory: $MODE_ARG" >&2; exit 1; }
+    [[ -f "$MODE_ARG2" && ! -L "$MODE_ARG2" ]] || { echo "gstack-slug: no such checkpoint file: $MODE_ARG2" >&2; exit 1; }
+    PT_FILE="$(cd "$(dirname "$MODE_ARG2")" && pwd -P)/$(basename "$MODE_ARG2")"
+    PT_BUCKET=$(basename "$(dirname "$(dirname "$PT_FILE")")")
+    [[ "$(basename "$(dirname "$PT_FILE")")" == checkpoints && "$(dirname "$(dirname "$(dirname "$PT_FILE")")")" == "$STATE_PHYS/projects" ]] \
+      || { echo "gstack-slug: $MODE_ARG2 is not a saved checkpoint under $GSTACK_STATE_ROOT/projects" >&2; exit 1; }
+    PT_START=$(cd "$MODE_ARG" && "$0" --get SLUG 2>/dev/null) || exit 1
+    case "$PT_START" in ""|.|..) exit 1 ;; esac
+    [[ "$PT_START" != "$PT_BUCKET" ]] || exit 0
+    IFS=$'\037' read -r _b PT_ROOT _w _t <<<"$(_checkpoint_meta "$PT_FILE")"
+    PT_DIR="$GSTACK_STATE_ROOT/projects/$PT_START/checkpoint-pointers"
+    mkdir -p "$PT_DIR" || exit 1
+    PT_OUT="$PT_DIR/$(basename "$PT_FILE" .md)--$PT_BUCKET.json"
+    printf '{\n  "checkpoint": %s,\n  "bucket": %s,\n  "project_root": %s\n}\n' \
+      "$(_json_str "$PT_FILE")" "$(_json_str "$PT_BUCKET")" "$(_json_str "$PT_ROOT")" > "$PT_OUT" || exit 1
+    echo "POINTER_WRITTEN $PT_OUT"
+    ;;
+
+  newer-task)
+    # Restore candidates arrive current-branch first. When another branch of
+    # this repository holds a newer checkpoint for the same task (a worktree
+    # below the main tree, the same title, or the same ticket token), name it
+    # so /context-restore shows both instead of silently taking the branch match.
+    NT_FIRST=""; NT_FB=""; NT_FR=""; NT_FW=""; NT_FT=""; NT_FTOK=""
+    NT_HERE=$(_git_toplevel "$PROJECT_DIR")
+    NT_MAIN=""
+    [[ "$(basename "$GIT_COMMON_DIR")" != .git ]] || NT_MAIN=$(dirname "$GIT_COMMON_DIR")
+    while IFS= read -r f || [[ -n "$f" ]]; do
+      [[ -n "$f" ]] || continue
+      if [[ -n "$NT_FIRST" ]]; then
+        nb=$(basename "$f"); fb=$(basename "$NT_FIRST")
+        [[ "${nb:0:15}" > "${fb:0:15}" ]] || continue
+      fi
+      IFS=$'\037' read -r b root wt title <<<"$(_checkpoint_meta "$f")"
+      if [[ -z "$NT_FIRST" ]]; then
+        [[ -n "$MODE_ARG" && "$b" == "$MODE_ARG" ]] || exit 0
+        NT_FIRST="$f"; NT_FB="$b"; NT_FT=$(_norm_title "$title"); NT_FTOK=$(_ticket_tokens "$title" "$b")
+        continue
+      fi
+      [[ "$b" != "$NT_FB" ]] || continue
+      wt="${wt:-$root}"
+      if [[ -n "$NT_MAIN" && "$NT_HERE" == "$NT_MAIN" && "$wt" == "$NT_MAIN"/* ]]; then
+        echo "NEWER_TASK $f"; exit 0
+      fi
+      nt=$(_norm_title "$title")
+      if [[ -n "$nt" && "$nt" == "$NT_FT" ]]; then echo "NEWER_TASK $f"; exit 0; fi
+      if [[ -n "$NT_FTOK" ]] && [[ -n "$(comm -12 <(printf '%s\n' "$NT_FTOK") <(_ticket_tokens "$title" "$b") 2>/dev/null)" ]]; then
+        echo "NEWER_TASK $f"; exit 0
+      fi
     done
     ;;
 

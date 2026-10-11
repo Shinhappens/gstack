@@ -120,9 +120,10 @@ export function planFloorDXReplyInput(visible: string, call: NativePlanQuestionC
   const first = lines.findIndex(line => /^  1\. /.test(line));
   if (first < 0) return null;
   lines[first] = lines[first]!.replace(/^  1\./, '❯ 1.');
-  const pane = planFloorDXPane(lines.map(line => line.replace(
-    /^(Enter to select · ↑\/↓ to navigate · (?:n to add notes · )?)ctrl\+g to edit in [^\x00-\x1f\x7f·]+ · (Esc to cancel)$/,
-    '$1$2')).join('\n'), call);
+  // Only the final footer line is presentation; question text that resembles it stays verbatim.
+  const footer = lines.findLastIndex(line => line.trim().length > 0);
+  lines[footer] = lines[footer]!.replace(/^[ \t]*(Enter to select · ↑\/↓ to navigate(?: · n to add notes)?) · ctrl\+g to edit in [^\x00-\x1f\x7f·]+( · Esc to cancel)[ \t]*$/, '$1$2');
+  const pane = planFloorDXPane(lines.join('\n'), call);
   if (!pane || compact(pane) !== compact(state.pane)) return null;
   return state.stage === 'paste'
     ? { input: '\x1b[200~' + state.reply + '\x1b[201~', stage: 'submit' }
@@ -171,7 +172,7 @@ export async function runPlanSkillFloorCheck(opts: PlanSkillFloorOptions): Promi
     // Runs 36626737820 and 36776104571: CEO read scope preservation as approving
     // approach A, so the seeded premise gap never reached a question. Run 36794871032:
     // CEO read this request as supplying every answer up front and asked nothing.
-    ...(opts.skillName === 'plan-ceo-review' ? ['Preserving scope does not approve the plan\'s premise, approach or any remedy. This request answers only the routing, recall, outside-reviewer and review-mode questions named above.'] : []),
+    ...(opts.skillName === 'plan-ceo-review' ? ['Preserving scope does not approve the plan\'s premise, approach or any remedy. The routing, recall, outside-reviewer and review-mode choices above are already answered. Premise, approach and remedy decisions remain unanswered; follow the skill\'s normal interactive decision workflow for those choices.'] : []),
     ...(opts.productType === 'sdk-documentation' ? [
       'Product type is confirmed: SDK quickstart documentation, with the complete journey to the first SDK call as context. If asked to classify, choose SDK + Docs when offered, otherwise Documentation. This confirms the review lens; it does not expand the plan.',
       'Target persona is confirmed: a hands-on developer integrating this SDK for the first time, trying to make one successful call. Product type and persona setup are already answered; proceed to reviewing the supplied plan.',
@@ -191,7 +192,7 @@ export async function runPlanSkillFloorCheck(opts: PlanSkillFloorOptions): Promi
     artifactError: undefined, finished: false, started: false, start: 0, deadlineAt: 0, screenDeadlineAt: 0,
   } as unknown as FloorRun;
   return runPtySession<PlanSkillFloorObservation>({
-    driver,
+    driver, budgetMs: timeoutMs,
     cleanup: () => fixture.cleanup(),
     launch: {
       permissionMode: 'plan',

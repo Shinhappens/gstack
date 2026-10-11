@@ -113,8 +113,9 @@ export const FILE_RETRY_BUDGETS = [
     { file: 'test/skill-e2e-plan-ceo-mode-routing.test.ts', attemptMs: 2 * CAPTURE_LONG_MS, caseMs: CAPTURE_LONG_MS },
     { file: 'test/skill-e2e-plan-eng-plan-mode.test.ts', attemptMs: 2 * CAPTURE_LONG_MS, caseMs: CAPTURE_LONG_MS },
     { file: 'test/skill-e2e-plan-prosons.test.ts', attemptMs: 4 * (CAPTURE_MS + 10_000), caseMs: CAPTURE_MS + 10_000 },
-    // Gate: six 300s cases + one 610s case; periodic: two 900s + three 600s.
-    { file: 'test/skill-e2e-plan.test.ts', attemptMs: Math.max(6 * CAPTURE_MS + CAPTURE_LONG_MS + 10_000, 2 * PTY_MS + 3 * CAPTURE_LONG_MS), caseMs: PTY_MS },
+    // Gate: six 300s cases + one 610s case; periodic: two 900s + two 600s
+    // (plan-eng-review-artifact runs from its own PTY file).
+    { file: 'test/skill-e2e-plan.test.ts', attemptMs: Math.max(6 * CAPTURE_MS + CAPTURE_LONG_MS + 10_000, 2 * PTY_MS + 2 * CAPTURE_LONG_MS), caseMs: PTY_MS },
   ].map(({ file, attemptMs, caseMs }) => ({
     file, attemptMs, caseMs,
     id: `${file.slice('test/'.length, -'.test.ts'.length)}-existing-retry-v1`,
@@ -129,3 +130,20 @@ export function assertPaidTestBudget(file: string, ms: number): void {
     throw new Error(`Unregistered paid test budget: ${file}: ${ms}`);
   }
 }
+
+/**
+ * Diagnostic thresholds, outside EVAL_POLICY: v1 verdicts never read them.
+ * A session above HEADROOM_WARN of the timeout it armed is flagged by
+ * `eval:pass-rates --headroom`; above HEADROOM_FAIL the weekly `--gate` alarms.
+ * Cut work to get under them; budgets are never raised.
+ */
+export const HEADROOM_WARN = 0.75;
+export const HEADROOM_FAIL = 0.85;
+
+/**
+ * In-request stream silence that labels a provider stall (failure_cause
+ * provider_stall, still a failure under EVAL_POLICY v1). Pre-registered from
+ * census 37198445662 on Claude Code 2.1.284: the longest gap inside one model
+ * message across 50 messages was 9.6 s, thinking deltas included.
+ */
+export const STALL_WINDOW_MS = 120_000;

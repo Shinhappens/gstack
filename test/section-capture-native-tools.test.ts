@@ -76,10 +76,11 @@ mock.module(${JSON.stringify(source)},()=>({...capture,captureSectionReads:async
     return successful;
   } finally { fs.rmSync(opts.planDir,{recursive:true,force:true}); }
 }}));
-await import(${JSON.stringify(path.join(root,'test/carve-section-loading-plan-eng-review.test.ts'))});
+const { registerCarveSectionCase } = await import(${JSON.stringify(path.join(root,'test/helpers/carve-section-case.ts'))});
+registerCarveSectionCase('plan-eng-review');
 `);
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: dir, TMP: dir, TEMP: dir,
-    GSTACK_HOME: operatorState, GSTACK_STATE_ROOT: operatorState, EVALS_HERMETIC: '1', EVALS: '', EVALS_ALL: '', GSTACK_CARVE_SKILL: '' };
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: dir, TMP: dir, TEMP: dir,
+    GSTACK_HOME: operatorState, GSTACK_STATE_ROOT: operatorState, EVALS_HERMETIC: '1', EVALS: '', EVALS_ALL: '' };
   delete env.CI;
   const child = Bun.spawn([process.execPath, 'test', script], { env, cwd: dir, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
   const timer = setTimeout(() => child.kill(), 20_000);
@@ -156,7 +157,7 @@ for(const scenario of ['delivery','timeout','timeout-partial','synthetic-success
 }
 console.log(JSON.stringify(results));
 `);
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: dir, TMP: dir, TEMP: dir, EVALS_HERMETIC: '1' };
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: dir, TMP: dir, TEMP: dir, EVALS_HERMETIC: '1' };
   delete env.CI;
   const child = Bun.spawn([process.execPath, script], { env, cwd: dir, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
   const timer = setTimeout(() => child.kill(), 15_000);
@@ -197,7 +198,7 @@ test('CEO section caller supplies the author scope instead of blanket recommenda
   const caller = fs.readFileSync(path.join(import.meta.dir, 'skill-e2e-plan-ceo-review-section-loading.test.ts'), 'utf8');
   expect(caller).toContain('decisionPolicy: CEO_SECTION_DECISION_POLICY');
   expect(caller).toContain('validateCeoReviewCompletion(capture)');
-  expect(caller).toContain('expect(hasStaleFillRaceFinding(output)).toBe(true)');
+  expect(caller).toContain('expect(hasApprovedStaleFillDecision(output) || hasStaleFillRaceFinding(output)).toBe(true)');
   expect(caller).toContain('timeout: LONG_SECTION_CAPTURE_MS');
   expect(caller).toContain('CAPTURE_LONG_MS');
 });
@@ -224,7 +225,7 @@ await Bun.write('PLAN.md',CEO_SECTION_CACHE_PLAN);
 const capture=await captureSectionReads({planDir:${JSON.stringify(dir)},skillName:'plan-ceo-review',scenario:'Review PLAN.md. Consider weaker consistency, a new alert project, or full implementation code.',decisionPolicy:CEO_SECTION_DECISION_POLICY,reportFile:'PLAN.md',reportMarker:/^## GSTACK REVIEW REPORT\\s*$/m,nativeReviewOnly:true,testName:'ceo-scope-delivery',timeout:LONG_SECTION_CAPTURE_MS,model:'fake-model'});
 console.log(JSON.stringify({reads:[...capture.readSections],report:capture.reportProduced,written:capture.reportWritten,exit:capture.exitReason}));
 `);
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: dir, TMP: dir, TEMP: dir, EVALS_HERMETIC: '1' };
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: dir, TMP: dir, TEMP: dir, EVALS_HERMETIC: '1' };
   delete env.CI;
   const child = Bun.spawn([process.execPath, script], { env, cwd: dir, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
   const timer = setTimeout(() => child.kill(), 15_000);
@@ -283,7 +284,7 @@ const started=Date.now();
 const deadline=await runSkillTest({...base,prompt:'deadline',appendSystemPrompt:${JSON.stringify(literal)},timeout:200,startupGraceMs:200});
 console.log(JSON.stringify({plain:plain.exitReason,literal:literal.exitReason,section:{reads:[...section.readSections],report:section.reportProduced},shell:{reads:[...shell.readSections],report:shell.reportProduced},deadline:{reason:deadline.exitReason,wall:Date.now()-started}}));
 `);
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: dir, TMP: dir, TEMP: dir, EVALS_HERMETIC: '1' };
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: dir, TMP: dir, TEMP: dir, EVALS_HERMETIC: '1' };
   delete env.CI;
   const child = Bun.spawn([process.execPath, script], { env, cwd: dir, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
   const timer = setTimeout(() => child.kill(), 15_000);
@@ -497,4 +498,25 @@ test('section detection credits a complete Bash print of the section, never a pa
   expect(read([{ tool: 'Bash', input: { command: 'cat sections/review-sections.md' }, output: '' }])).toEqual([]);
   expect(read(ranges.map(call => ({ ...call, tool: 'Grep' })))).toEqual([]);
   expect(read([{ tool: 'Read', input: { file_path: '/fixture/plan-ceo-review/sections/review-sections.md' }, output: '' }])).toEqual(['review-sections.md']);
+});
+
+// Census 37178143007: the agent printed the section in byte ranges that split
+// lines at their edges (head -c, then tail -c +N | head -c, one-byte overlaps).
+test('section detection credits complete byte-range prints and still refuses a gap', async () => {
+  const { detectSectionReads } = await import('./helpers/auq-sdk-capture');
+  const file = path.resolve(import.meta.dir, '..', 'plan-ceo-review/sections/review-sections.md');
+  const content = fs.readFileSync(file, 'utf-8'), bytes = Buffer.from(content);
+  const sections = new Map([['review-sections.md', content]]);
+  const chunk = (command: string, from: number, length?: number) => ({ tool: 'Bash', input: { command },
+    output: bytes.subarray(from, length === undefined ? undefined : from + length).toString('utf8') });
+  const calls = [
+    chunk('wc -c plan-ceo-review/sections/review-sections.md && head -c 16000 plan-ceo-review/sections/review-sections.md', 0, 16000),
+    ...[16000, 33000, 50000].map(start => chunk(`tail -c +${start} plan-ceo-review/sections/review-sections.md | head -c 17000`, start - 1, 17000)),
+    chunk('tail -c +67000 plan-ceo-review/sections/review-sections.md', 66999),
+  ];
+  const read = (list: typeof calls) => [...detectSectionReads(list, sections)];
+  expect(bytes.length).toBeGreaterThan(67000);
+  expect(read(calls)).toEqual(['review-sections.md']);
+  expect(read(calls.filter((_, i) => i !== 2))).toEqual([]);
+  expect(read(calls.slice(0, -1))).toEqual([]);
 });

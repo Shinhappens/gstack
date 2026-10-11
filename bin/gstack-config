@@ -92,6 +92,11 @@ CONFIG_HEADER='# gstack configuration — edit freely, changes take effect on ne
 #                           # Set to true once the privacy gate has asked the user.
 #                           # Flip back to false to be re-prompted.
 #
+# artifacts_sync_removals: off  # on | off — on: each sync also publishes the
+#                           #   removal of synced files gone from disk; more than
+#                           #   20 at once is held for gstack-brain-sync
+#                           #   --publish-removals. See docs/gbrain-sync.md.
+#
 # ─── Transcript ingest (gbrain memory) ───────────────────────────────
 # transcript_ingest_mode: off  # recent | all | off | new@<UTC> — consent for
 #                           #   /sync-gbrain to ingest Claude Code and Codex
@@ -151,6 +156,18 @@ CONFIG_HEADER='# gstack configuration — edit freely, changes take effect on ne
 #                           #   ID and re-renders; ./setup --claude-model claude
 #                           #   returns to the generic overlay.
 #
+# ─── Model policy (gstack-models shows the effective choices) ───────
+# Plan review tier: frontier | smart | host. host delegates to the CLI settings;
+# GSTACK_CLAUDE_MODEL / GSTACK_CODEX_MODEL still win.
+# plan_review_tier: frontier
+# Implementation recommendation: frontier | smart. Never switches your session.
+# implementation_tier: smart
+# Optional pins: model_frontier_claude, model_frontier_openai,
+# model_smart_claude and model_smart_openai. Leave pins absent for catalog defaults;
+# empty pins are invalid. gstack-models list prints copyable set/unset commands.
+# Invalid writes are rejected and preserve the stored value.
+# Docs: docs/model-policy.md
+#
 # ─── Advanced ────────────────────────────────────────────────────────
 # codex_reviews: enabled    # Workflow outside review (Codex or Claude Code by harness).
 #                           #   enabled: /review, /ship, /document-release, plan reviews,
@@ -159,6 +176,9 @@ CONFIG_HEADER='# gstack configuration — edit freely, changes take effect on ne
 #                           #   plan/document reviews skip the entire extra review step.
 #                           #   Office hours/design/spec/manual wrappers keep their own
 #                           #   opt-in/skip controls. Invalid values preserve the old value.
+# browse_extension_id:      # Forks and self-built extensions: the 32-letter (a-p)
+#                           #   Chrome extension ID the browse sidebar terminal accepts.
+#                           #   Empty = the gstack extension. "" clears it.
 # design_detector_install_prompted: false
 #                           #   true once you answered the one-time offer from the
 #                           #   design skills to download the impeccable engine with
@@ -172,6 +192,45 @@ CONFIG_HEADER='# gstack configuration — edit freely, changes take effect on ne
 #                           #   value preserved) so a typo cannot silently disable it.
 # gstack_contributor: false # true = file field reports when gstack misbehaves
 # skip_eng_review: false    # true = skip eng review gate in /ship (not recommended)
+#
+# ─── Browser extension ───────────────────────────────────────────────
+# browse_extension_id:      # Chrome extension ID the browse daemon trusts for
+#                           #   /extension-token and the terminal-agent /ws
+#                           #   (32 letters a-p). Empty = the published gstack
+#                           #   extension. Set it only for a fork or a
+#                           #   self-built extension; no environment variable
+#                           #   or project .env can change it. An invalid value
+#                           #   is REJECTED and the stored value kept.
+#
+# ─── /ship measure-then-fix loop ─────────────────────────────────────
+# A red eval case is measured alone before the full gate reruns
+# (scripts/ship-measure.ts; docs/TESTING_INTERNALS.md#ship-measure).
+# Bar (scripts/lib/measure-bar.ts): MEETS at 9/10 of the trials, MEETS-qualified
+# at 8/10 with every red qualifying, EXTEND at 7/10 (one more batch, pooled).
+# ship_measure_rule_trials: 10        # rule cases: trials per batch (MEETS 9 of 10)
+# ship_measure_behavior_panels: 4     # behavior cases: panels of 3 per batch
+#                           #   (12 trials; MEETS 11 of 12)
+# ship_measure_judge_outputs: 10      # judge cases: outputs per batch, each scored
+#                           #   by its median 3-sample panel (MEETS 9 of 10)
+# ship_measure_ask_per_trial_usd: 2   # ask first above this estimated cost per trial
+# ship_measure_budget_usd: 25         # estimated admission budget per red case
+#                           #   (baseline, extension, redispatch, repair rounds)
+# ship_measure_max_rounds: 3          # repair rounds before a named-red stop
+# ship_measure_sweep_cases: 5         # weekly off-ship sweep: cases measured (K)
+# ship_measure_sweep_budget_usd: 150  # weekly off-ship sweep: spend cap per 7 days
+# ship_rerun_backend: local # local | ubicloud — where free-suite flake reruns
+#                           #   run; ubicloud also needs UBICLOUD_API_KEY.
+#                           #   Invalid values are REJECTED (value kept).
+# test_backend: local       # local | ubicloud — where the full unit and E2E
+#                           #   tiers run (plan E2). The gstack-doctor cores row
+#                           #   recommends ubicloud under 8 cores; ubicloud
+#                           #   needs UBICLOUD_API_KEY and scripts/ubicloud/.
+#                           #   Invalid values are REJECTED (value kept).
+# ship_greptile_early: true # true | false — when the repo uses Greptile, /ship
+#                           #   pushes and opens a draft PR after its free tests
+#                           #   so Greptile reviews in parallel (a public repo
+#                           #   asks once). false keeps the old order.
+#                           #   Invalid values are REJECTED (value kept).
 #
 # ─── Workspace-aware ship ────────────────────────────────────────────
 # workspace_root: $HOME/conductor/workspaces  # Where /ship looks for sibling
@@ -203,6 +262,7 @@ lookup_default() {
     cross_project_learnings) echo "" ;; # intentionally empty → unset triggers first-time prompt
     artifacts_sync_mode) echo "off" ;;
     artifacts_sync_mode_prompted) echo "false" ;;
+    artifacts_sync_removals) echo "off" ;; # on | off — publish removals of synced files gone from disk
     plan_tune_hooks) echo "prompt" ;; # prompt | yes | no — controls ./setup plan-tune hook install
     timeline_stop_hook) echo "yes" ;; # yes | no — controls ./setup timeline Stop hook registration (#2677)
 
@@ -211,6 +271,7 @@ lookup_default() {
     pair_agent) echo "off" ;; # remote tunnel consent — fail-closed until /pair-agent asks
     memorable_recall) echo "off" ;; # on | off — Memorable bridge gate, fail-closed until `gstack-memorable enable`
     founder_resources) echo "true" ;; # office-hours resource pitch — #538 permanent opt-out sets false
+    browse_extension_id) echo "" ;; # empty → browse trusts gstack's own extension ID (D1)
     claude_overlay_model) echo "claude" ;; # set only by ./setup --claude-model; presence via `has`
     # Brain-aware planning (v1.48 / T5+T10+T16). Defaults documented inline:
     #   brain_trust_policy@<endpoint-id>  — unset on fresh install; setup-gbrain
@@ -235,6 +296,21 @@ lookup_default() {
     # a synthesized "unknown" default turns the classifier into dead code.
     # Empty + exit 0 = "no override set, go classify".
     repo_mode) echo "" ;;
+    # /ship measure-then-fix loop (scripts/ship-measure.ts reads these).
+    ship_measure_rule_trials) echo "10" ;;
+    ship_measure_behavior_panels) echo "4" ;;
+    ship_measure_judge_outputs) echo "10" ;;
+    ship_measure_ask_per_trial_usd) echo "2" ;;
+    ship_measure_budget_usd) echo "25" ;;
+    ship_measure_max_rounds) echo "3" ;;
+    ship_measure_sweep_cases) echo "5" ;;
+    ship_measure_sweep_budget_usd) echo "150" ;;
+    ship_rerun_backend) echo "local" ;; # local | ubicloud (Ubicloud spend is opt-in)
+    test_backend) echo "local" ;; # local | ubicloud — full unit/E2E tiers (plan E2)
+    plan_review_tier) echo "frontier" ;; # frontier | smart | host — lib/model-policy.ts reads it strictly
+    implementation_tier) echo "smart" ;; # frontier | smart
+    model_frontier_claude|model_frontier_openai|model_smart_claude|model_smart_openai) echo "" ;; # empty = shipped catalog ID (gstack-models list)
+    ship_greptile_early) echo "true" ;; # true | false — /ship's early Greptile PR
     # Unknown key: exit non-zero instead of printing "". The fallback pattern
     # the preambles use,
     #   VAR=$(gstack-config get <key> 2>/dev/null || echo "<default>")
@@ -570,7 +646,7 @@ case "${1:-}" in
     # A config value is one non-empty line (disabled_skills may be empty: it
     # clears the list). Reject rather than truncate, so a bad value never
     # replaces the stored one.
-    if [ -z "$VALUE" ] && [ "$KEY" != "disabled_skills" ]; then
+    if [ -z "$VALUE" ] && [ "$KEY" != "disabled_skills" ] && [ "$KEY" != "browse_extension_id" ]; then
       echo "Error: $KEY value is empty. Existing value left unchanged." >&2
       exit 1
     fi
@@ -599,6 +675,10 @@ case "${1:-}" in
     fi
     if [ "$KEY" = "artifacts_sync_mode" ] && [ "$VALUE" != "off" ] && [ "$VALUE" != "artifacts-only" ] && [ "$VALUE" != "full" ]; then
       echo "Warning: artifacts_sync_mode '$VALUE' not recognized. Valid values: off, artifacts-only, full. Using off." >&2
+      VALUE="off"
+    fi
+    if [ "$KEY" = "artifacts_sync_removals" ] && [ "$VALUE" != "on" ] && [ "$VALUE" != "off" ]; then
+      echo "Warning: artifacts_sync_removals '$VALUE' not recognized. Valid values: on, off. Using off." >&2
       VALUE="off"
     fi
     # redact_repo_visibility: a LOCAL override for repos gh/glab can't read (e.g.
@@ -635,6 +715,51 @@ case "${1:-}" in
       echo "Error: codex_reviews '$VALUE' not recognized. Valid values: enabled, disabled. Existing value left unchanged." >&2
       exit 1
     fi
+    case "$KEY" in
+      plan_review_tier|implementation_tier|model_frontier_claude|model_frontier_openai|model_smart_claude|model_smart_openai)
+        _mp_doc="https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#model-policy-config"
+        VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
+        VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
+        _mp_valid=1
+        case "$KEY" in
+          plan_review_tier) case "$VALUE" in frontier|smart|host) ;; *) _mp_valid="" ; _mp_rule="Valid values: frontier, smart, host." ;; esac ;;
+          implementation_tier) case "$VALUE" in frontier|smart) ;; *) _mp_valid="" ; _mp_rule="Valid values: frontier, smart." ;; esac ;;
+          *_claude) { [ "${#VALUE}" -le 512 ] && printf '%s' "$VALUE" | LC_ALL=C grep -qE '^[][A-Za-z0-9._:/@+-]+$'; } || { _mp_valid=""; _mp_rule="An Anthropic model ID is 1-512 characters from A-Z a-z 0-9 . _ : / @ + [ ] -."; } ;;
+          *_openai) printf '%s' "$VALUE" | LC_ALL=C grep -qE '^[A-Za-z0-9._:/-]{1,100}$' || { _mp_valid=""; _mp_rule="An OpenAI model ID is 1-100 characters from A-Z a-z 0-9 . _ : / -."; } ;;
+        esac
+        if [ -z "$VALUE" ]; then
+          echo "Error: $KEY value is empty. Existing value left unchanged. fix: gstack-config unset $KEY restores the default ($_mp_doc)" >&2
+          exit 1
+        fi
+        if [ -z "$_mp_valid" ]; then
+          echo "Error: $KEY '$VALUE' not recognized. $_mp_rule Existing value left unchanged. fix: gstack-config unset $KEY restores the default ($_mp_doc)" >&2
+          exit 1
+        fi ;;
+    esac
+    # The measure-loop controls bound paid spend: reject a typo instead of
+    # coercing it, so a bad value never changes how much /ship may spend.
+    case "$KEY" in
+      ship_measure_rule_trials|ship_measure_behavior_panels|ship_measure_judge_outputs|ship_measure_max_rounds|ship_measure_sweep_cases)
+        if ! printf '%s' "$VALUE" | LC_ALL=C grep -qE '^[1-9][0-9]*$'; then
+          echo "Error: $KEY '$VALUE' is not a positive integer. Existing value left unchanged." >&2
+          exit 1
+        fi ;;
+      ship_measure_ask_per_trial_usd|ship_measure_budget_usd|ship_measure_sweep_budget_usd)
+        if ! printf '%s' "$VALUE" | LC_ALL=C grep -qE '^([0-9]+(\.[0-9]+)?|\.[0-9]+)$' || ! printf '%s' "$VALUE" | LC_ALL=C grep -qE '[1-9]'; then
+          echo "Error: $KEY '$VALUE' is not a positive amount in USD (e.g. 25 or 2.50). Existing value left unchanged." >&2
+          exit 1
+        fi ;;
+      ship_greptile_early)
+        if [ "$VALUE" != "true" ] && [ "$VALUE" != "false" ]; then
+          echo "Error: ship_greptile_early '$VALUE' not recognized. Valid values: true, false. Existing value left unchanged." >&2
+          exit 1
+        fi ;;
+      ship_rerun_backend|test_backend)
+        if [ "$VALUE" != "local" ] && [ "$VALUE" != "ubicloud" ]; then
+          echo "Error: $KEY '$VALUE' not recognized. Valid values: local, ubicloud. Existing value left unchanged." >&2
+          exit 1
+        fi ;;
+    esac
     # design_detector_install_prompted records "never ask again" for the one-time
     # engine install offer. Rejecting a typo keeps the offer from silently coming
     # back (or never coming back) because of a mistyped value.
@@ -686,6 +811,13 @@ case "${1:-}" in
     # never flip consent in either direction, so nothing is coerced or stored.
     if [ "$KEY" = "memorable_recall" ] && [ "$VALUE" != "on" ] && [ "$VALUE" != "off" ]; then
       echo "Error: memorable_recall '$VALUE' not recognized. Valid values: on, off. Existing value left unchanged." >&2
+      exit 1
+    fi
+    # browse_extension_id (D1) decides which Chrome extension may reach the
+    # browse daemon's token route and terminal socket. Reject anything that is
+    # not a Chrome extension ID; "" clears the override.
+    if [ "$KEY" = "browse_extension_id" ] && [ -n "$VALUE" ] && ! printf '%s' "$VALUE" | LC_ALL=C grep -qE '^[a-p]{32}$'; then
+      echo "Error: browse_extension_id '$VALUE' is not a Chrome extension ID (32 letters a-p, shown on chrome://extensions). Existing value left unchanged." >&2
       exit 1
     fi
     # disabled_skills (#1206): comma-separated skill names, one value for the
@@ -809,8 +941,13 @@ case "${1:-}" in
     for KEY in proactive routing_declined telemetry auto_upgrade update_check \
                skill_prefix explain_level \
                codex_reviews gstack_contributor skip_eng_review workspace_root \
-               artifacts_sync_mode artifacts_sync_mode_prompted plan_tune_hooks \
-               timeline_stop_hook design_detector design_detector_install_prompted memorable_recall; do
+               artifacts_sync_mode artifacts_sync_mode_prompted artifacts_sync_removals plan_tune_hooks \
+               timeline_stop_hook design_detector design_detector_install_prompted memorable_recall \
+               browse_extension_id ship_measure_rule_trials ship_measure_behavior_panels \
+               ship_measure_judge_outputs ship_measure_ask_per_trial_usd ship_measure_budget_usd \
+               ship_measure_max_rounds ship_measure_sweep_cases ship_measure_sweep_budget_usd ship_rerun_backend test_backend \
+               plan_review_tier implementation_tier model_frontier_claude model_frontier_openai \
+               model_smart_claude model_smart_openai; do
       gstack_config_select "$KEY"
       VALUE="$_gstack_cfg_value"
       SOURCE="default"
@@ -829,8 +966,13 @@ case "${1:-}" in
     for KEY in proactive routing_declined telemetry auto_upgrade update_check \
                skill_prefix explain_level \
                codex_reviews gstack_contributor skip_eng_review workspace_root \
-               artifacts_sync_mode artifacts_sync_mode_prompted plan_tune_hooks \
-               timeline_stop_hook design_detector design_detector_install_prompted memorable_recall; do
+               artifacts_sync_mode artifacts_sync_mode_prompted artifacts_sync_removals plan_tune_hooks \
+               timeline_stop_hook design_detector design_detector_install_prompted memorable_recall \
+               browse_extension_id ship_measure_rule_trials ship_measure_behavior_panels \
+               ship_measure_judge_outputs ship_measure_ask_per_trial_usd ship_measure_budget_usd \
+               ship_measure_max_rounds ship_measure_sweep_cases ship_measure_sweep_budget_usd ship_rerun_backend test_backend \
+               plan_review_tier implementation_tier model_frontier_claude model_frontier_openai \
+               model_smart_claude model_smart_openai; do
       printf '  %-24s %s\n' "$KEY:" "$(lookup_default "$KEY")"
     done
     ;;
@@ -867,10 +1009,12 @@ case "${1:-}" in
 
     # Summarize for the user. Use python (already required elsewhere) to
     # parse the JSON portably; fall back to grep if python is unavailable.
+    # The file goes in on stdin (E6, #1967): bash opens the path, so a native
+    # Windows Python under Git Bash never has to resolve an MSYS /c/... path.
     PYTHON_CMD=$(command -v python3 || command -v python || true)
     if [ -n "$PYTHON_CMD" ]; then
-      STATUS=$("$PYTHON_CMD" -c "import json,sys; d=json.load(open('$DETECTION_FILE')); print(d.get('gbrain_local_status','unknown'))" 2>/dev/null || echo unknown)
-      VERSION=$("$PYTHON_CMD" -c "import json,sys; d=json.load(open('$DETECTION_FILE')); print(d.get('gbrain_version') or 'unknown')" 2>/dev/null || echo unknown)
+      STATUS=$("$PYTHON_CMD" -c "import json,sys; d=json.load(sys.stdin); print(d.get('gbrain_local_status','unknown'))" < "$DETECTION_FILE" 2>/dev/null || echo unknown)
+      VERSION=$("$PYTHON_CMD" -c "import json,sys; d=json.load(sys.stdin); print(d.get('gbrain_version') or 'unknown')" < "$DETECTION_FILE" 2>/dev/null || echo unknown)
     else
       STATUS=$(grep -o '"gbrain_local_status":[[:space:]]*"[^"]*"' "$DETECTION_FILE" | sed 's/.*"\([^"]*\)"$/\1/')
       VERSION=$(grep -o '"gbrain_version":[[:space:]]*"[^"]*"' "$DETECTION_FILE" | sed 's/.*"\([^"]*\)"$/\1/')
@@ -879,8 +1023,10 @@ case "${1:-}" in
     fi
 
     case "$STATUS" in
-      ok|timeout|thin-client|engine-locked)
-        # "timeout" = slow-but-healthy engine (#1964); "thin-client" =
+      ok|timeout|db-unreachable|thin-client|engine-locked)
+        # "timeout" = slow-but-healthy engine (#1964); "db-unreachable" =
+        # network/DNS failure with an intact config, transient like timeout
+        # (A2); "thin-client" =
         # remote-HTTP MCP brain, no local engine by design (#2051);
         # "engine-locked" = same class (#2456): PGLite is single-writer, so a
         # live `gbrain serve` (typically an MCP server) holds the embedded DB.

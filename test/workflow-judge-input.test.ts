@@ -73,9 +73,12 @@ function occurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
+/** The judge's bundle: every generated section except runner-only profiles (manifest `runner_only`, plan B4). */
 function sectionPaths(skill: string): string[] {
+  const runnerOnly = new Set((JSON.parse(readFileSync(join(ROOT, skill, 'sections', 'manifest.json'), 'utf8')).sections as Array<{ file: string; runner_only?: boolean }>)
+    .filter(section => section.runner_only).map(section => section.file));
   return readdirSync(join(ROOT, skill, 'sections'))
-    .filter(name => name.endsWith('.md'))
+    .filter(name => name.endsWith('.md') && !runnerOnly.has(name))
     .sort()
     .map(name => `${skill}/sections/${name}`);
 }
@@ -324,8 +327,9 @@ describe('workflow judge file bundle', () => {
     expect(entrypoint.content).toContain('## Scope gate');
     expect(entrypoint.content.indexOf('## Scope gate')).toBeLessThan(entrypoint.content.indexOf('### Step 0: Scope Challenge'));
     expect(entrypoint.content).toContain('## Web research runs in Aside');
-    expect(entrypoint.content).toContain('echo "READY: aside');
-    expect(input.text.indexOf('echo "READY: aside')).toBeLessThan(input.text.indexOf('- **Search check:**'));
+    // E7: the readiness probe prints the resolved Aside path (READY: $_A).
+    expect(entrypoint.content).toContain('echo "READY: $_A');
+    expect(input.text.indexOf('echo "READY: $_A')).toBeLessThan(input.text.indexOf('- **Search check:**'));
     expect(entrypoint.content).not.toContain('- **Search check:**');
     expect(occurrences(input.text, '- **Search check:**')).toBe(1);
     expect(occurrences(input.text, '## Scope gate')).toBe(1);

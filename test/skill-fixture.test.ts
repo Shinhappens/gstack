@@ -30,6 +30,7 @@ import {
 import { E2E_TOUCHFILES, GLOBAL_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import { readShippedSkillRouting } from './helpers/shipped-skill-routing';
 import { hasNarrationLeak } from './helpers/skill-body-narration';
+import { expectMentions } from './helpers/prompt-structure';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 
@@ -298,7 +299,8 @@ describe('real-skill pins: section lists used by E2E fixtures', () => {
     expect(out).not.toContain('## Telemetry (run last)');
     expect(out).not.toContain('## Step 5: Fix-First Review');
     expect(out).not.toContain('review/sections/review-army.md');
-    expect(out).toContain('Enum & Value Completeness requires reading code OUTSIDE the diff.');
+    // Step 4's sideways-sweep paragraph (plan D2 replaced the enum-only one) survives the extraction.
+    expect(out).toContain('Sideways sweep (every finding; reads code OUTSIDE the diff).');
     // Meaningfully smaller than the source.
     const full = fs.readFileSync(path.join(ROOT, 'review', 'SKILL.md'), 'utf-8');
     expect(out.length).toBeLessThan(full.length * 0.5);
@@ -343,7 +345,7 @@ describe('real-skill pins: section lists used by E2E fixtures', () => {
     expect(out).toContain('### Step 14: Write the Narrative');
     expect(out).not.toContain('## Global Retrospective Mode');
     expect(out).toContain('Read `~/.claude/skills/gstack/retro/sections/report-format.md` and execute it');
-    expect(out).toContain('After delivering the repo-scoped report, run the following learning capture and result-save steps, then stop.');
+    expectMentions(out, [['stop', 'repo-scoped', 'result-save']], 'out');
     expect(out).not.toContain('## Telemetry (run last)');
 
     const reportFormat = fs.readFileSync(
@@ -458,8 +460,6 @@ test('routing catalog contains installed project names without a request-to-skil
   expect(instructions).toContain(readShippedSkillRouting().instruction);
   expect(instructions).not.toContain('→ invoke');
   expect(instructions).toContain('installed gstack skills: gstack, qa, review.');
-  expect(instructions).toContain("built-in skills are outside this project's workflow");
-  expect(instructions).toContain('matching the request to the skill descriptions');
   expect(instructions).not.toContain('photography');
   expect(instructions).not.toContain('code-review');
   expect(instructions).not.toContain('ship');

@@ -49,8 +49,8 @@ QA Test Plan/task JSONL keep discovery paths `$GSTACK_STATE_ROOT/projects/{slug}
 existing destination and preserve its content. For a new file, create permitted
 parent directories, then write that header, an unchanged copy of the original
 plan (for plan targets), and the scope record or ledger being saved. Recheck option 3's collision before
-creation; use a suffix rather than overwrite. Do not add findings or fixes before
-Scope Challenge C. Put records before an existing `## GSTACK REVIEW REPORT`, or
+creation; use a suffix rather than overwrite. Findings and fixes first enter
+through Scope Challenge C's ledger saves, never earlier. Put records before an existing `## GSTACK REVIEW REPORT`, or
 at EOF if absent; create that terminal report only at Plan File Review Report.
 
 **Write routes.** A forbidden write follows its row above.
@@ -307,12 +307,9 @@ changes or write findings into the plan yet.
   Count each once, label estimates, and seek fewer moving parts. Use these counts in B.
 - **Search check:** For each new architectural pattern, infrastructure component
    or concurrency approach, research built-ins, current practice and pitfalls
-   through Aside (entrypoint readiness), one read-only request per pattern:
-
-   ```bash
-   {{ASIDE_EXEC_PRELUDE}}
-   _aside_exec "Search the web for {framework} {pattern} built-in, {pattern} best practice {current year}, and {framework} {pattern} pitfalls. Read-only: do not sign in, submit, or change anything. Reply with up to 8 bullets, each with its source URL, then stop."
-   ```
+   through Aside (entrypoint readiness), one read-only request per pattern.
+   Prompt file text (create, write and send it with the Web research runs in Aside blocks in SKILL.md):
+   `{framework} {pattern} built-in, {pattern} best practice {current year}, and {framework} {pattern} pitfalls. Reply with up to 8 bullets, each with its source URL.`
 
    If Aside is unavailable, use host WebSearch for these queries. With neither,
    skip and note: "Search unavailable — proceeding with in-distribution knowledge only."
@@ -328,6 +325,8 @@ changes or write findings into the plan yet.
 
 - **Distribution check:** For new artifacts, verify build/publish CI/CD, target
    OS/architectures and download/install channels. Put deferrals in "NOT in scope".
+
+{{PLAN_REALITY_ROWS:eng}}
 
 ### B. Resolve complexity selectors
 
@@ -380,6 +379,8 @@ including when B was skipped. A smaller arrangement that preserves scope is not
 a scope reduction. This result supplies MODE; it approves no pending remedy.
 Keep it current if later approved choices change scope.
 Continue to Section 1 only when no answer is pending.
+
+{{PLAN_REALITY_ROWS:deep}}
 
 ## Review Sections (after scope is agreed)
 
@@ -537,6 +538,7 @@ prior reviews; the terminal report adds those separately.
 ### Completion summary
 From final decisions/outputs; publish after report Read-back and Review Log:
 - Step 0: Scope Challenge — ___ (scope accepted as-is / scope reduced per recommendation)
+{{PLAN_REALITY_ROWS:summary}}
 - Architecture Review: ___ issues found
 - Code Quality Review: ___ issues found
 - Test Review: diagram produced, ___ gaps identified
@@ -594,6 +596,8 @@ copy the working plan's task prerequisites, dependencies and execution order
 without adding or strengthening them in the question or descriptions. A test
 required before editing one function does not make every independent lane wait.
 A next-step answer approves no implementation change.
+
+When the user chooses C: {{IMPLEMENTATION_MODEL_HANDOFF}}
 
 ## Learning hooks
 

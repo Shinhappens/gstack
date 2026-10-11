@@ -10,7 +10,9 @@
  * Shipped as Release 2 of the self-learning roadmap (SELF_LEARNING_V0.md).
  */
 import type { TemplateContext } from './types';
-import { CC_BACKGROUND_DEFAULT_SINCE } from './constants';
+import { CC_BACKGROUND_DEFAULT_SINCE, FOREGROUND_IF_AVAILABLE, BACKGROUND_RECOVERY } from './constants';
+import { learningsCapture, LEARNINGS_VERDICT } from './learnings';
+import { DEFENSIVE_REVIEW_FRAMING, FIXTURE_SUMMARY_MODE } from './defensive-review';
 
 function generateSpecialistSelection(ctx: TemplateContext): string {
   const isShip = ctx.skillName === 'ship';
@@ -100,12 +102,18 @@ Construct the prompt for each specialist. The prompt includes:
 3. Past learnings for this domain (if any exist):
 
 \`\`\`bash
-${ctx.paths.binDir}/gstack-learnings-search --type pitfall --query "{specialist domain}" --limit 5 2>/dev/null || true
+${learningsCapture(`${ctx.paths.binDir}/gstack-learnings-search --type pitfall --query "{specialist domain}" --limit 5`)}
+${LEARNINGS_VERDICT}
 \`\`\`
 
 If learnings are found, include them: "Past learnings for this domain: {learnings}"
 
-4. Instructions:
+4. **Defensive framing (Security specialist and the Red Team below only).** Begin the prompt with:
+"${DEFENSIVE_REVIEW_FRAMING}"
+and replace its full-diff command with: "${FIXTURE_SUMMARY_MODE}"
+Every other specialist, including Testing, reads the full diff with fixtures.
+
+5. Instructions:
 
 "You are a specialist code reviewer. Read the checklist at {checklist path}, then run
 \`DIFF_BASE=$(git merge-base origin/<base> HEAD) && git diff "$DIFF_BASE"\` to get the full diff. Apply the checklist against the diff.
@@ -130,7 +138,7 @@ Past learnings: {learnings or 'none'}"
 
 **Subagent configuration:**
 - Use \`subagent_type: "general-purpose"\`
-- Pass \`run_in_background: false\` on every specialist Agent call — background is the default since ${CC_BACKGROUND_DEFAULT_SINCE}; omitting the flag is not foreground.
+- Pass ${FOREGROUND_IF_AVAILABLE} on every specialist Agent call — background is the default since ${CC_BACKGROUND_DEFAULT_SINCE}; omitting an available flag is not foreground. ${BACKGROUND_RECOVERY}
 
 **Wait for readers before editing:**
 - Confirm that each task has finished or is stopped. A timeout alone does not prove termination. If a reader or writer is still active, wait; if its state is unknown, inspect its task/process status. If you cannot confirm it stopped, use the parent's Fix-First stop path without edits.
@@ -260,16 +268,16 @@ function generateRedTeam(ctx: TemplateContext): string {
 
 **Activation:** Only if DIFF_LINES > 200 OR any specialist produced a CRITICAL finding.
 
-If activated, dispatch one more subagent via the Agent tool (pass \`run_in_background: false\` — foreground; subagents default to background since ${CC_BACKGROUND_DEFAULT_SINCE}).
+If activated, dispatch one more subagent via the Agent tool (pass ${FOREGROUND_IF_AVAILABLE} — foreground; subagents default to background since ${CC_BACKGROUND_DEFAULT_SINCE}; ${BACKGROUND_RECOVERY})
 
 The Red Team subagent receives:
 1. The red-team checklist path \`${ctx.paths.skillRoot}/review/specialists/red-team.md\` (it reads the file)
 2. The merged specialist findings from Step ${stepMerge}, one line each (so it knows what was already caught)
 3. The git diff command
 
-Prompt: "You are a red team reviewer. The code has already been reviewed by N specialists
+Prompt, after the defensive framing and fixture handling from item 4 of the specialist dispatch: "You are a red team reviewer. The code has already been reviewed by N specialists
 who found the following issues: {merged findings summary}. Your job is to find what they
-MISSED. Read the checklist at {red-team checklist path}, run \`DIFF_BASE=$(git merge-base origin/<base> HEAD) && git diff "$DIFF_BASE"\`, and look for gaps.
+MISSED. Read the checklist at {red-team checklist path}, list changed files with \`DIFF_BASE=$(git merge-base origin/<base> HEAD) && git diff --name-status "$DIFF_BASE"\`, read them as that fixture handling says, and look for gaps.
 Output findings as JSON objects (same schema as the specialists). Focus on cross-cutting
 concerns, integration boundary issues, and failure modes that specialist checklists
 don't cover."

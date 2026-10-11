@@ -204,6 +204,24 @@ describe('gstack-skill-start behavior', () => {
     expect(fs.existsSync(path.join(tmpGstackHome, 'sessions', '424242'))).toBe(true);
   });
 
+  test('echoes SESSIONS: the count of live session markers, this one included (#1651)', () => {
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-sessions-'));
+    fs.writeFileSync(path.join(state, 'config.yaml'), 'update_check: false\n');
+    try {
+      const sessions = path.join(state, 'sessions');
+      fs.mkdirSync(sessions);
+      fs.writeFileSync(path.join(sessions, '111'), '');
+      fs.writeFileSync(path.join(sessions, 'stale'), '');
+      const threeHoursAgo = new Date(Date.now() - 3 * 3600_000);
+      fs.utimesSync(path.join(sessions, 'stale'), threeHoursAgo, threeHoursAgo);
+      const out = runStart(['--parent-pid', '222'], { GSTACK_HOME: state });
+      expect(out).toMatch(/^SESSIONS: 2$/m);
+      expect(fs.readdirSync(sessions).sort()).toEqual(['111', '222']);
+    } finally {
+      fs.rmSync(state, { recursive: true, force: true });
+    }
+  });
+
   test('without --parent-pid the script derives the harness pid past tool-call shells (#2763)', () => {
     // Claude Code runs each Bash call in a fresh `bash -c`; the session must be
     // the harness (here: this bun process), not that per-call shell, even
@@ -285,6 +303,116 @@ describe('gstack-skill-start behavior', () => {
       expect(out).toMatch(/^SPAWNED_OVERRIDE: env \(GSTACK_SESSION_KIND\)$/m);
     } finally {
       fs.rmSync(freshGh, { recursive: true, force: true });
+    }
+  });
+
+  test('unattended override: no prompts, no publishing, explicit skip lines; unknown kinds are loud (plan B1)', () => {
+    const freshGh = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-unattended-'));
+    fs.writeFileSync(path.join(freshGh, 'config.yaml'), 'update_check: false\n');
+    try {
+      const out = runStart(['--skill', 'autoplan'], {
+        GSTACK_SESSION_KIND: 'unattended',
+        GSTACK_HEADLESS: '1',
+        CONDUCTOR_WORKSPACE_PATH: '/x',
+        GSTACK_HOME: freshGh,
+        GSTACK_EPHEMERAL: '1',
+      });
+      // The explicit override outranks GSTACK_HEADLESS; headless alone keeps BLOCK.
+      expect(out).toMatch(/^SESSION_KIND: unattended$/m);
+      expect(out).toMatch(/^UNATTENDED_SESSION: true$/m);
+      expect(out).not.toContain('CONDUCTOR_SESSION: true');
+      expect(out).toMatch(/^STATE_ROOT: .* durable=no$/m);
+      expect(out).toMatch(/^TELEMETRY_WRITE: skipped \(unattended session\)$/m);
+      expect(out).toMatch(/^ARTIFACTS_SYNC: skipped \(unattended session; mode=\S+ queue=\d+ retained\)$/m);
+      expect(out).toMatch(/^learnings: skipped \(state root is ephemeral; set GSTACK_STATE_ROOT\)$/m);
+      expect(out).toMatch(/^autoplan guard: not enforced by this host; publication order is unverified \(GUARD_NOT_INSTALLED\)$/m);
+      expect(out.match(/GUARD_NOT_INSTALLED/g)).toHaveLength(1);
+      const ids = (out.match(/^GSTACK_INSTRUCTION_BEGIN: (\S+)/gm) ?? []).map((h) => h.replace(/^GSTACK_INSTRUCTION_BEGIN: /, ''));
+      expect(ids).toEqual(['unattended-session']);
+      expect(out).toContain('GSTACK_RESULT: skill=<name> status=gate_pending run=<dir>');
+      expect(out).toMatch(/never approve/i);
+      expect(out).toMatch(/^FIRST_TASK: $/m);
+      expect(out).not.toContain('.telemetry-prompted');
+      expect(fs.existsSync(path.join(freshGh, '.activated'))).toBe(false);
+      expect(fs.existsSync(path.join(freshGh, 'analytics', 'skill-usage.jsonl'))).toBe(false);
+
+      const headless = runStart([], { GSTACK_HEADLESS: '1', GSTACK_HOME: freshGh });
+      expect(headless).toMatch(/^SESSION_KIND: headless$/m);
+      expect(headless).not.toContain('UNATTENDED_SESSION');
+      expect(headless).not.toContain('GUARD_NOT_INSTALLED');
+
+      const durable = runStart(['--skill', 'review'], { GSTACK_SESSION_KIND: 'unattended', GSTACK_HOME: freshGh });
+      expect(durable).toMatch(/^STATE_ROOT: .* durable=yes$/m);
+      expect(durable).not.toContain('learnings: skipped');
+      expect(durable).not.toContain('GUARD_NOT_INSTALLED');
+
+      const unknown = runStart([], { GSTACK_SESSION_KIND: 'robot', GSTACK_HOME: freshGh });
+      expect(unknown).toMatch(/^SESSION_KIND: interactive \(unknown kind 'robot'\)$/m);
+      expect(unknown).not.toContain('UNATTENDED_SESSION');
+
+      const claude = runStart(['--skill', 'autoplan'], { CLAUDECODE: '1', GSTACK_HOME: freshGh });
+      expect(claude).not.toContain('GUARD_NOT_INSTALLED');
+      const codex = runStart(['--skill', 'autoplan'], { CLAUDECODE: '1', GSTACK_ACTIVE_HOST: 'codex', GSTACK_HOME: freshGh });
+      expect(codex.match(/GUARD_NOT_INSTALLED/g)).toHaveLength(1);
+    } finally {
+      fs.rmSync(freshGh, { recursive: true, force: true });
+    }
+  });
+
+  test('unattended session makes no egress call even with telemetry and artifacts sync enabled and a queue pending (plan B1)', () => {
+    // Shadow bin: every helper is the real one except the egress sinks, which
+    // record their invocation. Bins resolve siblings through dirname "$0", so a
+    // symlinked copy of the script resolves the shadow dir as _BIN.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-egress-'));
+    const shadow = path.join(tmp, 'bin');
+    const gh = path.join(tmp, 'gh');
+    const log = path.join(tmp, 'egress.log');
+    const sinks = ['gstack-telemetry-log', 'gstack-brain-sync', 'gstack-update-check'];
+    fs.mkdirSync(shadow); fs.mkdirSync(gh);
+    for (const name of fs.readdirSync(path.join(ROOT, 'bin'))) {
+      if (!sinks.includes(name)) fs.symlinkSync(path.join(ROOT, 'bin', name), path.join(shadow, name));
+    }
+    for (const name of sinks) {
+      fs.writeFileSync(path.join(shadow, name), `#!/usr/bin/env bash\necho "${name} $*" >> "${log}"\n`, { mode: 0o755 });
+    }
+    const realGit = execFileSync('bash', ['-c', 'command -v git'], { encoding: 'utf-8', timeout: 5_000 }).trim();
+    const pathDir = path.join(tmp, 'path'); fs.mkdirSync(pathDir);
+    fs.writeFileSync(path.join(pathDir, 'git'), `#!/usr/bin/env bash\ncase "$1" in fetch|push|pull|ls-remote|merge) echo "git $*" >> "${log}" ;; esac\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(gh, 'config.yaml'), 'telemetry: on\nartifacts_sync_mode: full\nartifacts_sync_mode_prompted: true\nupdate_check: true\n');
+    fs.mkdirSync(path.join(gh, '.git'));
+    fs.mkdirSync(path.join(gh, 'analytics'));
+    fs.writeFileSync(path.join(gh, 'analytics', '.pending-old'), 'x');
+    fs.writeFileSync(path.join(gh, '.brain-queue.jsonl'), '{"a":1}\n{"b":2}\n');
+    fs.writeFileSync(path.join(gh, 'last-update-check'), 'UPGRADE_AVAILABLE 1.0.0 9.9.9\n');
+    const env = (extra: Record<string, string>) => ({ PATH: `${pathDir}:${process.env.PATH!}`, HOME: tmp, GSTACK_HOME: gh, ...extra });
+    const start = (extra: Record<string, string>) => execFileSync(path.join(shadow, 'gstack-skill-start'), ['--skill', 'review'], { timeout: 30_000, encoding: 'utf-8', cwd: tmp, env: env(extra) });
+    const end = (extra: Record<string, string>) => execFileSync(path.join(shadow, 'gstack-skill-end'), ['--skill', 'review', '--outcome', 'success', '--session-id', 'sid-u', '--tel-start', '1'], { timeout: 30_000, encoding: 'utf-8', cwd: tmp, env: env(extra) });
+    try {
+      const out = start({ GSTACK_SESSION_KIND: 'unattended' });
+      expect(out).toMatch(/^TELEMETRY_WRITE: skipped \(unattended session\)$/m);
+      expect(out).toMatch(/^ARTIFACTS_SYNC: skipped \(unattended session; mode=full queue=2 retained\)$/m);
+      expect(out).not.toContain('UPGRADE_AVAILABLE');
+      const endOut = end({ GSTACK_SESSION_KIND: 'unattended' });
+      expect(endOut).toMatch(/^UPGRADE_AVAILABLE: 9\.9\.9; run \/gstack-upgrade$/m);
+      expect(endOut).toMatch(/^ARTIFACTS_SYNC: skipped \(unattended session\)$/m);
+      expect(fs.existsSync(log)).toBe(false);
+      expect(fs.existsSync(path.join(gh, 'analytics', 'skill-usage.jsonl'))).toBe(false);
+      expect(fs.existsSync(path.join(gh, 'analytics', '.pending-old'))).toBe(true);
+      expect(fs.readFileSync(path.join(gh, '.brain-queue.jsonl'), 'utf-8').split('\n').filter(Boolean)).toHaveLength(2);
+      // The spool is the sync's input: skill-end's timeline write would enqueue
+      // in a human session; unattended's enqueue is a no-op at the entrypoint.
+      expect(fs.existsSync(path.join(gh, '.brain-queue.d'))).toBe(false);
+      // Control: the same home in an interactive session reaches the sinks, so
+      // the instrumentation can see what unattended withheld.
+      start({});
+      end({});
+      const calls = fs.readFileSync(log, 'utf-8');
+      expect(calls).toMatch(/^gstack-brain-sync --once/m);
+      expect(calls).toMatch(/^gstack-telemetry-log /m);
+      expect(calls).toMatch(/^gstack-update-check/m);
+      expect(fs.readdirSync(path.join(gh, '.brain-queue.d')).length).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 
@@ -432,6 +560,173 @@ describe('gstack-skill-start behavior', () => {
       for (const dir of [gh, bin, remote]) fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+// ---------------------------------------------------------------
+// ARTIFACTS_SYNC attention lines. The cases are generated from the sync
+// status table in bin/gstack-brain-sync's usage header: every row needs a
+// fixture, and each fixture must print exactly that row's line.
+// ---------------------------------------------------------------
+describe('ARTIFACTS_SYNC attention lines (sync status table)', () => {
+  const SYNC = path.join(ROOT, 'bin', 'gstack-brain-sync');
+  const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const NOW = () => iso(Date.now());
+  const OLD = () => iso(Date.now() - 2 * 86_400_000);
+  type Row = { state: string; trigger: string; line: string; fix: string };
+
+  function statusTable(): Row[] {
+    const rows: Row[] = [];
+    for (const raw of fs.readFileSync(SYNC, 'utf-8').split('\n')) {
+      const head = raw.match(/^#   ([a-z_-]+)\s+trigger: (.+)$/);
+      if (head) { rows.push({ state: head[1], trigger: head[2], line: '', fix: '' }); continue; }
+      const field = raw.match(/^#\s+(line|fix):\s+(.+)$/);
+      if (field && rows.length) rows[rows.length - 1][field[1] as 'line' | 'fix'] = field[2];
+    }
+    return rows;
+  }
+  const attention = (out: string) => out.split('\n').filter((l) => l.startsWith('ARTIFACTS_SYNC: attention: '));
+
+  /** An initialized sync home whose drain lock is held by this (live) test
+   *  process, so skill start's merge and drain skip and the fixture's status
+   *  file is what skill start reads. */
+  function syncHome(status: Record<string, unknown> | string | null, queued = 0): string {
+    const gh = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-attn-'));
+    execFileSync('git', ['init', '-q', '-b', 'main', gh], { timeout: 30_000, stdio: 'pipe' });
+    fs.writeFileSync(path.join(gh, 'config.yaml'), 'update_check: false\nartifacts_sync_mode: full\nartifacts_sync_mode_prompted: true\n');
+    fs.mkdirSync(path.join(gh, '.brain-sync.lock.d'));
+    fs.writeFileSync(path.join(gh, '.brain-sync.lock.d', 'pid'), `${process.pid}\n`);
+    if (status !== null) {
+      fs.writeFileSync(path.join(gh, '.brain-sync-status.json'), typeof status === 'string' ? status : JSON.stringify(status) + '\n');
+    }
+    fs.mkdirSync(path.join(gh, '.brain-queue.d'));
+    for (let i = 0; i < queued; i++) {
+      fs.writeFileSync(path.join(gh, '.brain-queue.d', `${Math.floor(Date.now() / 1000)}-1-q${i}.json`), '{"file":"projects/p/x.md"}\n');
+    }
+    return gh;
+  }
+  const status = (code: string, extra: Record<string, unknown> = {}) => ({
+    status: code, held_count: 0, drainable: 0, last_drain_at: NOW(), last_push_at: NOW(), ts: NOW(), held: [], message: 'm', ...extra,
+  });
+
+  const FIXTURES: Record<string, { status: () => Record<string, unknown>; queued?: number; n?: number }> = {
+    held: { status: () => status('held', { held_count: 2 }), n: 2 },
+    blocked: { status: () => status('blocked') },
+    push_failed: { status: () => status('push_failed') },
+    error: { status: () => status('error') },
+    unknown: { status: () => status('rebooting') },
+    'stale-push': { status: () => status('idle', { drainable: 3, last_push_at: OLD() }), queued: 3 },
+    'stale-drain': { status: () => status('ok', { last_drain_at: OLD() }), queued: 1 },
+  };
+
+  test('the table names every state skill start can report, each with a line and a fix', () => {
+    const rows = statusTable();
+    expect(rows.map((r) => r.state).sort()).toEqual(Object.keys(FIXTURES).sort());
+    // The docs carry the same table (one source of wording).
+    const docs = fs.readFileSync(path.join(ROOT, 'docs', 'gbrain-sync-errors.md'), 'utf-8');
+    for (const r of rows) {
+      expect(r.line).toStartWith('ARTIFACTS_SYNC: attention: ');
+      expect(r.line).toContain('<bin> --status');
+      expect(r.fix.length).toBeGreaterThan(0);
+      expect(docs).toContain('`' + r.line.slice('ARTIFACTS_SYNC: attention: '.length) + '`');
+    }
+  });
+
+  for (const row of statusTable()) {
+    test(`${row.state}: ${row.trigger}`, () => {
+      const fx = FIXTURES[row.state];
+      expect(fx).toBeDefined();
+      const gh = syncHome(fx.status(), fx.queued ?? 0);
+      try {
+        const expected = row.line.replaceAll('<bin>', SYNC).replaceAll('<N>', String(fx.n ?? 0));
+        expect(attention(runStart([], { GSTACK_HOME: gh }))).toEqual([expected]);
+      } finally {
+        fs.rmSync(gh, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test('ok and idle print no attention line', () => {
+    for (const code of ['ok', 'idle']) {
+      const gh = syncHome(status(code), 1);
+      try {
+        const out = runStart([], { GSTACK_HOME: gh });
+        expect(out).toMatch(/^ARTIFACTS_SYNC: mode=full \| last_push=\S+ \| queue=\d+$/m);
+        expect(attention(out)).toEqual([]);
+      } finally {
+        fs.rmSync(gh, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('attention lines carry no status text, artifact path or bare helper name', () => {
+    const leak = ['ghp', 'abcdefghij1234567890abcdef1234567890'].join('_');
+    const gh = syncHome(status('held', {
+      held_count: 7,
+      message: `secret pattern detected (github-token:${leak.slice(0, 30)}...) in projects/p/learnings.jsonl`,
+      held: [{ path: 'projects/p/learnings.jsonl', rule: 'github-token', dependents: [], fixes: ['gstack-brain-sync --skip-file projects/p/learnings.jsonl'] }],
+      last_drain_at: `${NOW()}"; echo pwned`,
+    }), 1);
+    try {
+      const lines = attention(runStart([], { GSTACK_HOME: gh }));
+      expect(lines.length).toBeGreaterThan(0);
+      const text = lines.join('\n');
+      expect(text).not.toContain('ghp_');
+      expect(text).not.toContain('projects/p');
+      expect(text).not.toContain('pwned');
+      // The only path is the absolute helper path; no bare gstack- command remains.
+      const stripped = text.replaceAll(SYNC, '<bin>');
+      expect(stripped).not.toContain('/');
+      expect(stripped).not.toContain('gstack-');
+      // A forged last_drain_at fails the timestamp clamp, which reads as a drain that never ran.
+      expect(lines).toContain(`ARTIFACTS_SYNC: attention: stale-drain. The sync has not run for over 24 hours while files wait in the queue. See why: ${SYNC} --status`);
+    } finally {
+      fs.rmSync(gh, { recursive: true, force: true });
+    }
+  });
+
+  test('a held file is reported at skill start while other files keep pushing; a privacy-held queue raises no alarm', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-sync-home-'));
+    const gh = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-sync-gh-'));
+    const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-ss-sync-remote-'));
+    const env = { PATH: process.env.PATH!, HOME: home, GSTACK_HOME: gh };
+    const bin = (name: string, args: string[]) =>
+      execFileSync(path.join(ROOT, 'bin', name), args, { timeout: 30_000, encoding: 'utf-8', cwd: home, env, stdio: 'pipe' });
+    const remoteFiles = () => execFileSync('git', ['--git-dir=' + remote, 'ls-tree', '-r', '--name-only', 'main'], { encoding: 'utf-8', timeout: 30_000 });
+    try {
+      execFileSync('git', ['init', '-q', '--bare', '-b', 'main', remote], { timeout: 30_000 });
+      bin('gstack-artifacts-init', ['--remote', remote]);
+      bin('gstack-config', ['set', 'artifacts_sync_mode', 'full']);
+      bin('gstack-config', ['set', 'artifacts_sync_mode_prompted', 'true']);
+      bin('gstack-config', ['set', 'update_check', 'false']);
+      fs.mkdirSync(path.join(gh, 'projects/p/ceo-plans'), { recursive: true });
+      fs.writeFileSync(path.join(gh, 'projects/p/learnings.jsonl'), `{"gh":"${['ghp', 'abcdefghij1234567890abcdef1234567890'].join('_')}"}\n`);
+      fs.writeFileSync(path.join(gh, 'projects/p/ceo-plans/clean.md'), '# a plan\n');
+      bin('gstack-brain-enqueue', ['projects/p/learnings.jsonl']);
+      bin('gstack-brain-enqueue', ['projects/p/ceo-plans/clean.md']);
+
+      const held = runStart([], env);
+      expect(held).toMatch(/^ARTIFACTS_SYNC: mode=full \| last_push=\S+ \| queue=\d+$/m);
+      expect(attention(held)).toEqual([
+        `ARTIFACTS_SYNC: attention: status=held held=1. The secret scan is holding back 1 file(s); everything else still syncs. See which files and how to fix them: ${path.join(ROOT, 'bin', 'gstack-brain-sync')} --status`,
+      ]);
+      expect(held).not.toContain('ghp_');
+      expect(remoteFiles()).toContain('projects/p/ceo-plans/clean.md');
+      expect(remoteFiles()).not.toContain('projects/p/learnings.jsonl');
+
+      // Privacy-held records never count as drainable: no alarm, even with
+      // the last push two days old.
+      bin('gstack-brain-sync', ['--skip-file', 'projects/p/learnings.jsonl']);
+      bin('gstack-config', ['set', 'artifacts_sync_mode', 'artifacts-only']);
+      fs.writeFileSync(path.join(gh, 'projects/p/timeline.jsonl'), '{"skill":"x"}\n');
+      bin('gstack-brain-enqueue', ['projects/p/timeline.jsonl']);
+      fs.writeFileSync(path.join(gh, '.brain-last-push'), `${OLD()}\n`);
+      const quiet = runStart([], env);
+      expect(quiet).toMatch(/^ARTIFACTS_SYNC: mode=artifacts-only \| last_push=\S+ \| queue=\d+$/m);
+      expect(attention(quiet)).toEqual([]);
+    } finally {
+      for (const dir of [home, gh, remote]) fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe('gstack-skill-end', () => {

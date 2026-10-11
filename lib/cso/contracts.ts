@@ -3,6 +3,13 @@ import { createHash } from 'node:crypto';
 
 export const ABI = 3;
 export const MAX_OUTPUT = 1024 * 1024;
+/**
+ * Longest bounded verification attempt, used by Rails: one attempt prepares two dependency trees, and an
+ * offline Rails preparation that compiles native gems takes about 3.5 minutes on amd64 and 8.5 on arm64.
+ * It equals the longest comprehensive run budget, and every attempt is still cut to the run's reporting
+ * deadline. Other stacks use 300 s.
+ */
+export const MAX_VERIFICATION_ATTEMPT_MS = 1_800_000;
 const UNSAFE_STRING_CONTROLS =
   /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u;
 const UNSAFE_PROPERTY_CONTROLS = /[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u;
@@ -24,7 +31,8 @@ export type ErrorCode =
   | 'CANCELLED'
   | 'PREREQUISITE'
   | 'INCOMPATIBLE_INPUT'
-  | 'ASSERTION_FAILED';
+  | 'ASSERTION_FAILED'
+  | 'PREPARED_EXPORT_REJECTED';
 export class CsoError extends Error {
   constructor(
     public code: ErrorCode,
@@ -184,7 +192,7 @@ export interface VerificationRequest {
   port: number;
   start: Command;
   legitimate: HttpAssertion[];
-  security: HttpAssertion;
+  security: HttpAssertion | HttpAssertion[];
   existingTests: Command[];
   fixtures: Record<string, string>;
   boundaryFiles: string[];
@@ -678,6 +686,22 @@ function assertion(value: unknown, name: string): HttpAssertion {
     ...(v.vulnerable === undefined ? {} : { vulnerable: oracle(object(v.vulnerable), `${name}.vulnerable`) }),
   };
 }
+export const MAX_SECURITY_ASSERTIONS = 8;
+export function securityAssertions(security: VerificationRequest['security']): HttpAssertion[] {
+  return Array.isArray(security) ? security : [security];
+}
+function securityAssertion(value: unknown): VerificationRequest['security'] {
+  if (!Array.isArray(value)) return assertion(value, 'security');
+  if (!value.length || value.length > MAX_SECURITY_ASSERTIONS)
+    throw new CsoError(
+      'INVALID_SCHEMA',
+      `security must be one assertion or 1..${MAX_SECURITY_ASSERTIONS} assertions`,
+    );
+  const assertions = value.map((x, i) => assertion(x, `security[${i}]`));
+  if (new Set(assertions.map((x) => x.name)).size !== assertions.length)
+    throw new CsoError('INVALID_SCHEMA', 'security assertion names must be distinct');
+  return assertions;
+}
 export function validateVerificationRequest(input: unknown): VerificationRequest {
   const v = object(input, 'verification request'),
     changes = v.changes,
@@ -729,7 +753,7 @@ export function validateVerificationRequest(input: unknown): VerificationRequest
     legitimate: (Array.isArray(v.legitimate) ? v.legitimate : []).map((x, i) =>
       assertion(x, `legitimate[${i}]`),
     ),
-    security: assertion(v.security, 'security'),
+    security: securityAssertion(v.security),
     existingTests: (Array.isArray(v.existingTests) ? v.existingTests : []).map((x, i) =>
       validateCommand(x, `existingTests[${i}]`),
     ),
@@ -770,7 +794,7 @@ export function validateVerificationRequest(input: unknown): VerificationRequest
     throw new CsoError('INVALID_SCHEMA', 'port must be 1024..65535');
   if (
     !request.legitimate.length ||
-    !request.security.vulnerable ||
+    securityAssertions(request.security).some((x) => !x.vulnerable) ||
     !request.existingTests.length ||
     !request.boundaryFiles.length ||
     !request.testFiles.length
@@ -779,17 +803,15 @@ export function validateVerificationRequest(input: unknown): VerificationRequest
       'INVALID_SCHEMA',
       'Verification needs a legitimate control, distinct before/fixed security oracles, existing tests, immutable test files, and boundary files',
     );
-  const secure = request.security.expected,
-    vulnerable = request.security.vulnerable;
-  const mutuallyExclusive =
-    secure.status !== vulnerable.status ||
+  const mutuallyExclusive = ({ expected: secure, vulnerable }: HttpAssertion) =>
+    secure.status !== vulnerable!.status ||
     (secure.includes !== undefined &&
-      vulnerable.excludes !== undefined &&
-      secure.includes.includes(vulnerable.excludes)) ||
-    (vulnerable.includes !== undefined &&
+      vulnerable!.excludes !== undefined &&
+      secure.includes.includes(vulnerable!.excludes)) ||
+    (vulnerable!.includes !== undefined &&
       secure.excludes !== undefined &&
-      vulnerable.includes.includes(secure.excludes));
-  if (!mutuallyExclusive)
+      vulnerable!.includes.includes(secure.excludes));
+  if (!securityAssertions(request.security).every(mutuallyExclusive))
     throw new CsoError(
       'INVALID_SCHEMA',
       'The vulnerable and fixed security oracles must be provably mutually exclusive',

@@ -15,6 +15,7 @@ import {
 import { basename, dirname, join, isAbsolute, delimiter, resolve } from 'node:path';
 import { redactFindingSpans } from '../redact-engine';
 import { CsoError, MAX_OUTPUT } from './contracts';
+import { windowsDockerUnavailable } from './windows-docker';
 
 const SOURCE_RUNTIME = /^bun(?:\.exe)?$/i.test(basename(process.execPath));
 const WINDOWS_GIT =
@@ -45,6 +46,7 @@ export function executable(name: string): string {
       );
     }
   }
+  if (process.platform === 'win32' && name.toLowerCase() === 'docker') windowsDockerUnavailable();
   for (const directory of TRUSTED_DIRECTORIES) {
     const candidates =
       process.platform === 'win32'
@@ -73,6 +75,47 @@ export function childEnvironment(home: string): Record<string, string> {
     GIT_OPTIONAL_LOCKS: '0',
     GIT_ATTR_NOSYSTEM: '1',
   };
+}
+/**
+ * Redact each same-stream run of captured output in place. The result is
+ * released only when every view a reader could assemble from it (each channel,
+ * both concatenation orders, and the chronological interleaving) is free of
+ * findings; a span crossing a channel boundary or one that cannot be located
+ * therefore still withholds both channels.
+ */
+function spliceRedaction(
+  ordered: Buffer[],
+  streams: Array<Buffer[]>,
+  out: Buffer[],
+): { stdout: string; stderr: string } | null {
+  const runs: Array<{ stdout: boolean; text: string }> = [];
+  for (let i = 0; i < ordered.length;) {
+    let j = i;
+    while (j < ordered.length && streams[j] === streams[i]) j++;
+    const bytes = Buffer.concat(ordered.slice(i, j)),
+      text = bytes.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(bytes)) return null;
+    runs.push({ stdout: streams[i] === out, text });
+    i = j;
+  }
+  const released: Array<{ stdout: boolean; text: string }> = [];
+  for (const run of runs) {
+    const text = redactFindingSpans(run.text, { maxBytes: MAX_OUTPUT });
+    if (text === null) return null;
+    released.push({ stdout: run.stdout, text });
+  }
+  const stdout = released
+      .filter((run) => run.stdout)
+      .map((run) => run.text)
+      .join(''),
+    stderr = released
+      .filter((run) => !run.stdout)
+      .map((run) => run.text)
+      .join(''),
+    chronological = released.map((run) => run.text).join('');
+  const views = [stdout, stderr, stdout + stderr, stderr + stdout, chronological];
+  if (views.some((view) => redactFindingSpans(view, { maxBytes: 4 * MAX_OUTPUT }) !== view)) return null;
+  return { stdout, stderr };
 }
 export function redact(value: string): string {
   // Scan the complete bounded stream, including across write/chunk boundaries.
@@ -172,12 +215,25 @@ function safeMetadata(value: string, key: string): boolean {
   if (key === 'signature' && /^[a-f0-9]{128}$/.test(value)) return true;
   if (key === 'image' && /^[a-z0-9./:_-]+@sha256:[a-f0-9]{64}$/.test(value)) return true;
   if (key === 'integrity' && /^(?:sha256|sha512)-[A-Za-z0-9+/]+={0,2}$/.test(value)) return true;
+  if (
+    ['catalog', 'catalogRevision', 'scannerCatalog'].includes(key) &&
+    /^cso-(?:scanners|v3|eval)-[a-z0-9._-]{1,120}$/.test(value)
+  )
+    return true;
+  if (
+    key === 'workflow' &&
+    /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/[0-9]{1,20}$/.test(value)
+  )
+    return true;
   return false;
 }
+// Run ids are public CI metadata to the shared redactor; here only the validated
+// workflow slot may carry one.
+const RUN_ID_SEGMENT = /(\/actions\/runs\/)[0-9]+/g;
 function sanitizeJson(value: unknown, key: string, seen: WeakSet<object>, trustedMetadata: boolean): unknown {
   if (typeof value === 'string') {
     if (trustedMetadata && safeMetadata(value, key)) return value;
-    return redact(value);
+    return redact(value).replace(RUN_ID_SEGMENT, '$1<REDACTED-ci-run-id>');
   }
   if (value === null || typeof value !== 'object') return value;
   if (seen.has(value as object)) throw new CsoError('INVALID_SCHEMA', 'Cyclic JSON cannot be persisted');
@@ -445,6 +501,28 @@ function hardenGit(file: string, args: string[]): { args: string[]; configs?: Gi
     ],
   };
 }
+/** Ceiling for one supervised child command. */
+export const COMMAND_TIMEOUT_MS = 300_000;
+/**
+ * Ceiling for one dependency fetch or install command inside a preparation
+ * container. Rails lockfiles that pin only the `ruby` platform compile native
+ * gems offline, which takes about 385 s at the app role's CPU share. Every
+ * other command keeps COMMAND_TIMEOUT_MS, and both stay inside the caller's
+ * aggregate deadline.
+ */
+export const PREPARATION_COMMAND_TIMEOUT_MS = 900_000;
+export function commandTimeoutMs(
+  deadline: number,
+  phase: 'command' | 'preparation',
+  now = Date.now(),
+): number {
+  return Math.max(
+    1,
+    Math.min(phase === 'preparation' ? PREPARATION_COMMAND_TIMEOUT_MS : COMMAND_TIMEOUT_MS, deadline - now),
+  );
+}
+/** Raw output is never printed or persisted, so a caller may opt in to more than MAX_OUTPUT (snapshot path listings). */
+const RAW_OUTPUT_LIMIT = 16 * 1024 * 1024;
 export async function runProcess(
   file: string,
   args: string[],
@@ -455,6 +533,10 @@ export async function runProcess(
     maxBytes?: number;
     input?: string;
     raw?: boolean; // Only for inert Git framing or private helper/Docker control JSON that is validated before use. Never print or persist raw results.
+    /** `splice` replaces each located sensitive span with a marker instead of withholding both channels. */
+    redaction?: 'withhold' | 'splice';
+    /** Allows PREPARATION_COMMAND_TIMEOUT_MS; only preparation dependency commands set it. */
+    preparationCommand?: true;
   },
 ): Promise<ProcessResult> {
   if (!isAbsolute(file) || !isAbsolute(opts.cwd) || !existsSync(opts.cwd))
@@ -466,7 +548,7 @@ export async function runProcess(
     throw new CsoError('INVALID_ARGUMENT', 'Invalid child argument');
   const hardened = hardenGit(file, args);
   args = hardened.args;
-  const cap = Math.min(opts.maxBytes ?? MAX_OUTPUT, MAX_OUTPUT);
+  const cap = Math.min(opts.maxBytes ?? MAX_OUTPUT, opts.raw ? RAW_OUTPUT_LIMIT : MAX_OUTPUT);
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, {
       cwd: opts.cwd,
@@ -476,7 +558,8 @@ export async function runProcess(
     });
     const out: Buffer[] = [],
       err: Buffer[] = [],
-      ordered: Buffer[] = [];
+      ordered: Buffer[] = [],
+      streams: Array<Buffer[]> = [];
     let bytes = 0,
       timedOut = false,
       truncated = false;
@@ -491,7 +574,13 @@ export async function runProcess(
         timedOut = true;
         kill();
       },
-      Math.max(1, Math.min(opts.timeoutMs ?? 30_000, 300_000)),
+      Math.max(
+        1,
+        Math.min(
+          opts.timeoutMs ?? 30_000,
+          opts.preparationCommand ? PREPARATION_COMMAND_TIMEOUT_MS : COMMAND_TIMEOUT_MS,
+        ),
+      ),
     );
     const capture = (target: Buffer[]) => (chunk: Buffer) => {
       bytes += chunk.length;
@@ -502,6 +591,7 @@ export async function runProcess(
       }
       target.push(chunk);
       ordered.push(chunk);
+      streams.push(target);
     };
     child.stdout.on('data', capture(out));
     child.stderr.on('data', capture(err));
@@ -526,6 +616,12 @@ export async function runProcess(
         const forward = stdout + stderr,
           reverse = stderr + stdout,
           chronological = Buffer.concat(ordered).toString('utf8');
+        const spliced =
+          opts.redaction === 'splice' && !truncated ? spliceRedaction(ordered, streams, out) : null;
+        if (spliced) {
+          resolve({ code: code ?? -1, ...spliced, timedOut, truncated, capturedBytes: bytes });
+          return;
+        }
         if ([stdout, stderr, forward, reverse, chronological].some((value) => redact(value) !== value)) {
           resolve({
             code: code ?? -1,
@@ -546,12 +642,13 @@ export async function runProcess(
     child.stdin.end(opts.input);
   });
 }
-export async function git(repo: string, args: string[], home: string): Promise<string> {
+export async function git(repo: string, args: string[], home: string, maxBytes?: number): Promise<string> {
   const result = await runProcess(executable('git'), ['--no-optional-locks', '-C', repo, ...args], {
     cwd: home,
     env: childEnvironment(home),
     raw: true,
     timeoutMs: 15_000,
+    maxBytes,
   });
   if (result.code || result.timedOut || result.truncated) {
     // Git stderr and argv can contain repository paths, refs, and configured

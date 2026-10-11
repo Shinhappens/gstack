@@ -230,6 +230,14 @@ describe.skipIf(process.platform === 'win32')('session-runner explicit tool avai
           });
           globalThis.clearTimeout = ((id) => { timers.delete(id); realClearTimeout(id); });
           const pause = () => new Promise(resolve => realSetTimeout(resolve, 5));
+          // work-ready only proves the fake CLI printed its Read event; the
+          // runner's progress line proves the read loop has collected it.
+          let readCollected = false;
+          const writeStderr = process.stderr.write.bind(process.stderr);
+          process.stderr.write = (chunk, ...rest) => {
+            readCollected ||= String(chunk).includes('tool #1: Read(');
+            return writeStderr(chunk, ...rest);
+          };
           let pending;
           let finished = false;
           try {
@@ -238,7 +246,7 @@ describe.skipIf(process.platform === 'win32')('session-runner explicit tool avai
               testName: 'section-budget', ${long ? 'timeout: LONG_SECTION_CAPTURE_MS,' : ''}
             });
             const waitStarted = realNow();
-            while (!fs.existsSync('work-ready') || ![...timers.values()].some(timer => timer.delay > 200_000)) {
+            while (!fs.existsSync('work-ready') || !readCollected || ![...timers.values()].some(timer => timer.delay > 200_000)) {
               if (realNow() - waitStarted > 5_000) throw new Error('Fake CLI did not enter the work phase');
               await pause();
             }
@@ -272,6 +280,7 @@ describe.skipIf(process.platform === 'win32')('session-runner explicit tool avai
             }
             for (const id of timers.keys()) realClearTimeout(id);
             Date.now = realNow;
+            process.stderr.write = writeStderr;
             globalThis.setTimeout = realSetTimeout;
             globalThis.clearTimeout = realClearTimeout;
           }
@@ -305,8 +314,34 @@ describe.skipIf(process.platform === 'win32')('session-runner explicit tool avai
     await withFakeClaude(async (dir, observed) => {
       await runSkillTest({ prompt: 'Default tools', workingDirectory: dir, allowedTools: ['Read'], timeout: 5_000 });
       expect(observed().args).not.toContain('--tools');
-      expect(observed().args).not.toContain('--include-partial-messages');
+      // Partial messages always stream for the session ledger's liveness summary (plan 0.2).
+      expect(observed().args).toContain('--include-partial-messages');
       expect(flagValue(observed().args, '--allowed-tools')).toBe('Read');
+    });
+  });
+
+  test('without public diagnostics, partial messages feed only the session ledger; the transcript keeps its shape', async () => {
+    await withFakeClaude(async (dir) => {
+      fs.writeFileSync(path.join(dir, 'diagnostic-case'), 'complete');
+      const evalDir = path.join(dir, 'eval');
+      const saved = process.env.GSTACK_EVAL_DIR;
+      process.env.GSTACK_EVAL_DIR = evalDir;
+      let result: Awaited<ReturnType<typeof runSkillTest>>;
+      try {
+        result = await runSkillTest({ prompt: 'diagnose', workingDirectory: dir, tools: ['Read', 'Write'], timeout: 5_000, testName: 'ledger-case' });
+      } finally {
+        if (saved === undefined) delete process.env.GSTACK_EVAL_DIR; else process.env.GSTACK_EVAL_DIR = saved;
+      }
+      expect(result.exitReason).toBe('success');
+      expect(result.transcript.map(e => e.type)).toEqual(['system', 'assistant', 'assistant', 'result']);
+      expect(JSON.stringify(result.transcript)).not.toContain('stream_event');
+      const rows = fs.readFileSync(path.join(evalDir, 'session-ledger.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ key: 'claude-p:ledger-case#1', test_name: 'ledger-case', runner: 'claude-p', budget_ms: 5_000, end: 'completed',
+        liveness: { partial: true, turns: 0, last_event: 'result', open_tool_at_end: 'Write' } });
+      expect(rows[0].elapsed_ms).toBeGreaterThan(0);
+      expect(rows[0].liveness.max_request_silence_ms).toBeLessThan(5_000);
+      expect(JSON.stringify(rows[0])).not.toContain('PRIVATE');
     });
   });
 

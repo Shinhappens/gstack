@@ -487,13 +487,14 @@ IMPORTANT: Do NOT try to browse any URLs or use a browse binary. This is a plan 
             // Check that the agent produced design ratings (0-10 scale)
             const output = result.output || '';
             const hasRatings = /\d+\/10/.test(output);
-            const hasDesignContent = output.toLowerCase().includes('information architecture') ||
-              output.toLowerCase().includes('interaction state') ||
-              output.toLowerCase().includes('ai slop') ||
-              output.toLowerCase().includes('hierarchy');
 
             // Check that the plan file was edited (the core new behavior)
             const planAfter = fs.readFileSync(path.join(reviewDir, 'plan.md'), 'utf-8');
+            // A rated summary may leave the design terms to the plan it wrote
+            // (census 37179171083); a plan term counts only when the review added it.
+            const count = (text: string, term: string) => text.toLowerCase().split(term).length - 1;
+            const hasDesignContent = ['information architecture', 'interaction state', 'ai slop', 'hierarchy'].some(term =>
+              output.toLowerCase().includes(term) || (hasRatings && count(planAfter, term) > count(planBefore, term)));
             const planWasEdited = planAfter !== planBefore && planAfter.length > 300;
             const planHasDesignAdditions = planAfter.toLowerCase().includes('empty') ||
               planAfter.toLowerCase().includes('loading') ||
@@ -1124,7 +1125,9 @@ Then write ${repoDir}/detector-output.md: one FINDING-NNN row per rule in the DE
 
       const bash = result.toolCalls.filter(c => c.tool === 'Bash').map(c => String(c.input?.command ?? ''));
       expect(bash.some(c => c.includes('npx impeccable'))).toBe(false);
-      expect(bash.some(c => /\$B\b|\bbrowse\s|\baside\s+repl\b|\bplaywright\b|\bpuppeteer\b/.test(c))).toBe(false);
+      // `$B` runs the browse binary only in command position; a shell variable
+      // named B (a base branch, say) is not a browser step.
+      expect(bash.some(c => /(?:^|[;&|(\n]|\b(?:then|do|else)\b)\s*"?\$B"?\s+\S|\bbrowse\s|\baside\s+repl\b|\bplaywright\b|\bpuppeteer\b/.test(c))).toBe(false);
       expect(result.toolCalls.some(c => /browser|browse|playwright|puppeteer/i.test(c.tool))).toBe(false);
       const calls: Array<{ argv: string[]; cwd: string; exit: number; engine: Array<{ argv: string[]; cwd: string }> }> =
         fs.readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));

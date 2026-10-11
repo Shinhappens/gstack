@@ -21,18 +21,6 @@ export const QA_FUNCTIONAL_CASES = [
   { id: 'qa-functional-webhook-fix', family: 'webhook', mode: 'qa' },
 ] as const;
 
-export const QA_FUNCTIONAL_INPUTS = [
-  ...QA_EVIDENCE_RUNTIME, 'test/helpers/qa-evidence-producer.ts', 'test/qa-evidence.test.ts', 'test/qa-evidence-producer.test.ts',
-  'qa/SKILL.md.tmpl', 'qa-only/SKILL.md.tmpl',
-  'qa/sections/', 'qa-only/sections/', 'qa/templates/',
-  'scripts/resolvers/qa.ts', 'scripts/resolvers/utility.ts', 'scripts/resolvers/sections.ts',
-  'scripts/gen-skill-docs.ts', 'test/helpers/qa-functional-fixture.ts',
-  'test/helpers/qa-functional-observer.ts', 'test/helpers/qa-functional-evidence.ts',
-  'test/helpers/qa-checkpoint-evidence.ts',
-  'test/helpers/qa-functional-eval.ts', 'test/helpers/session-runner.ts',
-  'test/helpers/hermetic-env.ts', 'test/helpers/skill-fixture.ts',
-];
-
 export function qaFunctionalPrompt(entry: { family: QAFamily; mode: QAMode }): string {
   return `Read ${entry.mode}/SKILL.md, qa/sections/scope.md, ${entry.mode}/sections/exploratory.md and qa/sections/system-functional.md in full to load gstack's /${entry.mode} functional workflow for this repository with ${entry.mode === 'qa' ? 'Full exploration and the Standard fix tier' : 'Full report-only exploration'}. All four reads are required before probing in this fixture, even when its surfaces and isolation are already established. This is a CLI/webhook product, not a browser or DX request. The generated local skill copies are the current evaluation inputs; all their installed-root references resolve inside this fixture. The common preamble alone was removed using the repository extractor.
 
@@ -62,6 +50,7 @@ Actions outside this interface are unsupported and fail acceptance; they are not
 
 Materialize qa-reports/evidence.json first, then write a concise qa-reports/report.md using the functional report structure. Link the evidence and checkpoint files rather than repeating full probe payloads in Markdown. Both artifacts are required before completion. The resulting evidence.json schema is:
 { "revision": "<full 40-character git rev-parse HEAD>", "runtime": "bun <version>", "cwd": "<working directory>", "evidence": [{"command":"<exact full outer capture invocation>","contract":"README.md","expected":"<declared expected behavior>","classification":"pass|product-defect|setup-blocked|inconclusive","observed":<complete unchanged JSON emitted by the native probe>}], "learning":[<rows the helper copies from the selected checkpoints>], "limits":["<untested or blocked coverage>"] }
+Classify by what the probe observed: setup-blocked whenever it reported a missing optional dependency (exit 69, SETUP_BLOCKED), even where README documents that outcome; product-defect when observed behavior contradicts README; pass when a working path behaved as README states; inconclusive otherwise.
 Evidence rows contain ONLY complete JSON actually emitted by native probes, including failures and repeats; retain pre-repair results alongside green results. Never synthesize JSON from a tool error or raw test output. Put tests, raw CLI diagnostics, launch failures and timeouts in Markdown with their actual output and limits. The learning array is a summary: choose one completed checkpoint where an observation motivated a different later command, not the required same-command replay. Select that checkpoint ID in annotations.learning; the production helper copies its observationCommand, hypothesis and nextCommand, or a merged note's capture IDs, argv and hypothesis. Both commands must name exact captured probes with different native child commands, never a combined command list or a replay distinguished only by capture ID. This selects existing exploration evidence, not another probe or a duplicate of the complete checkpoint ledger. Preserve every checkpoint and link every checkpoint in Markdown; keep every executed probe and its complete JSON in evidence, including the required replay. Missing dependencies remain setup blockers, not repairs. No browser installation or execution is needed.`;
 }
 

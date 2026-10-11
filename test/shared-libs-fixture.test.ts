@@ -885,6 +885,25 @@ describe('shared-code curl source isolation', () => {
     expect(after).toEqual(before);
   });
 
+  test('the provider rate-limit probe gets the same 404 over curl as over gh, not a refusal', () => {
+    // Gate census 37174266054 slice 9: shared-libs-read-only probed API availability
+    // with this exact command; gh already answers rate_limit as an unknown endpoint (404).
+    const f = createSharedLibsFixture('curl-rate-limit');
+    cleanup.push(f.root);
+    installSourceShims(f);
+    const command = 'curl -sS -m 20 -o /dev/null -w "%{http_code}\\n" "https://api.github.com/rate_limit" 2>&1';
+    const response = curl(f, ['-sS', '-m', '20', '-o', '/dev/null', '-w', '%{http_code}\\n', 'https://api.github.com/rate_limit']);
+    expect(response.status).toBe(0);
+    expect(response.stdout).toBe('404\n');
+    expect(gh(f, 'rate_limit').stderr).toContain('HTTP 404');
+    expect(sharedReadOnlyViolations([{ tool: 'Bash', input: { command } }], readRequests(f))).toEqual([]);
+    for (const args of [['-X', 'POST', 'https://api.github.com/rate_limit'], ['-o', path.join(scratch(), 'out'), 'https://api.github.com/rate_limit'],
+      ['https://api.github.com/rate_limit/extra']]) {
+      expect(curl(f, args).status, JSON.stringify(args)).toBe(2);
+      expect(sharedReadOnlyViolations([], readRequests(f).slice(-1)).length, JSON.stringify(args)).toBeGreaterThan(0);
+    }
+  });
+
   test('unknown URLs, methods and file-producing curl options are rejected by the shim', () => {
     const f = createSharedLibsFixture('curl-rejected');
     cleanup.push(f.root);
@@ -1458,6 +1477,108 @@ test('outer-timeout', () => captures.runAttempt('outer-timeout', ['audit'], 50, 
 
 const nativeCallbackReceipts = {
   "intrinsic": [
+    {
+      "source": "https://github.com/garrytan/gstack/actions/runs/37694473528/job/113044020494 (Claude Code 2.1.292, shared-libs-read-only)",
+      "source_sha256": "a2523bdfe2289e207127af58c83ab69268f1201922a9c30ba063dc77dbf0e023",
+      "public_request": {
+        "tool": "git",
+        "args": [
+          "-c",
+          "protocol.ext.allow=never",
+          "-c",
+          "submodule.recurse=false",
+          "-c",
+          "log.showSignature=false",
+          "-c",
+          "format.pretty=medium",
+          "-c",
+          "gc.auto=0",
+          "-c",
+          "maintenance.auto=false",
+          "-c",
+          "hook.applypatch-msg.enabled=false",
+          "-c",
+          "hook.pre-applypatch.enabled=false",
+          "-c",
+          "hook.post-applypatch.enabled=false",
+          "-c",
+          "hook.pre-commit.enabled=false",
+          "-c",
+          "hook.pre-merge-commit.enabled=false",
+          "-c",
+          "hook.prepare-commit-msg.enabled=false",
+          "-c",
+          "hook.commit-msg.enabled=false",
+          "-c",
+          "hook.post-commit.enabled=false",
+          "-c",
+          "hook.pre-rebase.enabled=false",
+          "-c",
+          "hook.post-checkout.enabled=false",
+          "-c",
+          "hook.post-merge.enabled=false",
+          "-c",
+          "hook.pre-push.enabled=false",
+          "-c",
+          "hook.pre-receive.enabled=false",
+          "-c",
+          "hook.update.enabled=false",
+          "-c",
+          "hook.proc-receive.enabled=false",
+          "-c",
+          "hook.post-receive.enabled=false",
+          "-c",
+          "hook.post-update.enabled=false",
+          "-c",
+          "hook.reference-transaction.enabled=false",
+          "-c",
+          "hook.push-to-checkout.enabled=false",
+          "-c",
+          "hook.pre-auto-gc.enabled=false",
+          "-c",
+          "hook.post-rewrite.enabled=false",
+          "-c",
+          "hook.sendemail-validate.enabled=false",
+          "-c",
+          "hook.fsmonitor-watchman.enabled=false",
+          "-c",
+          "hook.p4-changelist.enabled=false",
+          "-c",
+          "hook.p4-prepare-changelist.enabled=false",
+          "-c",
+          "hook.p4-post-changelist.enabled=false",
+          "-c",
+          "hook.p4-pre-submit.enabled=false",
+          "-c",
+          "hook.post-index-change.enabled=false",
+          "--literal-pathspecs",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "core.fsmonitor=",
+          "-c",
+          "core.askPass=",
+          "-c",
+          "core.quotePath=false",
+          "-c",
+          "core.safecrlf=false",
+          "ls-files",
+          "-z",
+          "--stage"
+        ],
+        "env": {
+          "GIT_OPTIONAL_LOCKS": "0",
+          "GIT_NO_LAZY_FETCH": "1",
+          "GIT_TERMINAL_PROMPT": "0"
+        },
+        "cwd": "/home/runner/.cache/gstack-paid-shard-g3tk70/tmp/gstack-shared-read-only-9Ndx49/repo",
+        "pid": 4849,
+        "ppid": 4497,
+        "parentExecutable": "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        "parentCommand": "claude -p --model claude-fable-5-1 --output-format stream-json --verbose --dangerously-skip-permissions --max-turns 24 --allowed-tools Bash Read Write Edit Glob Grep --tools Bash,Read,Write,Edit,Glob,Grep --include-partial-messages --strict-mcp-config "
+      },
+      "matching_model_commands": []
+    },
     {
       "source": "/home/user/.capy/work/shared-libs-captures/1790267940497-shared-libs-read-only-1-1.json",
       "source_sha256": "5c4b660f37f0a100e5eef97896241b1b139ec4c57f38d9d450fb153543da6fac",

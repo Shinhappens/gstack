@@ -378,6 +378,7 @@ function failure(plan: ScannerPlan, error: unknown, version?: string): ScannerOu
     PREREQUISITE: 'PREREQUISITE',
     INCOMPATIBLE_INPUT: 'PREREQUISITE',
     ASSERTION_FAILED: 'TOOL_FAILED',
+    PREPARED_EXPORT_REJECTED: 'TOOL_FAILED',
   };
   const code = codes[e.code];
   return {
@@ -728,7 +729,11 @@ export async function createDockerScannerRunner(context: ScannerRunnerContext): 
     await group.start(scanner);
     const capture = async (command: string[]): Promise<ScannerExecution> => {
       if (!scanner) throw new CsoError('ISOLATION_FAILED', 'Scanner container is unavailable');
-      const result = await group!.execCapture(scanner, command, { workdir: '/work', env: plan.env });
+      const result = await group!.execCapture(scanner, command, {
+        workdir: '/work',
+        env: plan.env,
+        redaction: 'splice',
+      });
       return { stdout: result.stdout, stderr: result.stderr, exitCode: result.code };
     };
     return {
@@ -794,7 +799,7 @@ export async function createDockerScannerRunner(context: ScannerRunnerContext): 
               ? ['/opt/cso/run-app', '/bin/sleep', '2147483647']
               : ['/opt/cso/run-app', api.start.executable, ...api.start.args],
           });
-          await group!.start(app);
+          await (rails ? group!.startHeldApplication(app) : group!.start(app));
           if (rails) {
             const clean = [
               '/usr/bin/env',

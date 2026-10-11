@@ -11,10 +11,13 @@ and `run_in_background: false`. Use Step 7's shared foreground-dispatch rule.
 The child reads the plan and every referenced
 code file; the parent validates its report and applies the gates below.
 
-**Subagent prompt:** Substitute `<base>` and supply the active plan's absolute path
-or complete text, including user-approved scope changes. If none is known, say
-so; the child runs the fallback search below. If discovery found no plan, skip
-dispatch. The child does not inherit the parent's conversation.
+**Before dispatch, the parent binds the plan:**
+
+{{PLAN_COMPLETION_GATE_SHIP:discovery}}
+
+**Subagent prompt:** Substitute `<base>` and supply the bound plan's absolute path
+or complete text, including user-approved scope changes. When discovery printed the
+not-run line, skip dispatch. The child does not inherit the parent's conversation.
 
 ````text
 You are running a ship-workflow plan completion audit. The base branch is `<base>`. Use `git diff origin/<base>` and inspect untracked files from `git status` to see the full proposed change. Do not commit or push. Report only: classify every item, but do not execute Gate Logic, ask the user, or advance the workflow. The parent applies those gates to your report.
@@ -35,9 +38,14 @@ Counts map one-to-one to the classifications above and sum to total_items. No pl
    extra or invalid fields fail. Valid no-plan/no-actionable reports retain zero counts
    and their summary.
 2. Store counts for Step 20 and `summary` for Step 19's `## Plan Completion`.
-3. Apply Gate Logic below before continuing. Carry approved deferrals, with item text
+3. Run the parent-computed Acceptance edits check below on the bound plan; it adds
+   `ACCEPTANCE_EDITED` beside the child's classes and never changes the child's
+   seven fields.
+4. Apply Gate Logic below before continuing. Carry approved deferrals, with item text
    and plan path, to Step 14; keep them separate from dropped scope. The gate supplies
    the required PR notes and per-item manual verification evidence.
+
+{{PLAN_COMPLETION_GATE_SHIP:acceptance}}
 
 **Audit-failure fallback:** On failure, invalid JSON or no final output after ~10
 minutes, stop any live child and confirm it stopped before an inline audit with the same

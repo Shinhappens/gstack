@@ -12,6 +12,7 @@ import {
   type PaidCaseSelection, type SliceResult,
 } from '../scripts/test-paid-shards';
 import { PR_PROFILE_CASE_IDS, PR_PROFILE_FILES } from '../scripts/test-pr-profile';
+import { fileCaseRegistration } from '../scripts/lib/paid-cases';
 import { E2E_TOUCHFILES } from './helpers/touchfiles-data';
 import { resolveModuleSelection } from './helpers/e2e-helpers';
 
@@ -64,6 +65,19 @@ describe('PR profile paid-runner integration', () => {
     }
   });
 
+  test('every short probe with literal test names has a test the PR lane name pattern selects', () => {
+    for (const [file, cases] of Object.entries(PR_PROFILE_FILES)) {
+      const source = fs.readFileSync(path.join(ROOT, file), 'utf8');
+      if (fileCaseRegistration(file, source).computed) continue;
+      const titles = [...source.matchAll(/\b(?:describe\w*|test\w*|it)(?:\.\w+)?\(\s*(['"`])((?:(?!\1)[^\\]|\\.)*)\1/g)].map(m => m[2]!);
+      const names = titles.flatMap(outer => [outer, ...titles.map(inner => `${outer} ${inner}`)]);
+      for (const id of cases) {
+        const pattern = new RegExp(prProfileTestNamePattern(file, { e2e: [id], judges: [] }));
+        expect(names.some(name => pattern.test(name)), `${file} has no test named for ${id}`).toBe(true);
+      }
+    }
+  });
+
   test('planner binds E2E and judge IDs and plans the CEO plan-mode probe in the PR lane', () => {
     const manifest = ceoManifest();
     expect(manifest.profile).toBe('pr');
@@ -81,7 +95,7 @@ describe('PR profile paid-runner integration', () => {
   });
 
   test('unknown dependencies restore full gate while missing prompt coverage fails before execution', () => {
-    const fallback = computePaidCaseSelection({ profile: 'pr', env: {}, changedFiles: ['lib/unknown-pr-runtime.ts'] });
+    const fallback = computePaidCaseSelection({ profile: 'pr', env: {}, changedFiles: ['ETHOS.md'] });
     expect(fallback.coverage?.mode).toBe('full-fallback');
     expect(fallback.selection.e2e).toContain('qa-only-no-fix');
     expect(fallback.selection.e2e).not.toContain('autoplan-dual-voice');

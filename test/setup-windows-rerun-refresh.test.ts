@@ -159,6 +159,8 @@ function runInstaller(
     `IS_WINDOWS=${isWindows}`,
     extraVars,
     extractFn('_link_or_copy'),
+    extractFn('_link_runtime_dists'),
+    extractFn('_copy_runtime_skill_refs'),
     // Ownership gates (#2142) — dependencies of every installer under test.
     extractFn('_owned_for_windows_refresh'),
     extractFn('_sidecar_root_user_owned'),

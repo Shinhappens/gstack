@@ -15,6 +15,12 @@ CSO_FINAL_CORE="$CSO_BUILD_ROOT/bin/gstack-cso-core$CSO_EXE"
 CSO_FINAL_LAUNCHER="$CSO_BUILD_ROOT/bin/gstack-cso-launcher$CSO_EXE"
 CSO_FINAL_WATCHDOG="$CSO_BUILD_ROOT/bin/gstack-cso-watchdog"
 CSO_FINAL_GENERATION="$CSO_BUILD_ROOT/bin/.gstack-cso-generation"
+# Build-result record read by setup's summary and gstack-doctor (#3071).
+CSO_RESULT_FILE="$CSO_BUILD_ROOT/bin/.gstack-cso-build-result"
+CSO_RESULT_RECORDING=0
+CSO_RESULT_STAGE=build
+CSO_REVISION=""
+CSO_PREVIOUS_INSTALLED=""
 CSO_STAGE=""
 CSO_PUBLISHING=0
 CSO_COMMITTED=0
@@ -27,6 +33,7 @@ CSO_NEW_LAUNCHER_INSTALLED=0
 CSO_NEW_CORE_INSTALLED=0
 CSO_NEW_WATCHDOG_INSTALLED=0
 CSO_NEW_GENERATION_INSTALLED=0
+CSO_EVALUATION_UNIT=""
 
 cso_checkpoint() {
   [ "${GSTACK_CSO_BUILD_TESTING:-0}" = 1 ] || return 0
@@ -37,6 +44,25 @@ cso_checkpoint() {
   if [ "${GSTACK_CSO_BUILD_TEST_KILL_AFTER:-}" = "$1" ]; then
     kill -KILL "$$"
   fi
+  if [ "${GSTACK_CSO_BUILD_TEST_REMOVE_LOCKER_AFTER:-}" = "$1" ]; then
+    rm -f "$CSO_STAGE_LOCKER"
+  fi
+}
+
+cso_record_field() { sed -n "s/^$1=//p" "$CSO_RESULT_FILE" 2>/dev/null | head -1; }
+
+# One record per run: result (ok/failed), stage (build/publish), reason, this
+# checkout's revision, the revision of the CSO generation still installed, and
+# whether that launcher is usable. A SIGKILL leaves the last "interrupted" entry.
+cso_write_result() {
+  launcher=no
+  if cso_valid_artifact "$CSO_FINAL_LAUNCHER" && cso_valid_artifact "$CSO_FINAL_CORE"; then launcher=yes; fi
+  installed=""
+  if [ "$1" = ok ]; then installed=$CSO_REVISION
+  elif [ "$launcher" = yes ]; then installed=${CSO_PREVIOUS_INSTALLED:-an earlier build}; fi
+  # Written in place: publication's signal tests count on mv moving artifacts only.
+  printf 'result=%s\nstage=%s\nreason=%s\nrevision=%s\ninstalled=%s\nlauncher=%s\ndiagnostic=%s\n' \
+    "$1" "$2" "$3" "$CSO_REVISION" "$installed" "$launcher" "${GSTACK_CSO_BUILD_LOG:-the scripts/build-cso.sh output}" > "$CSO_RESULT_FILE" || true
 }
 
 cso_restore_previous() {
@@ -87,6 +113,11 @@ cso_cleanup() {
     if ! cso_restore_previous; then status=1; cleanup_stage=0; fi
   fi
   if [ "$cleanup_stage" -eq 1 ] && [ -n "$CSO_STAGE" ] && [ ! -f "$CSO_STAGE/.retain-recovery" ]; then rm -rf "$CSO_STAGE"; fi
+  if [ -n "$CSO_EVALUATION_UNIT" ]; then rm -rf "$CSO_EVALUATION_UNIT"; fi
+  if [ "$CSO_RESULT_RECORDING" -eq 1 ]; then
+    if [ "$status" -eq 0 ] && [ "$CSO_COMMITTED" -eq 1 ]; then cso_write_result ok publish committed
+    else cso_write_result failed "$CSO_RESULT_STAGE" "exit $status"; fi
+  fi
   exit "$status"
 }
 trap 'cso_cleanup $?' EXIT
@@ -143,6 +174,89 @@ cso_sha256() {
   printf '%s\n' "$digest"
 }
 
+# Bun's compile-time switches stop configuration discovery in the audited
+# working directory before the helper can apply its own policy.
+cso_compile_bun() {
+  "$BUN_CMD" build --compile \
+    --no-compile-autoload-dotenv \
+    --no-compile-autoload-bunfig \
+    --no-compile-autoload-tsconfig \
+    --no-compile-autoload-package-json \
+    "$1" --outfile "$2"
+  chmod +x "$2"
+}
+cso_compile_watchdog() {
+  "$CSO_CC" -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -Wall -Wextra \
+    lib/cso/watchdog.c -o "$1"
+  chmod +x "$1"
+}
+cso_compile_posix_launcher() {
+  CSO_LAUNCHER_FLAGS=""
+  case "$(uname -s)" in
+    Linux) CSO_LAUNCHER_FLAGS="-static" ;;
+    # Local ad-hoc signatures do not distinguish the launcher from another
+    # ad-hoc dylib. This section makes dyld prune DYLD_* before constructors.
+    Darwin) CSO_LAUNCHER_FLAGS="-Wl,-sectcreate,__RESTRICT,__restrict,/dev/null" ;;
+  esac
+  # shellcheck disable=SC2086 -- the optional platform flags are fixed literals.
+  "$CSO_CC" -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -Wall -Wextra $CSO_LAUNCHER_FLAGS \
+    "-DGSTACK_CSO_CORE_SHA256=\"$2\"" lib/cso/launcher.c -o "$1"
+}
+
+# An evaluation candidate embeds a cso-eval-* runtime catalog in a private
+# five-artifact producer unit outside this checkout. It never touches bin/, and
+# its .gstack-cso-evaluation manifest marks it evaluation-only for setup.
+cso_build_evaluation_candidate() {
+  [ "$#" -eq 4 ] && [ "$1" = --evaluation-candidate ] && [ "$3" = --output ] || {
+    echo 'Usage: build-cso.sh --evaluation-candidate <cso-eval-catalog.json> --output <new-directory>' >&2;return 64; }
+  [ -z "$CSO_EXE" ] || { echo 'CSO evaluation candidates are built only on Linux and macOS.' >&2;return 69; }
+  command -v "$CSO_CC" >/dev/null 2>&1 || { echo 'CSO build requires a C compiler (cc/clang/gcc) for the trusted launcher and watchdog.' >&2;return 1; }
+  candidate_catalog=$2
+  [ -f "$candidate_catalog" ] && [ ! -L "$candidate_catalog" ] || { echo 'CSO evaluation catalog must be one regular file.' >&2;return 66; }
+  candidate_parent="$(cd "$(dirname "$4")" 2>/dev/null && pwd -P)" || { echo 'CSO evaluation output parent must be an existing directory.' >&2;return 73; }
+  candidate_output="$candidate_parent/$(basename "$4")"
+  if cso_present "$candidate_output";then echo 'CSO evaluation output must be a new directory.' >&2;return 73;fi
+  case "$candidate_output/" in "$CSO_BUILD_ROOT"/*) echo 'CSO evaluation output must be outside the gstack checkout, where setup and distribution never look.' >&2;return 73;;esac
+  candidate_revision="$(grep -o '"revision": *"cso-eval-[0-9]\{1,\}-[a-f0-9]\{12\}"' "$candidate_catalog" | head -n 1 | sed 's/.*"\(cso-eval-[^"]*\)"$/\1/' || true)"
+  [ -n "$candidate_revision" ] || { echo 'CSO evaluation candidates require a cso-eval-<runId>-<sha12> catalog revision.' >&2;return 65; }
+
+  CSO_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/gstack-cso-evaluation.XXXXXX")"
+  CSO_EVALUATION_UNIT="$(mktemp -d "$candidate_parent/.gstack-cso-evaluation.XXXXXX")"
+  source_root="$CSO_STAGE/source"
+  mkdir -m 700 "$source_root" "$source_root/test"
+  cp -R lib scripts "$source_root/"
+  cp -R test/helpers "$source_root/test/"
+  cp "$candidate_catalog" "$source_root/lib/cso/runtime-catalog.json"
+  (cd "$source_root" && "$BUN_CMD" scripts/cso-runtime-promotion.ts check-evaluation lib/cso/runtime-catalog.json)
+  (cd "$source_root" && cso_compile_bun lib/cso/cli.ts "$CSO_EVALUATION_UNIT/gstack-cso-core")
+  (cd "$source_root" && cso_compile_bun scripts/cso-eval-producer.ts "$CSO_EVALUATION_UNIT/cso-eval-producer")
+  cso_compile_watchdog "$CSO_EVALUATION_UNIT/gstack-cso-watchdog"
+  if [ "$(uname -s)" = Darwin ]; then
+    cso_sign_macos_artifact "$CSO_EVALUATION_UNIT/gstack-cso-core" 0
+    cso_sign_macos_artifact "$CSO_EVALUATION_UNIT/gstack-cso-watchdog" 0
+  fi
+  candidate_core_sha256="$(cso_sha256 "$CSO_EVALUATION_UNIT/gstack-cso-core")"
+  cso_compile_posix_launcher "$CSO_EVALUATION_UNIT/gstack-cso-launcher" "$candidate_core_sha256"
+  chmod +x "$CSO_EVALUATION_UNIT/gstack-cso-launcher"
+  if [ "$(uname -s)" = Darwin ];then cso_sign_macos_artifact "$CSO_EVALUATION_UNIT/gstack-cso-launcher" 1;fi
+  printf '%s\n' "$candidate_core_sha256" > "$CSO_EVALUATION_UNIT/.gstack-cso-generation"
+  printf '{"schemaVersion":1,"evaluationOnly":true,"runtimeCatalogRevision":"%s","runtimeCatalogSha256":"%s","coreSha256":"%s"}\n' \
+    "$candidate_revision" "$(cso_sha256 "$source_root/lib/cso/runtime-catalog.json")" "$candidate_core_sha256" \
+    > "$CSO_EVALUATION_UNIT/.gstack-cso-evaluation"
+  for artifact in gstack-cso-core gstack-cso-launcher gstack-cso-watchdog cso-eval-producer;do
+    cso_valid_artifact "$CSO_EVALUATION_UNIT/$artifact" || { echo "Evaluation $artifact is not one executable regular file." >&2;return 1; }
+  done
+  cso_valid_generation "$CSO_EVALUATION_UNIT/.gstack-cso-generation" || { echo 'Evaluation generation manifest is invalid.' >&2;return 1; }
+  [ "$(cso_sha256 "$CSO_EVALUATION_UNIT/gstack-cso-core")" = "$candidate_core_sha256" ] || { echo 'Evaluation core changed after launcher binding.' >&2;return 1; }
+  "$CSO_EVALUATION_UNIT/gstack-cso-launcher" --version >/dev/null
+  chmod 0555 "$CSO_EVALUATION_UNIT"/gstack-cso-core "$CSO_EVALUATION_UNIT"/gstack-cso-launcher "$CSO_EVALUATION_UNIT"/gstack-cso-watchdog "$CSO_EVALUATION_UNIT"/cso-eval-producer
+  chmod 0444 "$CSO_EVALUATION_UNIT/.gstack-cso-generation" "$CSO_EVALUATION_UNIT/.gstack-cso-evaluation"
+  chmod 0755 "$CSO_EVALUATION_UNIT"
+  mv "$CSO_EVALUATION_UNIT" "$candidate_output"
+  CSO_EVALUATION_UNIT=""
+  printf '{"output":"%s","revision":"%s","evaluationOnly":true}\n' "$candidate_output" "$candidate_revision"
+}
+
 cso_publish_locked() {
   [ "${GSTACK_CSO_PUBLISH_LOCKED:-}" = 1 ] || { echo 'CSO publication requires the native publisher lock.' >&2;return 73; }
   [ "$#" -eq 1 ] && [ -d "$1" ] && [ ! -L "$1" ] || { echo 'CSO publication stage is invalid.' >&2;return 69; }
@@ -196,10 +310,32 @@ cso_publish_locked() {
   CSO_COMMITTED=1
 }
 
+cso_start_result() {
+  CSO_RESULT_RECORDING=1
+  CSO_RESULT_STAGE=$1
+  CSO_REVISION="$(head -1 "$CSO_BUILD_ROOT/VERSION" 2>/dev/null | tr -cd '0-9A-Za-z.+-')"
+  revision_sha="$(git -C "$CSO_BUILD_ROOT" rev-parse --short=12 HEAD 2>/dev/null | tr -cd '0-9a-f')"
+  CSO_REVISION="${CSO_REVISION:-unknown}${revision_sha:+ ($revision_sha)}"
+  CSO_PREVIOUS_INSTALLED="$(cso_record_field installed)"
+}
+
 if [ "${1:-}" = __publish_locked ];then
   shift
+  cso_start_result publish
   cso_publish_locked "$@"
   exit 0
+fi
+if [ "${1:-}" = --evaluation-candidate ];then
+  cso_build_evaluation_candidate "$@"
+  exit 0
+fi
+[ "$#" -eq 0 ] || { echo 'Usage: build-cso.sh [--evaluation-candidate <cso-eval-catalog.json> --output <new-directory>]' >&2;exit 64; }
+cso_start_result build
+cso_write_result failed build interrupted
+# Distribution builds embed only the committed catalog, never an evaluation one.
+if [ -f lib/cso/runtime-catalog.json ] && grep -q '"revision": *"cso-eval-' lib/cso/runtime-catalog.json;then
+  echo 'lib/cso/runtime-catalog.json is an evaluation-only catalog; distribution builds refuse it. Restore the committed catalog.' >&2
+  exit 65
 fi
 
 # This entrypoint can be run directly. Once it may publish a CSO generation,
@@ -226,21 +362,13 @@ if [ -n "$CSO_EXE" ];then : > "$CSO_STAGE/.gstack-cso-generation.lock";fi
 
 # These are compile-time switches. Bun otherwise discovers configuration in
 # the audited working directory before the helper can apply its own policy.
-"$BUN_CMD" build --compile \
-  --no-compile-autoload-dotenv \
-  --no-compile-autoload-bunfig \
-  --no-compile-autoload-tsconfig \
-  --no-compile-autoload-package-json \
-  lib/cso/cli.ts --outfile "$CSO_STAGE_CORE"
-chmod +x "$CSO_STAGE_CORE"
+cso_compile_bun lib/cso/cli.ts "$CSO_STAGE_CORE"
 cso_checkpoint core
 
 # POSIX process groups are required by the detached watchdog. Windows keeps
 # comprehensive execution unavailable instead of substituting a weaker timer.
 if [ -z "$CSO_EXE" ]; then
-  "$CSO_CC" -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -Wall -Wextra \
-    lib/cso/watchdog.c -o "$CSO_STAGE_WATCHDOG"
-  chmod +x "$CSO_STAGE_WATCHDOG"
+  cso_compile_watchdog "$CSO_STAGE_WATCHDOG"
   cso_checkpoint watchdog
 fi
 
@@ -252,12 +380,14 @@ CSO_CORE_SHA256="$(cso_sha256 "$CSO_STAGE_CORE")"
 printf '%s\n' "$CSO_CORE_SHA256" > "$CSO_STAGE_GENERATION"
 
 if [ -n "$CSO_EXE" ];then
-  if ! command -v powershell.exe >/dev/null 2>&1||! command -v cygpath >/dev/null 2>&1;then
-    echo 'CSO Windows build requires Git Bash and Windows PowerShell with MSVC Build Tools.' >&2;exit 1
+  # PowerShell 7 first: Windows PowerShell 5.1 can crash outright (#3071).
+  CSO_POWERSHELL="$(command -v pwsh 2>/dev/null || command -v powershell.exe 2>/dev/null || true)"
+  if [ -z "$CSO_POWERSHELL" ]||! command -v cygpath >/dev/null 2>&1;then
+    echo 'CSO Windows build requires Git Bash and PowerShell (pwsh or Windows PowerShell) with MSVC Build Tools.' >&2;exit 1
   fi
   CSO_WINDOWS_GIT="$(type -P git 2>/dev/null || true)"
   [ -n "$CSO_WINDOWS_GIT" ] && [ -f "$CSO_WINDOWS_GIT" ] || { echo 'CSO Windows build requires the Git for Windows git.exe selected by Git Bash.' >&2;exit 1; }
-  powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  "$CSO_POWERSHELL" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
     -File "$(cygpath -w "$CSO_BUILD_ROOT/scripts/build-cso-windows.ps1")" \
     -RepoRoot "$(cygpath -w "$CSO_BUILD_ROOT")" \
     -OutputPath "$(cygpath -w "$CSO_STAGE_LAUNCHER")" \
@@ -265,16 +395,7 @@ if [ -n "$CSO_EXE" ];then
     -CoreSha256 "$CSO_CORE_SHA256" \
     -GitExePath "$(cygpath -aw "$CSO_WINDOWS_GIT")"
 else
-  CSO_LAUNCHER_FLAGS=""
-  case "$(uname -s)" in
-    Linux) CSO_LAUNCHER_FLAGS="-static" ;;
-    # Local ad-hoc signatures do not distinguish the launcher from another
-    # ad-hoc dylib. This section makes dyld prune DYLD_* before constructors.
-    Darwin) CSO_LAUNCHER_FLAGS="-Wl,-sectcreate,__RESTRICT,__restrict,/dev/null" ;;
-  esac
-  # shellcheck disable=SC2086 -- the optional platform flags are fixed literals.
-  "$CSO_CC" -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -Wall -Wextra $CSO_LAUNCHER_FLAGS \
-    "-DGSTACK_CSO_CORE_SHA256=\"$CSO_CORE_SHA256\"" lib/cso/launcher.c -o "$CSO_STAGE_LAUNCHER"
+  cso_compile_posix_launcher "$CSO_STAGE_LAUNCHER" "$CSO_CORE_SHA256"
   "$CSO_CC" -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -Wall -Wextra lib/cso/publish-lock.c -o "$CSO_STAGE_LOCKER"
 fi
 chmod +x "$CSO_STAGE_LAUNCHER" "$CSO_STAGE_LOCKER"
@@ -298,4 +419,18 @@ if [ -n "$CSO_EXE" ];then
 else
   case "${BASH:-}" in /*) CSO_PUBLISH_SHELL=$BASH;; *) echo 'CSO publication requires an absolute Bash executable.' >&2;exit 1;;esac
 fi
+cso_valid_artifact "$CSO_STAGE_LOCKER" || { echo 'Staged CSO publisher lock is not one executable regular file.' >&2; exit 1; }
+CSO_RESULT_STAGE=publish
+cso_write_result failed publish interrupted
+cso_checkpoint before-exec
+# From here the locked child owns the stage: its own EXIT trap restores and
+# cleans it. Git Bash's exec of a native program may not replace this shell,
+# so this trap must not be armed under the running child (#3071). If the exec
+# itself fails, clean up here.
+set +e
+shopt -s execfail
+trap - EXIT
 exec "$CSO_STAGE_LOCKER" "$CSO_BUILD_ROOT/bin" "$CSO_PUBLISH_SHELL" "$CSO_BUILD_ROOT/scripts/build-cso.sh" __publish_locked "$CSO_STAGE"
+cso_exec_status=$?
+echo "CSO publication could not start $CSO_STAGE_LOCKER (exit $cso_exec_status)." >&2
+cso_cleanup "$cso_exec_status"
