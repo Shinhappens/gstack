@@ -108,6 +108,112 @@ describe('caller native-event observer controls', () => {
       ['exploratory', 'system-functional'].map(id => [id, ready.find(tool => String(tool.input.file_path).endsWith(`/qa/sections/${id}.md`))] as const))).toEqual([]);
   });
 
+  test('census 38212265208: a probe batched with the caller section Read is flagged, and the scheduling contract never calls a probe discovery', async () => {
+    // Native order of census 38212265208 (gate-census-6, ship-exploratory-late-input): provider
+    // message, tool, input; outputs abbreviated. Capture 001 shares a response with the Step 9 section Read.
+    const R = '/home/runner/.cache/gstack-paid-shard-iHlpIM/tmp/qc-cALQYz';
+    const capture = (id: string, extra = '') => `bun ${R}/host/runtime/bin/gstack-qa-evidence capture ${R}/product/reports ${id} --public --deadline ${R}/product/reports/deadline.json ${extra}-- bun scripts/probe.ts`;
+    const replay: Array<[string, string, Record<string, string>, string]> = [
+      ['YvqEApde', 'Read', { file_path: `${R}/host/runtime/ship/sections/plan-completion.md` }, '## Step 8: Plan Completion Audit'],
+      ['YvqEApde', 'Read', { file_path: `${R}/host/runtime/ship/sections/review-army.md` }, '## Step 9: Pre-Landing Review'],
+      ['YvqEApde', 'Bash', { command: `${capture('001')} 3` }, '{"id":"probe-b5ae2d9c-af87-4e8a-9aab-76972f826079","charter":"happy","input":"3"}'],
+      ['w9Gt4kmL', 'Read', { file_path: `${R}/host/runtime/qa/sections/exploratory.md` }, '# Shared exploratory QA'],
+      ['w9Gt4kmL', 'Read', { file_path: `${R}/host/runtime/bin/gstack-qa-evidence` }, '#!/usr/bin/env bun'],
+      ['w9Gt4kmL', 'Bash', { command: `${R}/host/runtime/bin/gstack-review-read` }, 'NO_REVIEWS'],
+      ['w9Gt4kmL', 'Bash', { command: `${R}/host/runtime/bin/gstack-specialist-stats` }, 'SPECIALIST_STATS: 0 reviews analyzed'],
+      ['cba4VKcQ', 'Bash', { command: `${capture('002', "--after 001 --hypothesis 'upper bound 9 should still print 18' ")} 9` }, '{"id":"probe-baf59bfd-ac54-4a4a-8bec-2cd416154bbf","charter":"plan:nine","input":"9"}'],
+      ['cba4VKcQ', 'Read', { file_path: `${R}/host/runtime/qa/sections/scope.md` }, '### Select the surface before setup'],
+      ['cba4VKcQ', 'Read', { file_path: `${R}/host/runtime/qa/sections/system-functional.md` }, '# Functional QA with repository-native tools'],
+    ];
+    const replayTools = (rows: typeof replay) => callerTools(rows.flatMap(([message, name, input, output], i) =>
+      nativeCall(`toolu_${i}`, name, input, output).map((event: any) => event.type === 'assistant'
+        ? { ...event, session_id: 'census-38212265208', message: { ...event.message, id: `msg_${message}` } } : event)));
+    const probeErrors = (tools: ReturnType<typeof callerTools>) => tools.filter(tool => / capture /.test(String(tool.input.command)))
+      .flatMap(probe => callerProbeReadErrors(probe, ['exploratory', 'system-functional']
+        .map(id => [id, tools.find(tool => String(tool.input.file_path).endsWith(`/qa/sections/${id}.md`))] as const)));
+    const tools = replayTools(replay);
+    const section = tools.find(tool => String(tool.input.file_path).endsWith('/ship/sections/review-army.md'))!;
+    expect(tools.find(tool => / capture /.test(String(tool.input.command)))!.messageId).toBe(section.messageId);
+    expect(probeErrors(tools)).toEqual([
+      'probe preceded resource read: exploratory', 'probe preceded resource read: system-functional',
+      'probe preceded resource read: system-functional',
+    ]);
+    const isProbe = ([, , input]: (typeof replay)[number]) => / capture /.test(input.command ?? '');
+    expect(probeErrors(replayTools([...replay.filter(row => !isProbe(row)),
+      ...replay.filter(isProbe).map(([message, ...rest]) => [`${message}-after-reads`, ...rest] as (typeof replay)[number])]))).toEqual([]);
+
+    const fixture = createQaCallerFixture('ship-exploratory-late-input');
+    try {
+      await runQaCaller(fixture, 'free-read-probe-contract', async options => {
+        const contract = options.appendSystemPrompt!;
+        const discovery = contract.match(/Read-only discovery is [^.]*;([^.]*)\./);
+        expect(discovery?.[1]).toMatch(/capture/);
+        expect(discovery?.[1]).toMatch(/guard start/);
+        expect(discovery?.[1]).toMatch(/never discovery/);
+        return { exitReason: 'error_max_turns', transcript: [] } as unknown as SkillTestResult;
+      });
+    } finally { await fixture.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+  });
+
+  test('captured section skips 38973329985 and 38993076767: the reads stay required, and the prompt binds names instead of teaching helper forms', async () => {
+    // Paid gate runs 38973329985 and 38993076767, ship-exploratory-small-cli: both actors read ship/sections/review-army.md, never
+    // read qa/sections/exploratory.md or system-functional.md, ran captures with the syntax the session prompt taught, then a bare
+    // materialize the prompt had not taught. Every passing session in the window read both sections.
+    const captured = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/qa-caller-section-skip-ship-small-cli.json'), 'utf8'));
+    const reportRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'qc-skip-'));
+    checkpointRoots.push(reportRoot);
+    const validate = (transcript: unknown[]) => validateCallerEvidence({
+      caller: 'ship', result: { exitReason: 'success', transcript }, probes: [], receipt: { status: 'pass', probes: [], remaining: [] },
+      currentSnapshot: snapshot, requiredCharters: [], mutations: [], observerComplete: true,
+      reportRoot, checkpointFiles: {}, reportMarkdown: '',
+    });
+    const missing = ['missing executed resource read: /qa/sections/exploratory.md', 'missing executed resource read: /qa/sections/system-functional.md'];
+    for (const run of ['38973329985', '38993076767']) {
+      const events = captured.runs[run] as unknown[];
+      expect(callerTools(events).filter(tool => / materialize \/qc\/product\/reports$/.test(String(tool.input.command)))).toHaveLength(1);
+      const errors = validate(events);
+      for (const error of missing) expect(errors).toContain(error);
+      const control = [...events.slice(0, 4), ...nativeCall(`${run}-exploratory`, 'Read', { file_path: '/qc/host/runtime/qa/sections/exploratory.md' }, '# Shared exploratory QA'),
+        ...nativeCall(`${run}-functional`, 'Read', { file_path: '/qc/host/runtime/qa/sections/system-functional.md' }, '# Functional QA'), ...events.slice(4)];
+      for (const error of missing) expect(validate(control)).not.toContain(error);
+    }
+    for (const caseId of QA_CALLER_CASES) {
+      const fixture = createQaCallerFixture(caseId, { installRuntime: false });
+      try {
+        const prompt = qaCallerSessionOptions(fixture, 'free-bindings').prompt;
+        expect(prompt).not.toMatch(/gstack-qa-(?:evidence|deadline) (?:capture|checkpoint|materialize|start|status|run)\b|--after PREV|--hypothesis/);
+        expect(prompt).toContain('forms are in the installed qa/sections/exploratory.md this phase requires you to Read');
+        for (const binding of [`DEADLINE_TOOL = ${fixture.runtime}/bin/gstack-qa-deadline`, `EVIDENCE_TOOL = ${fixture.runtime}/bin/gstack-qa-evidence`,
+          `PROBE_DIR = ${fixture.cwd}/reports`, `DEADLINE_FILE = ${fixture.cwd}/reports/deadline.json`, 'so --public is approved', '--timeout-ms 10000']) {
+          expect(prompt).toContain(binding);
+        }
+        // PR gate 39077524802 (0f71a55) ship-exploratory-late-input: after the late input change the actor reran captures
+        // 001 and 002 with --timeout-ms 10000, reading revalidation as 'outside the smoke budget'.
+        expect(prompt).toContain('Only an explicit plan check this phase requires may use --timeout-ms 10000 in place of the deadline; every other capture, including a rerun or revalidation of an earlier probe, uses the deadline.');
+        expect(prompt).not.toContain('Explicit plan probes outside the smoke budget may use');
+      } finally { await fixture.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+    }
+    const section = fs.readFileSync(path.join(import.meta.dir, '../qa/sections/exploratory.md'), 'utf8');
+    for (const form of ['bun DEADLINE_TOOL start DEADLINE_FILE SECONDS [EARLIER_UTC]', 'bun EVIDENCE_TOOL capture PROBE_DIR NNN [--public] --deadline DEADLINE_FILE -- COMMAND ARGS',
+      "--after PREV --hypothesis 'why'", 'bun EVIDENCE_TOOL materialize PROBE_DIR annotations.json']) {
+      expect(section).toContain(form);
+    }
+  });
+
+  test('captured 39002269281 standalone state-machine detect stays outside the caller interface; the generated scope block runs it', async () => {
+    // PR gate run 39002269281 ship-exploratory-plan-checks, native Bash call 17: the selection prose named the detector, so the
+    // actor ran it alone. The detector now runs inside the generated scope block, which is the declared form.
+    const fixture = createQaCallerFixture('ship-exploratory-plan-checks', { installRuntime: false });
+    try {
+      const standalone = `${fixture.runtime}/bin/gstack-state-matrix detect --base main`;
+      expect(qaCallerCommandAllowed(standalone, fixture.workflowCommands)).toBe(false);
+      const block = fixture.workflowCommands.find(command => command.includes('/bin/gstack-state-matrix detect --base main'));
+      expect(block).toBeDefined();
+      expect(block).toContain('/gstack-diff-scope main 2>/dev/null) || true');
+      expect(qaCallerCommandAllowed(block!, fixture.workflowCommands)).toBe(true);
+    } finally { await fixture.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+  });
+
   test.each(['pending-result', 'same-event', 'same-message-id'])('method Read %s cannot authorize a dependent probe', ordering => {
     const observed = evidence();
     const events = observed.result.transcript as any[];

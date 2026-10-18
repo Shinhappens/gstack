@@ -565,6 +565,25 @@ describe('gen-skill-docs', () => {
     }
   });
 
+  test('bash blocks never loop over an unquoted variable (zsh does not word-split it)', () => {
+    // `for f in $LIST` runs once with the whole list under zsh (no SH_WORD_SPLIT),
+    // which is the Bash tool's shell on macOS. Iterate with
+    // `printf '%s\n' "$LIST" | while IFS= read -r f` or `$(echo "$LIST")`;
+    // zsh still splits an unquoted command substitution.
+    const violations: string[] = [];
+    for (const skill of CLAUDE_GENERATED_SKILLS) {
+      const content = readSkillUnion(skill.dir);
+      for (const block of [...content.matchAll(/```bash\n([\s\S]*?)```/g)].map(m => m[1])) {
+        for (const loop of block.matchAll(/\bfor\s+\w+\s+in\s+([^;\n]*)/g)) {
+          if (loop[1].split(/\s+/).some(word => /^\$\{?\w+\}?$/.test(word))) {
+            violations.push(`${skill.dir}: ${loop[0].trim()}`);
+          }
+        }
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+
   test('preamble-using skills have correct skill name in telemetry', () => {
     const PREAMBLE_SKILLS = [
       { dir: '.', name: 'gstack' },
@@ -2360,10 +2379,13 @@ describe('DESIGN_OUTSIDE_VOICES resolver', () => {
   test('branches correctly per skillName — different prompts', () => {
     const planContent = readSkillUnion('plan-design-review');
     const consultContent = readSkillUnion('design-consultation');
-    // plan-design-review uses analytical prompt (high reasoning)
-    expect(planContent).toContain('model_reasoning_effort="high"');
+    // plan-design-review uses analytical prompt (high reasoning); run-with-timeout
+    // turns --effort X into -c model_reasoning_effort="X" (test/codex-probe-subcommands.test.ts)
+    expect(planContent).toContain('run-with-timeout --effort high ');
+    expect(planContent).not.toContain('--effort medium');
     // design-consultation uses creative prompt (medium reasoning)
-    expect(consultContent).toContain('model_reasoning_effort="medium"');
+    expect(consultContent).toContain('run-with-timeout --effort medium ');
+    expect(consultContent).not.toContain('--effort high');
   });
 });
 
@@ -4534,8 +4556,8 @@ describe('plan-mode-info resolver (handshake-replacement)', () => {
 
   test('vestigial handshake is absent from non-Claude host outputs', () => {
     // Non-Claude hosts render to hostSubdirs (.agents/, .openclaw/, etc). The
-    // plan-mode-info resolver has no host-scoping — all hosts get the new
-    // section, none get the old handshake. Scan every candidate host tree in
+    // plan-mode-info section renders only on planMode hosts (#3168); no host
+    // gets the old handshake. Scan every candidate host tree in
     // the module-level out-dir render (--host all), which is always present —
     // so the check can no longer silently degrade to a console warning.
     const hostDirs = ['.agents', '.openclaw', '.opencode', '.factory', '.hermes', '.kiro', '.cursor', '.slate'];
@@ -4554,6 +4576,26 @@ describe('plan-mode-info resolver (handshake-replacement)', () => {
       }
     }
     expect(checked).toBeGreaterThan(0);
+  });
+
+  test('plan-mode section renders only for hosts whose capabilities declare planMode (#3168)', () => {
+    for (const host of ALL_HOST_CONFIGS) {
+      const skillsRoot = host.name === 'claude' ? EXTERNAL_OUT : path.join(EXTERNAL_OUT, host.hostSubdir, 'skills');
+      const files = fs.readdirSync(skillsRoot, { withFileTypes: true })
+        .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+        .map(entry => path.join(skillsRoot, entry.name, 'SKILL.md'))
+        .filter(file => fs.existsSync(file));
+      expect(files.length, `${host.name}: no rendered skills under ${skillsRoot}`).toBeGreaterThan(0);
+      const withSection = files.filter(file => {
+        const content = fs.readFileSync(file, 'utf-8');
+        return content.includes(PLAN_MODE_INFO_MARKER) || content.includes('## Plan Mode Safe Operations');
+      }).map(file => path.relative(EXTERNAL_OUT, file));
+      if (host.capabilities.planMode) {
+        expect(withSection.some(file => file.endsWith(`plan-ceo-review${path.sep}SKILL.md`)), `${host.name} lost the plan-mode section`).toBe(true);
+      } else {
+        expect(withSection, `${host.name} declares planMode:false but renders the plan-mode section`).toEqual([]);
+      }
+    }
   });
 
   test.each(REVIEW_SKILLS)(

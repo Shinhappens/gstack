@@ -13,7 +13,7 @@ import {
   statSync,
 } from 'node:fs';
 import { basename, dirname, join, isAbsolute, delimiter, resolve } from 'node:path';
-import { redactFindingSpans } from '../redact-engine';
+import { redactFindingSpans, redactJsonFindingSpans } from '../redact-engine';
 import { CsoError, MAX_OUTPUT } from './contracts';
 import { windowsDockerUnavailable } from './windows-docker';
 
@@ -62,6 +62,9 @@ export function executable(name: string): string {
   }
   throw new CsoError('TOOL_UNAVAILABLE', `${name} is not installed in a trusted system executable directory`);
 }
+// Git for Windows 2.56 rejects GIT_CONFIG_GLOBAL=NUL ("unable to access 'NUL'"); its MSYS
+// path layer maps /dev/null, so one spelling empties the global config on every platform.
+export const EMPTY_GLOBAL_GIT_CONFIG = '/dev/null';
 export function childEnvironment(home: string): Record<string, string> {
   return {
     PATH: TRUSTED_PATH,
@@ -70,7 +73,7 @@ export function childEnvironment(home: string): Record<string, string> {
     LC_ALL: 'C.UTF-8',
     TZ: 'UTC',
     GIT_CONFIG_NOSYSTEM: '1',
-    GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
+    GIT_CONFIG_GLOBAL: EMPTY_GLOBAL_GIT_CONFIG,
     GIT_TERMINAL_PROMPT: '0',
     GIT_OPTIONAL_LOCKS: '0',
     GIT_ATTR_NOSYSTEM: '1',
@@ -81,12 +84,15 @@ export function childEnvironment(home: string): Record<string, string> {
  * released only when every view a reader could assemble from it (each channel,
  * both concatenation orders, and the chronological interleaving) is free of
  * findings; a span crossing a channel boundary or one that cannot be located
- * therefore still withholds both channels.
+ * therefore still withholds both channels. A JSON-declared stdout is redacted
+ * as one concatenated stream with redactJsonFindingSpans, so it stays
+ * parseable, and every view is then checked the same way.
  */
 function spliceRedaction(
   ordered: Buffer[],
   streams: Array<Buffer[]>,
   out: Buffer[],
+  stdoutFormat?: 'json',
 ): { stdout: string; stderr: string } | null {
   const runs: Array<{ stdout: boolean; text: string }> = [];
   for (let i = 0; i < ordered.length;) {
@@ -98,9 +104,14 @@ function spliceRedaction(
     runs.push({ stdout: streams[i] === out, text });
     i = j;
   }
+  const json =
+    stdoutFormat === 'json'
+      ? jsonStdoutRuns(runs.filter((run) => run.stdout).map((run) => run.text))
+      : undefined;
+  if (json === null) return null;
   const released: Array<{ stdout: boolean; text: string }> = [];
   for (const run of runs) {
-    const text = redactFindingSpans(run.text, { maxBytes: MAX_OUTPUT });
+    const text = json && run.stdout ? json.shift()! : redactFindingSpans(run.text, { maxBytes: MAX_OUTPUT });
     if (text === null) return null;
     released.push({ stdout: run.stdout, text });
   }
@@ -116,6 +127,32 @@ function spliceRedaction(
   const views = [stdout, stderr, stdout + stderr, stderr + stdout, chronological];
   if (views.some((view) => redactFindingSpans(view, { maxBytes: 4 * MAX_OUTPUT }) !== view)) return null;
   return { stdout, stderr };
+}
+/**
+ * Each stdout run's share of the JSON-redacted concatenation. A replacement
+ * that straddles a run boundary (a number split by interleaved stderr) goes
+ * whole to the run where it starts, so no share holds part of a marker.
+ */
+function jsonStdoutRuns(texts: string[]): string[] | null {
+  const redacted = redactJsonFindingSpans(texts.join(''), { maxBytes: MAX_OUTPUT });
+  if (!redacted) return null;
+  const { body, edits } = redacted;
+  const shares: string[] = [];
+  let raw = 0,
+    cut = 0,
+    shift = 0,
+    from = 0,
+    next = 0;
+  for (const text of texts) {
+    raw += text.length;
+    cut = Math.max(cut, raw);
+    cut = edits.find((edit) => edit.start < cut && cut < edit.end)?.end ?? cut;
+    for (; next < edits.length && edits[next].end <= cut; next++)
+      shift += edits[next].text.length - (edits[next].end - edits[next].start);
+    shares.push(body.slice(from, cut + shift));
+    from = cut + shift;
+  }
+  return shares;
 }
 export function redact(value: string): string {
   // Scan the complete bounded stream, including across write/chunk boundaries.
@@ -535,8 +572,16 @@ export async function runProcess(
     raw?: boolean; // Only for inert Git framing or private helper/Docker control JSON that is validated before use. Never print or persist raw results.
     /** `splice` replaces each located sensitive span with a marker instead of withholding both channels. */
     redaction?: 'withhold' | 'splice';
+    /** With `splice`: stdout is a declared JSON report (scan output only), redacted so it stays parseable. */
+    stdoutFormat?: 'json';
     /** Allows PREPARATION_COMMAND_TIMEOUT_MS; only preparation dependency commands set it. */
     preparationCommand?: true;
+    /**
+     * The name the child sees as argv[0]. `executable()` returns the canonical
+     * path, and a multicall binary (OrbStack's docker -> docker-tools) dispatches
+     * on argv[0], so callers pass the command name they resolved.
+     */
+    argv0?: string;
   },
 ): Promise<ProcessResult> {
   if (!isAbsolute(file) || !isAbsolute(opts.cwd) || !existsSync(opts.cwd))
@@ -546,11 +591,14 @@ export async function runProcess(
     );
   if (!args.every((a) => typeof a === 'string' && !a.includes('\0')))
     throw new CsoError('INVALID_ARGUMENT', 'Invalid child argument');
+  if (opts.argv0 !== undefined && !/^[a-zA-Z0-9._-]+$/.test(opts.argv0))
+    throw new CsoError('INVALID_ARGUMENT', 'Invalid child argv0');
   const hardened = hardenGit(file, args);
   args = hardened.args;
   const cap = Math.min(opts.maxBytes ?? MAX_OUTPUT, opts.raw ? RAW_OUTPUT_LIMIT : MAX_OUTPUT);
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, {
+      argv0: opts.argv0,
       cwd: opts.cwd,
       env: opts.env,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -617,7 +665,9 @@ export async function runProcess(
           reverse = stderr + stdout,
           chronological = Buffer.concat(ordered).toString('utf8');
         const spliced =
-          opts.redaction === 'splice' && !truncated ? spliceRedaction(ordered, streams, out) : null;
+          opts.redaction === 'splice' && !truncated
+            ? spliceRedaction(ordered, streams, out, opts.stdoutFormat)
+            : null;
         if (spliced) {
           resolve({ code: code ?? -1, ...spliced, timedOut, truncated, capturedBytes: bytes });
           return;

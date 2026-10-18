@@ -36,6 +36,15 @@ test.each(['success', 'error', 'abort', 'unknown'])('same-session literal end ac
   expect(docsToolFailures(result, fixture)).toEqual([]);
 });
 
+test('start --help is a read with or without the spawned prefix; anything else after the prefix still names document-release', () => {
+  const start = `${fixture.skills.split(path.sep).join('/')}/bin/gstack-skill-start`;
+  expect(docsCommandAllowed(`GSTACK_SESSION_KIND=spawned ${start} --help`, fixture)).toBe(true);
+  expect(docsCommandAllowed(`${start} --help`, fixture)).toBe(true);
+  expect(docsCommandAllowed(`GSTACK_SESSION_KIND=spawned ${start} --help --skill qa`, fixture)).toBe(false);
+  expect(docsCommandAllowed(`GSTACK_SESSION_KIND=spawned ${start} --skill qa --model claude`, fixture)).toBe(false);
+  expect(docsCommandAllowed(`GSTACK_SESSION_KIND=spawned /tmp/gstack-skill-start --help`, fixture)).toBe(false);
+});
+
 test('historical misplaced spawned prefix remains rejected while corrected preamble stays supported', () => {
   const [original, spawned] = docsPreambleCommands(fixture);
   // The pre-#2763 wrapper put a misplaced prefix on its _SS assignment.
@@ -113,7 +122,8 @@ test('Git guidance uses the existing working directory; --git-dir and --work-tre
 describe('stored docsync observer commands', () => {
   const stored = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/docsync-observer-commands.json'), 'utf8')) as
     { known_good: string[]; known_bad: string[] };
-  const fill = (command: string) => command.replaceAll('{repo}', fixture.repo).replaceAll('{other}', path.dirname(fixture.repo));
+  const fill = (command: string) => command.replaceAll('{repo}', fixture.repo).replaceAll('{other}', path.dirname(fixture.repo))
+    .replaceAll('{home}', fixture.home);
   test.each(stored.known_good)('harmless read form is accepted: %s', command => {
     expect(docsCommandAllowed(fill(command), fixture)).toBe(true);
   });

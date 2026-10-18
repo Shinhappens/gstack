@@ -1,22 +1,48 @@
 import { spawn } from 'child_process';
-import type { RunResult } from './types';
+import type { RunResult, ToolTimelineEntry } from './types';
 
 /** Usage, turns and the latest text from `claude -p --output-format stream-json --verbose --include-partial-messages`. */
 export interface ClaudeStreamState {
   totals: { input: number; output: number; cached: number };
   /** The message each stream (main thread or a tool's subagent) is currently receiving. */
   open: Map<string, { input: number; output: number; cached: number }>;
+  /** Subagent messages, by message id: claude prints them only as `assistant` events tagged with their Agent call. */
+  subagents: Map<string, { input: number; output: number; cached: number }>;
   turns: number;
+  /** Turns summed over every `result` event: a background subagent's completion gives the main thread another result. */
+  resultTurns: number;
   lastText: string;
   result?: Record<string, unknown>;
   invalidLines: number;
+  startedAt: number;
+  /** Content-free: each tool call's name, start and end offsets and thread, never its input or output. */
+  toolTimeline: ToolTimelineEntry[];
+  /** Timeline index by tool-use id, for recorded calls only, so it stays within the timeline cap. */
+  toolUseIndex: Map<string, number>;
 }
 
 export function claudeStreamState(): ClaudeStreamState {
-  return { totals: { input: 0, output: 0, cached: 0 }, open: new Map(), turns: 0, lastText: '', invalidLines: 0 };
+  return { totals: { input: 0, output: 0, cached: 0 }, open: new Map(), subagents: new Map(), turns: 0, resultTurns: 0, lastText: '', invalidLines: 0, startedAt: Date.now(), toolTimeline: [], toolUseIndex: new Map() };
 }
 
+const TOOL_TIMELINE_LIMIT = 4096;
+
 const count = (value: unknown): number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+
+function recordToolUse(state: ClaudeStreamState, block: { id?: unknown; name?: unknown }, agent: 'main' | 'subagent'): void {
+  if (typeof block.id !== 'string' || state.toolUseIndex.has(block.id) || state.toolTimeline.length >= TOOL_TIMELINE_LIMIT) return;
+  state.toolUseIndex.set(block.id, state.toolTimeline.length);
+  state.toolTimeline.push({
+    atMs: Date.now() - state.startedAt,
+    tool: typeof block.name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(block.name) ? block.name : 'other',
+    agent,
+  });
+}
+
+function recordToolResult(state: ClaudeStreamState, block: { tool_use_id?: unknown }): void {
+  const index = typeof block.tool_use_id === 'string' ? state.toolUseIndex.get(block.tool_use_id) : undefined;
+  if (index !== undefined && state.toolTimeline[index].endMs === undefined) state.toolTimeline[index].endMs = Date.now() - state.startedAt;
+}
 
 function close(state: ClaudeStreamState, key: string): void {
   const message = state.open.get(key);
@@ -30,7 +56,23 @@ export function consumeClaudeStreamLine(state: ClaudeStreamState, line: string):
   let event: any;
   try { event = JSON.parse(line); } catch { state.invalidLines++; return; }
   if (!event || typeof event !== 'object') { state.invalidLines++; return; }
-  if (event.type === 'result') { state.result = event; return; }
+  if (event.type === 'result') {
+    state.result = event;
+    if (Number.isSafeInteger(event.num_turns) && event.num_turns >= 0) state.resultTurns += event.num_turns;
+    return;
+  }
+  if (event.type === 'assistant' && Array.isArray(event.message?.content)) {
+    for (const block of event.message.content) if (block?.type === 'tool_use') recordToolUse(state, block, typeof event.parent_tool_use_id === 'string' ? 'subagent' : 'main');
+  }
+  if (event.type === 'user' && Array.isArray(event.message?.content)) {
+    for (const block of event.message.content) if (block?.type === 'tool_result') recordToolResult(state, block);
+    return;
+  }
+  if (event.type === 'assistant' && typeof event.parent_tool_use_id === 'string') {
+    const usage = event.message?.usage;
+    if (typeof event.message?.id === 'string' && usage) state.subagents.set(event.message.id, { input: count(usage.input_tokens), output: count(usage.output_tokens), cached: count(usage.cache_read_input_tokens) });
+    return;
+  }
   if (event.type === 'assistant' && Array.isArray(event.message?.content)) {
     for (const block of event.message.content) if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) state.lastText = block.text;
     return;
@@ -43,6 +85,8 @@ export function consumeClaudeStreamLine(state: ClaudeStreamState, line: string):
     const usage = stream.message?.usage ?? {};
     state.open.set(key, { input: count(usage.input_tokens), output: count(usage.output_tokens), cached: count(usage.cache_read_input_tokens) });
     if (key === 'main') state.turns++;
+  } else if (stream.type === 'content_block_start' && stream.content_block?.type === 'tool_use') {
+    recordToolUse(state, stream.content_block, key === 'main' ? 'main' : 'subagent');
   } else if (stream.type === 'message_delta' && stream.usage) {
     const message = state.open.get(key);
     if (!message) return;
@@ -55,25 +99,38 @@ export function consumeClaudeStreamLine(state: ClaudeStreamState, line: string):
   }
 }
 
-/** Every message seen so far, including ones a kill interrupted mid-stream. */
+/** Every message seen so far, subagents' included, and ones a kill interrupted mid-stream. */
 export function claudeStreamUsage(state: ClaudeStreamState): { input: number; output: number; cached: number } {
   const totals = { ...state.totals };
-  for (const message of state.open.values()) { totals.input += message.input; totals.output += message.output; totals.cached += message.cached; }
+  for (const message of [...state.open.values(), ...state.subagents.values()]) { totals.input += message.input; totals.output += message.output; totals.cached += message.cached; }
   return totals;
 }
 
+/** `modelUsage` is the session total across models, subagents included; `usage` covers only the main thread's last turn. */
+function resultTokens(result: Record<string, unknown>): { input: number; output: number; cached: number } | undefined {
+  const models = result.modelUsage;
+  if (models && typeof models === 'object' && Object.keys(models).length) {
+    const totals = { input: 0, output: 0, cached: 0 };
+    for (const usage of Object.values(models as Record<string, Record<string, unknown>>)) {
+      totals.input += count(usage?.inputTokens); totals.output += count(usage?.outputTokens); totals.cached += count(usage?.cacheReadInputTokens);
+    }
+    return totals;
+  }
+  const usage = result.usage as Record<string, unknown> | undefined;
+  return usage ? { input: count(usage.input_tokens), output: count(usage.output_tokens), cached: count(usage.cache_read_input_tokens) } : undefined;
+}
+
 /**
- * The final `result` event is authoritative for usage and turns; without it (a killed run) the per-message stream
- * usage stands in. A paid producer still needs a successful result event with a nonblank `result`.
+ * The final `result` event is authoritative for usage (its `modelUsage` session totals) and its text; turns sum over
+ * every result. Without one (a killed run) the per-message stream usage stands in. A paid producer still needs a
+ * successful result event with a nonblank `result`.
  */
 export function resultFromClaudeStream(state: ClaudeStreamState, opts: { model: string; durationMs: number; error?: RunResult['error'] }): RunResult {
-  const result = state.result, usage = (result?.usage ?? undefined) as Record<string, unknown> | undefined;
-  const tokens = usage
-    ? { input: count(usage.input_tokens), output: count(usage.output_tokens), cached: count(usage.cache_read_input_tokens) }
-    : claudeStreamUsage(state);
-  const toolCalls = result && Number.isSafeInteger(result.num_turns) ? result.num_turns as number : state.turns;
+  const result = state.result;
+  const tokens = (result && resultTokens(result)) ?? claudeStreamUsage(state);
+  const toolCalls = result ? state.resultTurns : state.turns;
   const modelUsed = typeof result?.model === 'string' && result.model ? result.model : opts.model;
-  const base = { tokens, durationMs: opts.durationMs, toolCalls, modelUsed };
+  const base = { tokens, durationMs: opts.durationMs, toolCalls, toolTimeline: state.toolTimeline, modelUsed };
   if (opts.error) return { ...base, output: typeof result?.result === 'string' ? result.result : state.lastText, error: opts.error };
   const explicitError = result?.is_error === true || (typeof result?.subtype === 'string' && result.subtype !== 'success');
   if (!result || explicitError || typeof result.result !== 'string' || !result.result.trim()) {
